@@ -1,4 +1,4 @@
-# SHINYCAD
+# SHINYCAD (FULLY AI DEVELOPED)
 
 Local web application that creates ISO drawings from STEP files.
 Each drawing has an ISO 5457 frame, an ISO 7200 title block, first-angle Front / Top / Right views, section A-A through the part centre and an isometric view.
