@@ -1,0 +1,847 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SHINYCAD</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>SHINYCAD</h1>
+  <div class="head-right">
+    <div id="status"><span id="spinner" hidden></span><span id="status-text">Ready</span></div>
+    <button type="button" id="opt-open" class="small" title="Drawing units and keyboard shortcuts">Options</button>
+  </div>
+</header>
+
+<div id="layout">
+  <aside>
+    <section>
+      <h2>Models</h2>
+      <label id="drop" for="file-input">Drop STEP files here or click to select
+        <input id="file-input" type="file" accept=".step,.stp" multiple hidden>
+      </label>
+      <div class="row">
+        <input id="path-input" type="text" placeholder="Folder or STEP file path on this PC">
+        <button type="button" class="browse" data-browse="open" data-filter="step" data-target="#path-input" title="Choose a STEP file">…</button>
+        <button type="button" class="browse" data-browse="folder" data-target="#path-input" title="Choose a folder">Folder…</button>
+        <button id="path-open" type="button">Open</button>
+      </div>
+      <div id="files"></div>
+    </section>
+
+    <section>
+      <h2>Sheet</h2>
+      <div class="grid2">
+        <label>Sheet size<select id="sheet"></select></label>
+        <label>Scale<select id="scale"></select></label>
+        <label class="span2">Mode
+          <select id="mode">
+            <option value="per_part">One drawing per part</option>
+            <option value="document">One drawing per file</option>
+          </select>
+        </label>
+      </div>
+    </section>
+
+    <section>
+      <h2>Views</h2>
+      <label class="check"><input type="checkbox" id="v-orthographic"> Front, Top, Right (first angle)</label>
+      <label class="check"><input type="checkbox" id="v-section"> Section A-A</label>
+      <div class="grid3">
+        <label>Plane normal<select id="v-section_axis">
+          <option value="X">X</option><option value="Y">Y</option><option value="Z">Z</option>
+        </select></label>
+        <label>Offset (mm)<input type="number" id="v-section_offset_mm" step="1"></label>
+        <label class="check bottom"><input type="checkbox" id="v-section_flip"> Reverse</label>
+      </div>
+      <label class="check"><input type="checkbox" id="v-isometric"> Isometric</label>
+      <label class="check"><input type="checkbox" id="v-hidden_lines"> Hidden lines</label>
+      <label class="check"><input type="checkbox" id="v-smooth_lines"> Tangent edges</label>
+      <div class="grid2">
+        <label>Isometric scale factor<input type="number" id="v-isometric_scale_factor" step="0.1" min="0.1"></label>
+        <label>Density (kg/m^3)<input type="number" id="density" step="1" min="0"></label>
+      </div>
+    </section>
+
+    <section>
+      <div class="row"><h2>Title block</h2><button type="button" id="tb-open2" class="small" title="Title block layout, frame margins, logo, line widths and text heights">Edit…</button></div>
+      <p class="hint">Empty Title, Identification number and Date of issue are filled automatically.</p>
+      <div id="fields" class="grid2"></div>
+    </section>
+
+    <section>
+      <h2>Output</h2>
+      <div class="row">
+        <label class="check"><input type="checkbox" id="f-pdf"> PDF</label>
+        <label class="check"><input type="checkbox" id="f-dxf"> DXF</label>
+        <label class="check"><input type="checkbox" id="f-svg"> SVG</label>
+        <label class="check"><input type="checkbox" id="f-fcstd"> FCStd</label>
+      </div>
+      <label>Output folder (empty: project drawings folder, else download)<span class="row"><input type="text" id="out-dir" placeholder="C:\path\to\drawings"><button type="button" class="browse" data-browse="folder" data-target="#out-dir" title="Choose a folder">…</button></span></label>
+      <label class="check"><input type="checkbox" id="next-to-source"> Write to a drawings folder next to each opened STEP file</label>
+      <div class="buttons">
+        <button id="btn-preview" type="button" class="primary">Preview</button>
+        <label class="check inline" title="Preview again after every change to the settings, views, title block fields or line widths"><input type="checkbox" id="auto-preview"> Auto</label>
+        <button id="btn-export" type="button">Export</button>
+        <button id="btn-save" type="button" class="quiet">Save as defaults</button>
+      </div>
+    </section>
+  </aside>
+
+  <main>
+    <nav class="tabs">
+      <button type="button" class="tab active" data-tab="project">Project</button>
+      <button type="button" class="tab" data-tab="annotate">Drawings</button>
+      <button type="button" class="tab" data-tab="part">Part</button>
+      <button type="button" class="tab" data-tab="asm">Assembly</button>
+      <button type="button" class="tab" data-tab="fea">Analysis</button>
+      <button type="button" class="tab" data-tab="xp">Explicit</button>
+    </nav>
+
+    <div id="tab-project" class="tabpane project-pane">
+      <div class="pj-head">
+        <div class="pj-root">
+          <label class="inline">Projects folder<input type="text" id="pj-root" class="sk-path" placeholder="folder that holds the projects"></label>
+          <button type="button" class="browse" data-browse="folder" data-target="#pj-root" title="Choose the projects folder">…</button>
+          <button type="button" id="pj-setroot">Set</button>
+          <span class="sk-sep"></span>
+          <label class="inline">Project<select id="pj-list"></select></label>
+          <button type="button" id="pj-open">Open</button>
+          <button type="button" id="pj-new">New…</button>
+          <button type="button" id="pj-adopt" hidden title="Create a project from the parts, sketches and assemblies of the program folder (the files are moved)">Take over existing files…</button>
+          <span id="pj-current" class="hint"></span>
+        </div>
+      </div>
+      <div class="pj-body">
+        <section class="pj-section" id="pj-info">
+          <div class="row"><h2 id="pj-title">No project open</h2><button type="button" id="pj-rename" class="small">Rename</button><button type="button" id="pj-folder" class="small" title="Open the project folder on this PC">Open folder</button></div>
+          <label>Description<textarea id="pj-desc" rows="2" placeholder="purpose, customer, notes"></textarea></label>
+          <p class="hint" id="pj-paths"></p>
+        </section>
+        <section class="pj-section">
+          <div class="row"><h2>Documents</h2>
+            <input type="text" id="pj-filter" placeholder="filter" class="sk-short">
+            <label class="check inline"><input type="checkbox" id="pj-showlinks" checked> Links</label>
+            <button type="button" id="pj-refresh" class="small">Refresh</button>
+          </div>
+          <div id="pj-docs"></div>
+        </section>
+        <section class="pj-section">
+          <div class="row"><h2>Exports</h2>
+            <button type="button" class="small" data-pjfolder="drawings">Open drawings folder</button>
+            <button type="button" class="small" data-pjfolder="step">Open STEP folder</button>
+            <button type="button" class="small" data-pjfolder="step_import">Open imported STEP folder</button>
+          </div>
+          <div id="pj-exports"></div>
+        </section>
+        <section class="pj-section">
+          <div class="row"><h2>Project states</h2>
+            <input type="text" id="pj-statename" placeholder="state name" class="sk-short">
+            <button type="button" id="pj-savestate" class="small" title="Saves which documents are open in the tabs, the Models list and the drawing settings">Save current state</button>
+          </div>
+          <div id="pj-states"></div>
+        </section>
+      </div>
+    </div>
+    <div id="tab-annotate" class="tabpane annotate-pane" hidden>
+      <div class="ann-top">
+        <div class="seg dmode" title="Drawings of the models, or sketches on a blank sheet"><button type="button" data-dmode="annotate">Drawings</button><button type="button" data-dmode="sketch">Sketches</button></div>
+        <select id="ann-drawing"></select>
+        <div class="toolbar" id="ann-tools">
+          <button type="button" data-tool="select" title="Select, move (S). Drag empty space to pan, wheel to zoom">Select</button>
+          <button type="button" data-tool="h" title="Horizontal dimension (H)">Horizontal</button>
+          <button type="button" data-tool="v" title="Vertical dimension (V)">Vertical</button>
+          <button type="button" data-tool="a" title="Aligned dimension (A)">Aligned</button>
+          <button type="button" data-tool="angle" title="Angle dimension (G): pick two straight edges, then the arc position">Angle</button>
+          <button type="button" data-tool="diameter" title="Diameter (D)">&#216; Diameter</button>
+          <button type="button" data-tool="radius" title="Radius (R)">R Radius</button>
+          <button type="button" data-tool="note" title="Note (N)">Note</button>
+          <button type="button" data-tool="leader" title="Note with leader (L)">Leader note</button>
+          <button type="button" data-tool="balloon" title="Item balloon (B)">Balloon</button>
+          <button type="button" data-tool="detail" title="Detail view (E): click the centre on a view, then a point on the circle">Detail</button>
+          <button type="button" data-tool="sketch" title="Sketch (K): click a view to sketch on it, or the sheet outside the views">Sketch</button>
+        </div>
+        <div class="toolbar">
+          <button type="button" id="ann-undo" title="Undo (Ctrl+Z)">Undo</button>
+          <button type="button" id="ann-fitview" title="Fit sheet (F)">Fit</button>
+          <button type="button" id="ann-resetviews" title="Return all views to the automatic layout">Reset views</button>
+          <label class="check inline" id="ann-plist-box" title="Parts list above the title block of this assembly drawing" hidden><input type="checkbox" id="ann-plist"> Parts list</label>
+          <button type="button" id="ann-autoballoons" title="One balloon per component of an assembly drawing, numbered as the parts list">Auto balloons</button>
+          <button type="button" id="ann-holecallouts" title="One note per hole and thread feature of a part drawing: thread or diameter, counterbore, countersink, depth; external threads with length; metric threads with the size before threading and the thread depth">Thread &amp; hole callouts</button>
+          <button type="button" id="tb-open" title="Title block editor: title block layout, frame margins, logo, line widths and text heights">Title block…</button>
+          <button type="button" id="ann-reference" title="Reference tables: metric threads (coarse, fine), trapezoidal threads, thread tolerance limits, clearance holes, counterbores and countersinks, ISO fits, surface roughness">Reference</button>
+        </div>
+        <div id="ann-views" class="ann-views" title="Views shown on this drawing"></div>
+      </div>
+      <div class="ann-body">
+        <div id="ann-canvas"><p class="empty">Open STEP files and press Preview.</p></div>
+        <div id="ann-props" class="ann-props">
+          <p id="ann-hint" class="hint"></p>
+          <div id="ann-details" hidden>
+            <strong>Detail views</strong>
+            <div id="ann-detail-list"></div>
+          </div>
+          <div id="ann-sketches" hidden>
+            <strong>Sketches</strong>
+            <div id="ann-sketch-list"></div>
+          </div>
+          <div id="ann-form" hidden>
+            <div class="row"><strong id="ann-kind"></strong><span id="ann-value" class="hint"></span></div>
+            <div id="ann-dim-fields">
+              <label>Prefix<input type="text" id="ann-prefix" placeholder="e.g. 4x "></label>
+              <label>Text override<input type="text" id="ann-text" placeholder="measured value"></label>
+              <label class="check" id="ann-centred-row"><input type="checkbox" id="ann-centred"> Text centred between extension lines</label>
+              <label>Tolerance
+                <select id="ann-tolmode">
+                  <option value="none">None (general tolerance)</option>
+                  <option value="fit">ISO 286 fit</option>
+                  <option value="sym">Symmetric &#177;</option>
+                  <option value="dev">Upper / lower deviation</option>
+                </select>
+              </label>
+              <div id="ann-fit-row" class="grid2">
+                <label>Class<input type="text" id="ann-fit" list="fit-classes" placeholder="H7"></label>
+                <label class="check bottom"><input type="checkbox" id="ann-showdev"> Show deviations</label>
+              </div>
+              <div class="buttons"><button type="button" id="ann-fitcalc" class="small" title="ISO 286 fits: limits, clearance or interference of a hole and shaft pair, IT grades">Fit calculator</button></div>
+              <p id="ann-fit-result" class="hint"></p>
+              <div id="ann-dev-row" class="grid2">
+                <label>Upper (<span class="dev-unit">&#181;m</span>)<input type="text" inputmode="decimal" class="numf" id="ann-plus"></label>
+                <label>Lower (<span class="dev-unit">&#181;m</span>)<input type="text" inputmode="decimal" class="numf" id="ann-minus"></label>
+              </div>
+            </div>
+            <div id="ann-note-fields">
+              <label>Text<textarea id="ann-notetext" rows="6"></textarea></label>
+              <p class="hint">Enter starts a new line. The text is applied when the field loses focus.</p>
+            </div>
+            <label>Text height (mm)<input type="number" id="ann-height" step="0.5" min="1" placeholder="default from Title block editor"></label>
+            <div class="buttons">
+              <button type="button" id="ann-delete" class="danger">Delete</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <datalist id="fit-classes"></datalist>
+    </div>
+
+    <div id="tab-sketch" class="tabpane annotate-pane" hidden>
+      <div id="sk-partbar" class="ann-top sk-partbar" hidden>
+        <strong id="sk-parttitle" title="Dashed: section of the part with the sketch plane. Grey: the part seen along the plane normal (dotted: hidden edges). Reference geometry snaps only."></strong>
+        <label class="check inline"><input type="checkbox" id="sk-partproj" checked> Model edges</label>
+        <button type="button" id="sk-include" title="Click reference geometry to copy it into the sketch as fixed entities">Include</button>
+        <button type="button" id="sk-includesec" title="Copy the whole section into the sketch">Include section</button>
+        <button type="button" id="sk-includeproj" title="Copy all visible model edges into the sketch">Include edges</button>
+        <label class="check inline" title="Checked: included geometry is fixed construction geometry. Unchecked: included geometry is ordinary sketch geometry, editable and used in profiles"><input type="checkbox" id="sk-includeconstr" checked> As construction</label>
+        <button type="button" id="sk-partfinish" class="primary">Finish sketch</button>
+        <button type="button" id="sk-partcancel">Cancel</button>
+        <button type="button" id="sk-filetoggle" title="Show or hide the file row (DXF, saved sketches, sheet, export)">File…</button>
+      </div>
+      <div class="ann-top sk-file">
+        <div class="seg dmode" title="Drawings of the models, or sketches on a blank sheet"><button type="button" data-dmode="annotate">Drawings</button><button type="button" data-dmode="sketch">Sketches</button></div>
+        <button type="button" id="sk-new">New</button>
+        <label class="file-btn">Open DXF<input type="file" id="sk-file" accept=".dxf" hidden></label>
+        <input type="text" id="sk-path" class="sk-path" placeholder="DXF path on this PC">
+        <button type="button" class="browse" data-browse="open" data-filter="dxf" data-target="#sk-path" title="Choose a DXF file">…</button>
+        <button type="button" id="sk-path-open">Open</button>
+        <select id="sk-list" title="Saved sketches"></select>
+        <button type="button" id="sk-load">Load</button>
+        <button type="button" id="sk-save" title="Save the sketch with constraints (sketches folder)">Save</button>
+        <span class="sk-sep"></span>
+        <label class="inline">Name<input type="text" id="sk-name" class="sk-short"></label>
+        <label class="inline">Scale<input type="text" id="sk-scale" class="sk-tiny" value="1:1"></label>
+        <label class="inline">Sheet<select id="sk-page"><option value="extents">None (extents)</option><option>A4</option><option selected>A3</option><option>A2</option><option>A1</option><option>A0</option></select></label>
+        <label class="check inline"><input type="checkbox" id="sk-tb" checked> Title block</label>
+        <button type="button" id="sk-centre" title="Centre the drawing in the drawing area of the sheet">Centre on sheet</button>
+        <label class="inline">Folder<input type="text" id="sk-folder" class="sk-path" placeholder="empty: project folder, else download"></label><button type="button" class="browse" data-browse="folder" data-target="#sk-folder" title="Choose the output folder">…</button>
+        <button type="button" id="sk-dxf">Export DXF</button>
+        <button type="button" id="sk-pdf">Export PDF</button>
+      </div>
+      <div class="ann-top sk-tools">
+        <div class="toolbar" id="sk-tools-draw">
+          <button type="button" data-tool="select" title="Select (S). Click, Shift+click, window drag. Drag points and lines">Select</button>
+          <button type="button" data-tool="line" title="Line (L). Chain of lines; Esc ends">Line</button>
+          <button type="button" data-tool="rect" title="Rectangle: two corners">Rectangle</button>
+          <button type="button" data-tool="circle" title="Circle (C): centre, radius point">Circle</button>
+          <button type="button" data-tool="arc" title="Arc (A): centre, start point, end point (counter-clockwise)">Arc</button>
+          <button type="button" data-tool="ellipse" title="Ellipse: centre, end of the first axis, half length of the second axis">Ellipse</button>
+          <button type="button" data-tool="conic" title="Conic section: start, end, tangent intersection, then the shoulder point or rho (0.5 parabola, below 0.5 ellipse, above 0.5 hyperbola)">Conic</button>
+          <button type="button" data-tool="spline" title="Spline through fit points: click the points; Enter, Esc or double-click finishes; click the first point to close">Spline</button>
+          <button type="button" data-tool="polygon" title="Regular polygon: number of sides (dialog), centre, vertex or typed distance across flats">Polygon</button>
+          <button type="button" data-tool="p3g" title="Polygon profile (DIN 32711 P3G, Schaublin bore, custom n and k): parameters in Properties, then centre and lobe direction">P3G</button>
+          <button type="button" data-tool="point" title="Point (P)">Point</button>
+        </div>
+        <div class="toolbar" id="sk-tools-mod">
+          <button type="button" data-tool="move" title="Move (M): base point, destination">Move</button>
+          <button type="button" data-tool="copy" title="Copy: base point, destinations; Esc ends">Copy</button>
+          <button type="button" data-tool="rotate" title="Rotate: centre, then angle (typed, deg) or a point">Rotate</button>
+          <button type="button" data-tool="mirror" title="Mirror: two points on the mirror line">Mirror</button>
+          <button type="button" data-tool="offset" title="Offset (O): distance, entity, side">Offset</button>
+          <button type="button" data-tool="trim" title="Trim (T): click the part to remove">Trim</button>
+          <button type="button" data-tool="extend" title="Extend (E): click near the end to extend">Extend</button>
+          <button type="button" data-tool="fillet" title="Fillet: radius, first line, second line">Fillet</button>
+          <button type="button" data-tool="chamfer" title="Chamfer: distance, first line, second line">Chamfer</button>
+          <button type="button" id="sk-pattern" title="Pattern of the selected entities: two directions, row offset">Pattern</button>
+        </div>
+        <div class="toolbar" id="sk-tools-con">
+          <button type="button" data-tool="dim" title="Dimension (D): line, circle, arc, two points, point and line, two lines (angle)">Dimension</button>
+          <button type="button" data-tool="dimh" title="Horizontal dimension">Horizontal</button>
+          <button type="button" data-tool="dimv" title="Vertical dimension">Vertical</button>
+          <button type="button" data-con="coincident" title="Coincident: two or more points, or points and a line, circle or arc">Coincident</button>
+          <button type="button" data-con="horizontal" title="Horizontal: lines, or two points">Horiz.</button>
+          <button type="button" data-con="vertical" title="Vertical: lines, or two points">Vert.</button>
+          <button type="button" data-con="parallel" title="Parallel: two or more lines">Parallel</button>
+          <button type="button" data-con="perpendicular" title="Perpendicular: two lines">Perp.</button>
+          <button type="button" data-con="tangent" title="Tangent: line and circle/arc, or two circles/arcs">Tangent</button>
+          <button type="button" data-con="equal" title="Equal: lines (length) or circles/arcs (radius)">Equal</button>
+          <button type="button" data-con="pointon" title="Point on object: point and line, circle or arc">On</button>
+          <button type="button" data-con="midpoint" title="Midpoint: point and line">Mid</button>
+          <button type="button" data-con="concentric" title="Concentric: circles/arcs">Conc.</button>
+          <button type="button" data-con="symmetric" title="Symmetric: two points and a line">Sym.</button>
+          <button type="button" data-con="fix" title="Fix: points or entities">Fix</button>
+        </div>
+        <div class="toolbar" id="sk-tools-dim">
+          <button type="button" data-tool="note" title="Note (N)">Note</button>
+          <button type="button" data-tool="leader" title="Leader note">Leader</button>
+        </div>
+        <div class="toolbar">
+          <button type="button" id="sk-construction" title="Toggle construction geometry for the selection">Construction</button>
+        <button type="button" id="sk-axes" title="Add or remove the sketch axes (x axis, y axis and origin as fixed construction entities)">Axes</button>
+        <button type="button" id="sk-check" title="Check the sketch: gaps between ends, open ends, junctions that are nearly tangent; fixes them">Check</button>
+          <button type="button" id="sk-delete" title="Delete selection (Delete)">Delete</button>
+          <button type="button" id="sk-undo" title="Undo (Ctrl+Z)">Undo</button>
+          <button type="button" id="sk-redo" title="Redo (Ctrl+Y)">Redo</button>
+          <button type="button" id="sk-fit" title="Fit (F)">Fit</button>
+          <button type="button" id="sk-keys" title="Keyboard shortcuts">Keys</button>
+        <button type="button" class="panel-toggle" data-panel="#tab-sketch .ann-props" title="Hide or show the side panel (Ctrl+B)">Panel</button>
+        </div>
+        <label class="check inline"><input type="checkbox" id="sk-snap" checked> Snap</label>
+        <label class="check inline"><input type="checkbox" id="sk-auto" checked> Auto constraints</label>
+        <label class="check inline"><input type="checkbox" id="sk-driving" checked> Driving dimensions</label>
+        <label class="check inline"><input type="checkbox" id="sk-showcon" checked> Show constraints</label>
+        <label class="check inline" title="Fillet and chamfer add construction lines to the original corner"><input type="checkbox" id="sk-cornerlines" checked> Corner construction lines</label>
+      </div>
+      <div class="ann-body">
+        <div class="sk-left">
+          <div id="sk-canvas" tabindex="0"></div>
+          <div id="sk-next" class="sk-next" hidden></div>
+          <div class="sk-cmdbar">
+            <span id="sk-hint" class="hint"></span>
+            <span id="sk-msg" class="hint"></span>
+            <input type="text" id="sk-cmd" placeholder="x,y   @dx,dy   @L&lt;A   value">
+            <span id="sk-coords" class="hint"></span>
+            <span id="sk-dof" class="hint"></span>
+          </div>
+        </div>
+        <div class="ann-props">
+          <h2>Layers</h2>
+          <div id="sk-layers"></div>
+          <div class="buttons"><button type="button" id="sk-layer-add" class="small">Add layer</button></div>
+          <h2 class="sk-h">Properties</h2>
+          <div id="sk-props"><p class="hint">Nothing selected.</p></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="tab-part" class="tabpane annotate-pane" hidden>
+      <div class="ann-top sk-tools">
+        <div class="dd">
+          <button type="button" class="dd-btn" title="New, load, save, name, export, make drawing">File ▾</button>
+          <div class="dd-menu file-menu sk-file">
+            <div class="row fm-head"><span id="pt-project" class="fm-project"></span><button type="button" id="pt-openwork" class="small" title="Open the work folder of the project on this PC">Open folder</button></div>
+            <div class="row"><label class="inline">Part<select id="pt-list" title="Saved parts of the open project; choosing one opens it"></select></label></div>
+            <div class="row"><button type="button" id="pt-new">New</button><button type="button" id="pt-save" title="Save under the current name (Ctrl+S)">Save</button><button type="button" id="pt-saveas" title="Save under a new name">Save as…</button><button type="button" id="pt-rename" title="Rename the saved document in the project">Rename…</button></div>
+            <div class="row"><label class="inline">Output folder<input type="text" id="pt-folder" class="sk-path"></label><button type="button" class="browse" data-browse="folder" data-target="#pt-folder" title="Choose the output folder">…</button><button type="button" id="pt-openstep" class="small" title="Open the STEP folder of the project on this PC">Open</button></div>
+            <div class="row"><button type="button" id="pt-step">Export STEP</button><button type="button" id="pt-mesh" title="FEA mesh of the part (gmsh)">Export mesh</button><button type="button" id="pt-draw" class="primary" title="Add the part to Models and make the drawing">Make drawing</button></div>
+          </div>
+        </div>
+        <div class="toolbar">
+          <button type="button" data-add="import" title="Base geometry from a STEP file">Import STEP</button>
+          <button type="button" data-add="place" title="Move the part so that its faces lie on the principal planes XY, XZ, YZ (and bounding box centre or minimum to the planes)">Place</button>
+          <button type="button" data-add="sketch" title="Sketch on a reference plane, a plane feature, a planar face or normal to an edge">Sketch</button>
+          <button type="button" data-add="plane" title="Datum plane for sketches and partitions">Plane</button>
+          <button type="button" data-add="point" title="Reference point: coordinates, on an edge, face centre, offset, on an axis, axis and plane intersection, midpoint">Point</button>
+          <button type="button" data-add="axis" title="Reference axis: point and direction, two points, straight edge, cylinder axis, two planes, normal to a plane, parallel">Axis</button>
+          <button type="button" data-add="extrude">Extrude</button>
+          <button type="button" data-add="cut">Cut</button>
+          <button type="button" data-add="revolve">Revolve</button>
+          <button type="button" data-add="fillet">Fillet</button>
+          <button type="button" data-add="chamfer">Chamfer</button>
+          <button type="button" data-add="shell">Shell</button>
+          <button type="button" data-add="hole">Hole</button>
+          <button type="button" data-add="thread" title="External thread on a cylindrical face: cosmetic thread and callout on the drawing">Thread</button>
+          <button type="button" data-add="pattern">Pattern</button>
+          <button type="button" data-add="mirror">Mirror</button>
+          <button type="button" data-add="boolean" title="Boolean between solids of the part: union, subtract, intersect">Boolean</button>
+          <button type="button" data-add="sweep">Sweep</button>
+        </div>
+        <div class="dd">
+          <button type="button" class="dd-btn" title="Face operations for mesh preparation">Faces ▾</button>
+          <div class="toolbar dd-menu">
+          <button type="button" data-add="split" title="Cut the cells with a plane (CAE: Partition Cell)">Partition</button>
+          <button type="button" data-add="unify" title="Merge coplanar faces and collinear edges (CAE: virtual topology)">Merge faces</button>
+          <button type="button" data-add="heal" title="Fix topology, drop small edges (CAE: geometry repair)">Heal</button>
+          <button type="button" data-add="defeature" title="Remove faces and close the gap (CAE: remove faces)">Remove faces</button>
+          <button type="button" data-add="offset_faces" title="Move faces along their normals; the neighbouring faces follow (CAD: offset face, push/pull)">Offset faces</button>
+          <button type="button" data-add="move_faces" title="Move faces by a vector: planar faces along their normals, or a hole, boss or slot to a new position">Move faces</button>
+          <button type="button" data-add="smooth" title="Re-approximate wavy B-spline surfaces with smooth splines">Smooth surfaces</button>
+          <button type="button" data-add="replace" title="Rebuild faces on a clean, offset surface: cut outside, fill inside (CAE: replace faces)">Replace faces</button>
+          <button type="button" data-add="combine" title="Mesh several faces as one surface; geometry unchanged (CAE: virtual topology)">Combine faces</button>
+          <button type="button" data-add="hole_mesh" title="O-grid partition around holes and element counts for the structured hexahedral mesh">Hole mesh</button>
+          </div>
+        </div>
+        <div class="dd">
+          <button type="button" class="dd-btn" title="Surface and curve features">Surfaces ▾</button>
+          <div class="toolbar dd-menu">
+          <button type="button" data-add="surf_extract" title="Copy faces of the solid as a surface body, with an offset">Extract surface</button>
+          <button type="button" data-add="surf_fit" title="One clean surface fitted to faces, extended">Fit surface</button>
+          <button type="button" data-add="surf_sketch" title="Sketch curves extruded normal to the sketch plane, or a planar face">Extruded surface</button>
+          <button type="button" data-add="surf_sketch" data-init='{"kind":"revolve"}' title="Sketch curves revolved about a sketch axis or a construction line">Revolved surface</button>
+          <button type="button" data-add="surf_loft" title="Loft through sketch curves">Loft surface</button>
+          <button type="button" data-add="surf_fill" title="N-sided patch over a loop of edges">Fill surface</button>
+          <button type="button" data-add="surf_bridge" title="Ruled surface between two chains of edges, corner to corner">Bridge surface</button>
+          <button type="button" data-add="surf_offset" title="Offset a surface body">Offset surface</button>
+          <button type="button" data-add="surf_sew" title="Sew surface bodies into one shell">Sew surfaces</button>
+          <button type="button" data-add="surf_import" title="Faces of a STEP file (one component) as a surface body">Import surface</button>
+          <button type="button" data-add="thicken" title="Solid from a surface body">Thicken</button>
+          <button type="button" data-add="surf_cut" title="Split the solid with a surface body and keep one side">Cut with surface</button>
+          <button type="button" data-add="curve_extract" title="3D curve from edges, joined and cleaned">Extract curve</button>
+          <button type="button" data-add="curve_section" title="Intersection curve of surfaces or of a surface with the solid">Intersection curve</button>
+          <button type="button" data-add="surf_from_curve" title="Extrude or revolve a curve body into a surface">Surface from curve</button>
+          <button type="button" data-add="surf_trim" title="Split a surface body with the solid, a surface or a projected curve and keep pieces">Trim surface</button>
+          <button type="button" data-add="surf_extend" title="Extend a surface body beyond its boundary by a distance">Extend surface</button>
+          <button type="button" id="pt-inspect" title="Free edges, gaps, non-manifold edges, small faces and short edges of the selected surface body (or of the solid)">Inspect body</button>
+          </div>
+        </div>
+        <div class="toolbar">
+          <button type="button" id="pt-measure-btn" data-icon="measure" title="Measure: click a face, a reference plane, a plane feature or an axis feature, then a second one: distances, angles, diameters, minimum distance. Esc ends">Measure</button>
+        </div>
+        <div class="toolbar">
+          <button type="button" data-view="iso">Iso</button>
+          <button type="button" data-view="front">Front</button>
+          <button type="button" data-view="top">Top</button>
+          <button type="button" data-view="right">Right</button>
+          <button type="button" data-view="fit">Fit</button>
+        </div>
+        <div class="dd">
+          <button type="button" class="dd-btn" title="Edges, axes, reference planes and sketches in the view">Show ▾</button>
+          <div class="dd-menu show-menu">
+            <label class="check inline"><input type="checkbox" id="pt-edges" checked> Edges</label>
+            <label class="check inline"><input type="checkbox" id="pt-axes" checked> Axes</label>
+            <label class="check inline"><input type="checkbox" id="pt-planes" checked> Planes</label>
+            <label class="check inline"><input type="checkbox" id="pt-showsketch" checked> Sketches</label>
+            <label class="check inline" title="Cut the view with a plane; the cut faces are capped"><input type="checkbox" id="pt-sectionchk"> Section view</label>
+          </div>
+        </div>
+        <span id="pt-info" class="hint"></span>
+        <button type="button" class="panel-toggle" data-panel="#tab-part .ann-props" title="Hide or show the side panel (Ctrl+B)" style="margin-left:auto">Panel</button>
+      </div>
+      <div id="pt-cmdbar" class="ann-top sk-partbar" hidden>
+        <span id="pt-cmdtitle"></span>
+        <button type="button" id="pt-cmdfinish" class="primary">Finish</button>
+        <button type="button" id="pt-cmdcancel">Cancel</button>
+      </div>
+      <div class="ann-body">
+        <div id="pt-view"><div id="pt-meshinfo" class="meshinfo" hidden></div><div id="pt-section" class="meshinfo section-box" hidden></div>
+          <div id="pt-measure" class="meas-win meas-right" hidden>
+            <div class="as-matewin-head"><strong>Measure</strong><button type="button" id="pt-measure-close" class="small" title="End measuring (Esc)">×</button></div>
+            <div id="pt-measure-body"></div>
+          </div>
+        </div>
+        <div class="ann-props">
+          <h2>Tree</h2>
+          <div id="pt-features"><p class="hint">Sketch on a reference plane, then Extrude.</p></div>
+          <h2 class="sk-h">Command</h2>
+          <div id="pt-props"></div>
+          <h2 class="sk-h">Configurations</h2>
+          <div id="pt-configs"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="tab-asm" class="tabpane annotate-pane" hidden>
+      <div class="ann-top sk-tools">
+        <div class="dd">
+          <button type="button" class="dd-btn" title="New, load, save, name, export, make drawing">File ▾</button>
+          <div class="dd-menu file-menu sk-file">
+            <div class="row fm-head"><span id="as-project" class="fm-project"></span><button type="button" id="as-openwork" class="small" title="Open the work folder of the project on this PC">Open folder</button></div>
+            <div class="row"><label class="inline">Assembly<select id="as-list" title="Saved assemblies of the open project; choosing one opens it"></select></label></div>
+            <div class="row"><button type="button" id="as-new">New</button><button type="button" id="as-save" title="Save under the current name (Ctrl+S)">Save</button><button type="button" id="as-saveas" title="Save under a new name">Save as…</button><button type="button" id="as-rename" title="Rename the saved document in the project">Rename…</button></div>
+            <div class="row"><label class="inline">Output folder<input type="text" id="as-folder" class="sk-path"></label><button type="button" class="browse" data-browse="folder" data-target="#as-folder" title="Choose the output folder">…</button><button type="button" id="as-openstep" class="small" title="Open the STEP folder of the project on this PC">Open</button></div>
+            <div class="row"><button type="button" id="as-step">Export STEP</button><button type="button" id="as-mesh" title="FEA mesh of the assembly (gmsh)">Export mesh</button><button type="button" id="as-draw" class="primary" title="Add the assembly to Models and make the drawing">Make drawing</button></div>
+          </div>
+        </div>
+        <div class="toolbar">
+          <button type="button" id="as-add-part" data-icon="as_part" title="Add a saved part of the project">Add part</button>
+          <button type="button" id="as-add-step" data-icon="import" title="Add a STEP file">Add STEP</button>
+          <button type="button" id="as-dup" data-icon="copy" title="Copy the selected component">Duplicate</button>
+          <button type="button" id="as-del" data-icon="as_delete" title="Delete the selected component">Delete</button>
+          <button type="button" id="as-undo" data-icon="as_undo" title="Undo the last change of the components or mates, solves included (Ctrl+Z)">Undo</button>
+          <button type="button" id="as-redo" data-icon="as_redo" title="Redo (Ctrl+Y)">Redo</button>
+        </div>
+        <div class="toolbar">
+          <button type="button" id="as-box" data-icon="as_box" title="Box select: left drag from left to right selects the components inside the box, from right to left the components it touches. Ctrl + left drag draws a box at any time and adds to the selection; Ctrl + click adds or removes one component">Box select</button>
+          <button type="button" id="as-showall" data-icon="as_showall" title="Show all components (Shift+Space)">Show all</button>
+          <button type="button" id="as-invert" data-icon="as_invert" title="Invert: show the hidden components and hide the shown ones (Ctrl+Space)">Invert</button>
+        </div>
+        <div class="toolbar">
+          <button type="button" id="as-drag" data-icon="move" title="Drag mode (D): left drag moves a component that is not fixed, in the directions its mates leave free; Shift: along the nearest axis X, Y or Z">Drag</button>
+          <button type="button" id="as-rotate" data-icon="rotate" title="Rotate mode (R): left drag rotates a component that is not fixed, about the axis its mates leave free (else about the view direction); Shift: steps of 15 deg">Rotate</button>
+        </div>
+        <div class="toolbar" id="as-tb-mates">
+          <button type="button" data-mate="coincident" data-icon="mate_coincident" title="Coincident mate: planar faces facing each other in one plane, or an axis in a plane, or two collinear axes. Click a face on each of two components">Coincident</button>
+          <button type="button" data-mate="distance" data-icon="mate_distance" title="Distance mate: planar faces facing each other at a distance. Click a face on each of two components">Distance</button>
+          <button type="button" data-mate="parallel" data-icon="mate_parallel" title="Parallel mate: planar faces or axes parallel. Click a face on each of two components">Parallel</button>
+          <button type="button" data-mate="angle" data-icon="mate_angle" title="Angle mate: planar faces at an angle. Click a face on each of two components">Angle</button>
+          <button type="button" data-mate="concentric" data-icon="mate_concentric" title="Concentric mate: cylindrical faces or axes on one axis. Click a cylinder on each of two components">Concentric</button>
+          <button type="button" data-mate="point" data-icon="mate_point" title="Point mate: the face centres coincide. Click a face on each of two components">Point</button>
+          <button type="button" id="as-mates-btn" data-icon="as_mates" title="Show or hide the mates window">Mates</button>
+          <button type="button" id="as-solve" data-icon="as_solve" title="Solve the mates">Solve</button>
+          <button type="button" id="as-measure-btn" data-icon="measure" title="Measure: click a face (or, with Datums, a reference plane or axis), then a second one: distances, angles, diameters, minimum distance. Esc ends">Measure</button>
+          <button type="button" id="as-check" data-icon="as_check" title="Mate check: conflicting mates, mates not satisfied, redundant mates, and the motions each component has left">Check</button>
+        </div>
+        <div class="toolbar">
+          <button type="button" data-asview="iso">Iso</button>
+          <button type="button" data-asview="front">Front</button>
+          <button type="button" data-asview="top">Top</button>
+          <button type="button" data-asview="right">Right</button>
+          <button type="button" data-asview="fit">Fit</button>
+        </div>
+        <label class="inline" title="Shaded; Transparent: see-through faces with edges; Hidden lines removed: visible edges only; Wireframe: all edges">Display<select id="as-display"><option value="shaded">Shaded</option><option value="transparent">Transparent</option><option value="hidden">Hidden lines removed</option><option value="wire">Wireframe</option></select></label>
+        <label class="check inline"><input type="checkbox" id="as-edges" checked> Edges</label>
+        <label class="check inline"><input type="checkbox" id="as-axes" checked> Axes</label>
+        <label class="check inline" title="Reference planes and axes: of the selected component; while a mate side is picked, of all components (pickable)"><input type="checkbox" id="as-datums"> Datums</label>
+        <label class="check inline" title="Components moved by their explode offsets"><input type="checkbox" id="as-explode"> Exploded</label>
+        <span class="as-section" title="Cross-section of the view: the components are cut by a plane normal to the axis at the offset">
+          <label class="check inline"><input type="checkbox" id="as-sec"> Section</label>
+          <select id="as-sec-axis"><option value="x">X</option><option value="y">Y</option><option value="z" selected>Z</option></select>
+          <input type="range" id="as-sec-pos" min="0" max="1000" value="500" title="Position of the section plane in the assembly">
+          <label class="check inline"><input type="checkbox" id="as-sec-flip"> Reverse</label>
+        </span>
+        <label class="check inline" title="Check overlapping components after each build (slow for many components)"><input type="checkbox" id="as-interf"> Interference check</label>
+        <label class="check inline" title="Parts list above the title block of the assembly drawing"><input type="checkbox" id="as-plist" checked> Parts list</label>
+        <span id="as-info" class="hint"></span>
+      </div>
+      <div class="ann-body">
+        <div id="as-view">
+          <div id="as-measure" class="meas-win" hidden>
+            <div class="as-matewin-head"><strong>Measure</strong><button type="button" id="as-measure-close" class="small" title="End measuring (Esc)">×</button></div>
+            <div id="as-measure-body"></div>
+          </div>
+          <div id="as-matewin" class="as-matewin" hidden>
+            <div class="as-matewin-head"><strong>Mates</strong><span id="as-matewin-count" class="hint"></span><label class="check inline as-iso" title="Show only the components of the selected mate (the others faint and not pickable)"><input type="checkbox" id="as-isolate"> Isolate</label><button type="button" id="as-matewin-close" class="small" title="Close (the Mates button opens it)">×</button></div>
+            <div id="as-mates"></div>
+          </div>
+        </div>
+        <div class="ann-props">
+          <h2>Components</h2>
+          <div id="as-comps"><p class="hint">Add a saved part or a STEP file.</p></div>
+          <h2 class="sk-h">Properties</h2>
+          <div id="as-props"></div>
+          <details class="as-massbox"><summary class="sk-h">Mass</summary><div id="as-mass" class="hint"></div></details>
+          <div id="as-interf-out"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="tab-fea" class="tabpane annotate-pane" hidden>
+      <div class="ann-top sk-tools">
+        <div class="dd">
+          <button type="button" class="dd-btn" title="New, load, save, name">File ▾</button>
+          <div class="dd-menu file-menu sk-file">
+            <div class="row fm-head"><span id="fa-project" class="fm-project"></span><button type="button" id="fa-openwork" class="small" title="Open the work folder of the project on this PC">Open folder</button></div>
+            <div class="row"><label class="inline">Analysis<select id="fa-list" title="Saved analyses of the open project; choosing one opens it"></select></label></div>
+            <div class="row"><button type="button" id="fa-new">New</button><button type="button" id="fa-save" title="Save under the current name (Ctrl+S)">Save</button><button type="button" id="fa-saveas" title="Save under a new name">Save as…</button><button type="button" id="fa-rename" title="Rename the saved document in the project">Rename…</button></div>
+            <div class="row" hidden><input type="text" id="fa-folder"><button type="button" id="fa-openstep"></button></div>
+            <div class="row"><button type="button" id="fa-openrun" title="Open the folder of the solver files (input file, results, report) on this PC">Open run folder</button><button type="button" id="fa-inp" title="Write the CalculiX input file without solving (Mesh)">Write input file</button></div>
+          </div>
+        </div>
+        <label class="inline" title="Geometry of the analysis: a saved assembly or part">Geometry<select id="fa-source"></select></label>
+        <div class="toolbar">
+          <button type="button" id="fa-mesh" data-icon="fa_mesh" title="Mesh the bodies and show the mesh">Mesh</button>
+          <button type="button" id="fa-solve" data-icon="fa_solve" class="primary" title="Mesh, solve with CalculiX and show the results">Solve</button>
+          <button type="button" id="fa-cancel" data-icon="fa_stop" title="Stop the solver" disabled>Stop</button>
+        </div>
+        <div class="toolbar">
+          <button type="button" id="fa-add-beam" data-icon="fa_beam" title="Beam: bending, shear, torsion and axial force. Click end A, then end B">Beam</button>
+          <button type="button" id="fa-add-rod" data-icon="fa_rod" title="Rod: axial force only. Click end A, then end B">Rod</button>
+          <button type="button" id="fa-add-skm" data-icon="fa_skbeams" title="A beam on each straight line of the sketches of the geometry">Sketch beams</button>
+          <button type="button" id="fa-add-pface" data-icon="fa_pface" title="Plate on a planar face of a body">Plate on face</button>
+          <button type="button" id="fa-add-ppts" data-icon="fa_ppts" title="Plate from outline points (click them in the view or type them)">Plate by points</button>
+          <button type="button" id="fa-add-fast" data-icon="fa_fast" title="Fastener: pick the face at the head, then the face at the nut or thread">Fastener</button>
+          <button type="button" id="fa-add-rp" data-icon="fa_rp" title="Reference point: a point rigidly connected to faces; supports and loads (force, moment) act on it">Ref. point</button>
+          <button type="button" id="fa-add-sup" data-icon="fa_sup" title="Support: click the face, or choose a member end in the panel">Support</button>
+          <button type="button" id="fa-add-load" data-icon="fa_load" title="Load: click the face; Type in the panel changes the load">Load</button>
+        </div>
+        <div class="toolbar">
+          <button type="button" data-faview="iso">Iso</button>
+          <button type="button" data-faview="front">Front</button>
+          <button type="button" data-faview="top">Top</button>
+          <button type="button" data-faview="right">Right</button>
+          <button type="button" data-faview="fit">Fit</button>
+        </div>
+        <div class="toolbar" id="fa-resbar">
+          <label class="inline">Show<select id="fa-show"><option value="model">Model</option><option value="mesh">Mesh</option><option value="results">Results</option></select></label>
+          <label class="inline">Result<select id="fa-field"><option value="vm">von Mises stress</option><option value="u">Displacement |u|</option><option value="ux">ux</option><option value="uy">uy</option><option value="uz">uz</option></select></label>
+          <label class="inline">State<select id="fa-state"></select></label>
+          <label class="inline" title="Deformation scale (empty: automatic, largest displacement 5 % of the model size)">Scale<input type="text" id="fa-scale" class="numf" style="width:60px" placeholder="auto"></label>
+          <label class="check inline"><input type="checkbox" id="fa-undef"> Undeformed</label>
+        </div>
+        <label class="check inline"><input type="checkbox" id="fa-edges" checked> Edges</label>
+        <label class="check inline"><input type="checkbox" id="fa-axes" checked> Axes</label>
+        <span id="fa-info" class="hint"></span>
+      </div>
+      <div class="ann-body">
+        <div id="fa-view"><div id="fa-legend" class="fa-legend" hidden></div></div>
+        <div id="fa-split" class="fa-split" title="Drag to change the width of the panel"></div>
+        <div class="ann-props" id="fa-panel">
+          <h2>Settings</h2>
+          <div id="fa-settings"></div>
+          <h2 class="sk-h">Materials</h2>
+          <div id="fa-mats"></div>
+          <h2 class="sk-h">Bodies</h2>
+          <div id="fa-bodies"></div>
+          <h2 class="sk-h">Members</h2>
+          <div id="fa-members"></div>
+          <h2 class="sk-h">Plates</h2>
+          <div id="fa-plates"></div>
+          <h2 class="sk-h">Fasteners</h2>
+          <div id="fa-fasts"></div>
+          <h2 class="sk-h">Reference points</h2>
+          <div id="fa-rps"></div>
+          <h2 class="sk-h">Supports</h2>
+          <div id="fa-sups"></div>
+          <h2 class="sk-h">Loads</h2>
+          <div id="fa-loads"></div>
+          <h2 class="sk-h">Results</h2>
+          <div id="fa-results"><p class="hint">Solve to see the results.</p></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="tab-xp" class="tabpane annotate-pane" hidden>
+      <div class="ann-top sk-tools">
+        <div class="dd">
+          <button type="button" class="dd-btn" title="New, load, save, name">File ▾</button>
+          <div class="dd-menu file-menu sk-file">
+            <div class="row fm-head"><span id="xp-project" class="fm-project"></span><button type="button" id="xp-openwork" class="small" title="Open the work folder of the project on this PC">Open folder</button></div>
+            <div class="row"><label class="inline">Explicit<select id="xp-list" title="Saved explicit analyses of the open project; choosing one opens it"></select></label></div>
+            <div class="row"><button type="button" id="xp-new">New</button><button type="button" id="xp-save" title="Save under the current name (Ctrl+S)">Save</button><button type="button" id="xp-saveas" title="Save under a new name">Save as…</button><button type="button" id="xp-rename" title="Rename the saved document in the project">Rename…</button></div>
+            <div class="row" hidden><input type="text" id="xp-folder"><button type="button" id="xp-openstep"></button></div>
+            <div class="row"><button type="button" id="xp-openrun" title="Open the folder of the model .inp and the run folders on this PC">Open explicit folder</button></div>
+          </div>
+        </div>
+        <label class="inline" title="Geometry of the model: a saved assembly or part (Model: Source)">Geometry<select id="xp-source"></select></label>
+        <div class="toolbar">
+          <button type="button" id="xp-model-btn" data-icon="fa_mesh" title="Mesh the bodies and write the model .inp">Write .inp</button>
+          <button type="button" id="xp-supbtn" data-icon="fa_sup" title="Support: click a face of a deformable body">Support</button>
+          <button type="button" id="xp-build" data-icon="xp_build" title="Build the OpenRadioss deck (inp2rad and the Build settings)">Build</button>
+          <button type="button" id="xp-run" data-icon="fa_solve" class="primary" title="Run the Target .rad (or the queue): starter, engine, VTK and CSV conversion, post-processing">Run</button>
+          <button type="button" id="xp-starter" data-icon="xp_starter" title="Run the starter only (added-mass table, Min dt)">Starter</button>
+          <button type="button" id="xp-kill" data-icon="fa_stop" title="Kill the running solver of the Env (Solve)">Kill</button>
+        </div>
+        <div class="toolbar">
+          <button type="button" data-xpview="iso">Iso</button>
+          <button type="button" data-xpview="front">Front</button>
+          <button type="button" data-xpview="top">Top</button>
+          <button type="button" data-xpview="right">Right</button>
+          <button type="button" data-xpview="fit">Fit</button>
+        </div>
+        <div class="toolbar">
+          <label class="inline">Show<select id="xp-show"><option value="model">Model</option><option value="mesh">Mesh</option><option value="results">Results</option></select></label>
+          <label class="inline">Field<select id="xp-field" style="max-width:190px"></select></label>
+          <button type="button" id="xp-play" title="Play the frames">▶</button>
+          <input type="range" id="xp-frame" min="0" max="0" value="0" style="width:120px" title="Frame">
+          <span id="xp-ftime" class="hint"></span>
+          <label class="inline" title="Deformation scale (1: true deformation)">Scale<input type="text" id="xp-scale" class="numf" style="width:44px" placeholder="1"></label>
+          <label class="inline" title="Colour range (empty: the range of the frame)">Range<input type="text" id="xp-min" class="numf" style="width:52px" placeholder="min"><input type="text" id="xp-max" class="numf" style="width:52px" placeholder="max"></label>
+          <label class="check inline" title="Elements with EROSION_STATUS 0 are not drawn (rigid bodies are drawn)"><input type="checkbox" id="xp-eroded" checked> Hide eroded</label>
+          <label class="check inline"><input type="checkbox" id="xp-undef"> Undeformed</label>
+        </div>
+        <label class="check inline"><input type="checkbox" id="xp-edges" checked> Edges</label>
+        <label class="check inline"><input type="checkbox" id="xp-axes" checked> Axes</label>
+        <span id="xp-info" class="hint"></span>
+      </div>
+      <div class="ann-body">
+        <div id="xp-view"><div id="xp-legend" class="fa-legend" hidden></div><div class="xp-strip"><span id="xp-busy"></span> <span id="xp-last"></span></div></div>
+        <div id="xp-split" class="fa-split" title="Drag to change the width of the panel"></div>
+        <div class="ann-props" id="xp-panel">
+          <details id="xp-sec-model" open><summary class="sk-h">Model</summary><div id="xp-model"></div></details>
+          <details id="xp-sec-runs" open><summary class="sk-h">Runs</summary><div id="xp-runs"></div></details>
+          <details id="xp-sec-build" open><summary class="sk-h">Build</summary><div id="xp-buildp"></div></details>
+          <details id="xp-sec-solve" open><summary class="sk-h">Solve</summary><div id="xp-solvep"></div></details>
+          <details id="xp-sec-results" open><summary class="sk-h">Results</summary><div id="xp-results"></div></details>
+          <details id="xp-sec-console" open><summary class="sk-h">Console</summary><div id="xp-console"></div></details>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+<div id="text-dialog" class="modal" hidden>
+  <div class="modal-box">
+    <strong>Note text</strong>
+    <textarea id="text-dialog-input" rows="6"></textarea>
+    <p class="hint">Enter starts a new line. Ctrl+Enter or OK places the note.</p>
+    <div class="buttons">
+      <button type="button" id="text-dialog-ok" class="primary">OK</button>
+      <button type="button" id="text-dialog-cancel">Cancel</button>
+    </div>
+  </div>
+</div>
+<div id="fea-dialog" class="modal" hidden>
+  <div class="modal-box">
+    <strong>Export FEA mesh</strong>
+    <div class="grid2">
+      <label>Format<select id="fea-format"></select></label>
+      <label>Elements<select id="fea-kind">
+        <option value="hex">Hexahedra, structured (every cell a block)</option>
+        <option value="hexmix">Hexahedra in block cells, tetrahedra elsewhere</option>
+        <option value="allhex">All hexahedra by subdivision</option>
+        <option value="solid">Tetrahedra</option>
+        <option value="surface">Surface triangles</option>
+        <option value="surfquad">Surface quadrangles</option></select></label>
+      <label>Element size (mm)<input type="number" id="fea-size" step="any" placeholder="auto: diagonal / 20"></label>
+      <label>Minimum size (mm)<input type="number" id="fea-size-min" step="any" placeholder="auto: size / 5"></label>
+      <label>Order<select id="fea-order"><option value="1">1 (linear)</option><option value="2" selected>2 (quadratic)</option></select></label>
+      <label>3D algorithm<select id="fea-algo"><option value="default">Delaunay</option><option value="frontal">Frontal</option><option value="hxt">HXT (parallel)</option></select></label>
+      <label>Elements per 2&pi; of curvature<input type="number" id="fea-curv" step="1" min="0" value="0"></label>
+      <label>Block corner angle limit (deg)<input type="number" id="fea-corner" step="1" min="90" max="180" value="135"></label>
+      <label>Geometry fixes at import (tolerance mm, 0: off)<input type="number" id="fea-fixtol" step="any" min="0" value="0" title="gmsh healing of degenerated and small edges and faces, sewing; for imported geometry that fails to mesh"></label>
+      <label class="check"><input type="checkbox" id="fea-groups" checked> Sets per face (F1..Fn) and solid (S1..Sn)</label>
+      <label class="check"><input type="checkbox" id="fea-opt" checked> Optimise (Netgen)</label>
+    </div>
+    <p class="hint" id="fea-hint">Abaqus .inp: solid elements C3D4 / C3D10 with one node set per face. The folder field of the tab gives the output folder (empty: download).</p>
+    <div class="buttons">
+      <button type="button" id="fea-preview">Preview mesh</button>
+      <button type="button" id="fea-ok" class="primary">Export</button>
+      <button type="button" id="fea-cancel">Cancel</button>
+    </div>
+  </div>
+</div>
+<div id="pj-vdialog" class="modal" hidden>
+  <div class="modal-box">
+    <div class="ref-head"><strong id="pj-vtitle">Versions</strong><button type="button" id="pj-vclose">Close</button></div>
+    <div id="pj-vlist"></div>
+  </div>
+</div>
+<div id="tb-dialog" class="modal" hidden>
+  <div class="modal-box tb-box">
+    <div class="ref-head"><strong>Title block editor</strong><button type="button" id="tb-close">Close</button></div>
+    <div class="editor">
+      <div class="editor-form">
+        <div class="grid4">
+          <label>Width (mm)<input type="number" id="tb-width_mm" step="1"></label>
+          <label>Height (mm)<input type="number" id="tb-height_mm" step="1"></label>
+          <label>Label height (mm)<input type="number" id="tb-label_size_mm" step="0.1"></label>
+          <label>Font<input type="text" id="tb-font"></label>
+          <label>Logo cell x, y, w, h<input type="text" id="tb-logo_cell"></label>
+          <label>Projection cell x, y, w, h<input type="text" id="tb-projection_cell"></label>
+          <label>Binding edge (mm)<input type="number" id="b-left_mm" step="1"></label>
+          <label>Other edges (mm)<input type="number" id="b-other_mm" step="1"></label>
+        </div>
+        <div class="row">
+          <label class="file-btn">Logo (PNG/JPG)<input type="file" id="logo-input" accept=".png,.jpg,.jpeg" hidden></label>
+          <span id="logo-name" class="hint"></span>
+          <button type="button" id="logo-clear" class="quiet">Remove logo</button>
+        </div>
+        <h2 class="sk-h">Line widths and text (mm)</h2>
+        <div class="grid4" id="lw-grid">
+          <label>Visible<input type="number" id="lw-visible" step="0.05" min="0.05"></label>
+          <label>Hidden<input type="number" id="lw-hidden" step="0.05" min="0.05"></label>
+          <label>Chain (centre, cutting plane)<input type="number" id="lw-chain" step="0.05" min="0.05"></label>
+          <label>Hatch<input type="number" id="lw-hatch" step="0.05" min="0.05"></label>
+          <label>Dimensions<input type="number" id="lw-dim" step="0.05" min="0.05"></label>
+          <label>Frame<input type="number" id="lw-frame" step="0.05" min="0.05"></label>
+          <label>Title block<input type="number" id="lw-title" step="0.05" min="0.05"></label>
+          <label>Text stroke<input type="number" id="lw-text" step="0.05" min="0.05"></label>
+          <label>Text height<input type="number" id="th-text" step="0.5" min="1"></label>
+          <label>Dimension text height<input type="number" id="th-dim" step="0.5" min="1"></label>
+        </div>
+        <p class="hint">ISO 128 pairs: 0.5 / 0.25 mm (default), 0.7 / 0.35 mm, 0.35 / 0.18 mm. Applies to the preview, PDF, DXF (lineweights) and SVG after <strong>Save title block</strong>.</p>
+        <h2 class="sk-h">Title block cells</h2>
+        <p class="hint">Cell coordinates in mm from the top-left corner of the title block. Key is the field name; a new key adds a field.</p>
+        <table id="cells">
+          <thead><tr><th>Key</th><th>Label</th><th>x</th><th>y</th><th>w</th><th>h</th><th>Text h</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <div class="buttons">
+          <button type="button" id="cell-add" class="quiet">Add cell</button>
+          <button type="button" id="tb-preview" class="primary">Update preview</button>
+          <button type="button" id="tb-save">Save title block</button>
+        </div>
+      </div>
+      <div class="editor-preview">
+        <div id="tb-zoom" class="sheet"></div>
+        <div id="tb-sheet" class="sheet"></div>
+      </div>
+    </div>
+  </div>
+</div>
+<div id="ref-dialog" class="modal" hidden>
+  <div class="modal-box ref-box">
+    <div class="ref-head"><strong>Reference tables</strong><button type="button" id="ref-close">Close</button></div>
+    <div id="ref-tabs" class="toolbar">
+      <button type="button" data-ref="coarse">Metric coarse</button>
+      <button type="button" data-ref="fine">Metric fine</button>
+      <button type="button" data-ref="bearing">Bearing nut threads</button>
+      <button type="button" data-ref="trap">Trapezoidal</button>
+      <button type="button" data-ref="unc">UNC</button>
+      <button type="button" data-ref="unf">UNF</button>
+      <button type="button" data-ref="bspp">Pipe G</button>
+      <button type="button" data-ref="tol">Tolerance limits</button>
+      <button type="button" data-ref="holes">Holes for screws</button>
+      <button type="button" data-ref="fits">ISO fits</button>
+      <button type="button" data-ref="rough">Surface roughness</button>
+    </div>
+    <div id="ref-body"></div>
+  </div>
+</div>
+<div id="opt-dialog" class="modal" hidden>
+  <div class="modal-box opt-box">
+    <div class="ref-head"><strong>Options</strong><button type="button" id="opt-close">Close</button></div>
+    <label>Drawing units
+      <select id="opt-units">
+        <option value="mm">mm (default)</option>
+        <option value="inch">inch, decimal point</option>
+      </select>
+    </label>
+    <p class="hint">Applies to dimension text, tolerances, hole callouts, the title block <b>Units</b> field and the deviation fields of the dimension properties. The model, the other input fields and the exports of the Part, Assembly and Analysis tabs are in mm.</p>
+    <label>Keyboard shortcuts
+      <select id="opt-keys">
+        <option value="default">Default</option>
+        <option value="left">Left-handed (keys on the right side of the keyboard)</option>
+      </select>
+    </label>
+    <label>Browser (used at the next start; empty: the system default)
+      <input type="text" id="opt-browser" placeholder="e.g. &quot;C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe&quot; --app={url}">
+    </label>
+    <p class="hint">An executable path; {url} marks where the address goes. With --app={url}, Edge and Chrome open SHINYCAD in a window without tabs and address bar.</p>
+    <div id="opt-keylist" class="opt-keylist"></div>
+  </div>
+</div>
+<div id="value-dialog" class="modal" hidden>
+  <div class="modal-box">
+    <strong id="value-dialog-title">Value</strong>
+    <input type="text" id="value-dialog-input">
+    <select id="value-dialog-select" size="8" hidden></select>
+    <div class="buttons">
+      <button type="button" id="value-dialog-ok" class="primary">OK</button>
+      <button type="button" id="value-dialog-cancel">Cancel</button>
+    </div>
+  </div>
+</div>
+<script type="importmap">{"imports": {"three": "/static/vendor/three.module.min.js"}}</script>
+<script src="/static/app.js"></script>
+<script src="/static/annotate.js"></script>
+<script src="/static/sketch.js"></script>
+<script src="/static/refdiagrams.js"></script>
+<script src="/static/project.js"></script>
+<script src="/static/reference.js"></script>
+<script src="/static/icons.js"></script>
+<script type="module" src="/static/part.js"></script>
+<script type="module" src="/static/assembly.js"></script>
+<script type="module" src="/static/analysis.js"></script>
+<script type="module" src="/static/explicit.js"></script>
+</body>
+</html>

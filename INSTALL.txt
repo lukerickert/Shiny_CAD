@@ -18,8 +18,8 @@ Optional programs (not installed by start.bat):
 
 Installation
 ------------
-1. Unzip the package to a folder with a short path, for example C:\SHINYCAD.
-   Keep all files and folders together.
+1. Right-click the zip file > Extract All..., to a folder with a short path, for example C:\.
+   Keep all files and folders together. start.bat does not run from inside the zip file.
 2. Double-click start.bat.
    The first start creates the Python environment in %LOCALAPPDATA%\drawgen\venv
    and installs build123d, flask, ezdxf, reportlab and gmsh from requirements.txt.
@@ -28,6 +28,18 @@ Installation
 
 Later starts use the existing environment.
 When requirements.txt changes, start.bat installs the packages again.
+
+Troubleshooting
+---------------
+start.bat keeps its window open with a message when it stops.
+- "Windows protected your PC": the zip came from the internet. Click More info > Run anyway,
+  or before extracting: right-click the zip > Properties > Unblock.
+- "run.py, requirements.txt or drawgen\web.py is missing": start.bat was started from inside
+  the zip. Extract the zip and start start.bat in the extracted SHINYCAD folder.
+- "Python 3.10 to 3.14 was not found": install Python 3.14 (64-bit) from python.org with the
+  options "py launcher" and "Add python.exe to PATH".
+- "Package installation failed": no connection to pypi.org (internet, proxy, firewall).
+- "SHINYCAD stopped with an error": the lines above the message give the cause.
 
 First use
 ---------

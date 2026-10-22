@@ -1,4 +1,4 @@
-# SHINYCAD (FULLY AI DEVELOPED)
+# SHINYCAD
 
 Local web application that creates ISO drawings from STEP files.
 Each drawing has an ISO 5457 frame, an ISO 7200 title block, first-angle Front / Top / Right views, section A-A through the part centre and an isometric view.
@@ -13,14 +13,24 @@ AstoCAD is not used at run time. Projection and hidden-line removal use OpenCasc
 ## 1. Installation (Windows)
 
 1. Install Python 3.10 to 3.14 from python.org (64-bit). `py -0` lists the versions known to the py launcher.
-2. Unzip the `drawgen` folder with all files in the same folder.
+2. Extract the zip file (right-click > **Extract All...**) to a folder with a short path, for example `C:\SHINYCAD`, with all files in the same folder.
 3. Double-click `start.bat`.
 
-`start.bat` uses the py launcher and selects the newest installed version from 3.14 to 3.10.
+`start.bat` uses the py launcher and selects the newest installed version from 3.14 to 3.10; without the py launcher it uses `python.exe` on PATH (not the Microsoft Store alias in `WindowsApps`) when it is version 3.10 to 3.14.
+`start.bat` runs only from the extracted folder: started from inside the zip file, it reports the missing files and stops.
+An environment whose Python no longer starts (Python removed or reinstalled) is created again.
 The first start creates the environment in `%LOCALAPPDATA%\drawgen\venv` and installs `build123d`, `flask`, `ezdxf`, `reportlab` and `gmsh` (approximately 500 MB, internet connection required).
 Later starts use the existing environment. When `requirements.txt` differs from the installed copy, the packages are installed again before the start.
 The server runs at `http://localhost:8765` and the browser opens automatically.
 Close the command window to stop the server.
+
+| Message or behaviour of `start.bat` | Cause and action |
+|---|---|
+| Windows protected your PC (SmartScreen) | The zip came from the internet. **More info** > **Run anyway**, or before extracting: right-click the zip > **Properties** > **Unblock** |
+| run.py, requirements.txt or drawgen\web.py is missing | Started from inside the zip. Extract the zip (**Extract All...**) and start `start.bat` in the extracted folder |
+| Python 3.10 to 3.14 was not found | Install Python 3.14 (64-bit) from python.org with **py launcher** and **Add python.exe to PATH** |
+| Package installation failed | No connection to pypi.org (internet, proxy, firewall) on the first start |
+| SHINYCAD stopped with an error | The lines above the message give the cause, for example Port 8765 is already in use |
 
 Manual installation:
 
