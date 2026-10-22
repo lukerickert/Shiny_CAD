@@ -1,0 +1,5 @@
+build123d>=0.9
+flask>=3.0
+ezdxf>=1.1
+reportlab>=4.0
+gmsh>=4.12

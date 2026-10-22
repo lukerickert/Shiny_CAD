@@ -1,0 +1,70 @@
+SHINYCAD - installation and start
+=================================
+
+Full manual: README.md (installation section 1, Explicit tab section 13).
+
+Requirements
+------------
+- Windows 10 or 11, 64-bit.
+- Python 3.10 to 3.14, 64-bit, from python.org, with the py launcher.
+  "py -0" in a command window lists the installed versions.
+- Internet connection for the first start (approximately 500 MB of packages).
+
+Optional programs (not installed by start.bat):
+- CalculiX ccx (Analysis tab): ccx_static.exe of PrePoMax or a CalculiX build for Windows (README section 12.1).
+- OpenRadioss for Windows (Explicit tab): starter, engine, anim_to_vtk, th_to_csv (README section 13.1).
+- ParaView (Explicit tab: strain extraction, renders).
+- OpenSSH of Windows and a Linux server with OpenRadioss and task-spooler (Explicit tab, remote runs).
+
+Installation
+------------
+1. Unzip the package to a folder with a short path, for example C:\SHINYCAD.
+   Keep all files and folders together.
+2. Double-click start.bat.
+   The first start creates the Python environment in %LOCALAPPDATA%\drawgen\venv
+   and installs build123d, flask, ezdxf, reportlab and gmsh from requirements.txt.
+3. The browser opens http://localhost:8765.
+   Close the command window to stop the server.
+
+Later starts use the existing environment.
+When requirements.txt changes, start.bat installs the packages again.
+
+First use
+---------
+1. Project tab: set the Projects folder, then New... to create a project.
+2. Drawings tab: Title block... (toolbar) opens the title block editor
+   (title block layout, logo, line widths, text heights; Save title block writes config.json).
+3. Analysis tab: set the path of ccx (README section 12.1).
+4. Explicit tab, Solve panel: set the OpenRadioss exec folder, or leave it empty when the
+   executables are on PATH. Settings of this PC are written to config.json > explicit.
+   Without that entry the ORC3 configuration %APPDATA%\ORC3\workspace_config.json is read.
+
+Command line options (run.py, through the environment):
+  run.py --port 9000        other port
+  run.py --no-browser       no browser at the start
+  run.py --browser "<cmd>"  browser command for this start
+
+Tests
+-----
+run_tests.bat runs the automatic tests in tests\ (first run installs pytest, pyflakes and
+Playwright with Chromium, approximately 150 MB).
+  run_tests.bat         all tests
+  run_tests.bat fast    without the browser tests
+
+Package contents
+----------------
+start.bat, run.py          start of the program
+requirements.txt           Python packages
+config.json                settings and title block (without the projects folder, the open
+                           project and the Explicit settings of the PC it was taken from)
+logo.png                   logo of the title block
+README.md                  full manual
+SHINYCAD_functions.png     overview of the functions
+drawgen\                   program (server, drawing, part, assembly, analysis modules)
+drawgen\static\            interface (HTML, JavaScript, three.js 0.160.0, MIT licence)
+drawgen\explicit\          Explicit tab: ORC3 core, inp2rad.py and inp2rad_run.py
+                           (inp2rad: Altair Engineering, MIT licence), deck generator
+                           (deck.py, deck_mesh.py, deck_stepgen.py)
+tests\                     automatic tests, run_tests.bat
+parts\, sketches\, assemblies\, annotations\
+                           document folders used when no project is open (empty)
