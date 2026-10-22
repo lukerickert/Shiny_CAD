@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""FreeCAD / AstoCAD document (.FCStd) with a TechDraw page.
+"""FreeCAD document (.FCStd) with a TechDraw page.
 
 The document holds the part as a Part::Feature, an SVG template with
 editable title block fields and TechDraw views (Front, Top, Right, section,

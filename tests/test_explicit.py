@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Explicit tab (drawgen/explicit, ORC**3 core): mesh view data and readers, the model .inp of the ShinyCAD geometry,
 the deck build (inp2rad and the cards of the settings), run folders, the local solve with a stand-in for the
-OpenRadioss executables (fake_openradioss.py), results, post-processing, the Explicit document in the project."""
+OpenCourant executables (fake_openradioss.py), results, post-processing, the Explicit document in the project."""
 import base64
 import glob
 import json
@@ -520,3 +520,29 @@ def test_deck_model_build_and_step_part(client, tmp_path):
     wait_job(client, ok(client.post("/api/explicit/deck/step", json=base))["job"])
     p2 = ok(client.get("/api/part/file/xp_deck1_deck"))
     assert [f["type"] for f in p2["features"]].count("surf_import") == 8 and any(f["type"] == "extrude" for f in p2["features"])
+
+
+def test_solver_packages_in_the_solvers_folder(tmp_path, monkeypatch):
+    """OpenCourant: the exec folder of a package in <program>/solvers/ when OpenCourant exec folder is empty;
+    CalculiX: ccx of a PrePoMax folder in <program>/solvers/."""
+    from drawgen import analysis
+    monkeypatch.setattr(host, "SOLVERS_DIR", str(tmp_path))
+    w = host.Workspace()
+    w.apply({"or_exec": ""})
+    assert w._or_dir() == "" and w._or_env() is None
+    ex = tmp_path / "OpenCourant" / "OpenCourant_win64" / "exec"
+    ex.mkdir(parents=True)
+    (tmp_path / "OpenCourant" / "OpenCourant_win64" / "hm_cfg_files").mkdir()
+    name = "starter_win64.exe" if os.name == "nt" else "starter_linux64_gf"
+    (ex / name).write_text("x")
+    assert w._or_dir() == str(ex) and w._or_exe("starter") == str(ex / name)
+    assert w._or_env()["RAD_CFG_PATH"].endswith("hm_cfg_files") or os.environ.get("RAD_CFG_PATH")
+    w.apply({"or_exec": "/opt/x/exec"})
+    assert w._or_dir() == "/opt/x/exec"
+    monkeypatch.setattr(analysis, "SOLVERS_DIR", str(tmp_path))
+    sv = tmp_path / "PrePoMax v3.0.0 RC2" / "Solver"
+    sv.mkdir(parents=True)
+    ext = ".exe" if os.name == "nt" else ""
+    for n in ("ccx_dynamic", "ccx_static"):
+        (sv / (n + ext)).write_text("x")
+    assert analysis.find_ccx("") == str(sv / ("ccx_static" + ext))

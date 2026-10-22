@@ -838,7 +838,7 @@ class BuildMixin:
         if unsupported:
             self.log_msg("")
             self.log_msg(f"BUILD HALTED: inp2rad cannot convert element type(s): {', '.join(unsupported)}.")
-            self.log_msg("OpenRadioss meshes are first-order, so higher-order elements aren't supported.")
+            self.log_msg("OpenCourant meshes are first-order, so higher-order elements aren't supported.")
             self.log_msg("Re-mesh the affected part(s) with linear elements in PrePoMax")
             self.log_msg("(e.g. S8/S8R shells -> S4R or S3; C3D20 solids -> C3D8), re-export, and rebuild.")
             return

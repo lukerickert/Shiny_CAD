@@ -3,12 +3,12 @@
 Local web application that creates ISO drawings from STEP files.
 Each drawing has an ISO 5457 frame, an ISO 7200 title block, first-angle Front / Top / Right views, section A-A through the part centre and an isometric view.
 Dimensions, notes and ISO 286 tolerances are added interactively.
-Output is PDF, DXF, SVG and FCStd (FreeCAD / AstoCAD document with a TechDraw page).
+Output is PDF, DXF, SVG and FCStd (FreeCAD document with a TechDraw page).
 The **Sketches** pane of the **Drawings** tab creates 2D sketches on a blank sheet and edits DXF files, with geometric constraints and driving dimensions. The same editor sketches on a view or on the sheet of a model drawing.
 The **Part** tab creates 3D parts from sketches with extrude, cut and revolve features.
 The **Analysis** tab runs linear static analyses of assemblies and parts with CalculiX: solid bodies, plates, beams, rods and preloaded fasteners.
-The **Explicit** tab builds and runs OpenRadioss explicit analyses (ORC\*\*3 core) from the ShinyCAD geometry or a PrePoMax .inp, locally or on a Linux server, and shows the results.
-AstoCAD is not used at run time. Projection and hidden-line removal use OpenCascade through build123d.
+The **Explicit** tab builds and runs OpenCourant explicit analyses (ORC\*\*3 core) from the ShinyCAD geometry or a PrePoMax .inp, locally or on a Linux server, and shows the results.
+Projection and hidden-line removal use OpenCascade through build123d.
 
 ## 1. Installation (Windows)
 
@@ -40,12 +40,32 @@ py -3.14 -m venv %LOCALAPPDATA%\drawgen\venv
 %LOCALAPPDATA%\drawgen\venv\Scripts\python.exe run.py
 ```
 
-The **Analysis** tab needs the CalculiX solver `ccx` (not installed by `start.bat`): the `ccx_static.exe` of PrePoMax, or a CalculiX build for Windows (section 12.1).
-The **Explicit** tab needs OpenRadioss (not installed by `start.bat`), and ParaView for the strain extraction and the renders (section 13.1).
+The **Analysis** tab needs the CalculiX solver `ccx` and the **Explicit** tab needs OpenCourant (section 1.1). ParaView is used for the strain extraction and the renders of the Explicit tab (section 13.1).
 
 `run.py --port 9000` sets a different port and `run.py --no-browser` does not open the browser.
 `run.py --browser "<command>"` opens the program in that browser for this start (section 3.1 **Browser**).
 The server listens on 127.0.0.1 only.
+
+### 1.1 Solvers
+
+The solvers are not installed by `start.bat`.
+Packages unpacked in the folder `solvers\` of the program are found without settings.
+
+| Solver | Source | Installation |
+|---|---|---|
+| CalculiX `ccx` (Analysis tab) | PrePoMax, https://prepomax.fs.um.si/downloads/ (portable zip `PrePoMax v<version>.zip`, GPL-3.0, source https://gitlab.com/MatejB/PrePoMax); its `Solver` folder holds the Windows build of CalculiX | Unpack the zip to `solvers\` of the program (`solvers\PrePoMax v<version>\Solver\`), or to the user folder, Desktop, Downloads, Documents, `Program Files` or the root of the system drive. With **Solver (ccx)** empty, the program uses the first `ccx*.exe` in `solvers\` (up to 4 folder levels; `ccx.exe`, then the shortest name, so `ccx_static.exe` before `ccx_dynamic.exe`), then `ccx` on PATH, then the `Solver` folder of a `PrePoMax*` folder in those places (section 12.1). The PrePoMax program itself needs the .NET Framework 4.8. Other CalculiX builds: https://github.com/calculix |
+| OpenRadioss, Windows (Explicit tab, local runs; use this until OpenCourant publishes a Windows package) | Last official OpenRadioss Windows release `latest-20260728`, archived by OpenCourant: https://github.com/OpenCourant/extlib/releases/tag/upstream-latest-20260728-win64, asset `OpenRadioss_win64.zip`. SHA-256 given on the page: `04dfecb0bf26ce071132cda86dc6861417c6a4127a389befe82b8c97341b3268` | Download `OpenRadioss_win64.zip`. Check the hash in PowerShell: `Get-FileHash .\OpenRadioss_win64.zip -Algorithm SHA256`. Unpack it to `solvers\OpenRadioss\`, so that `starter_win64.exe` is in `solvers\OpenRadioss\exec\` or one folder deeper (`solvers\OpenRadioss\OpenRadioss\exec\`). Check that `exec\` also holds `anim_to_vtk_win64.exe` and `th_to_csv_win64.exe` (results view and energy curves). With **OpenCourant exec folder** empty, the program uses that folder and sets the environment of the package (section 13.1) |
+| OpenCourant, Windows (Explicit tab, local runs) | https://github.com/OpenCourant/OpenCourant/releases (no Windows package on 2026-10-22) | When a Windows package is published: unpack it to `solvers\OpenCourant\` the same way and delete `solvers\OpenRadioss\`, so that one exec folder remains in `solvers\` |
+| OpenCourant, Linux (Explicit tab, remote runs) | `OpenCourant_linux64.zip` of the same releases page | Unpack on the server and set **Exec dir** to its `exec` folder (section 13.6). The `_ompi` engine needs OpenMPI 4.1.2 in `/opt/openmpi`; the SMP engine runs without it |
+
+OpenCourant (https://github.com/OpenCourant) is the community continuation of OpenRadioss.
+The executable names (`starter_win64.exe`, `engine_win64.exe`, `anim_to_vtk_win64.exe`, `th_to_csv_win64.exe`; `starter_linux64_gf`, ...) and the package layout (`exec`, `extlib`, `hm_cfg_files`) are those of OpenRadioss.
+Siemens discontinued OpenRadioss on 2026-10-01 and deleted its GitHub repository and releases; the OpenRadioss download links of other documentation no longer work.
+The OpenCourant release of 2026-10-05 (`latest-20261005`) has Linux x86_64 packages only (release notes: "Windows and Linux arm64 packages are not available yet").
+Until OpenCourant publishes a Windows package, local runs on Windows use the archived OpenRadioss Windows package above, or a Windows build of the OpenCourant source (`build_windows.bat`, `INSTALL.md` of the repository).
+The archive is a community-held copy of the official package; the page states that its SHA-256 matches an independently recorded official hash.
+
+Other locations: **Solver (ccx)** (Analysis tab, Settings) or `ccx` on PATH (section 12.1); **OpenCourant exec folder** (Explicit tab, Solve panel) or PATH (section 13.1).
 
 ## 2. Files
 
@@ -56,6 +76,9 @@ The server listens on 127.0.0.1 only.
 | `config.json` | Defaults: sheet, scale, views, line widths, sheet sizes, frame, title block layout and field values; projects folder and open project |
 | `requirements.txt` | Python packages |
 | `logo.png` | Logo of the title block |
+| `solvers/` | Solver packages: PrePoMax (CalculiX) and OpenCourant, unpacked here (section 1.1); `solvers/README.txt` |
+| `INSTALL.txt` | Installation, troubleshooting and first use, short form |
+| `.gitattributes`, `.gitignore` | Git: CRLF line endings of the `.bat` files; `__pycache__` and the contents of `solvers/` except `README.txt` are not tracked |
 | `drawgen/web.py` | Web server |
 | `drawgen/pool.py` | Worker processes for the drawing views and the assembly builds |
 | `drawgen/model.py` | STEP reading: solids and their names |
@@ -864,7 +887,7 @@ The panel at the right is 480 px wide; the bar at its left edge changes the widt
 
 ### 12.1 Solver
 
-**Solver (ccx)** under **Settings** is the path of the CalculiX executable (written to `config.json` > `ccx_path`). When it is empty, the program uses `ccx` on PATH, or `ccx_static.exe` / `ccx_dynamic.exe` of a PrePoMax installation under `Program Files`, `%LOCALAPPDATA%` or the user folder (`Desktop\PrePoMax`, `Downloads\PrePoMax`). The line below the field gives the executable in use. `OMP_NUM_THREADS` and `CCX_NPROC_STIFFNESS` are set to the number of processor cores.
+**Solver (ccx)** under **Settings** is the path of the CalculiX executable (written to `config.json` > `ccx_path`). When it is empty, the program uses the first `ccx*.exe` in `solvers\` of the program (section 1.1), `ccx` on PATH, or `ccx_static.exe` / `ccx_dynamic.exe` of a `PrePoMax*` folder (for example `PrePoMax v3.0.0 RC2`) in `Program Files`, `%LOCALAPPDATA%`, the user folder, its `Desktop`, `Downloads` and `Documents`, or the root of the system drive. The line below the field gives the executable in use. `OMP_NUM_THREADS` and `CCX_NPROC_STIFFNESS` are set to the number of processor cores.
 
 ### 12.2 Controls
 
@@ -1051,9 +1074,10 @@ Meshing runs in a separate process (`drawgen/femesh.py`) and stops after 1800 s.
 
 ## 13. Explicit
 
-The **Explicit** tab builds OpenRadioss decks from an Abaqus .inp, runs them on this PC or on a Linux server, and shows the results.
+The **Explicit** tab builds OpenCourant decks from an Abaqus .inp, runs them on this PC or on a Linux server, and shows the results.
 The deck build, the run folders, the solver control and the post-processing are the ORC\*\*3 v1.0 code (OpenRadioss CalculiX Converter and Control) in `drawgen/explicit/`.
 `inp2rad.py` (Altair Engineering, MIT licence) converts the .inp to the starter deck.
+OpenCourant (https://github.com/OpenCourant), the community continuation of OpenRadioss, runs the decks (installation: section 1.1).
 The .inp comes from the ShinyCAD geometry (section 13.3), from the deck generator (section 13.3.1) or from PrePoMax.
 
 Units: mm, t, s, N, MPa; density in t/mm^3 in the .inp and the decks, in kg/m^3 in the **Materials** table; velocity in mm/s; energy in mJ.
@@ -1062,15 +1086,15 @@ Units: mm, t, s, N, MPa; density in t/mm^3 in the .inp and the decks, in kg/m^3 
 
 | Program | Use |
 |---|---|
-| OpenRadioss for Windows: `starter_win64`, `engine_win64`, `anim_to_vtk_win64`, `th_to_csv_win64` | Local runs. Taken from **OpenRadioss exec folder** (Solve panel), or from PATH when the field is empty |
-| `ssh`, `scp` (OpenSSH of Windows) | Remote runs. Task-spooler (`tsp`) and OpenRadioss (`starter_linux64_gf`, `engine_linux64_gf`, `anim_to_vtk_linux64_gf`, `th_to_csv_linux64_gf`) on the server |
+| OpenCourant for Windows: `starter_win64`, `engine_win64`, `anim_to_vtk_win64`, `th_to_csv_win64` | Local runs. Taken from **OpenCourant exec folder** (Solve panel); when the field is empty, from the first `solvers\*\exec` or `solvers\*\*\exec` folder of the program that holds `starter_win64.exe` (section 1.1), else from PATH |
+| `ssh`, `scp` (OpenSSH of Windows) | Remote runs. Task-spooler (`tsp`) and OpenCourant (`starter_linux64_gf`, `engine_linux64_gf`, `anim_to_vtk_linux64_gf`, `th_to_csv_linux64_gf`) on the server |
 | ParaView `pvbatch.exe`, `paraview.exe` | **Extract Strains**, **PV Images**, **Open in ParaView**. Empty fields: searched in `C:\Program Files\ParaView*`, `Documents\ParaView*` and `C:\ParaView*` |
 | matplotlib (optional, not installed by `start.bat`) | `<job>_KE.png` in the build folder |
 
-With **OpenRadioss exec folder** set, the local solver processes get the exec folder and the existing folders `extlib\hm_reader\win64`, `extlib\h3d\lib\win64` and `extlib\intelOneAPI_runtime\win64` of the OpenRadioss folder (the parent of the exec folder) on PATH, `RAD_CFG_PATH` = `<OpenRadioss folder>\hm_cfg_files`, `RAD_H3D_PATH` and `KMP_STACKSIZE` = `OMP_STACKSIZE` = 400m, where these are not set.
+With an exec folder (**OpenCourant exec folder**, or found in `solvers\`), the local solver processes get the exec folder and the existing folders `extlib\hm_reader\win64`, `extlib\h3d\lib\win64` and `extlib\intelOneAPI_runtime\win64` of the OpenCourant folder (the parent of the exec folder) on PATH, `RAD_CFG_PATH` = `<OpenCourant folder>\hm_cfg_files`, `RAD_H3D_PATH` and `KMP_STACKSIZE` = `OMP_STACKSIZE` = 400m, where these are not set.
 The line below the fields in the Solve panel gives the executables found.
 
-The fields **Env**, **Threads**, **OpenRadioss exec folder**, **Server (user@host)**, **SSH Port**, **Env script**, **Exec dir**, **Scratch dir**, **Share map**, **pvbatch** and **paraview** are settings of this PC and are written to `config.json` > `explicit`.
+The fields **Env**, **Threads**, **OpenCourant exec folder**, **Server (user@host)**, **SSH Port**, **Env script**, **Exec dir**, **Scratch dir**, **Share map**, **pvbatch** and **paraview** are settings of this PC and are written to `config.json` > `explicit`.
 When `config.json` has no `explicit` entry, they are read from the ORC\*\*3 configuration `%APPDATA%\ORC3\workspace_config.json` when it exists.
 All other fields are stored in the explicit document.
 
@@ -1226,7 +1250,7 @@ Reserved ids: 9999997 gravity, 9999998 all-node group and global tie, 9999999 su
 | **Threads** | Engine threads (`-nt`) |
 | **Stream remote output** | Follows the remote job to the end (status, copy-back, post-processing); required for SCP transfer |
 | **Plot KE**, **Extract Strains**, **PV Images** | Post-processing after a run: KE curve and PNG; principal strain summary (pvbatch); PNG renders (pvbatch) |
-| **OpenRadioss exec folder** | Local executables (section 13.1) |
+| **OpenCourant exec folder** | Local executables (section 13.1) |
 | **Server (user@host)**, **SSH Port**, **Env script**, **Exec dir**, **Scratch dir**, **Share map** | Remote run: `ssh`/`scp` target; script sourced before `tsp`; folder of the Linux executables; work folder for SCP transfer; `WIN => LINUX` path pairs separated by `;` (a run folder on a mapped share runs in place on the server, other folders are copied to **Scratch dir** and the results copied back) |
 | **pvbatch**, **paraview** | ParaView executables (empty: searched) |
 | **Run Simulation** (toolbar **Run**) | Runs **Target .rad**, or the queue when **Target .rad** is empty or in the queue |
@@ -1300,13 +1324,13 @@ The tests use a copy of `config.json`, a projects folder and a view cache in a t
 | `tests/test_api.py` | Server requests: projects and documents (rename, copy, version, delete, states), part build, STEP export and read back, drawing preview, options (inch dimension text in the preview, invalid values refused), snap points of a sketch on a drawing, PDF / DXF / SVG export (sheet size, layers, entities), annotations, sketches on drawings (view map, layers, background without the edited sketch), sketch DXF export, assembly build, view cache, mates on reference planes and axes, interference, STEP export, components from a STEP file and their listing in **Documents**; parallel saves of one file |
 | `tests/test_hole_mesh.py` | **Hole mesh**: blocks and prisms for a through hole, two holes, a blind and a counterbored hole, a hole near the edge; holes too close; structured mesh with only C3D8 (and C3D6 below a blind hole), shared nodes, 24 nodes on the hole circle for 3 elements per 45 deg, 4 elements through the thickness |
 | `tests/test_analysis.py` | Analysis against hand calculations: section properties, member axes, cantilever (tip deflection P L^3 / 3 E I, root moment and reaction), simply supported beam under a line load (5 q L^4 / 384 E I, q L^2 / 8), two-rod truss, portal frame with a hinged beam (equilibrium, q L^2 / 8), bonded blocks with a preloaded fastener (preload force, sum of the steps, weight, equilibrium), preload without a load path refused, plate tied to a block with a beam on the plate (pressure total, moment, reactions); plate items: solid from points (position, normal, errors), cantilever plate between beam and plate theory, T-joint of two plates with a post connected within a radius, deck plate on four columns without geometry (weight, equilibrium); API: save, mesh, solve, saved results, report, document links; cantilever block with tetrahedra (C3D10, C3D4), structured hexahedra (C3D8I, C3D8, C3D20R) and hexahedra by subdivision (tip deflection within 6 %); prescribed displacement and normal support with a value on a hexahedral block tied to a tetrahedral block (reactions); member section from its group; member stresses in the view data; triangular plate tied to the beams along its edges; plate group resolution; reference point rigidly connected to a block end (reaction force and moment, point displacement and rotation, report), face support with rotations (guided cantilever moment P L / 2), beam end at a reference point and beam end with a rigid face coupling (moment transfer, face stays plane). Skipped without `ccx` |
-| `tests/test_explicit.py` | Explicit tab with `tests/fake_openradioss.py` in place of the OpenRadioss executables: mesh view data of solids and shells, .inp and ASCII and BINARY VTK reading, max principal strain; settings of ORC\*\*3 snapshots, executables and environment, remote paths; deck build of a shell model (library material, /FAIL/TENSSTRAIN with SoftBand, *TIE ties, normal healing, Istrain, TYPE7 Idel, /INIVEL on the /RBODY main node, engine deck, build numbers); BUILD HALTED on a CAD file; .inp of the ShinyCAD geometry (roles, rigid body reference node at the centre of mass, supports); deck generator: .inp equal in nodes, elements, element sets and sections to `deck_mesh.py`, element type, edge supports, parameter table, z = 0 area equal to the panel area, check errors (coincident beams, position outside the panel, zero thickness) and warnings, deck build (/PROP/SHELL thicknesses, /BCS), **Generate STEP** and the part with **Import surface** bodies (z = 0 area), second **Generate STEP** keeping other features; run folder, build, starter only with the Min dt offer, run, status board, run history, results, frames, eroded elements, salvage, clean, run settings, killed engine, queue; explicit documents in **Documents**, rename of the geometry and of the document |
+| `tests/test_explicit.py` | Explicit tab with `tests/fake_openradioss.py` in place of the OpenCourant executables: mesh view data of solids and shells, .inp and ASCII and BINARY VTK reading, max principal strain; settings of ORC\*\*3 snapshots, executables and environment, remote paths; deck build of a shell model (library material, /FAIL/TENSSTRAIN with SoftBand, *TIE ties, normal healing, Istrain, TYPE7 Idel, /INIVEL on the /RBODY main node, engine deck, build numbers); BUILD HALTED on a CAD file; .inp of the ShinyCAD geometry (roles, rigid body reference node at the centre of mass, supports); deck generator: .inp equal in nodes, elements, element sets and sections to `deck_mesh.py`, element type, edge supports, parameter table, z = 0 area equal to the panel area, check errors (coincident beams, position outside the panel, zero thickness) and warnings, deck build (/PROP/SHELL thicknesses, /BCS), **Generate STEP** and the part with **Import surface** bodies (z = 0 area), second **Generate STEP** keeping other features; run folder, build, starter only with the Min dt offer, run, status board, run history, results, frames, eroded elements, salvage, clean, run settings, killed engine, queue; explicit documents in **Documents**, rename of the geometry and of the document |
 | `tests/test_pool.py` | Worker processes: view data and interference equal to the values computed in the server |
 | `tests/test_browser.py` | The interface in headless Chromium: all tabs; **Title block editor** window (opened from the Drawings toolbar and the drawing settings panel, filled from the saved configuration, preview, save, Close, Esc); sketch, extrude and save in the Part tab; **File ▾** load and **Make drawing** (opens **Drawings**); **Sketch** tool on a front view, line typed in view coordinates, **Finish sketch**; **Hole mesh** command; **Remove faces** pick by a click without **Pick faces**; hover text Ø and length of edges; **Point** coordinates from a vertex click; **Partition** face click in **Method**; assembly **Add part**, **Drag**, **Fix in space**, mate on reference planes, mate sides by clicking faces and a reference axis; drag of a mated component in its free plane; a drag on a fixed component leaves the view unchanged; Space hides a component, Shift+Space shows all; mate type buttons (**Coincident**, **Concentric**) in a long mate list with incomplete mates; unsatisfied mates red in the list and a one-line status; mate picking cursor in Drag mode; **Rotate** of a plane-mated component about Z, **Section** clipping and slider, mates window, collapsed **Mass**; sketch rectangle (DOF 4), constraint buttons with icons in the group of the dimension tools; **Surface finish** **Guide** sets the field from the roughness table; **ISO fits** calculator (H7/u6 interference, H7/g6 clearance, H7/k6 transition); **Drawings**: properties of a selected dimension, ISO 286 class and deviations in µm; **Options**: inch units relabel the deviation fields, left-handed keys relabel the tooltips and select the tools; **Analysis**: load, beam by coordinates, face pick, **Solve**, results, states and fields; plate by typed points; **Analysis** with a sketch-only part as geometry (sketch drawn, **Beam** ends snapped to sketch corners, **Sketch beams**, member end selection, hover marker, **Support** at the selected end, end and member picks, solve); drag of an unfixed mated pair; drag of a component held in a sliding component (the chain follows); conflicting mate left out, **Check**, **Suppress conflicting**, Ctrl+Z / Ctrl+Y; live drag of a chain; **Rotate** of a held component turns the chain; **Isolate**; default **Flip** from the current directions; **Measure** in the Assembly and Part tabs; **Show all** and **Invert**; component menu **Show only** the mated or connected components; **Box select**; Drawings **Angle** dimension; **Parts list** on and off; Analysis mesh settings (hexahedra by subdivision) and prescribed displacement support; Analysis member grid (typing, group creation, fill drag, paste, refused value, Delete), plate grid and plate groups, groups, member colours in the results and panel width; beam drawing with repeated properties; reference point with faces, support with six components and a moment load; Part **Place**; **Plane** normal to a sketch curve at its end; sketch x axis on a face from the view; **Bridge surface** command (side A and side B edges of surface bodies); **Display** modes; **Explicit**: geometry, rigid impactor, support face, **Write .inp**, **New run**, **Build**, **Run**, status board, results with the frame slider and hidden eroded elements, energy curve, **Save as…**; deck generator source: sum in a field, coincident position refused, **Pattern…** with skipped positions, plan and section diagrams, plates in the 3D view, edge support, **Write .inp**, **Generate STEP**, **Open part** with the surface bodies. A JavaScript error on the page fails the test |
 
 ## 15. Limitations
 
-- Input is STEP only. AstoCAD models are exported with **File > Export** > STEP.
+- Input is STEP only.
 - Dimensions and notes are not written to the FCStd file.
 - Dimensions in the DXF are lines and text, not DIMENSION entities.
 - One section view per drawing.

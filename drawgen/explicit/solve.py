@@ -93,7 +93,7 @@ class SolveMixin:
 
     def cmd_kill(self):
         if self.run_target.get() == "Local (Windows)":
-            self.log_msg("\nSending kill signal to local OpenRadioss processes...")
+            self.log_msg("\nSending kill signal to local OpenCourant processes...")
             self.local_abort = True
             try:
                 if os.name == "nt":
@@ -110,7 +110,7 @@ class SolveMixin:
             # the running processes were pkilled, so the next queued tsp job
             # would immediately start. tsp -K kills the spooler server itself
             # (queued jobs vanish; the next tsp call restarts it empty).
-            self.log_msg("\nKilling remote OpenRadioss processes and flushing the tsp queue...")
+            self.log_msg("\nKilling remote OpenCourant processes and flushing the tsp queue...")
             self.remote_abort = True
             env = self._remote_env_prefix()
             cmd = self._ssh_base() + [f"{env}tsp -K 2>/dev/null; pkill -9 -f linux64_gf 2>/dev/null; echo killed"]
@@ -986,7 +986,7 @@ class SolveMixin:
                 self._finalize_results_csv(run_folder, jobname, csv_proc.stdout)
             except FileNotFoundError:
                 self.log_msg("CSV WARNING: th_to_csv_win64 not found on PATH - no Results CSV; "
-                             "the KE plot needs it. Add the OpenRadioss exec folder to PATH.")
+                             "the KE plot needs it. Add the OpenCourant exec folder to PATH.")
             except Exception as e:
                 self.log_msg(f"CSV export error: {e}")
 

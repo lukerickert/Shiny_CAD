@@ -866,8 +866,8 @@ function renderSettings() {
   bindPanelSplit();
   const d = FA.doc, s = FA.solver || {};
   $("#fa-settings").innerHTML =
-    `<label title="CalculiX executable (ccx). Empty: ccx on PATH or the solver of a PrePoMax installation">Solver (ccx)<input type="text" id="fs-ccx" value="${fesc(s.configured || "")}" placeholder="${fesc(s.path || "not found")}"></label>` +
-    `<p class="hint">${s.path ? "Using " + fesc(s.path) : "CalculiX not found: give the path of ccx.exe (for example the Solver folder of PrePoMax)"}</p>` +
+    `<label title="CalculiX executable (ccx). Empty: ccx in the solvers folder of the program, ccx on PATH, or the Solver folder of a PrePoMax folder">Solver (ccx)<input type="text" id="fs-ccx" value="${fesc(s.configured || "")}" placeholder="${fesc(s.path || "not found")}"></label>` +
+    `<p class="hint">${s.path ? "Using " + fesc(s.path) : "CalculiX not found: unpack PrePoMax (prepomax.fs.um.si/downloads) to the solvers folder of the program, or give the path of the ccx executable in its Solver folder"}</p>` +
     `<label>Default material<select id="fs-defmat">${Object.keys(d.materials).map(n => `<option${n === d.default_material ? " selected" : ""}>${fesc(n)}</option>`).join("")}</select></label>` +
     `<p class="hint">Units: mm, N, s, t (tonne): stress and pressure MPa (N/mm^2), moment N mm, acceleration mm/s^2; densities are entered in kg/m^3.</p>` +
     meshSettingsHtml(d.mesh || {}) +

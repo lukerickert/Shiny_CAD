@@ -1,4 +1,4 @@
-// Explicit tab: explicit analysis with OpenRadioss (ORC**3 core, drawgen/explicit). Model from the ShinyCAD geometry
+// Explicit tab: explicit analysis with OpenCourant (ORC**3 core, drawgen/explicit). Model from the ShinyCAD geometry
 // (bodies, materials, supports, mesh, .inp) or an external .inp; run folders; deck build; local and remote solve; job
 // status board and console; results: animation frames on the 3D view, KE/IE curves, post-processing commands.
 import * as THREE from "three";
@@ -1321,7 +1321,7 @@ function renderSolve() {
     (decks.length ? `<select id="xp-decks" title="Decks of the selected run"><option value="">decks…</option>${optList(decks.map(d => [d, d.split("/").pop()]), "")}</select>` : "") + `</div>`;
   h += `<div class="row wrap"><label class="inline xp-f">Env<select data-e="run_target">${optList([[XP.meta.local, "Local"], [XP.meta.remote, "Remote (Linux)"]], E("run_target"))}</select></label>` +
     `${inE("ssh_threads", "Threads", 30)}${chkE("stream_remote", "Stream remote output")}${chkS("plot_ke", "Plot KE")}${chkS("extract_strains", "Extract Strains")}${chkS("pv_images", "PV Images")}</div>`;
-  if (!remote) h += `<div class="row">${inE("or_exec", "OpenRadioss exec folder", 260, "Folder of starter_win64, engine_win64, anim_to_vtk_win64, th_to_csv_win64 (empty: PATH)", "folder")}</div>`;
+  if (!remote) h += `<div class="row">${inE("or_exec", "OpenCourant exec folder", 260, "Folder of starter_win64, engine_win64, anim_to_vtk_win64, th_to_csv_win64 (empty: the exec folder of a package in the solvers folder of the program, else PATH)", "folder")}</div>`;
   else h += `<div class="row wrap">${inE("ssh_host", "Server (user@host)", 150)}${inE("ssh_port", "SSH Port", 40)}</div>` +
     `<div class="row wrap">${inE("remote_env", "Env script", 160)}${inE("remote_exec", "Exec dir", 200)}</div>` +
     `<div class="row wrap">${inE("remote_scratch", "Scratch dir", 160)}${inE("share_map", "Share map", 200, "WIN => LINUX; ';' separated. No match = SCP to scratch")}</div>`;
@@ -1345,7 +1345,7 @@ function renderSolve() {
     try { await postJSON("/api/explicit/queue", req({ op: b.dataset.q, key: XP.boardSel })); XP.boardSel = null; poll(); } catch (e) { showErr(e); }
   });
   box.querySelectorAll("[data-srv]").forEach(b => b.onclick = () => {
-    if (b.dataset.srv === "clear" && !confirm("This kills any running OpenRadioss job on the server and flushes the task-spooler queue. Continue?")) return;
+    if (b.dataset.srv === "clear" && !confirm("This kills any running OpenCourant job on the server and flushes the task-spooler queue. Continue?")) return;
     postJSON("/api/explicit/server", { op: b.dataset.srv }).then(poll).catch(showErr);
   });
   renderExecInfo();

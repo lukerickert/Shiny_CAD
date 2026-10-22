@@ -1976,7 +1976,7 @@ def fea_open_folder():
     return jsonify({"ok": True, "path": path})
 
 
-# --------------------------------------------------------------------------- explicit analysis (OpenRadioss)
+# --------------------------------------------------------------------------- explicit analysis (OpenCourant)
 
 from .explicit import routes as _explicit_routes      # noqa: E402
 EXPLICIT = _explicit_routes.register(sys.modules[__name__])

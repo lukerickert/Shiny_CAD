@@ -10,11 +10,33 @@ Requirements
   "py -0" in a command window lists the installed versions.
 - Internet connection for the first start (approximately 500 MB of packages).
 
-Optional programs (not installed by start.bat):
-- CalculiX ccx (Analysis tab): ccx_static.exe of PrePoMax or a CalculiX build for Windows (README section 12.1).
-- OpenRadioss for Windows (Explicit tab): starter, engine, anim_to_vtk, th_to_csv (README section 13.1).
+Solvers (not installed by start.bat; README section 1.1)
+-------------------------------------------------------
+Unpacked in the folder solvers\ of the program, the solvers are found without settings.
+- CalculiX ccx (Analysis tab): PrePoMax, https://prepomax.fs.um.si/downloads/
+  Unpack "PrePoMax v<version>.zip" to solvers\ (its Solver folder holds ccx).
+  A PrePoMax folder in the user folder, Desktop, Downloads, Documents, Program Files
+  or C:\ is also found.
+- Explicit tab, Windows (local runs): the last official OpenRadioss Windows release,
+  archived by OpenCourant:
+  https://github.com/OpenCourant/extlib/releases/tag/upstream-latest-20260728-win64
+  1. Download OpenRadioss_win64.zip from that page.
+  2. Check the file in PowerShell:
+       Get-FileHash .\OpenRadioss_win64.zip -Algorithm SHA256
+     The hash given on the page is
+       04dfecb0bf26ce071132cda86dc6861417c6a4127a389befe82b8c97341b3268
+  3. Unpack it to solvers\OpenRadioss\ (starter_win64.exe in exec\ or one folder deeper).
+  4. Check that exec\ also holds anim_to_vtk_win64.exe and th_to_csv_win64.exe.
+  Siemens discontinued OpenRadioss on 2026-10-01 and deleted its GitHub releases.
+  OpenCourant (https://github.com/OpenCourant) is its community continuation, with the
+  same executable names. Its release of 2026-10-05 has no Windows package. When one is
+  published at https://github.com/OpenCourant/OpenCourant/releases, unpack it to
+  solvers\OpenCourant\ and delete solvers\OpenRadioss\.
+- Explicit tab, Linux server (remote runs): OpenCourant_linux64.zip from
+  https://github.com/OpenCourant/OpenCourant/releases; Exec dir = its exec folder.
+Other programs:
 - ParaView (Explicit tab: strain extraction, renders).
-- OpenSSH of Windows and a Linux server with OpenRadioss and task-spooler (Explicit tab, remote runs).
+- OpenSSH of Windows and a Linux server with OpenCourant and task-spooler (remote runs).
 
 Installation
 ------------
@@ -46,9 +68,9 @@ First use
 1. Project tab: set the Projects folder, then New... to create a project.
 2. Drawings tab: Title block... (toolbar) opens the title block editor
    (title block layout, logo, line widths, text heights; Save title block writes config.json).
-3. Analysis tab: set the path of ccx (README section 12.1).
-4. Explicit tab, Solve panel: set the OpenRadioss exec folder, or leave it empty when the
-   executables are on PATH. Settings of this PC are written to config.json > explicit.
+3. Analysis tab, Settings: the line below Solver (ccx) gives the CalculiX executable in use.
+4. Explicit tab, Solve panel: the line below the fields gives the OpenCourant executables
+   found. Settings of this PC are written to config.json > explicit.
    Without that entry the ORC3 configuration %APPDATA%\ORC3\workspace_config.json is read.
 
 Command line options (run.py, through the environment):
@@ -74,6 +96,7 @@ README.md                  full manual
 SHINYCAD_functions.png     overview of the functions
 drawgen\                   program (server, drawing, part, assembly, analysis modules)
 drawgen\static\            interface (HTML, JavaScript, three.js 0.160.0, MIT licence)
+solvers\                   solver packages (PrePoMax, OpenCourant); solvers\README.txt
 drawgen\explicit\          Explicit tab: ORC3 core, inp2rad.py and inp2rad_run.py
                            (inp2rad: Altair Engineering, MIT licence), deck generator
                            (deck.py, deck_mesh.py, deck_stepgen.py)

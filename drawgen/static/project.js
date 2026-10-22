@@ -24,7 +24,7 @@
     $("#pj-desc").disabled = !cur;
     $("#pj-rename").disabled = !cur;
     $("#pj-folder").disabled = !cur;
-    $("#pj-paths").textContent = cur ? `${i.root}\\${cur.name}\\  work (documents), drawings (PDF, DXF, SVG, FCStd), step (STEP and mesh exports), step_import (copies of imported STEP files), analysis (solver files and reports), explicit (OpenRadioss model and run folders), versions, states` : "";
+    $("#pj-paths").textContent = cur ? `${i.root}\\${cur.name}\\  work (documents), drawings (PDF, DXF, SVG, FCStd), step (STEP and mesh exports), step_import (copies of imported STEP files), analysis (solver files and reports), explicit (OpenCourant model and run folders), versions, states` : "";
     $("#pj-adopt").hidden = !(i.root && !i.projects.length);
     if (i.current) { await refreshDocs(); await refreshStates(); }
     else { $("#pj-docs").innerHTML = ""; $("#pj-exports").innerHTML = ""; $("#pj-states").innerHTML = ""; }

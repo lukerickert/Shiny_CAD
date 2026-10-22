@@ -1637,7 +1637,7 @@ def test_part_bridge_surface_command(page, client):
 
 def test_explicit_tab_model_build_run_results(page, client, tmp_path):
     """Explicit tab: geometry, rigid impactor, support on a face, Write .inp, New run, Build, Run with the stand-in
-    OpenRadioss executables, status board, results on the 3D view and the energy curve."""
+    OpenCourant executables, status board, results on the 3D view and the energy curve."""
     import fake_openradioss
     from conftest import part_rec, rect
 

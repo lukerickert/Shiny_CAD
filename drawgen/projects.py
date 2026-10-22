@@ -10,7 +10,7 @@ document versions (snapshots) and saved project states.
     step/                 exported STEP and mesh files
     step_import/          local copies of imported STEP files
     analysis/<name>/      analysis runs: CalculiX input and result files, report, results for the view
-    explicit/<name>/      explicit analyses (OpenRadioss): model .inp, run folders with decks and results
+    explicit/<name>/      explicit analyses (OpenCourant): model .inp, run folders with decks and results
     versions/             <name>.<type>.v<N>.json snapshots with <name>.<type>.v<N>.meta.json
     states/               saved project states (*.state.json)
     trash/                deleted documents

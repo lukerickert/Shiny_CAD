@@ -55,6 +55,7 @@ load:     {"id", "name", "type": "force" | "moment" | "pressure" | "gravity" | "
           by area (RBE3 distribution); pressure: MPa, positive into the face; line: N/mm on a member (global);
           gravity: acceleration vector (mm/s^2) on all bodies and members.
 """
+import glob
 import json
 import math
 import os
@@ -195,28 +196,55 @@ def _point_tri_dist(P, A, B, C):
 
 # --------------------------------------------------------------------------- solver
 
+SOLVERS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "solvers")
+
+
+def _solvers_ccx():
+    """ccx executables in <program>/solvers/ (an unpacked CalculiX package), up to 4 folder levels deep; ccx.exe
+    and the shortest names first."""
+    found = []
+    if not os.path.isdir(SOLVERS_DIR):
+        return found
+    base = SOLVERS_DIR.rstrip(os.sep).count(os.sep)
+    for dp, dn, fn in os.walk(SOLVERS_DIR):
+        for f in fn:
+            fl = f.lower()
+            if fl.startswith("ccx") and (fl.endswith(".exe") if os.name == "nt" else "." not in fl):
+                found.append(os.path.join(dp, f))
+        if dp.count(os.sep) - base >= 4:
+            dn[:] = []
+    return sorted(found, key=lambda p: (os.path.basename(p).lower() not in ("ccx.exe", "ccx"), len(os.path.basename(p)), p))
+
+
 def find_ccx(cfg_path=""):
-    """Path of the CalculiX executable: configured path, ccx on PATH, or the solver of a PrePoMax installation."""
+    """Path of the CalculiX executable: configured path, a CalculiX package in <program>/solvers/, ccx on PATH, or
+    the solver of a PrePoMax installation."""
     cands = []
     if cfg_path:
         cands.append(cfg_path)
+    cands += _solvers_ccx()
     for n in ("ccx", "ccx.exe", "ccx_static", "ccx_static.exe", "ccx_dynamic", "ccx_dynamic.exe", "ccx_2.21", "ccx_2.22"):
         p = shutil.which(n)
         if p:
             cands.append(p)
+    # PrePoMax folders (the zip unpacks to "PrePoMax v<version>"): program folders, user folder, Desktop, Downloads,
+    # Documents, root of the system drive; names in reverse order (v3 before v2)
     roots = [os.environ.get(k, "") for k in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA", "USERPROFILE")]
+    if os.environ.get("SystemDrive"):
+        roots.append(os.environ["SystemDrive"] + os.sep)
+    bases = []
     for r in roots:
         if not r:
             continue
-        for sub in ("PrePoMax", os.path.join("Desktop", "PrePoMax"), os.path.join("Downloads", "PrePoMax")):
-            base = os.path.join(r, sub)
-            if os.path.isdir(base):
-                for dp, dn, fn in os.walk(base):
-                    for f in fn:
-                        if f.lower() in ("ccx_static.exe", "ccx_dynamic.exe", "ccx.exe"):
-                            cands.append(os.path.join(dp, f))
-                    if dp.count(os.sep) - base.count(os.sep) > 3:
-                        dn[:] = []
+        for par in [r] + [os.path.join(r, sub) for sub in ("Desktop", "Downloads", "Documents")]:
+            bases += sorted((b for b in glob.glob(os.path.join(par, "PrePoMax*")) if os.path.isdir(b)), reverse=True)
+    for base in bases:
+        for dp, dn, fn in os.walk(base):
+            for f in fn:
+                if f.lower() in ("ccx_static.exe", "ccx_dynamic.exe", "ccx.exe"):
+                    cands.append(os.path.join(dp, f))
+            if dp.count(os.sep) - base.count(os.sep) > 3:
+                dn[:] = []
     for c in cands:
         if c and os.path.isfile(c):
             return c

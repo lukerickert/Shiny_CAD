@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Stand-in for the OpenRadioss executables in the tests (starter, engine, anim_to_vtk, th_to_csv).
+"""Stand-in for the OpenCourant executables in the tests (starter, engine, anim_to_vtk, th_to_csv).
 
 python fake_openradioss.py <tool> <arguments of the tool>; install(folder) writes launchers named like the
-OpenRadioss executables (<tool>_win64.cmd on Windows, <tool>_linux64_gf elsewhere) into folder.
+OpenCourant executables (<tool>_win64.cmd on Windows, <tool>_linux64_gf elsewhere) into folder.
 The engine writes 5 animation files and a T01 file; anim_to_vtk writes a legacy ASCII VTK of a 4 x 4 x 1 hexahedron
 grid (10 mm cells) with Displacement, EROSION_STATUS, von Mises and a strain tensor that grow with the frame number;
 th_to_csv prints the energies. FAKE_OR_FAIL=engine makes the engine stop with a RUN KILLED message."""

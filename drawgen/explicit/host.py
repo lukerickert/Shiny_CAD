@@ -8,6 +8,7 @@ them (the keys of the ORC**3 settings snapshot written to run.json). The library
 Machine settings (ENV_KEYS) are kept in config.json > "explicit" by the web module; the others in the explicit
 document (<name>.exp.json).
 """
+import glob
 import json
 import os
 import threading
@@ -26,6 +27,8 @@ from .post import PostMixin
 LOCAL = "Local (Windows)"          # run_target values (ORC**3 labels)
 REMOTE = "Remote (Linux)"
 HISTORY_MAX = 200
+# solver packages unpacked next to the program: <program>/solvers/<package>/exec
+SOLVERS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "solvers")
 
 # ORC**3 defaults (workspace.py with an empty configuration), except the analysis type and the server fields
 DEFAULTS = {
@@ -240,12 +243,26 @@ class Workspace(BuildMixin, MaterialsMixin, RunMixin, SolveMixin, PostMixin):
         del self.run_history[:-HISTORY_MAX]
         self._history_save()
 
-    # ------------------------------------------------------------------ OpenRadioss executables
+    # ------------------------------------------------------------------ OpenCourant executables
+    def _or_dir(self):
+        """Exec folder of the local solver: the configured folder, else the exec folder of a package unpacked in
+        <program>/solvers/ (solvers/<package>/exec or solvers/<package>/<folder>/exec), else "" (PATH)."""
+        d = (self.or_exec.get() or "").strip().strip('"')
+        if d:
+            return d
+        exe = "starter" + ("_win64" if os.name == "nt" else "_linux64_gf")
+        for pat in (("*", "exec"), ("*", "*", "exec")):
+            for c in sorted(glob.glob(os.path.join(SOLVERS_DIR, *pat))):
+                for ext in ((".exe", ".cmd", ".bat") if os.name == "nt" else ("",)):
+                    if os.path.isfile(os.path.join(c, exe + ext)):
+                        return c
+        return ""
+
     def _or_exe(self, name):
         """starter, engine, anim_to_vtk, th_to_csv: <name>_win64 (Windows) or <name>_linux64_gf, in the exec folder
-        when one is set, else found on PATH (ORC**3)."""
+        (_or_dir) when there is one, else found on PATH (ORC**3)."""
         exe = name + ("_win64" if os.name == "nt" else "_linux64_gf")
-        d = (self.or_exec.get() or "").strip().strip('"')
+        d = self._or_dir()
         if not d:
             return exe
         for ext in ((".exe", ".cmd", ".bat") if os.name == "nt" else ("",)):
@@ -256,8 +273,8 @@ class Workspace(BuildMixin, MaterialsMixin, RunMixin, SolveMixin, PostMixin):
 
     def _or_env(self):
         """Environment of the local solver processes: None (inherited) without an exec folder; with one, the exec
-        folder and the OpenRadioss runtime libraries on PATH, RAD_CFG_PATH and RAD_H3D_PATH, KMP_STACKSIZE."""
-        d = (self.or_exec.get() or "").strip().strip('"')
+        folder and the OpenCourant runtime libraries on PATH, RAD_CFG_PATH and RAD_H3D_PATH, KMP_STACKSIZE."""
+        d = self._or_dir()
         if not d:
             return None
         env = dict(os.environ)
