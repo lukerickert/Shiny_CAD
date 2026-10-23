@@ -367,3 +367,22 @@ def test_parallel_saves_of_one_file(web):
     assert not errs, errs[:3]
     c = web.app.test_client()
     assert c.get("/api/annotations/par_ann").get_json()[0]["text"].startswith("T")
+
+
+def test_config_split_local_settings(web, tmp_path, monkeypatch):
+    """Settings of this PC (projects folder, open project, explicit, browser, ccx path) go to config.local.json; the
+    other settings stay in config.json. An older config.json with them is split at start."""
+    import json
+    cp, lp = tmp_path / "config.json", tmp_path / "config.local.json"
+    cp.write_text(json.dumps({"sheet": "A3", "projects_root": "C:\\\\P", "current_project": "X", "explicit": {"ssh_host": "h"}}))
+    monkeypatch.setattr(web, "CONFIG_PATH", str(cp))
+    monkeypatch.setattr(web, "LOCAL_PATH", str(lp))
+    web._split_config()
+    assert json.loads(cp.read_text()) == {"sheet": "A3"}
+    assert json.loads(lp.read_text()) == {"projects_root": "C:\\\\P", "current_project": "X", "explicit": {"ssh_host": "h"}}
+    cfg = web.load_config()
+    assert cfg["sheet"] == "A3" and cfg["current_project"] == "X"
+    cfg.update(browser="edge", sheet="A2")
+    web.save_config(cfg)
+    assert json.loads(cp.read_text()) == {"sheet": "A2"}
+    assert json.loads(lp.read_text())["browser"] == "edge"

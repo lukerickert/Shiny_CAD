@@ -73,7 +73,7 @@ def fast_mesh(shape, tol=None):
     emap = TopTools_IndexedMapOfShape()
     TopExp.MapShapes_s(shape.wrapped, TopAbs_EDGE, emap)
     done = set()
-    verts, tris, face_of_tri, edges = [], [], [], []
+    verts, tris, face_of_tri, edges, edge_ids = [], [], [], [], []
     for fi, fc in enumerate(shape.faces()):
         f = fc.wrapped
         loc = TopLoc_Location()
@@ -106,14 +106,15 @@ def fast_mesh(shape, tol=None):
             done.add(k)
             nodes = poly.Nodes()
             edges.append([verts[base + nodes.Value(j) - 1] for j in range(nodes.Lower(), nodes.Upper() + 1)])
-    return {"vertices": verts, "triangles": tris, "face_of_tri": face_of_tri, "edges": edges,
+            edge_ids.append(k - 1)
+    return {"vertices": verts, "triangles": tris, "face_of_tri": face_of_tri, "edges": edges, "edge_ids": edge_ids,
             "bbox": [bb.min.X, bb.min.Y, bb.min.Z, bb.max.X, bb.max.Y, bb.max.Z]}
 
 
 # view data of the sources on disk (mesh, face references, planes and axes, volume), so the first build after a
 # server start does not load or tessellate unchanged sources: <cache dir>/<mkey>.json.gz
 _VIEW_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "drawgen", "viewcache")
-_VIEW_KEYS = ("mesh", "refs", "datums", "vol", "cog", "err", "mkey")
+_VIEW_KEYS = ("mesh", "refs", "datums", "erefs", "vrefs", "vol", "cog", "err", "mkey")
 
 
 def _view_read(mkey):
@@ -122,7 +123,8 @@ def _view_read(mkey):
         with gzip.open(os.path.join(_VIEW_DIR, mkey + ".json.gz"), "rt", encoding="utf-8") as f:
             d = json.load(f)
         # entries written before the centre planes existed are computed again
-        return d if all(k in d for k in ("mesh", "refs", "vol", "cog")) and "cplane:XY" in (d.get("datums") or {}) else None
+        return d if all(k in d for k in ("mesh", "refs", "vol", "cog", "erefs", "vrefs")) and "cplane:XY" in (d.get("datums") or {}) \
+            and "edge_ids" in d["mesh"] else None
     except (OSError, ValueError, EOFError):
         return None
 
@@ -278,7 +280,7 @@ class Sources(object):
             g = GProp_GProps()
             BRepGProp.VolumeProperties_s(shape.wrapped, g)
             cm = g.CentreOfMass()
-            e.update({"refs": face_refs(shape),
+            e.update({"refs": face_refs(shape), "erefs": edge_refs(shape), "vrefs": vertex_refs(shape),
                       "datums": datum_refs(shape, self.fdatums.get(json.dumps(src, sort_keys=True)) or e.get("fdatums") or []),
                       "vol": g.Mass(), "cog": (cm.X(), cm.Y(), cm.Z()), "mkey": _mkey(k if k is not None else id(e)),
                       "mesh": mesh})
@@ -588,6 +590,7 @@ def view_data(asm, sources, explode=False, have=(), default_density=0.0):
                "color": c.get("color"), "visible": c.get("visible") is not False}
         if e["mkey"] not in have:
             out["mesh"], out["refs"], out["datums"] = e["mesh"], e["refs"], e.get("datums") or {}
+            out["erefs"], out["vrefs"] = e.get("erefs") or [], e.get("vrefs") or []
         comps.append(out)
         if c.get("visible") is False:
             continue
@@ -710,6 +713,84 @@ def face_refs(local_shape):
     return out
 
 
+def edge_refs(local_shape):
+    """Edge references of a component in its local coordinates, in the order of TopExp.MapShapes (edge_ids of
+    fast_mesh): kind line (p start, n direction, c midpoint, len) | circle (c centre, p = c, n axis, r) | edge (c
+    midpoint, len)."""
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.GeomAbs import GeomAbs_Circle, GeomAbs_Line
+    from OCP.TopAbs import TopAbs_EDGE
+    from OCP.TopExp import TopExp
+    from OCP.TopoDS import TopoDS
+    from OCP.GCPnts import GCPnts_AbscissaPoint
+    to_edge = getattr(TopoDS, "Edge_s", None) or TopoDS.Edge
+    try:
+        from OCP.TopTools import TopTools_IndexedMapOfShape
+    except ImportError:
+        from OCP.collections import IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher as TopTools_IndexedMapOfShape
+    emap = TopTools_IndexedMapOfShape()
+    TopExp.MapShapes_s(local_shape.wrapped, TopAbs_EDGE, emap)
+    r5 = lambda v: [round(v.X(), 5), round(v.Y(), 5), round(v.Z(), 5)]
+    out = []
+    for k in range(1, emap.Extent() + 1):
+        try:
+            ad = BRepAdaptor_Curve(to_edge(emap.FindKey(k)))
+            u0, u1 = ad.FirstParameter(), ad.LastParameter()
+            mid = ad.Value((u0 + u1) / 2)
+            ln = GCPnts_AbscissaPoint.Length_s(ad)
+            t = ad.GetType()
+            if t == GeomAbs_Line:
+                a, b = ad.Value(u0), ad.Value(u1)
+                d = _norm([b.X() - a.X(), b.Y() - a.Y(), b.Z() - a.Z()])
+                out.append({"kind": "line", "p": r5(a), "c": r5(mid), "n": [round(x, 7) for x in d], "len": round(ln, 5)})
+            elif t == GeomAbs_Circle:
+                ci = ad.Circle()
+                ax = ci.Axis()
+                c = r5(ax.Location())
+                D = ax.Direction()
+                out.append({"kind": "circle", "c": c, "p": c, "n": [round(D.X(), 7), round(D.Y(), 7), round(D.Z(), 7)],
+                            "r": round(ci.Radius(), 5), "len": round(ln, 5), "m": r5(mid)})
+            else:
+                out.append({"kind": "edge", "c": r5(mid), "len": round(ln, 5)})
+        except Exception:
+            out.append(None)
+    return out
+
+
+def vertex_refs(local_shape):
+    """Vertex references of a component in its local coordinates: {"kind": "point", "c"}."""
+    out = []
+    for v in local_shape.vertices():
+        out.append({"kind": "point", "c": [round(v.X, 5), round(v.Y, 5), round(v.Z, 5)]})
+    return out
+
+
+def geo_refs(e):
+    """Edge and vertex references of a cache entry as datum keys "edge:<i>", "vertex:<i>"."""
+    out = {}
+    for i, r in enumerate(e.get("erefs") or []):
+        if r:
+            out["edge:%d" % i] = r
+    for i, r in enumerate(e.get("vrefs") or []):
+        out["vertex:%d" % i] = r
+    return out
+
+
+def side_key(side):
+    """Datum key of a mate side that is a reference plane or axis, an edge or a vertex; None for a face."""
+    if side.get("datum"):
+        return side["datum"]
+    if side.get("edge") is not None:
+        return "edge:%d" % int(side["edge"])
+    if side.get("vertex") is not None:
+        return "vertex:%d" % int(side["vertex"])
+    return None
+
+
+def side_ok(side):
+    return side.get("face") is not None or side_key(side) is not None
+
+
 def _rot_matrix(rot):
     """3x3 rotation matrix: Rz * Ry * Rx (same convention as trsf_of)."""
     rx, ry, rz = [math.radians(float(a or 0)) for a in rot]
@@ -789,6 +870,7 @@ def _placed_ref(ref, params):
     R = _rot_matrix(rot)
     out = dict(ref)
     out["c"] = _apply(R, pos, ref["c"])
+    out["R"] = R
     if "n" in ref:
         out["n"] = _apply(R, pos, ref["n"], point=False)
     if "p" in ref:
@@ -812,11 +894,105 @@ def mate_error(mate, A, B):
     return max([abs(v) for v in res[nd:]] or [0.0]), math.degrees(math.asin(min(1.0, ang)))
 
 
+def _as_kind(X, other, t):
+    """A straight edge acts as an axis; a circular edge as a cylinder (concentric, tangent, gear), as its axis with an
+    axis or cylinder, else as its plane; a vertex is a point (the Point mate uses the centre "c" of any reference)."""
+    k = X.get("kind")
+    if k == "line":
+        return dict(X, kind="axis")
+    if k == "circle":
+        ok = (other or {}).get("kind")
+        if t in ("concentric", "tangent", "gear") or ok == "point":
+            return dict(X, kind="cylinder")
+        if ok in ("axis", "cylinder", "line"):
+            return dict(X, kind="axis")
+        return dict(X, kind="plane")
+    return X
+
+
+def _point_residuals(t, A, B, val):
+    """A vertex with a plane, an axis, a cylinder (its axis), a circle or another vertex: Coincident puts the point on
+    it, Distance at the distance."""
+    if t not in ("coincident", "distance"):
+        raise ValueError("a vertex mates by Coincident, Distance or Point")
+    P, O = (A, B) if A.get("kind") == "point" else (B, A)
+    c = P["c"]
+    ko = O.get("kind")
+    if ko == "point":
+        d = _sub(O["c"], c)
+        return (d if t == "coincident" else [math.sqrt(_dot(d, d) + 1e-18) - val]), 0
+    if ko == "plane":
+        return [_dot(_sub(c, O["c"]), O["n"]) - (val if t == "distance" else 0.0)], 0
+    if ko in ("axis", "cylinder"):
+        n = O["n"]
+        d = _sub(c, O.get("p") or O["c"])
+        off = _sub(d, [_dot(d, n) * x for x in n])
+        if O.get("r") and ko == "cylinder" and "len" in O:       # a circular edge: the point on the circle
+            return [_dot(d, n), math.sqrt(_dot(off, off) + 1e-18) - O["r"]], 0
+        return (off if t == "coincident" else [math.sqrt(_dot(off, off) + 1e-18) - val]), 0
+    raise ValueError("a vertex mates with a plane, an axis, a cylinder, a circular edge or a vertex")
+
+
+def _tangent_residuals(A, B, sgn):
+    """Tangent: a plane and a cylinder (axis parallel to the plane at the radius, on the side of the face normal; Flip:
+    the other side), or two cylinders (parallel axes at rA + rB; Flip: |rA - rB|, one inside the other)."""
+    ka, kb = A.get("kind"), B.get("kind")
+    if {ka, kb} == {"plane", "cylinder"}:
+        pl, cy = (A, B) if ka == "plane" else (B, A)
+        return [_dot(pl["n"], cy["n"]), _dot(_sub(cy["p"], pl["c"]), pl["n"]) - sgn * float(cy["r"])], 1
+    if ka == "cylinder" and kb == "cylinder":
+        na, nb = A["n"], B["n"]
+        res = _cross(na, nb)
+        d = _sub(B["p"], A["p"])
+        off = _sub(d, [_dot(d, na) * x for x in na])
+        ra, rb = float(A["r"]), float(B["r"])
+        want = ra + rb if sgn > 0 else abs(ra - rb)
+        return res + [math.sqrt(_dot(off, off) + 1e-18) - want], 3
+    raise ValueError("tangent needs a plane and a cylinder, or two cylinders")
+
+
+def _turn(R, R0, n):
+    """Rotation angle (rad, -pi to pi) about the unit axis n of R relative to R0."""
+    Rr = _mm(R, [[R0[j][i] for j in range(3)] for i in range(3)])
+    u, _v = _perp_basis(n)
+    u2 = _apply(Rr, [0, 0, 0], u, point=False)
+    return math.atan2(_dot(_cross(u, u2), n), _dot(u, u2))
+
+
+def _gear_residuals(mate, A, B):
+    """Gear: the rotation of B about its axis = -ratio x the rotation of A about its axis (Flip: +ratio), both from
+    the reference rotations of the mate ("ref", taken when the mate is made). The axis of B is taken in the direction
+    of the axis of A when they are parallel. Residual in mm at the radius of A (10 mm without a radius)."""
+    na, nb = A.get("n"), B.get("n")
+    if na is None or nb is None:
+        raise ValueError("gear needs two cylinders, circular edges or axes")
+    ref = mate.get("ref") or {}
+    if ref.get("a") is None or ref.get("b") is None:
+        return [0.0]
+    if _dot(na, nb) < -0.5:
+        nb = [-x for x in nb]
+    ta = _turn(A["R"], _rot_matrix(ref["a"]), na)
+    tb = _turn(B["R"], _rot_matrix(ref["b"]), nb)
+    ratio = float(mate.get("value") or 1.0)
+    s = -1.0 if mate.get("flip") else 1.0
+    L = float(A.get("r") or 10.0)
+    return [(tb + s * ratio * ta) * L]
+
+
 def _residuals_split(mate, A, B):
     """(residuals, number of direction residuals at the start of the list) of a mate."""
     t = mate.get("type")
     sgn = -1.0 if mate.get("flip") else 1.0
     val = float(mate.get("value") or 0)
+    A, B = _as_kind(A, B, t), _as_kind(B, A, t)
+    if "edge" in (A.get("kind"), B.get("kind")) and t != "point":
+        raise ValueError("a curved edge mates only by Point (its midpoint)")
+    if t == "gear":
+        return _gear_residuals(mate, A, B), 0
+    if t == "tangent":
+        return _tangent_residuals(A, B, sgn)
+    if "point" in (A.get("kind"), B.get("kind")) and t != "point":
+        return _point_residuals(t, A, B, val)
     res = []
     na, nb = A.get("n"), B.get("n")
     ka, kb = A.get("kind"), B.get("kind")
@@ -901,7 +1077,7 @@ def _solve_core(asm, refs_of, datums_of=None, detail=None, drag=None, summary=Tr
             msgs.append("mate %s skipped: a face is not picked" % name)
         elif a["comp"] not in comps or b["comp"] not in comps:
             msgs.append("mate %s skipped: its component was deleted" % name)
-        elif (a.get("face") is None and not a.get("datum")) or (b.get("face") is None and not b.get("datum")):
+        elif not side_ok(a) or not side_ok(b):
             msgs.append("mate %s skipped: a face is not picked" % name)
         else:
             mates.append(m)
@@ -963,11 +1139,12 @@ def _solve_core(asm, refs_of, datums_of=None, detail=None, drag=None, summary=Tr
 
     def ref(side, xv):
         cid, fi = side.get("comp"), side.get("face")
-        if side.get("datum"):
+        key = side_key(side)
+        if key:
             d = (datums_of(cid) if datums_of else None) or {}
-            if side["datum"] not in d:
-                raise ValueError("reference %s lost" % side["datum"])
-            return _placed_ref(d[side["datum"]], params(cid, xv))
+            if key not in d:
+                raise ValueError("reference %s lost" % key)
+            return _placed_ref(d[key], params(cid, xv))
         lst = refs_of(cid)
         if lst is None or fi is None or fi >= len(lst) or lst[fi] is None:
             raise ValueError("face reference lost")
@@ -1119,6 +1296,9 @@ def _solve_core(asm, refs_of, datums_of=None, detail=None, drag=None, summary=Tr
             A_, B_ = ref(m["a"], x), ref(m["b"], x)
         except ValueError:
             continue
+        A_, B_ = _as_kind(A_, B_, m.get("type")), _as_kind(B_, A_, m.get("type"))
+        if A_.get("n") is None or B_.get("n") is None:
+            continue                                 # a vertex: no direction
         if "plane" in (A_.get("kind"), B_.get("kind")) and "axis" in (A_.get("kind"), B_.get("kind")):
             continue                                 # a plane with an axis has no direction
         sgn = -1.0 if m.get("flip") else 1.0
@@ -1197,7 +1377,7 @@ def _valid_mates(asm, msgs):
             msgs.append("mate %s skipped: a face is not picked" % name)
         elif a["comp"] not in comps or b["comp"] not in comps:
             msgs.append("mate %s skipped: its component was deleted" % name)
-        elif (a.get("face") is None and not a.get("datum")) or (b.get("face") is None and not b.get("datum")):
+        elif not side_ok(a) or not side_ok(b):
             msgs.append("mate %s skipped: a face is not picked" % name)
         else:
             out.append(m)
@@ -1249,6 +1429,7 @@ def solve_mates(asm, refs_of, datums_of=None, detail=None, drag=None):
     Returns ({comp id: (pos, rot)}, max residual, messages). detail gets "unsatisfied" {mate id: text} and "conflicts"
     {mate id: text}; drag as in _solve_core (with conflicts: applied with the mates that are kept)."""
     msgs = []
+    gear_refs(asm)
     mates = _valid_mates(asm, msgs)
     comps = {c["id"]: c for c in asm.get("components") or []}
     order = [c["id"] for c in asm.get("components") or []]
@@ -1324,7 +1505,19 @@ def solve_mates(asm, refs_of, datums_of=None, detail=None, drag=None):
     return out, nr, msgs
 
 
-FLIPPABLE = ("coincident", "distance", "parallel", "concentric")
+FLIPPABLE = ("coincident", "distance", "parallel", "concentric", "tangent")
+
+
+def gear_refs(asm):
+    """Reference rotations of the gear mates without one: the rotations of their components in asm."""
+    comps = {c["id"]: c for c in asm.get("components") or []}
+    for m in asm.get("mates") or []:
+        if m.get("type") != "gear" or (m.get("ref") or {}).get("a") is not None:
+            continue
+        a, b = (m.get("a") or {}).get("comp"), (m.get("b") or {}).get("comp")
+        if a in comps and b in comps:
+            m["ref"] = {"a": [float(v or 0) for v in comps[a].get("rot") or [0, 0, 0]],
+                        "b": [float(v or 0) for v in comps[b].get("rot") or [0, 0, 0]]}
 
 
 def _solve_incremental(cids, gm, comps, refs_of, datums_of, flipped=None, kept_out=None):
@@ -1370,6 +1563,7 @@ def mate_report(asm, refs_of, datums_of=None):
     (central differences: 1e-4 mm, 1e-4 deg)."""
     import numpy as np
     det = {}
+    gear_refs(asm)
     out, nr, msgs = solve_mates(asm, refs_of, datums_of, det)
     comps = {c["id"]: dict(c) for c in asm.get("components") or []}
     for cid, (pos, rot) in out.items():
@@ -1387,9 +1581,10 @@ def mate_report(asm, refs_of, datums_of=None):
 
     def ref(side, params):
         cid = side["comp"]
-        if side.get("datum"):
+        key = side_key(side)
+        if key:
             d = (datums_of(cid) if datums_of else None) or {}
-            return _placed_ref(d[side["datum"]], params)
+            return _placed_ref(d[key], params)
         return _placed_ref(refs_of(cid)[side["face"]], params)
 
     def resid(m, override=None):

@@ -70,6 +70,11 @@ KAPPA = 1.0e7       # U1 shear factor: Euler-Bernoulli beam (1e7: equilibrium to
 SPRING_K = 1.0e-6       # stiffness (N/mm) of the preload node to ground (the node needs one element)
 
 
+ATYPES = ("static", "modal", "buckling")
+ATYPE_NAMES = {"static": "Linear static", "modal": "Modal (natural frequencies)", "buckling": "Linear buckling"}
+MAX_MODES = 100
+
+
 class AnalysisError(Exception):
     pass
 
@@ -513,6 +518,10 @@ class Model(object):
         self.rps = {}                   # reference point id -> {"name", "ref", "rot", "xyz", "nodes", "joints"}
         self.rigid = []                 # (nset, ref node, rot node) of *RIGID BODY
         self.rp_rot_nodes = set()       # rotation nodes of reference points (their translations are rotations)
+        self.atype = doc.get("analysis_type") or "static"      # static | modal | buckling
+        if self.atype not in ATYPES:
+            raise AnalysisError("unknown analysis type %s" % self.atype)
+        self.nmodes = max(1, min(MAX_MODES, int(doc.get("modes") or 6)))
 
     # ------------------------------------------------------------------ helpers
     def new_node(self, p):
@@ -720,6 +729,14 @@ class Model(object):
                     raise AnalysisError("member %s: end %s has no point" % (m.get("name") or m.get("id"), k.upper()))
         if not (doc.get("supports") or []):
             raise AnalysisError("no supports")
+        if self.atype != "static":
+            beams = [m.get("name") or m.get("id") for m in doc.get("members") or [] if (m.get("kind") or "beam") == "beam"]
+            fas = [f.get("name") or f.get("id") for f in doc.get("fasteners") or []]
+            if beams or fas:
+                raise AnalysisError("%s analysis: beams and fasteners are not available (the CalculiX U1 beam element has "
+                                    "no mass and no stress stiffness); %s. Rods, plates and solid bodies are available"
+                                    % (ATYPE_NAMES[self.atype].lower(), ", ".join(
+                                        (["beams " + ", ".join(beams[:5])] if beams else []) + (["fasteners " + ", ".join(fas[:5])] if fas else []))))
         # bodies
         self.body_sets = []
         for bid, mb in self.mesh["bodies"].items():
@@ -763,6 +780,16 @@ class Model(object):
         if self.doc.get("bonded", True):
             self._ties()
             self._member_plate_ties()
+        if self.atype == "modal":
+            mats = doc.get("materials") or {}
+            bad = [n for n in self.mat_names if not float((mats.get(n) or {}).get("rho") or 0) > 0]
+            if bad:
+                raise AnalysisError("modal analysis: material %s has no density" % ", ".join(bad))
+        if self.atype == "buckling":
+            loaded = any(v for v in self.cloads[1].values()) or any(v for sp in self.supports for v in sp["values"].values()) \
+                or any(v for sp in self.supports for v in ((sp.get("rot") or {}).get("values") or {}).values())
+            if not loaded:
+                raise AnalysisError("buckling analysis: no loads (the buckling factors multiply the loads)")
 
     def _member(self, m, ends, size):
         name = m.get("name") or m.get("id")
@@ -1431,6 +1458,25 @@ class Model(object):
             L.append("*SURFACE, NAME=%sM, TYPE=ELEMENT" % t["name"])
             L += ["%d, S%d" % fm for fm in t["master"]]
             L += ["*TIE, NAME=%s, POSITION TOLERANCE=%.6g, ADJUST=NO" % (t["name"], t["tol"]), "%sS, %sM" % (t["name"], t["name"])]
+        if self.atype != "static":
+            buck = self.atype == "buckling"
+            L += ["*STEP", "*BUCKLE" if buck else "*FREQUENCY", "%d" % self.nmodes, "*BOUNDARY"]
+            for sp in self.supports:
+                for d in sp["dofs"]:
+                    v = sp["values"].get(d, 0.0) if buck else 0.0
+                    L.append("%s, %d, %d" % (sp["nset"], d, d) + (", %.12g" % v if v else ""))
+                for d in (sp.get("rot") or {}).get("dofs") or []:
+                    v = sp["rot"]["values"].get(d, 0.0) if buck else 0.0
+                    L.append("%s, %d, %d" % (sp["rot"]["nset"], d, d) + (", %.12g" % v if v else ""))
+            if buck:
+                L.append("*CLOAD")
+                for (n, d), v in sorted(self.cloads[1].items()):
+                    if v != 0:
+                        L.append("%d, %d, %.12g" % (n, d, v))
+            L += ["*NODE FILE", "U", "*END STEP"]
+            with open(path, "w") as f:
+                f.write("\n".join(L) + "\n")
+            return
         steps = [0, 1] if springs else [1]
         for st in steps:
             L += ["*STEP", "*STATIC"]
@@ -1524,6 +1570,69 @@ def read_frd(path, want=("DISP", "STRESS")):
                     pass
             elif line.startswith(" -3"):
                 cur = None
+    return out
+
+
+def read_frd_modes(path):
+    """Displacement blocks of a .frd file in their order: [{node: [ux, uy, uz]}] (frequency and buckling steps
+    write one block per mode; a buckling step writes the static block of the reference loads first)."""
+    out = []
+    cur = None
+    with open(path, "r", errors="replace") as f:
+        for line in f:
+            if line.startswith(" -4"):
+                cur = {} if line[5:13].strip() == "DISP" else None
+                if cur is not None:
+                    out.append(cur)
+                continue
+            if cur is None:
+                continue
+            if line.startswith(" -1"):
+                try:
+                    s = line[13:].rstrip("\n")
+                    cur[int(line[3:13])] = [float(s[k:k + 12]) for k in range(0, 36, 12)]
+                except ValueError:
+                    pass
+            elif line.startswith(" -3"):
+                cur = None
+    return out
+
+
+def read_eigen(path):
+    """Eigenvalue tables of a .dat file: {"freq": [Hz], "factor": [buckling factors], "eff": [[mx, my, mz]] (t),
+    "total": [mx, my, mz] (t, total effective mass)}."""
+    out = {"freq": [], "factor": [], "eff": [], "total": None}
+    sec = None
+    with open(path, "r", errors="replace") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            if "E I G E N V A L U E   O U T P U T" in s:
+                sec = "freq"; continue
+            if "B U C K L I N G   F A C T O R" in s:
+                sec = "factor"; continue
+            if "T O T A L   E F F E C T I V E   M A S S" in s:
+                sec = "total"; continue
+            if "E F F E C T I V E   M O D A L   M A S S" in s:
+                sec = "eff"; continue
+            if s.startswith("P A R T I C I P") or s.startswith("S T E P") or s.startswith("MODE") or s.startswith("("):
+                if s.startswith("P A R T I C I P") or s.startswith("S T E P"):
+                    sec = None
+                continue
+            parts = s.split()
+            try:
+                if sec == "freq" and len(parts) >= 5:
+                    out["freq"].append(float(parts[3]))
+                elif sec == "factor" and len(parts) >= 2:
+                    out["factor"].append(float(parts[1]))
+                elif sec == "eff" and len(parts) >= 4 and parts[0] != "TOTAL":
+                    out["eff"].append([float(v) for v in parts[1:4]])
+                elif sec == "total" and len(parts) >= 3:
+                    out["total"] = [float(v) for v in parts[:3]]
+                    sec = None
+            except ValueError:
+                pass
     return out
 
 
@@ -1948,6 +2057,53 @@ class Results(object):
         return out
 
 
+class ModeResults(object):
+    """Results of a modal or buckling analysis: one state "m<k>" per mode with the mode shape normalised to a
+    largest displacement of 1."""
+
+    def __init__(self, model, blocks, eig):
+        self.m = model
+        self.kind = model.atype
+        vals = eig["freq"] if self.kind == "modal" else eig["factor"]
+        if not vals:
+            raise AnalysisError("the solver wrote no %s" % ("frequencies" if self.kind == "modal" else "buckling factors"))
+        blocks = blocks[-len(vals):] if len(blocks) >= len(vals) else blocks + [{}] * (len(vals) - len(blocks))
+        self.values = vals
+        self.eff = eig["eff"] if len(eig["eff"]) == len(vals) else None
+        self.total = eig["total"]
+        self.state_steps, self.U, self.S = {}, {}, {}
+        for k, b in enumerate(blocks):
+            st = "m%d" % (k + 1)
+            U = {n: np.asarray(v[:3], float) for n, v in b.items() if n in model.X}
+            mx = max([float(np.linalg.norm(u)) for u in U.values()] or [0.0])
+            if mx > 0:
+                U = {n: u / mx for n, u in U.items()}
+            self.state_steps[st] = [k]
+            self.U[st], self.S[st] = U, {}
+        self.members, self.fasteners, self.reactions = [], [], []
+
+    def modes(self):
+        out = []
+        for k, v in enumerate(self.values):
+            r = {"mode": k + 1, "value": float(v)}
+            if self.eff and self.total:
+                r["eff"] = [float(x) for x in self.eff[k]]
+                r["frac"] = [float(x / t) if t > 0 else 0.0 for x, t in zip(self.eff[k], self.total)]
+            out.append(r)
+        return out
+
+    def body_max(self, st):
+        return Results.body_max(self, st)
+
+    def payload(self):
+        return Results.payload(self)
+
+    def tables(self):
+        modes = self.modes()
+        return {st: {"bodies": self.body_max(st), "mode": modes[k], "members": [], "fasteners": [], "reactions": [],
+                     "applied": [0.0, 0.0, 0.0], "points": []} for k, st in enumerate(self.state_steps)}
+
+
 # --------------------------------------------------------------------------- report
 
 W = 96
@@ -1982,7 +2138,8 @@ def report(res, meta):
                  ("Solver", meta.get("solver")), ("Input file", meta.get("inp")),
                  ("Mesh", "%d nodes, %d elements" % (meta.get("nodes", 0), meta.get("elements", 0)))):
         L.append("%-14s%s" % (k, v or "-"))
-    L += ["%-14s%s" % ("Units", "N, mm, MPa, t/mm^3 (densities listed in kg/m^3)"), ""]
+    L += ["%-14s%s" % ("Units", "N, mm, MPa, t/mm^3 (densities listed in kg/m^3)")]
+    L += ["%-14s%s" % ("Analysis", ATYPE_NAMES[m.atype] + ("" if m.atype == "static" else ", %d modes requested" % m.nmodes)), ""]
     L += [_rule("="), "1  MODEL", _rule("=")]
     L += ["", "1.1  Materials"]
     L += _table(["Name", "E (MPa)", "nu", "rho (kg/m^3)"],
@@ -2046,6 +2203,14 @@ def report(res, meta):
         tot = ld.get("total")
         rows.append([ld["name"][:24], ld["type"], val[:30], "(" + ", ".join(_g(float(x), 5) for x in tot) + ")" if tot is not None else "-"])
     L += _table(["Load", "Type", "Value", "Total force (N)"], rows, [26, 10, 30, 30])
+    if m.atype == "modal":
+        L.append("The loads are not used in a modal analysis.")
+    if isinstance(res, ModeResults):
+        L += _mode_report(res)
+        if m.warnings:
+            L += ["", _rule("="), "WARNINGS", _rule("=")] + m.warnings
+        L.append(_rule("="))
+        return "\n".join(l[:W] if len(l) > W else l for l in L) + "\n"
     tables = res.tables()
     order = [st for st in ("preload", "loads", "total") if st in res.state_steps]
     for k, st in enumerate(order):
@@ -2086,6 +2251,33 @@ def report(res, meta):
         L += ["", _rule("="), "WARNINGS", _rule("=")] + m.warnings
     L.append(_rule("="))
     return "\n".join(l[:W] if len(l) > W else l for l in L) + "\n"
+
+
+def _mode_report(res):
+    modes = res.modes()
+    if res.kind == "modal":
+        L = ["", _rule("="), "2  RESULTS  Natural frequencies", _rule("=")]
+        if res.eff and res.total:
+            rows = [[str(r["mode"]), _g(r["value"], 6)] + ["%.1f" % (100 * f) for f in r["frac"]] for r in modes]
+            cum = np.sum([r["frac"] for r in modes], axis=0)
+            rows.append(["Sum", ""] + ["%.1f" % (100 * f) for f in cum])
+            L += _table(["Mode", "f (Hz)", "Eff. mass x (%)", "Eff. mass y (%)", "Eff. mass z (%)"], rows, [8, 16, 18, 18, 18])
+            L.append("Effective modal mass as a percentage of the total effective mass (%s kg in x, y, z)." %
+                     ", ".join(_g(t * 1000, 5) for t in res.total))
+        else:
+            L += _table(["Mode", "f (Hz)"], [[str(r["mode"]), _g(r["value"], 6)] for r in modes], [8, 16])
+    else:
+        L = ["", _rule("="), "2  RESULTS  Buckling factors", _rule("=")]
+        L += _table(["Mode", "Buckling factor"], [[str(r["mode"]), _g(r["value"], 6)] for r in modes], [8, 18])
+        L.append("Critical loads: buckling factor x the applied loads and prescribed displacements. A negative factor: "
+                 "buckling under the reversed loads.")
+    L += ["", "Mode shapes: displacements normalised to a largest value of 1 (CalculiX: mass-normalised for modal)."]
+    rows = []
+    for k, st in enumerate(res.state_steps):
+        for b in res.body_max(st):
+            rows.append([str(k + 1), b["name"][:30], _g(b["umax"], 4), "(%s)" % ", ".join(_g(v, 5) for v in (b["upos"] or []))])
+    L += _table(["Mode", "Body", "max |u|", "at (x, y, z)"], rows, [8, 32, 12, 36])
+    return L
 
 
 # --------------------------------------------------------------------------- run
@@ -2163,15 +2355,20 @@ def run(doc, asm, sources, workdir, ccx, progress=None, mesh_only=False, meta=No
         raise AnalysisError("solver failed: %s (see %s)" % ("; ".join(errs[:3]) or (text.strip().splitlines() or ["no output"])[-1], log))
     summary["solve_time"] = round(time.time() - t1, 2)
     say("results", "Reading the results")
-    frd = read_frd(os.path.join(workdir, "job.frd"))
-    dat = read_dat(os.path.join(workdir, "job.dat"))
-    res = Results(M, frd, dat)
+    if M.atype == "static":
+        frd = read_frd(os.path.join(workdir, "job.frd"))
+        dat = read_dat(os.path.join(workdir, "job.dat"))
+        res = Results(M, frd, dat)
+    else:
+        res = ModeResults(M, read_frd_modes(os.path.join(workdir, "job.frd")), read_eigen(os.path.join(workdir, "job.dat")))
     meta["solver"] = ccx
     rep = report(res, meta)
     rp = os.path.join(workdir, "%s_report.txt" % re.sub(r"[^A-Za-z0-9_\-.]+", "_", meta.get("name") or "analysis"))
     with open(rp, "w", encoding="utf-8") as f:
         f.write(rep)
+    summary["atype"] = M.atype
     out = {"payload": res.payload(), "tables": res.tables(), "summary": summary, "states": list(res.state_steps),
+           "atype": M.atype, "modes": res.modes() if M.atype != "static" else None,
            "files": {"inp": inp, "report": rp, "frd": os.path.join(workdir, "job.frd"), "dat": os.path.join(workdir, "job.dat"),
                      "log": log}}
     return out

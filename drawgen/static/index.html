@@ -264,6 +264,7 @@
           <button type="button" data-tool="line" title="Line (L). Chain of lines; Esc ends">Line</button>
           <button type="button" data-tool="rect" title="Rectangle: two corners">Rectangle</button>
           <button type="button" data-tool="circle" title="Circle (C): centre, radius point">Circle</button>
+          <button type="button" data-tool="circle3" title="Circle through three points">Circle 3P</button>
           <button type="button" data-tool="arc" title="Arc (A): centre, start point, end point (counter-clockwise)">Arc</button>
           <button type="button" data-tool="ellipse" title="Ellipse: centre, end of the first axis, half length of the second axis">Ellipse</button>
           <button type="button" data-tool="conic" title="Conic section: start, end, tangent intersection, then the shoulder point or rho (0.5 parabola, below 0.5 ellipse, above 0.5 hyperbola)">Conic</button>
@@ -280,7 +281,7 @@
           <button type="button" data-tool="offset" title="Offset (O): distance, entity, side">Offset</button>
           <button type="button" data-tool="trim" title="Trim (T): click the part to remove">Trim</button>
           <button type="button" data-tool="extend" title="Extend (E): click near the end to extend">Extend</button>
-          <button type="button" data-tool="fillet" title="Fillet: radius, first line, second line">Fillet</button>
+          <button type="button" data-tool="fillet" title="Fillet: first line, second line; radius automatic (type a value to set it), then drag the arc or dimension it">Fillet</button>
           <button type="button" data-tool="chamfer" title="Chamfer: distance, first line, second line">Chamfer</button>
           <button type="button" id="sk-pattern" title="Pattern of the selected entities: two directions, row offset">Pattern</button>
         </div>
@@ -338,6 +339,10 @@
           <h2>Layers</h2>
           <div id="sk-layers"></div>
           <div class="buttons"><button type="button" id="sk-layer-add" class="small">Add layer</button></div>
+          <h2 class="sk-h">Images</h2>
+          <div id="sk-images"></div>
+          <div class="buttons"><label class="file-btn small" title="Image file (PNG, JPG, GIF, WebP, BMP, TIFF) as a reference under the sketch; copied to the images folder of the project">Import image<input type="file" id="sk-img-file" accept="image/*,.tif,.tiff" hidden></label></div>
+          <div class="row sk-imgrow"><input type="text" id="sk-img-path" class="sk-path" placeholder="image path on this PC"><button type="button" class="browse" data-browse="open" data-filter="image" data-target="#sk-img-path" title="Choose an image file">…</button><button type="button" id="sk-img-open" class="small">Open</button></div>
           <h2 class="sk-h">Properties</h2>
           <div id="sk-props"><p class="hint">Nothing selected.</p></div>
         </div>
@@ -496,6 +501,8 @@
           <button type="button" data-mate="angle" data-icon="mate_angle" title="Angle mate: planar faces at an angle. Click a face on each of two components">Angle</button>
           <button type="button" data-mate="concentric" data-icon="mate_concentric" title="Concentric mate: cylindrical faces or axes on one axis. Click a cylinder on each of two components">Concentric</button>
           <button type="button" data-mate="point" data-icon="mate_point" title="Point mate: the face centres coincide. Click a face on each of two components">Point</button>
+          <button type="button" data-mate="tangent" data-icon="mate_tangent" title="Tangent mate: a plane and a cylinder, or two cylinders, touching along a line. Click the faces on each of two components">Tangent</button>
+          <button type="button" data-mate="gear" data-icon="mate_gear" title="Gear mate: the rotation of B about its axis follows the rotation of A about its axis by a ratio. Click a cylinder (or an axis or circular edge) on each of two components">Gear</button>
           <button type="button" id="as-mates-btn" data-icon="as_mates" title="Show or hide the mates window">Mates</button>
           <button type="button" id="as-solve" data-icon="as_solve" title="Solve the mates">Solve</button>
           <button type="button" id="as-measure-btn" data-icon="measure" title="Measure: click a face (or, with Datums, a reference plane or axis), then a second one: distances, angles, diameters, minimum distance. Esc ends">Measure</button>
@@ -512,6 +519,7 @@
         <label class="check inline"><input type="checkbox" id="as-edges" checked> Edges</label>
         <label class="check inline"><input type="checkbox" id="as-axes" checked> Axes</label>
         <label class="check inline" title="Reference planes and axes: of the selected component; while a mate side is picked, of all components (pickable)"><input type="checkbox" id="as-datums"> Datums</label>
+        <label class="check inline" title="While a mate side is picked: vertices (within 8 px) and edges (within 5 px) of the components are picked before the faces"><input type="checkbox" id="as-edgepick"> Edges and vertices</label>
         <label class="check inline" title="Components moved by their explode offsets"><input type="checkbox" id="as-explode"> Exploded</label>
         <span class="as-section" title="Cross-section of the view: the components are cut by a plane normal to the axis at the offset">
           <label class="check inline"><input type="checkbox" id="as-sec"> Section</label>

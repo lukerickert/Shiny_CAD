@@ -1,3 +1,5 @@
+# Line endings normalised (LF in the repository)
+* text=auto
 # Windows batch files: CRLF line endings in checkouts and in the GitHub "Download ZIP" archive
 *.bat text eol=crlf
 *.cmd text eol=crlf

@@ -2,3 +2,17 @@ __pycache__/
 *.pyc
 solvers/*
 !solvers/README.txt
+# settings of this PC (projects folder, open project, Explicit settings, browser, ccx path)
+config.local.json
+# documents and output of this PC (the program folder without a project)
+/_export/
+/parts/
+/sketches/
+/assemblies/
+/annotations/
+/stacks/
+/analysis/
+/explicit/
+/*.step
+/*.stp
+/*.inp

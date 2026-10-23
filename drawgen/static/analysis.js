@@ -590,6 +590,7 @@ function drawMesh(box, st) {
   const n = p.count;
   const pos = new Float32Array(d.pos);
   let vals = null, lo = 0, hi = 1, scale = 0, lvm = null;
+  if (modeResult() && $("#fa-field").value === "vm") $("#fa-field").value = "u";
   const field = $("#fa-field").value;
   if (st && p.states && p.states[st]) {
     const s = stateData(p, st);
@@ -617,7 +618,8 @@ function drawMesh(box, st) {
     }
     if (!isFinite(lo)) { lo = 0; hi = 0; }
     legend(field, lo, hi, scale, st);
-    $("#fa-info").textContent = `${STATE_NAME[st] || st}: max |u| ${ffmt(p.states[st].umax)} mm, max von Mises ${ffmt(p.states[st].vmmax)} MPa, scale ${ffmt(scale, 3)}`;
+    $("#fa-info").textContent = modeResult() ? `${stateName(st)}: mode shape (largest displacement 1), scale ${ffmt(scale, 3)}`
+      : `${stateName(st)}: max |u| ${ffmt(p.states[st].umax)} mm, max von Mises ${ffmt(p.states[st].vmmax)} MPa, scale ${ffmt(scale, 3)}`;
   }
   const g = track(new THREE.BufferGeometry());
   g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
@@ -727,6 +729,15 @@ function memberTubes(lp, cols, r) {
 }
 
 const STATE_NAME = { total: "Total", preload: "Step 1 preload", loads: "Step 2 loads" };
+/** Name of a result state: static states, or "Mode k: f Hz" / "Mode k: factor" of a modal or buckling result. */
+function stateName(st) {
+  if (STATE_NAME[st]) return STATE_NAME[st];
+  const m = /^m(\d+)$/.exec(st || "");
+  const md = m && FA.res && FA.res.modes ? FA.res.modes[+m[1] - 1] : null;
+  if (!md) return st;
+  return FA.res.atype === "modal" ? `Mode ${md.mode}: ${ffmt(md.value, 5)} Hz` : `Mode ${md.mode}: factor ${ffmt(md.value, 5)}`;
+}
+function modeResult() { return !!(FA.res && FA.res.atype && FA.res.atype !== "static"); }
 const FIELD_NAME = { vm: "von Mises (MPa)", u: "|u| (mm)", ux: "ux (mm)", uy: "uy (mm)", uz: "uz (mm)" };
 function legend(field, lo, hi, scale, st) {
   const el = $("#fa-legend");
@@ -734,7 +745,8 @@ function legend(field, lo, hi, scale, st) {
   for (let k = 0; k < 12; k++) { const c = bandColor((k + 0.5) / 12); stops.push(`#${c.getHexString()} ${k / 12 * 100}%`, `#${c.getHexString()} ${(k + 1) / 12 * 100}%`); }
   const ticks = [];
   for (let k = 12; k >= 0; k -= 2) ticks.push(`<span>${ffmt(lo + (hi - lo) * k / 12, 4)}</span>`);
-  el.innerHTML = `<div class="ttl">${FIELD_NAME[field]}</div><div class="hint" style="margin:0 0 4px">${STATE_NAME[st] || st}, deformation x ${ffmt(scale, 3)}</div>` +
+  const ttl = modeResult() ? FIELD_NAME[field].replace(" (mm)", " (normalised)") : FIELD_NAME[field];
+  el.innerHTML = `<div class="ttl">${ttl}</div><div class="hint" style="margin:0 0 4px">${stateName(st)}, deformation x ${ffmt(scale, 3)}</div>` +
     `<span class="bar" style="background:linear-gradient(to top, ${stops.join(", ")})"></span><span class="ticks">${ticks.join("")}</span>`;
   el.hidden = false;
 }
@@ -868,6 +880,9 @@ function renderSettings() {
   $("#fa-settings").innerHTML =
     `<label title="CalculiX executable (ccx). Empty: ccx in the solvers folder of the program, ccx on PATH, or the Solver folder of a PrePoMax folder">Solver (ccx)<input type="text" id="fs-ccx" value="${fesc(s.configured || "")}" placeholder="${fesc(s.path || "not found")}"></label>` +
     `<p class="hint">${s.path ? "Using " + fesc(s.path) : "CalculiX not found: unpack PrePoMax (prepomax.fs.um.si/downloads) to the solvers folder of the program, or give the path of the ccx executable in its Solver folder"}</p>` +
+    `<div class="grid2"><label title="Linear static: loads, displacements, stresses, reactions. Modal: natural frequencies and mode shapes (densities required; loads not used). Linear buckling: buckling factors of the loads. Modal and buckling: solid bodies, plates and rods only">Analysis type<select id="fs-atype">` +
+    [["static", "Linear static"], ["modal", "Modal (natural frequencies)"], ["buckling", "Linear buckling"]].map(([v, n]) => `<option value="${v}"${(d.analysis_type || "static") === v ? " selected" : ""}>${n}</option>`).join("") + `</select></label>` +
+    `<label title="Number of natural frequencies or buckling factors (1 to 100)">Number of modes<input type="text" inputmode="numeric" id="fs-modes" value="${d.modes || 6}"${(d.analysis_type || "static") === "static" ? " disabled" : ""}></label></div>` +
     `<label>Default material<select id="fs-defmat">${Object.keys(d.materials).map(n => `<option${n === d.default_material ? " selected" : ""}>${fesc(n)}</option>`).join("")}</select></label>` +
     `<p class="hint">Units: mm, N, s, t (tonne): stress and pressure MPa (N/mm^2), moment N mm, acceleration mm/s^2; densities are entered in kg/m^3.</p>` +
     meshSettingsHtml(d.mesh || {}) +
@@ -879,6 +894,8 @@ function renderSettings() {
   bindMeshSettings(d);
   $("#fs-defmat").onchange = () => { d.default_material = $("#fs-defmat").value; changed(); renderAll(); };
   $("#fs-bonded").onchange = () => { d.bonded = $("#fs-bonded").checked; changed(); };
+  $("#fs-atype").onchange = () => { d.analysis_type = $("#fs-atype").value; changed(); renderSettings(); };
+  $("#fs-modes").onchange = () => { const v = Math.round(fnum($("#fs-modes").value)); if (isFinite(v) && v >= 1 && v <= 100) { d.modes = v; changed(); } else { status("Number of modes: 1 to 100"); renderSettings(); } };
 }
 
 function renderMats() {
@@ -1786,7 +1803,23 @@ function renderResults() {
   const t = r.tables[st];
   if (!t) { box.innerHTML = ""; return; }
   const row = cells => `<tr>${cells.map(c => `<td>${c}</td>`).join("")}</tr>`;
-  let h = `<p class="hint">${fesc(r.name)} solved ${fesc(r.time || "")}: ${r.summary.nodes} nodes, ${r.summary.elements} elements, solver ${ffmt(r.summary.solve_time, 3)} s. State: ${STATE_NAME[st]}.</p>`;
+  if (modeResult()) {
+    const modal = r.atype === "modal";
+    const eff = modal && r.modes.length && r.modes[0].frac;
+    let h = `<p class="hint">${fesc(r.name)} solved ${fesc(r.time || "")}: ${modal ? "modal analysis" : "linear buckling analysis"}, ${r.summary.nodes} nodes, ${r.summary.elements} elements, solver ${ffmt(r.summary.solve_time, 3)} s. Shown: ${fesc(stateName(st))}.</p>`;
+    h += `<div class="fa-wide"><table class="fa-tbl"><tr><th>Mode</th><th>${modal ? "f (Hz)" : "Buckling factor"}</th>${eff ? "<th>Eff. mass x (%)</th><th>Eff. mass y (%)</th><th>Eff. mass z (%)</th>" : ""}</tr>` +
+      r.modes.map(m => `<tr data-mode="${m.mode}" class="${"m" + m.mode === st ? "sel" : ""}" style="cursor:pointer">` + [String(m.mode), ffmt(m.value, 6)].concat(eff ? m.frac.map(f => (100 * f).toFixed(1)) : []).map(c => `<td>${c}</td>`).join("") + "</tr>").join("") + `</table></div>` +
+      `<p class="hint">${modal ? "Effective modal mass as a percentage of the total effective mass. Loads are not used." : "Critical loads: buckling factor x the applied loads and prescribed displacements. A negative factor: buckling under the reversed loads."} Mode shapes are normalised to a largest displacement of 1. A click on a row shows the mode.</p>`;
+    h += `<div class="row" style="margin-top:8px"><button type="button" id="fr-report">Report</button><button type="button" id="fr-download">Download report</button><button type="button" id="fr-folder">Open run folder</button></div>`;
+    box.innerHTML = h;
+    box.querySelectorAll("tr[data-mode]").forEach(tr => tr.onclick = () => { $("#fa-state").value = "m" + tr.dataset.mode; draw(); renderResults(); });
+    const nm = encodeURIComponent(r.name);
+    $("#fr-report").onclick = () => window.open("/api/analysis/report/" + nm, "_blank");
+    $("#fr-download").onclick = () => { const a = document.createElement("a"); a.href = "/api/analysis/report/" + nm + "?download=1"; document.body.appendChild(a); a.click(); a.remove(); };
+    $("#fr-folder").onclick = () => postJSON("/api/analysis/open_folder", { name: r.name }).catch(showErr);
+    return;
+  }
+  let h = `<p class="hint">${fesc(r.name)} solved ${fesc(r.time || "")}: ${r.summary.nodes} nodes, ${r.summary.elements} elements, solver ${ffmt(r.summary.solve_time, 3)} s. State: ${stateName(st)}.</p>`;
   h += `<div class="fa-wide"><table class="fa-tbl"><tr><th>Body</th><th>max |u| (mm)</th><th>max von Mises (MPa)</th></tr>` +
     t.bodies.map(b => row([fesc(b.name), ffmt(b.umax), ffmt(b.smax)])).join("") + `</table></div>`;
   if (t.members.length) h += `<p class="hint" style="margin:8px 0 2px">Members: maximum section forces (local axes)</p><div class="fa-wide"><table class="fa-tbl"><tr><th>Member</th><th>N (N)</th><th>V1 (N)</th><th>V2 (N)</th><th>T (N mm)</th><th>M1 (N mm)</th><th>M2 (N mm)</th><th>sig (MPa)</th></tr>` +
@@ -1810,8 +1843,8 @@ function renderResults() {
 
 function setStates() {
   const sel = $("#fa-state");
-  const sts = FA.res && FA.res.states ? ["total", "preload", "loads"].filter(s => FA.res.states.includes(s)) : [];
-  sel.innerHTML = sts.map(s => `<option value="${s}">${STATE_NAME[s]}</option>`).join("");
+  const sts = !FA.res || !FA.res.states ? [] : modeResult() ? FA.res.states : ["total", "preload", "loads"].filter(s => FA.res.states.includes(s));
+  sel.innerHTML = sts.map(s => `<option value="${s}">${fesc(stateName(s))}</option>`).join("");
   sel.disabled = sts.length < 2;
 }
 

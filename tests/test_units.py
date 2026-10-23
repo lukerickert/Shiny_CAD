@@ -347,3 +347,98 @@ def test_drag_in_group_with_conflict():
         out, nr, msgs = A.solve_mates(asm, lambda cid: refs[cid], detail=det, drag={"comp": "s", "delta": [25, -10, 40], "skip": skip})
         assert "m2" in det["conflicts"]
         assert out["s"][0] == pytest.approx([25, -10, 0], abs=1e-3)
+
+
+# --------------------------------------------------------------------------- tangent, edge, vertex and gear mates
+
+PLZ = {"kind": "plane", "c": [0, 0, 0], "n": [0, 0, 1]}
+
+
+@pytest.mark.parametrize("flip, z", [(False, 5.0), (True, -5.0)])
+def test_tangent_plane_cylinder(flip, z):
+    from drawgen import assembly as A
+    refs = {"c1": [PLZ], "c2": [CYL]}
+    out, nr, msgs = _solve([{"id": "m", "type": "tangent", "flip": flip, "a": {"comp": "c2", "face": 0},
+                             "b": {"comp": "c1", "face": 0}}], refs)
+    assert nr < 1e-6 and not msgs
+    ax = _axis_of(out)
+    assert abs(ax[2]) < 1e-6                                   # axis parallel to the plane
+    p = A._apply(A._rot_matrix(out["c2"][1]), out["c2"][0], [0, 0, 0])
+    assert p[2] == pytest.approx(z, abs=1e-6)
+
+
+@pytest.mark.parametrize("flip, d", [(False, 15.0), (True, 5.0)])
+def test_tangent_two_cylinders(flip, d):
+    from drawgen import assembly as A
+    big = dict(CYL, r=10)
+    out, nr, msgs = _solve([{"id": "m", "type": "tangent", "flip": flip, "a": {"comp": "c2", "face": 0},
+                             "b": {"comp": "c1", "face": 0}}], {"c1": [big], "c2": [CYL]})
+    assert nr < 1e-6
+    ax = _axis_of(out)
+    assert abs(abs(ax[2]) - 1) < 1e-6
+    p = A._apply(A._rot_matrix(out["c2"][1]), out["c2"][0], [0, 0, 0])
+    assert math.hypot(p[0], p[1]) == pytest.approx(d, abs=1e-6)
+
+
+def test_edge_and_vertex_refs_and_mates():
+    from drawgen import assembly as A
+    from build123d import Box, Cylinder, Pos
+    box = Pos(5, 5, 5) * Box(10, 10, 10)
+    er, vr = A.edge_refs(box), A.vertex_refs(box)
+    assert len(er) == 12 and all(r["kind"] == "line" and r["len"] == pytest.approx(10) for r in er)
+    assert len(vr) == 8 and {tuple(v["c"]) for v in vr} == {(x, y, z) for x in (0, 10) for y in (0, 10) for z in (0, 10)}
+    m = A.fast_mesh(box)
+    assert len(m["edge_ids"]) == len(m["edges"]) == 12 and sorted(m["edge_ids"]) == list(range(12))
+    cyl = Cylinder(4, 20)
+    ce = [r for r in A.edge_refs(cyl) if r and r["kind"] == "circle"]
+    assert len(ce) == 2 and ce[0]["r"] == pytest.approx(4)
+    e = {"erefs": er, "vrefs": vr}
+    geo = A.geo_refs(e)
+    # vertex (10, 10, 10) of the moving box on the plane z = 0 of the base
+    vi = next(i for i, v in enumerate(vr) if v["c"] == [10, 10, 10])
+    out, nr, msgs = _solve([{"id": "m", "type": "coincident", "a": {"comp": "c2", "vertex": vi}, "b": {"comp": "c1", "face": 0}}],
+                           {"c1": [PLZ], "c2": []}, {"c1": {}, "c2": geo})
+    assert nr < 1e-6
+    p = A._apply(A._rot_matrix(out["c2"][1]), out["c2"][0], [10, 10, 10])
+    assert p[2] == pytest.approx(0, abs=1e-6)
+    # point mate vertex to vertex
+    out, nr, msgs = _solve([{"id": "m", "type": "point", "a": {"comp": "c2", "vertex": vi}, "b": {"comp": "c1", "vertex": 0}}],
+                           {"c1": [], "c2": []}, {"c1": geo, "c2": geo})
+    assert nr < 1e-6
+    assert A._apply(A._rot_matrix(out["c2"][1]), out["c2"][0], [10, 10, 10]) == pytest.approx(vr[0]["c"], abs=1e-6)
+    # an edge collinear with an edge (coincident lines), and a circular edge concentric with a cylinder
+    out, nr, msgs = _solve([{"id": "m", "type": "coincident", "a": {"comp": "c2", "edge": 0}, "b": {"comp": "c1", "edge": 5}}],
+                           {"c1": [], "c2": []}, {"c1": geo, "c2": geo})
+    assert nr < 1e-6
+    cg = A.geo_refs({"erefs": A.edge_refs(cyl), "vrefs": []})
+    ck = next(k for k, r in cg.items() if r["kind"] == "circle")
+    out, nr, msgs = _solve([{"id": "m", "type": "concentric", "a": {"comp": "c2", "datum": None, "edge": int(ck.split(":")[1])},
+                             "b": {"comp": "c1", "face": 0}}], {"c1": [dict(CYL, p=[50, 0, 0], c=[50, 0, 0])], "c2": []}, {"c1": {}, "c2": cg})
+    assert nr < 1e-6
+    p = A._apply(A._rot_matrix(out["c2"][1]), out["c2"][0], [0, 0, 0])
+    assert math.hypot(p[0] - 50, p[1]) == pytest.approx(0, abs=1e-6)
+    with pytest.raises(ValueError):
+        A._residuals({"type": "parallel"}, {"kind": "point", "c": [0, 0, 0]}, PLZ)
+
+
+@pytest.mark.parametrize("flip, ang", [(False, -60.0), (True, 60.0)])
+def test_gear_ratio(flip, ang):
+    """Gear A (fixed, turned 30 deg about z from its reference) drives gear B on a fixed axis with ratio 2."""
+    from drawgen import assembly as A
+    comps = [{"id": "c0", "fixed": True, "name": "FRAME"},
+             {"id": "c1", "fixed": True, "name": "GEAR_A", "rot": [0, 0, 30]},
+             {"id": "c2", "name": "GEAR_B", "pos": [30, 0, 0], "rot": [0, 0, 5]}]
+    refs = {"c0": [dict(CYL, p=[30, 0, 0], c=[30, 0, 0])], "c1": [dict(CYL, r=20)], "c2": [dict(CYL, r=10)]}
+    mates = [{"id": "m1", "type": "concentric", "flip": True, "a": {"comp": "c2", "face": 0}, "b": {"comp": "c0", "face": 0}},
+             {"id": "m2", "type": "gear", "value": 2, "flip": flip, "a": {"comp": "c1", "face": 0}, "b": {"comp": "c2", "face": 0},
+              "ref": {"a": [0, 0, 0], "b": [0, 0, 0]}}]
+    out, nr, msgs = _solve(mates, refs, comps=comps)
+    assert nr < 1e-6, msgs
+    R = A._rot_matrix(out["c2"][1])
+    assert math.degrees(math.atan2(R[1][0], R[0][0])) == pytest.approx(ang, abs=1e-4)
+    # without a reference the current rotations are the reference: B keeps its rotation
+    m2 = dict(mates[1]); m2.pop("ref")
+    out, nr, msgs = _solve([mates[0], m2], refs, comps=comps)
+    assert nr < 1e-6
+    R = A._rot_matrix(out["c2"][1])
+    assert math.degrees(math.atan2(R[1][0], R[0][0])) == pytest.approx(5, abs=1e-4)

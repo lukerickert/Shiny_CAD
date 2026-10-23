@@ -62,6 +62,9 @@ def solve(doc, bodies, wd, size=5.0):
     M.write(os.path.join(wd, "job.inp"), "test")
     r = subprocess.run([CCX, "-i", "job"], cwd=wd, capture_output=True, text=True)
     assert "Job finished" in r.stdout, r.stdout[-1500:]
+    if M.atype != "static":
+        return M, analysis.ModeResults(M, analysis.read_frd_modes(os.path.join(wd, "job.frd")),
+                                       analysis.read_eigen(os.path.join(wd, "job.dat")))
     return M, analysis.Results(M, analysis.read_frd(os.path.join(wd, "job.frd")), analysis.read_dat(os.path.join(wd, "job.dat")))
 
 
@@ -557,3 +560,79 @@ def test_plate_groups_resolve():
            "plates": [{"id": "p1", "name": "P1", "t": 1, "size": 7, "group": "g", "points": []}, {"id": "p2", "name": "P2", "t": 2}]}
     a, b = analysis.resolve_plate_groups(doc)
     assert (a["t"], a["material"], a.get("size")) == (4, "Aluminium", None) and b["t"] == 2
+
+
+# --------------------------------------------------------------------------- modal and buckling
+
+def _bar(L=200.0, b=20.0, h=10.0):
+    from build123d import Box, Pos
+    B = bodies_of({"bar": Pos(L / 2, b / 2, h / 2) * Box(L, b, h)})
+    root = face_index(B[0], lambda r: r["kind"] == "plane" and abs(r["c"][0]) < 1e-6)
+    tip = face_index(B[0], lambda r: r["kind"] == "plane" and abs(r["c"][0] - L) < 1e-6)
+    return B, root, tip
+
+
+@needs_ccx
+def test_modal_cantilever_bar(tmp_path):
+    """Bar 200 x 20 x 10 mm clamped at x = 0: f = 1.875^2 / (2 pi) sqrt(E I / (rho A L^4)), 1st mode bending about the
+    thin direction (I = 20 x 10^3 / 12), 2nd about the wide direction (twice the frequency). Effective mass of the
+    1st mode in z about 61 % (Euler-Bernoulli cantilever: 0.613)."""
+    B, root, tip = _bar()
+    doc = {"materials": STEEL, "default_material": "Steel", "mesh": {"size": 5.0}, "analysis_type": "modal", "modes": 4,
+           "supports": [{"id": "s1", "name": "root", "target": {"comp": "bar", "face": root}, "type": "fixed"}],
+           "loads": [{"id": "l1", "name": "tip", "type": "force", "target": {"comp": "bar", "face": tip}, "value": [0, 0, -100]}]}
+    M, R = solve(doc, B, str(tmp_path), size=5.0)
+    assert "*FREQUENCY" in open(os.path.join(str(tmp_path), "job.inp")).read()
+    E, rho, A, L = 210000.0, 7.85e-9, 200.0, 200.0
+    f = lambda I: 1.875 ** 2 / (2 * math.pi) * math.sqrt(E * I / (rho * A * L ** 4))
+    md = R.modes()
+    assert len(md) == 4 and list(R.state_steps) == ["m1", "m2", "m3", "m4"]
+    assert abs(md[0]["value"] / f(20 * 10 ** 3 / 12) - 1) < 0.03, md
+    assert abs(md[1]["value"] / f(10 * 20 ** 3 / 12) - 1) < 0.03, md
+    assert abs(md[0]["frac"][2] - 0.613) < 0.03 and md[0]["frac"][1] < 0.01
+    # mode shape: normalised, largest at the tip, along z
+    U = R.U["m1"]
+    assert abs(max(float(np.linalg.norm(u)) for u in U.values()) - 1) < 1e-9
+    tn = M.face({"comp": "bar", "face": tip})["nodes"]
+    assert np.mean([abs(U[n][2]) for n in tn]) > 0.95
+    rep = analysis.report(R, {"name": "modal"})
+    assert "Natural frequencies" in rep and "Modal (natural frequencies)" in rep and "Eff. mass z (%)" in rep
+    tb = R.tables()
+    assert tb["m1"]["mode"]["mode"] == 1 and tb["m2"]["bodies"][0]["umax"] == pytest.approx(1.0, abs=1e-6)
+    pl = R.payload()
+    assert set(pl["states"]) == {"m1", "m2", "m3", "m4"}
+
+
+@needs_ccx
+def test_buckling_column(tmp_path):
+    """Bar 200 x 20 x 10 mm clamped at x = 0, 1000 N compression at x = 200: Euler P = pi^2 E I / (4 L^2) with
+    I = 20 x 10^3 / 12, buckling factor P / 1000."""
+    B, root, tip = _bar()
+    doc = {"materials": STEEL, "default_material": "Steel", "mesh": {"size": 5.0}, "analysis_type": "buckling", "modes": 2,
+           "supports": [{"id": "s1", "name": "root", "target": {"comp": "bar", "face": root}, "type": "fixed"}],
+           "loads": [{"id": "l1", "name": "tip", "type": "force", "target": {"comp": "bar", "face": tip}, "value": [-1000, 0, 0]}]}
+    M, R = solve(doc, B, str(tmp_path), size=5.0)
+    P = math.pi ** 2 * 210000.0 * (20 * 10 ** 3 / 12) / (4 * 200.0 ** 2)
+    md = R.modes()
+    assert abs(md[0]["value"] / (P / 1000) - 1) < 0.04, (md, P)
+    assert "Buckling factors" in analysis.report(R, {"name": "buckle"})
+
+
+def test_modal_and_buckling_refusals():
+    B, root, tip = _bar()
+    mesh = {"nodes": {"ids": [], "xyz": []}, "bodies": {}, "warnings": []}
+    sup = [{"id": "s1", "name": "root", "target": {"member": "m1", "end": "a"}, "type": "fixed"}]
+    mem = [{"id": "m1", "name": "beam1", "kind": "beam", "a": {"xyz": [0, 0, 0]}, "b": {"xyz": [100, 0, 0]},
+            "section": {"shape": "ROUND", "d": 10}}]
+    doc = {"materials": STEEL, "default_material": "Steel", "analysis_type": "modal", "members": mem, "supports": sup, "loads": []}
+    with pytest.raises(analysis.AnalysisError, match="beams and fasteners"):
+        analysis.Model(doc, [], mesh).build()
+    rod = [dict(mem[0], kind="rod")]
+    nod = {"materials": {"Steel": {"E": 210000.0, "nu": 0.3, "rho": 0}}, "default_material": "Steel",
+           "analysis_type": "modal", "members": rod, "supports": sup, "loads": []}
+    with pytest.raises(analysis.AnalysisError, match="no density"):
+        analysis.Model(nod, [], mesh).build()
+    with pytest.raises(analysis.AnalysisError, match="no loads"):
+        analysis.Model(dict(nod, analysis_type="buckling"), [], mesh).build()
+    with pytest.raises(analysis.AnalysisError, match="unknown analysis type"):
+        analysis.Model(dict(nod, analysis_type="dynamic"), [], mesh)

@@ -56,6 +56,7 @@
     select: `<path ${S} d="M6 3 L18 13 H12 L15 20 L12.5 21 L9.5 14 L5 18 Z"/>`,
     line: `<path ${S} d="M4 20 L20 4"/><circle cx="4" cy="20" r="1.6" ${F}/><circle cx="20" cy="4" r="1.6" ${F}/>`,
     rect: `<rect x="4" y="6" width="16" height="12" ${S}/><circle cx="4" cy="6" r="1.6" ${F}/><circle cx="20" cy="18" r="1.6" ${F}/>`,
+    circle3: `<circle cx="12" cy="12" r="8" ${S}/><circle cx="4.5" cy="9.5" r="1.6" ${F}/><circle cx="17" cy="5.8" r="1.6" ${F}/><circle cx="15.5" cy="19.2" r="1.6" ${F}/>`,
     circle: `<circle cx="12" cy="12" r="8" ${S}/><circle cx="12" cy="12" r="1.4" ${F}/><path ${D} d="M12 12 H20"/>`,
     ellipse: `<ellipse cx="12" cy="12" rx="9" ry="5.5" ${S} transform="rotate(-20 12 12)"/><circle cx="12" cy="12" r="1.3" ${F}/>`,
     conic: `<path ${S} d="M3 20 Q12 2 21 20"/><path ${D} d="M3 20 L12 5 L21 20"/><circle cx="3" cy="20" r="1.3" ${F}/><circle cx="21" cy="20" r="1.3" ${F}/><circle cx="12" cy="5" r="1.3" ${S}/>`,
@@ -129,6 +130,8 @@
     mate_parallel: `<path ${S} d="M3 8 H21 M3 16 H21"/><path ${S} d="M10 4 L8 8 M16 4 L14 8 M10 20 L12 16 M16 20 L18 16"/>`,
     mate_angle: `<path ${S} d="M4 19 H20 M4 19 L16 6 M11 19 A7 7 0 0 0 8.75 13.86"/>`,
     mate_concentric: `<circle cx="12" cy="12" r="8" ${S}/><circle cx="12" cy="12" r="4.5" ${S}/><path ${D} d="M12 1.5 V22.5 M1.5 12 H22.5"/>`,
+    mate_tangent: `<circle cx="12" cy="10" r="6" ${S}/><path ${S} d="M3 16 H21"/><circle cx="12" cy="16" r="1.5" ${F}/>`,
+    mate_gear: `<circle cx="8" cy="12" r="4.5" ${S}/><circle cx="17" cy="12" r="3" ${S}/><path ${S} d="M8 5.5 V7.5 M8 16.5 V18.5 M1.5 12 H3.5 M3.4 7.4 L4.8 8.8 M3.4 16.6 L4.8 15.2 M17 7.5 V9 M17 15 V16.5 M20.5 12 H22"/>`,
     mate_point: `<path ${S} d="M12 3 V8.5 M12 15.5 V21 M3 12 H8.5 M15.5 12 H21"/><circle cx="12" cy="12" r="2.6" ${F}/>`,
     balloon: `<circle cx="12" cy="9" r="6" ${S}/><path ${S} d="M9 14 L5 21"/><text x="12" y="12" font-size="8" text-anchor="middle" fill="currentColor" font-family="sans-serif">1</text>`,
   };

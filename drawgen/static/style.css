@@ -188,6 +188,15 @@ g.ann.sel text, g.ann.sel polygon { fill: #d0451b !important; }
 .sk-layer input[type=color] { width: 20px; height: 18px; padding: 0; border: 1px solid var(--line); }
 .sk-layer.cur span { font-weight: 600; }
 .sk-h { margin-top: 14px !important; }
+.sk-image { display: grid; grid-template-columns: 18px 1fr auto; gap: 4px; align-items: center; font-size: 12px; padding: 2px 4px; border-radius: 3px; }
+.sk-image span { cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sk-image.cur { background: #fdebd9; }
+.sk-image.cur span { font-weight: 600; }
+.sk-image button.small { margin-left: 0; }
+.sk-imgrow { flex-wrap: nowrap; margin-top: 6px; }
+.sk-imgrow .sk-path { min-width: 0; flex: 1; }
+.sk-imgrow .file-btn { white-space: nowrap; }
+.sk-h3 { font-size: 13px; margin: 12px 0 2px; }
 #sk-props label { margin-bottom: 6px; }
 #sk-props .grid2 label { margin-bottom: 6px; }
 #value-dialog .modal-box { width: min(360px, 92vw); }
@@ -514,3 +523,4 @@ label > span.row input { flex: 1; min-width: 0; }
 .xp-pattern { border: 1px solid #dee2e6; padding: 4px 6px; margin: 4px 0; }
 .xp-face { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #xp-ftime { display: inline-block; min-width: 118px; margin-right: 6px; font-variant-numeric: tabular-nums; }
+.fa-tbl tr.sel td { background: #fdebd9; }

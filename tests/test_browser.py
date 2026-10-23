@@ -1756,3 +1756,479 @@ def test_explicit_tab_deck_generator(page, client):
     page.click("#xp-dk-openpart")
     page.wait_for_function("window.__part.PT.part && window.__part.PT.part.name === 'xpb_deck_deck' && Object.keys(window.__part.PT.status || {}).length === 8", timeout=120000)
     assert page.evaluate("Object.values(window.__part.PT.status).every(s => !s.error && s.surface)")
+
+
+# --------------------------------------------------------------------------- reference images of sketches
+
+def _photo(path, H, k1=0.0, size=(1600, 1200)):
+    """Synthetic photo: a 200 mm x 100 mm rectangle and its diagonals on a grey background, seen through the
+    homography H (object mm -> undistorted pixels) and a lens with the radial coefficient k1 (sketchimage model).
+    Returns the image pixels of the corners."""
+    import numpy as np
+    from PIL import Image, ImageDraw
+    from drawgen import sketchimage as si
+    w, h = size
+    im = Image.new("RGB", size, (150, 150, 150))
+    dr = ImageDraw.Draw(im)
+
+    def img(pts):
+        q, _ = si.apply_h(H, pts)
+        return si.distort(q, k1, w, h)
+    c = [(0, 0), (200, 0), (200, 100), (0, 100)]
+    for a, b in list(zip(c, c[1:] + c[:1])) + [(c[0], c[2]), (c[1], c[3])]:
+        t = np.linspace(0, 1, 60)[:, None]
+        p = img(np.array(a) * (1 - t) + np.array(b) * t)
+        dr.line([tuple(x) for x in p], fill=(0, 0, 0), width=3)
+    im.save(path)
+    return img(c)
+
+
+def _click_px(pg, px):
+    """Clicks the image pixel px (of the stored file) of the selected image in the sketch editor."""
+    s = pg.evaluate("([u, v]) => { const sk = window.__sk, m = sk.SK.doc.images.find(x => x.id === sk.SK.imgSel); return sk.S(sk.affApply(m.A, sk.imgShownPx(m, [u, v]))); }", [float(px[0]), float(px[1])])
+    box = pg.locator("#sk-canvas svg").bounding_box()
+    pg.mouse.click(box["x"] + s[0], box["y"] + s[1])
+
+
+def _model_of(pg, p):
+    """Sketch point of the image pixel p of the stored file, with the current corrections."""
+    return pg.evaluate("([u, v]) => { const sk = window.__sk, m = sk.SK.doc.images.find(x => x.id === sk.SK.imgSel); return sk.affApply(m.A, sk.imgShownPx(m, [u, v])); }", [float(p[0]), float(p[1])])
+
+
+def test_sketch_image_scale_perspective_lens(page, tmp_path):
+    import numpy as np
+    tab(page, "sketch")
+    page.click("#sk-new")
+    H = np.array([[4.2, 1.1, 300.0], [0.3, 3.0, 420.0], [0.0006, 0.0018, 1.0]])
+    path = str(tmp_path / "photo.png")
+    corners = _photo(path, H)
+    page.set_input_files("#sk-img-file", path)
+    page.wait_for_function("window.__sk.SK.doc.images.length === 1 && window.__sk.SK.imgSel")
+    wait_text(page, "#sk-props", "Scale from distance")
+    assert page.locator("#sk-images .sk-image").count() == 1
+    assert page.locator("#sk-img image").count() == 1
+    # scale from distance: corner 1 to corner 2 is 200 mm (in the perspective image this is approximate)
+    page.click("#sk-props button[data-ia=imgscale]")
+    page._answer = ""
+    _click_px(page, corners[0])
+    _click_px(page, corners[1])
+    page.fill("#value-dialog-input", "200")
+    page.press("#value-dialog-input", "Enter")
+    page.wait_for_function("window.__sk.SK.tool === 'select'")
+    a, b = _model_of(page, corners[0]), _model_of(page, corners[1])
+    assert abs(math.hypot(b[0] - a[0], b[1] - a[1]) - 200) < 1.0
+    # perspective: the four corners of the 200 x 100 mm rectangle
+    page.click("#sk-props button[data-ia=persp]")
+    page.fill("#skp-pw", "200")
+    page.fill("#skp-ph", "100")
+    page.click("#skp-ppick")
+    page.wait_for_function("window.__sk.SK.tool === 'imgpersp'")
+    for c in corners:
+        _click_px(page, c)
+    page.wait_for_function("window.__sk.SK.tool === 'select' && window.__sk.SK.doc.images[0].cfile", timeout=60000)
+    m = [_model_of(page, c) for c in corners]
+    d = [m[1][0] - m[0][0], m[1][1] - m[0][1]]
+    assert abs(d[0] - 200) < 1.5 and abs(d[1]) < 1.0, m
+    assert abs(math.hypot(m[2][0] - m[1][0], m[2][1] - m[1][1]) - 100) < 1.5, m
+    assert abs(math.hypot(m[3][0] - m[0][0], m[3][1] - m[0][1]) - 100) < 1.5, m
+    # the image is drawn from the corrected file
+    page.wait_for_function("document.querySelector('#sk-img image').getAttribute('href').includes('_c')")
+    if os.environ.get("DRAWGEN_SHOTS"):
+        page.screenshot(path=os.path.join(os.environ["DRAWGEN_SHOTS"], "sketch_image_perspective.png"))
+    # undo returns to the image before the perspective correction
+    page.keyboard.press("Control+z")
+    page.wait_for_function("!window.__sk.SK.doc.images[0].cfile")
+    # 3 control points: affine placement without a corrected file
+    page.click("#sk-images .sk-image span")
+    page.click("#sk-images .sk-image span")
+    page.click("#sk-props button[data-ia=imgctrl]")
+    page.wait_for_function("window.__sk.SK.tool === 'imgctrl'")
+    for p, xy in zip(corners[:3], ("10,10", "210,10", "210,-90")):
+        _click_px(page, p)
+        page.keyboard.type(xy)
+        page.keyboard.press("Enter")
+    wait_text(page, "#sk-props", "Pairs: 3")
+    page.focus("#sk-canvas")
+    page.keyboard.press("Enter")
+    page.wait_for_function("window.__sk.SK.tool === 'select'")
+    for p, xy in zip(corners[:3], ((10, 10), (210, 10), (210, -90))):
+        m = _model_of(page, p)
+        assert math.hypot(m[0] - xy[0], m[1] - xy[1]) < 1.0, (m, xy)
+    assert not page.evaluate("window.__sk.SK.doc.images[0].cfile")
+
+
+def test_sketch_image_lens_and_control_points(page, tmp_path):
+    import numpy as np
+    tab(page, "sketch")
+    page.click("#sk-new")
+    k1 = 0.08
+    H = np.array([[5.0, 0.0, 300.0], [0.0, 5.0, 350.0], [0.0, 0.0, 1.0]])
+    path = str(tmp_path / "lens.png")
+    _photo(path, H, k1)
+    page.set_input_files("#sk-img-file", path)
+    page.wait_for_function("window.__sk.SK.doc.images.length === 1 && window.__sk.SK.imgSel")
+    from drawgen import sketchimage as si
+    page.click("#sk-props button[data-ia=imglens]")
+    page.wait_for_function("window.__sk.SK.tool === 'imglens'")
+    # points along the long edges and the left edge of the rectangle (straight on the object), typed as sketch
+    # coordinates (a click is placed to the screen pixel)
+    A = page.evaluate("window.__sk.SK.doc.images[0].A")
+    for a, b in (((0, 0), (200, 0)), ((0, 100), (200, 100)), ((0, 0), (0, 100))):
+        for t in np.linspace(0, 1, 6):
+            q, _ = si.apply_h(H, [np.array(a) * (1 - t) + np.array(b) * t])
+            u, v = si.distort(q, k1, 1600, 1200)[0]
+            page.focus("#sk-canvas")
+            page.keyboard.type("%.6f,%.6f" % (A[0] * u + A[2] * v + A[4], A[1] * u + A[3] * v + A[5]))
+            page.keyboard.press("Enter")
+        page.click("#skp-lend")
+    wait_text(page, "#sk-props", "Lines: 3 (18 points)")
+    page.click("#skp-lapply")
+    page.wait_for_function("window.__sk.SK.tool === 'select' && window.__sk.SK.doc.images[0].cfile", timeout=60000)
+    got = page.evaluate("window.__sk.SK.doc.images[0].k1")
+    assert abs(got - k1) < 0.002, got
+    wait_text(page, "#sk-props", "lens k1")
+    # control points: 4 corners to typed sketch points (the rectangle 200 x 100 at the origin)
+    page.click("#sk-props button[data-ia=imgctrl]")
+    page.wait_for_function("window.__sk.SK.tool === 'imgctrl'")
+    cq, _ = si.apply_h(H, [(0, 0), (200, 0), (200, 100), (0, 100)])
+    cp = si.distort(cq, k1, 1600, 1200)
+    for p, xy in zip(cp, ("0,0", "200,0", "200,-100", "0,-100")):
+        _click_px(page, p)
+        page.keyboard.type(xy)
+        page.keyboard.press("Enter")
+    wait_text(page, "#sk-props", "Pairs: 4")
+    page.click("#skp-capply")
+    page.wait_for_function("window.__sk.SK.tool === 'select' && window.__sk.SK.doc.images[0].ctrl", timeout=60000)
+    for p, xy in zip(cp, ((0, 0), (200, 0), (200, -100), (0, -100))):
+        m = _model_of(page, p)
+        assert math.hypot(m[0] - xy[0], m[1] - xy[1]) < 1.5, (m, xy)
+    # saved with the sketch; the image file is in the images folder of the project
+    page.fill("#sk-name", "imgtest")
+    page.click("#sk-save")
+    wait_text(page, "#sk-msg, #status", "Saved")
+
+
+def test_analysis_modal_ui(page, client):
+    """Modal analysis of a cantilever plate item (500 x 100 x 10 mm): analysis type and number of modes in the
+    settings, mode list in the state selector and in the results, mode shape with a normalised legend."""
+    from test_analysis import CCX, STEEL
+    if CCX is None:
+        pytest.skip("CalculiX (ccx) not found")
+    doc = {"name": "fea_modal", "source": {"type": "assembly", "name": ""}, "materials": STEEL, "default_material": "Steel",
+           "mesh": {"size": 20}, "bonded": True, "bodies": {}, "fasteners": [], "members": [], "loads": [],
+           "plates": [{"id": "p1", "name": "P1", "t": 10, "position": "mid",
+                       "points": [[0, 0, 0], [500, 0, 0], [500, 100, 0], [0, 100, 0]]}]}
+    pv = client.post("/api/analysis/plates", json={"analysis": doc}).get_json()["plates"]
+    root = next(i for i, r in enumerate(pv[0]["refs"]) if r["kind"] == "plane" and abs(r["c"][0]) < 1e-6)
+    doc["supports"] = [{"id": "s1", "name": "root", "target": {"comp": "plate_p1", "face": root}, "type": "fixed"}]
+    client.put("/api/analysis/file/fea_modal", json=doc)
+    tab(page, "fea")
+    page.wait_for_function("window.__fea && window.__fea.FA.doc")
+    page.evaluate("window.__feaLoadNamed('fea_modal')")
+    page.wait_for_function("window.__fea.FA.doc.name === 'fea_modal'")
+    page.select_option("#fs-atype", "modal")
+    page.fill("#fs-modes", "3")
+    page.dispatch_event("#fs-modes", "change")
+    assert page.evaluate("window.__fea.FA.doc.analysis_type") == "modal" and page.evaluate("window.__fea.FA.doc.modes") == 3
+    page.click("#fa-solve")
+    page.wait_for_function("window.__fea.FA.res && window.__fea.FA.res.modes", timeout=300000)
+    assert page.locator("#fa-state option").count() == 3
+    wait_text(page, "#fa-results", "f (Hz)")
+    f1 = page.evaluate("window.__fea.FA.res.modes[0].value")
+    E, rho, A, L, I = 210000.0, 7.85e-9, 1000.0, 500.0, 100 * 10 ** 3 / 12
+    ref = 1.875 ** 2 / (2 * math.pi) * math.sqrt(E * I / (rho * A * L ** 4))
+    assert abs(f1 / ref - 1) < 0.05, (f1, ref)
+    wait_text(page, "#fa-legend", "Mode 1")
+    wait_text(page, "#fa-legend", "normalised")
+    page.click("#fa-results tr[data-mode='2']")
+    assert page.input_value("#fa-state") == "m2"
+    wait_text(page, "#fa-legend", "Mode 2")
+    if os.environ.get("DRAWGEN_SHOTS"):
+        page.screenshot(path=os.path.join(os.environ["DRAWGEN_SHOTS"], "analysis_modal.png"))
+
+
+def test_mate_vertex_edge_tangent_gear(page, client):
+    """Edges and vertices: a vertex of one plate picked for A of a Coincident mate (on a face of the other plate), the
+    circular edge of the hole for A of a Concentric mate; Tangent and Gear mates in the toolbar with their fields."""
+    client.put("/api/part/file/ui_ev", json=plate("ui_ev"))
+    tab(page, "asm")
+    add_part(page, "ui_ev")
+    page.wait_for_function("window.__asm.AS.result && window.__asm.AS.result.components.length >= 1 && window.__asm.AS.bbox")
+    add_part(page, "ui_ev")
+    page.wait_for_function("window.__asm.AS.result && window.__asm.AS.result.components.length >= 2 && window.__asm.AS.result.components.every(c => c.vrefs)")
+    n = asm_state(page, "AS.asm.components.length")
+    screen = """([i, kind, pred]) => { const A = window.__asm, AS = A.AS, T = A.THREE, t = AS.three;
+        const c = AS.result.components.find(x => x.id === AS.asm.components[i].id), M = A.compMatrix(A.comp(c.id));
+        const r = t.renderer.domElement.getBoundingClientRect();
+        const list = kind === 'vertex' ? c.vrefs.map((v, k) => [k, v.c]) : c.erefs.map((e, k) => [k, e && e.m]).filter(x => x[1]);
+        for (const [k, q] of list) {
+          if (kind === 'edge' && c.erefs[k].kind !== 'circle') continue;
+          const p = new T.Vector3(...q).applyMatrix4(M).project(t.camera);
+          const x = r.left + (p.x + 1) / 2 * r.width, y = r.top + (1 - p.y) / 2 * r.height;
+          const h = A.mateHitAt({ clientX: x, clientY: y }, true);
+          if (h && h.comp === c.id && (kind === 'vertex' ? h.vertex === k : h.edge === k)) return [x, y];
+        }
+        return null; }"""
+    centre = """(i) => { const AS = window.__asm.AS, T = window.__asm.THREE, t = AS.three;
+        const c = AS.asm.components[i], m = t.pickables.find(o => o.userData.id === c.id);
+        const b = new T.Box3().setFromObject(m), p = new T.Vector3(b.min.x + 0.1 * (b.max.x - b.min.x), b.min.y + 0.1 * (b.max.y - b.min.y), b.max.z).project(t.camera);
+        const r = t.renderer.domElement.getBoundingClientRect();
+        return [r.left + (p.x + 1) / 2 * r.width, r.top + (1 - p.y) / 2 * r.height]; }"""
+    page.click("#as-tb-mates button[data-mate=coincident]")
+    page.check("#as-edgepick")
+    xy = page.evaluate(screen, [n - 1, "vertex", None])
+    assert xy
+    page.mouse.click(*xy)
+    page.wait_for_function("(() => { const m = window.__asm.AS.asm.mates.slice(-1)[0]; return m.a && m.a.vertex !== undefined && !m.b; })()")
+    page.uncheck("#as-edgepick")
+    page.mouse.click(*page.evaluate(centre, n - 2))
+    page.wait_for_function("(() => { const m = window.__asm.AS.asm.mates.slice(-1)[0]; return m.b && m.b.face !== undefined; })()")
+    wait_text(page, "#as-mates", "vertex (")
+    page.wait_for_function("window.__asm.AS.unsat && Object.keys(window.__asm.AS.unsat).length === 0", timeout=60000)
+    # the circular edge of the hole for a Concentric mate
+    page.click("#as-tb-mates button[data-mate=concentric]")
+    page.check("#as-edgepick")
+    xy = page.evaluate(screen, [n - 1, "edge", None])
+    assert xy
+    page.mouse.click(*xy)
+    page.wait_for_function("(() => { const m = window.__asm.AS.asm.mates.slice(-1)[0]; return m.a && m.a.edge !== undefined; })()")
+    wait_text(page, "#as-mates", "edge, circle Ø20")
+    # Tangent and Gear: mate types, labels and the gear ratio field
+    page.click("#as-tb-mates button[data-mate=gear]")
+    wait_text(page, "#as-mates", "Ratio (turns of B per turn of A)")
+    assert page.input_value("#am-ratio") == "1"
+    page.select_option("#am-type", "tangent")
+    wait_text(page, "#as-mates", "cylinder on the other side")
+    assert page.locator("#as-tb-mates button[data-mate=tangent] svg.tb-ico").count() == 1
+
+
+def test_sketch_image_scale_from_circle(page, tmp_path):
+    """Scale from circle: 3 points on a circle of 300 px radius and a diameter of 50 mm give 50 / 600 mm/px."""
+    from PIL import Image, ImageDraw
+    path = str(tmp_path / "circle.png")
+    im = Image.new("RGB", (1200, 900), (255, 255, 255))
+    ImageDraw.Draw(im).ellipse([300, 150, 900, 750], outline=(0, 0, 0), width=3)
+    im.save(path)
+    tab(page, "sketch")
+    page.click("#sk-new")
+    page.set_input_files("#sk-img-file", path)
+    page.wait_for_function("window.__sk.SK.doc.images.length === 1 && window.__sk.SK.imgSel")
+    page.click("#sk-props button[data-ia=imgcircle]")
+    page.wait_for_function("window.__sk.SK.tool === 'imgcircle'")
+    for a in (20, 140, 260):
+        _click_px(page, (600 + 300 * math.cos(math.radians(a)), 450 + 300 * math.sin(math.radians(a))))
+    page.fill("#value-dialog-input", "50")
+    page.press("#value-dialog-input", "Enter")
+    page.wait_for_function("window.__sk.SK.tool === 'select'")
+    a, b = _model_of(page, (300, 450)), _model_of(page, (900, 450))
+    assert abs(math.hypot(b[0] - a[0], b[1] - a[1]) - 50) < 0.5
+
+
+def test_sketch_circle_three_points(page):
+    """Circle 3P through the typed points (0, 0), (100, 0) and (50, 50): centre (50, 0), radius 50."""
+    tab(page, "sketch")
+    page.click("#sk-new")
+    page.click("#tab-sketch [data-tool=circle3]")
+    for xy in ("0,0", "100,0", "50,50"):
+        page.focus("#sk-canvas")
+        page.keyboard.type(xy)
+        page.keyboard.press("Enter")
+    page.wait_for_function("window.__sk.SK.doc.entities.some(e => e.t === 'circle')")
+    c = page.evaluate("window.__sk.SK.doc.entities.find(e => e.t === 'circle')")
+    assert (c["cx"], c["cy"], c["r"]) == pytest.approx((50, 0, 50), abs=1e-9)
+    assert page.locator("#tab-sketch [data-tool=circle3] svg.tb-ico").count() == 1
+
+
+def test_sketch_offset_conic_and_ellipse(page):
+    """Offset of a conic (parabola) and an ellipse: a spline whose fit points lie at the offset distance from the
+    curve; an offset larger than the radius of curvature on the concave side is refused."""
+    tab(page, "sketch")
+    page.click("#sk-new")
+    page.evaluate("""() => { const sk = window.__sk, SK = sk.SK;
+        SK.doc.entities.push({ id: "e" + SK.doc.next_id++, t: "conic", x0: 0, y0: 0, x1: 100, y1: 0, xt: 50, yt: 50, rho: 0.5, layer: "0" });
+        SK.doc.entities.push({ id: "e" + SK.doc.next_id++, t: "ellipse", cx: 200, cy: 0, rx: 40, ry: 20, rot: 0, layer: "0" });
+        sk.fit(); }""")
+    def click(xy):
+        s = page.evaluate("(p) => window.__sk.S(p)", list(xy))
+        box = page.locator("#sk-canvas svg").bounding_box()
+        page.mouse.click(box["x"] + s[0], box["y"] + s[1])
+    def offset(d, on, side):
+        page.click("#tab-sketch [data-tool=offset]")
+        page.fill("#value-dialog-input", str(d))
+        page.press("#value-dialog-input", "Enter")
+        page.wait_for_function("window.__sk.SK.tool === 'offset'")
+        click(on)
+        click(side)
+    n0 = page.evaluate("window.__sk.SK.doc.entities.length")
+    offset(5, (50, 25), (50, 40))                  # the parabola point (50, 25), offset to the convex side
+    page.wait_for_function("window.__sk.SK.doc.entities.length === %d" % (n0 + 1))
+    sp = page.evaluate("window.__sk.SK.doc.entities.slice(-1)[0]")
+    assert sp["t"] == "spline" and not sp["closed"]
+    def conic(t):
+        a, b, c = (1 - t) ** 2, 2 * t * (1 - t), t * t
+        return ((b * 50 + c * 100) / (a + b + c), (b * 50) / (a + b + c))
+    cs = [conic(i / 4000) for i in range(4001)]
+    for p in sp["pts"]:
+        d = min(math.hypot(p[0] - q[0], p[1] - q[1]) for q in cs)
+        assert abs(d - 5) < 1e-3, d
+    assert sp["pts"][len(sp["pts"]) // 2][1] > 25
+    # parabola y = x - x^2 / 100: radius of curvature 50 mm at the vertex (50, 25)
+    offset(60, (50, 25), (50, 0))
+    wait_text(page, "#sk-msg", "folds over")
+    assert page.evaluate("window.__sk.SK.doc.entities.length") == n0 + 1
+    # ellipse: closed spline at 3 mm outside
+    page.keyboard.press("Escape")
+    offset(3, (240, 0), (260, 0))
+    page.wait_for_function("window.__sk.SK.doc.entities.length === %d" % (n0 + 2))
+    sp = page.evaluate("window.__sk.SK.doc.entities.slice(-1)[0]")
+    assert sp["t"] == "spline" and sp["closed"]
+    es = [(200 + 40 * math.cos(a / 2000 * 2 * math.pi), 20 * math.sin(a / 2000 * 2 * math.pi)) for a in range(2000)]
+    for p in sp["pts"]:
+        d = min(math.hypot(p[0] - q[0], p[1] - q[1]) for q in es)
+        assert abs(d - 3) < 3e-3, d
+    assert len(sp["pts"]) <= 64
+
+
+def test_sketch_convert_all_to_conics(page):
+    """Convert to conics: polylines and a spline sampled from conics become conics (deviation below the tolerance);
+    an S-curve (inflection) is kept. With a selection, only the selected entities are converted."""
+    tab(page, "sketch")
+    page.click("#sk-new")
+    page.evaluate("""() => { const sk = window.__sk, SK = sk.SK;
+        const par = (x0, y0, k, n) => { const out = []; for (let i = 0; i <= n; i++) { const x = 100 * i / n; out.push([x0 + x, y0 + x * (100 - x) / 100 * k]); } return out; };
+        const add = (t, props) => SK.doc.entities.push(Object.assign({ id: "e" + SK.doc.next_id++, t, layer: "0" }, props));
+        add("poly", { pts: par(0, 0, 1, 40), closed: false });
+        add("poly", { pts: par(0, 50, 0.5, 30), closed: false });
+        add("poly", { pts: par(0, 100, 0.3, 30), closed: false });
+        add("spline", { pts: par(150, 0, 1, 20), closed: false });
+        const s = []; for (let i = 0; i <= 40; i++) { const x = 100 * i / 40; s.push([150 + x, 100 + 20 * Math.sin(x / 100 * 2 * Math.PI)]); }
+        add("poly", { pts: s, closed: false });
+        sk.fit(); sk.SK.sel.clear(); }""")
+    page.click("#sk-check")
+    wait_text(page, "#sk-props", "Convert 5 to conics")
+    page.click("#skp-convconic")
+    page.wait_for_function("window.__sk.SK.doc.entities.filter(e => e.t === 'conic').length === 4", timeout=60000)
+    wait_text(page, "#sk-msg", "4 converted to conics; 1 kept")
+    ts = page.evaluate("window.__sk.SK.doc.entities.map(e => e.t)")
+    assert ts.count("poly") == 1 and ts.count("spline") == 0
+    # selection: one of two polylines
+    page.evaluate("""() => { const sk = window.__sk, SK = sk.SK;
+        const pts = []; for (let i = 0; i <= 20; i++) { const x = 100 * i / 20; pts.push([x, 200 + x * (100 - x) / 100]); }
+        SK.doc.entities.push({ id: "e" + SK.doc.next_id++, t: "poly", layer: "0", pts, closed: false });
+        SK.doc.entities.push({ id: "e" + SK.doc.next_id++, t: "poly", layer: "0", pts: pts.map(p => [p[0], p[1] + 50]), closed: false });
+        const conic = SK.doc.entities.find(e => e.t === "conic");
+        SK.sel.clear(); SK.sel.add("e:" + SK.doc.entities[SK.doc.entities.length - 1].id); SK.sel.add("e:" + conic.id); sk.fit(); }""")
+    page.evaluate("window.__sk.showProps()")
+    wait_text(page, "#sk-props", "Convert 1 to conics")
+    page.click("#skp-convconic")
+    page.wait_for_function("window.__sk.SK.doc.entities.filter(e => e.t === 'conic').length === 5", timeout=60000)
+    assert page.evaluate("window.__sk.SK.doc.entities.filter(e => e.t === 'poly').length") == 2
+    page.focus("#sk-canvas")
+    page.keyboard.press("Control+z")
+    page.wait_for_function("window.__sk.SK.doc.entities.filter(e => e.t === 'conic').length === 4")
+
+
+def test_sketch_fillet_automatic_radius_drag_and_dimension(page):
+    """Fillet without a radius: on a 100 x 60 rectangle, clicks at (92, 0) and (100, 12) give R8 (the fillet starts at
+    the click nearer to the corner); the arc dragged to another radius stays tangent and the lines stay on their
+    lines (the other lines of the rectangle do not move); a radius dimension then sets R5 with the lines in place and
+    its leader scaled with the radius."""
+    tab(page, "sketch")
+    page.click("#sk-new")
+    page.keyboard.press("w")
+    page.keyboard.type("0,0")
+    page.keyboard.press("Enter")
+    page.keyboard.type("100,60")
+    page.keyboard.press("Enter")
+    page.keyboard.press("Escape")
+    def click(xy):
+        s = page.evaluate("(p) => window.__sk.S(p)", list(xy))
+        box = page.locator("#sk-canvas svg").bounding_box()
+        page.mouse.click(box["x"] + s[0], box["y"] + s[1])
+    # zoom in about the corner (100, 0)
+    s = page.evaluate("(p) => window.__sk.S(p)", [100, 0])
+    box = page.locator("#sk-canvas svg").bounding_box()
+    page.mouse.move(box["x"] + s[0], box["y"] + s[1])
+    for _ in range(12):
+        page.mouse.wheel(0, -100)
+    page.wait_for_function("window.__sk.SK.view.s > 8")
+    page.wait_for_timeout(300)
+    page.click("#tab-sketch [data-tool=fillet]")
+    assert page.is_hidden("#value-dialog")
+    wait_text(page, "#sk-hint", "radius automatic")
+    click((92, 0))
+    click((100, 12))
+    page.wait_for_function("window.__sk.SK.doc.entities.some(e => e.t === 'arc')")
+    wait_text(page, "#sk-msg", "Fillet R8 (automatic)")
+    arc = lambda: page.evaluate("window.__sk.SK.doc.entities.find(e => e.t === 'arc')")
+    lines = lambda: page.evaluate("window.__sk.SK.doc.entities.filter(e => e.t === 'line' && !e.constr).map(e => [e.x1, e.y1, e.x2, e.y2])")
+    a = arc()
+    assert a["r"] == pytest.approx(8) and (a["cx"], a["cy"]) == pytest.approx((92, 8))
+    before = lines()
+    # drag the arc: the radius changes; the bottom and right lines stay on their lines, the others do not move
+    page.keyboard.press("Escape")
+    m = (92 + 8 * math.cos(math.radians(-45)), 8 + 8 * math.sin(math.radians(-45)))
+    s = page.evaluate("(p) => window.__sk.S(p)", list(m))
+    t = page.evaluate("(p) => window.__sk.S(p)", [m[0] - 2, m[1] + 2])
+    box = page.locator("#sk-canvas svg").bounding_box()
+    page.mouse.move(box["x"] + s[0], box["y"] + s[1])
+    page.mouse.down()
+    page.mouse.move(box["x"] + t[0], box["y"] + t[1], steps=5)
+    page.mouse.up()
+    a = arc()
+    # the arc passes through the release point (within a screen pixel)
+    q = (m[0] - 2, m[1] + 2)
+    assert math.hypot(a["cx"] - q[0], a["cy"] - q[1]) == pytest.approx(a["r"], abs=0.15)
+    assert a["r"] > 12
+    after = lines()
+    for l0, l1 in zip(before, after):
+        if abs(l0[1]) < 1e-9 and abs(l0[3]) < 1e-9:          # bottom line: on y = 0, its start in place
+            assert l1[1] == pytest.approx(0, abs=1e-6) and l1[3] == pytest.approx(0, abs=1e-6) and l1[0] == pytest.approx(0, abs=1e-6)
+        elif abs(l0[0] - 100) < 1e-9 and abs(l0[2] - 100) < 1e-9:   # right line: on x = 100, its top end in place
+            assert l1[0] == pytest.approx(100, abs=1e-6) and l1[2] == pytest.approx(100, abs=1e-6) and l1[3] == pytest.approx(60, abs=1e-6)
+        else:
+            assert l1 == pytest.approx(l0, abs=1e-6)
+    assert (a["cy"], 100 - a["cx"]) == pytest.approx((a["r"], a["r"]), abs=1e-6)
+    # radius dimension on the arc: driving, value 5
+    page.click("#tab-sketch [data-tool=dim]")
+    click((a["cx"] + a["r"] * math.cos(math.radians(-25)), a["cy"] + a["r"] * math.sin(math.radians(-25))))   # off the mid point grip
+    click((a["cx"] - 15, a["cy"] + 15))
+    page.wait_for_selector("#sk-canvas .sk-inline")
+    off0 = page.evaluate("window.__sk.SK.doc.dims[0].off")
+    r0 = arc()["r"]
+    page.fill("#sk-canvas .sk-inline", "5")
+    page.press("#sk-canvas .sk-inline", "Enter")
+    page.wait_for_function("Math.abs(window.__sk.SK.doc.entities.find(e => e.t === 'arc').r - 5) < 1e-6")
+    a = arc()
+    assert (a["cx"], a["cy"]) == pytest.approx((95, 5), abs=1e-6)       # the lines did not move
+    # the dimension leader scaled with the radius (first value)
+    off1 = page.evaluate("window.__sk.SK.doc.dims[0].off")
+    assert off1 == pytest.approx([v * 5 / r0 for v in off0], abs=1e-6)
+
+
+def test_sketch_trim_by_sweep(page):
+    """Trim with the button held: moving along y = 10 over three vertical lines removes their parts above the
+    horizontal line y = 0; one undo restores them."""
+    tab(page, "sketch")
+    page.click("#sk-new")
+    page.evaluate("""() => { const sk = window.__sk, SK = sk.SK;
+        const add = p => SK.doc.entities.push(Object.assign({ id: "e" + SK.doc.next_id++, t: "line", layer: "0" }, p));
+        add({ x1: 0, y1: 0, x2: 100, y2: 0 });
+        for (const x of [25, 50, 75]) add({ x1: x, y1: -20, x2: x, y2: 20 });
+        sk.fit(); }""")
+    page.click("#tab-sketch [data-tool=trim]")
+    box = page.locator("#sk-canvas svg").bounding_box()
+    sc = lambda p: page.evaluate("(p) => window.__sk.S(p)", list(p))
+    s0 = sc((10, 10))
+    page.mouse.move(box["x"] + s0[0], box["y"] + s0[1])
+    page.mouse.down()
+    for k in range(1, 41):
+        q = sc((10 + 2 * k, 10))
+        page.mouse.move(box["x"] + q[0], box["y"] + q[1])
+    page.mouse.up()
+    wait_text(page, "#sk-msg", "3 parts trimmed")
+    v = page.evaluate("window.__sk.SK.doc.entities.filter(e => e.t === 'line' && Math.abs(e.x1 - e.x2) < 1e-9).map(e => Math.max(e.y1, e.y2))")
+    assert sorted(v) == pytest.approx([0, 0, 0], abs=1e-9)
+    page.focus("#sk-canvas")
+    page.keyboard.press("Control+z")
+    page.wait_for_function("window.__sk.SK.doc.entities.filter(e => e.t === 'line' && Math.abs(e.x1 - e.x2) < 1e-9 && Math.max(e.y1, e.y2) > 19).length === 3")

@@ -15,9 +15,11 @@ import traceback
 import uuid
 import zipfile
 
+import numpy as np
+
 from flask import Flask, jsonify, request, send_file, send_from_directory
 
-from . import analysis, assembly, dialogs, drawing, fcstd, fea, fits, measure, model, part, render, sketch, units
+from . import analysis, assembly, dialogs, drawing, fcstd, fea, fits, measure, model, part, render, sketch, sketchimage, units
 from . import titleblock as tbk
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -55,9 +57,23 @@ LOCK = threading.Lock()
 
 # --------------------------------------------------------------------------- helpers
 
+# settings of this PC: config.local.json next to config.json (not in the repository); the other settings (sheet, views,
+# title block, options) stay in config.json
+LOCAL_PATH = os.path.splitext(CONFIG_PATH)[0] + ".local.json"
+LOCAL_KEYS = ("projects_root", "current_project", "explicit", "browser", "ccx_path")
+
+
 def load_config():
+    """config.json with the settings of this PC from config.local.json."""
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        cfg = json.load(f)
+    try:
+        with open(LOCAL_PATH, "r", encoding="utf-8") as f:
+            loc = json.load(f)
+    except (OSError, ValueError):
+        loc = {}
+    cfg.update({k: v for k, v in loc.items() if k in LOCAL_KEYS})
+    return cfg
 
 
 def _tmp_ext():
@@ -78,10 +94,27 @@ def _replace(tmp, path):
 
 
 def save_config(cfg):
-    tmp = CONFIG_PATH + _tmp_ext()
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-    _replace(tmp, CONFIG_PATH)
+    """Writes the settings of this PC (LOCAL_KEYS) to config.local.json and the others to config.json."""
+    for path, part in ((CONFIG_PATH, {k: v for k, v in cfg.items() if k not in LOCAL_KEYS}),
+                       (LOCAL_PATH, {k: cfg[k] for k in LOCAL_KEYS if k in cfg})):
+        tmp = path + _tmp_ext()
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(part, f, indent=2)
+        _replace(tmp, path)
+
+
+def _split_config():
+    """Moves settings of this PC that an older version wrote to config.json into config.local.json."""
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return
+    if any(k in raw for k in LOCAL_KEYS):
+        save_config(load_config() if os.path.isfile(LOCAL_PATH) else raw)
+
+
+_split_config()
 
 
 def safe_name(s):
@@ -574,7 +607,8 @@ def dialog():
     filt = (req.get("filter") or "").lower()
     pats = {"step": [("STEP files", "*.step *.stp"), ("All files", "*.*")],
             "dxf": [("DXF files", "*.dxf"), ("All files", "*.*")],
-            "inp": [("Abaqus input", "*.inp"), ("All files", "*.*")]}.get(filt, [("All files", "*.*")])
+            "inp": [("Abaqus input", "*.inp"), ("All files", "*.*")],
+            "image": [("Images", "*.png *.jpg *.jpeg *.gif *.webp *.bmp *.tif *.tiff"), ("All files", "*.*")]}.get(filt, [("All files", "*.*")])
     try:
         path = dialogs.ask(req.get("kind") or "open", req.get("title") or "", req.get("initial") or "", pats, req.get("save_name") or "")
     except Exception as e:
@@ -898,6 +932,117 @@ def sketch_put(name):
         json.dump(sk, f)
     _replace(tmp, _sketch_path(name))
     return jsonify({"ok": True, "path": _sketch_path(name)})
+
+
+# --------------------------------------------------------------------------- reference images of sketches
+
+def _img_dir():
+    return sketchimage.images_dir(os.fspath(SKETCH_DIR))
+
+
+def _img_path(fname):
+    path = sketchimage.find(_img_dir(), fname)
+    if not path:
+        raise FileNotFoundError("image not found: %s (folder %s)" % (fname, _img_dir()))
+    return path
+
+
+@app.route("/api/sketch/image", methods=["POST"])
+def sketch_image_import():
+    """Copies an image file (upload or path on this PC) to the images folder of the sketches."""
+    try:
+        if request.files:
+            fs = request.files.get("file")
+            name = os.path.basename(fs.filename or "image.png")
+            d = os.path.join(WORK_DIR, uuid.uuid4().hex[:8])
+            os.makedirs(d)
+            src = os.path.join(d, safe_name(name))
+            fs.save(src)
+        else:
+            src = (request.get_json(force=True).get("path") or "").strip().strip('"')
+            if not os.path.isfile(src):
+                return error("file not found: %s" % src)
+            name = os.path.basename(src)
+        fname, w, h = sketchimage.store(src, name, _img_dir())
+        return jsonify({"file": fname, "name": os.path.splitext(name)[0], "w": w, "h": h,
+                        "path": os.path.join(_img_dir(), fname)})
+    except ValueError as e:
+        return error(str(e))
+    except Exception as e:
+        traceback.print_exc()
+        return error("image import failed: %s" % e, 500)
+
+
+@app.route("/api/sketch/image/file/<path:fname>", methods=["GET"])
+def sketch_image_file(fname):
+    try:
+        return send_file(_img_path(fname), max_age=3600)
+    except FileNotFoundError as e:
+        return error(str(e), 404)
+
+
+@app.route("/api/sketch/image/lens", methods=["POST"])
+def sketch_image_lens():
+    """Radial lens coefficient k1 from lines of image pixels that are straight on the object."""
+    req = request.get_json(force=True) or {}
+    try:
+        w, h = sketchimage.image_size(_img_path(req.get("file")))
+        r = sketchimage.fit_k1(req.get("lines") or [], w, h)
+        r["bounds"] = sketchimage.lens_bounds(r["k1"], w, h)
+        return jsonify(r)
+    except FileNotFoundError as e:
+        return error(str(e), 404)
+    except (ValueError, np.linalg.LinAlgError) as e:
+        return error("lens correction: %s" % e)
+
+
+@app.route("/api/sketch/image/perspective", methods=["POST"])
+def sketch_image_perspective():
+    """Homography from the 4 picked corners (lens-corrected pixels) of a rectangle of known size."""
+    req = request.get_json(force=True) or {}
+    try:
+        w, h = sketchimage.image_size(_img_path(req.get("file")))
+        k1 = float(req.get("k1") or 0)
+        return jsonify(sketchimage.perspective(req.get("pts") or [], float(req.get("width") or 0),
+                                               float(req.get("height") or 0), sketchimage.lens_bounds(k1, w, h)))
+    except FileNotFoundError as e:
+        return error(str(e), 404)
+    except (ValueError, TypeError, np.linalg.LinAlgError) as e:
+        return error("perspective correction: %s" % e)
+
+
+@app.route("/api/sketch/image/fit", methods=["POST"])
+def sketch_image_fit():
+    """Homography from control points: lens-corrected pixels and their sketch points (at least 4 pairs)."""
+    req = request.get_json(force=True) or {}
+    try:
+        w, h = sketchimage.image_size(_img_path(req.get("file")))
+        k1 = float(req.get("k1") or 0)
+        return jsonify(sketchimage.fit_points(req.get("src") or [], req.get("dst") or [], sketchimage.lens_bounds(k1, w, h)))
+    except FileNotFoundError as e:
+        return error(str(e), 404)
+    except (ValueError, TypeError, np.linalg.LinAlgError) as e:
+        return error("control points: %s" % e)
+
+
+@app.route("/api/sketch/image/render", methods=["POST"])
+def sketch_image_render():
+    """Corrected image file of {file, k1, H, out}; an existing file of the same parameters is used again."""
+    req = request.get_json(force=True) or {}
+    try:
+        src = _img_path(req.get("file"))
+        k1, H, out = float(req.get("k1") or 0), req.get("H"), req.get("out")
+        if not H or not out:
+            return error("H and out are required")
+        name = sketchimage.corrected_name(os.path.basename(src), k1, H, out)
+        dst = os.path.join(_img_dir(), name)
+        if not os.path.isfile(dst):
+            sketchimage.render(src, k1, H, out, dst)
+        return jsonify({"file": name})
+    except FileNotFoundError as e:
+        return error(str(e), 404)
+    except (ValueError, TypeError, np.linalg.LinAlgError) as e:
+        return error("corrected image: %s" % e)
 
 
 @app.route("/api/sketch/sheet", methods=["POST"])
@@ -1579,7 +1724,7 @@ def asm_check():
     for c in asm.get("components") or []:
         e = src.info(c.get("source") or {})
         refs[c["id"]] = e.get("refs")
-        datums[c["id"]] = e.get("datums")
+        datums[c["id"]] = dict(e.get("datums") or {}, **assembly.geo_refs(e))
     try:
         return jsonify(assembly.mate_report(asm, lambda cid: refs.get(cid), lambda cid: datums.get(cid)))
     except Exception as e:
@@ -1597,7 +1742,7 @@ def asm_solve():
     for c in asm.get("components") or []:
         e = src.info(c.get("source") or {})
         refs[c["id"]] = e.get("refs")
-        datums[c["id"]] = e.get("datums")
+        datums[c["id"]] = dict(e.get("datums") or {}, **assembly.geo_refs(e))
     try:
         detail = {}
         out, nr, msgs = assembly.solve_mates(asm, lambda cid: refs.get(cid), lambda cid: datums.get(cid), detail,

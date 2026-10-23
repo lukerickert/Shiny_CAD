@@ -70,7 +70,7 @@ First use
    (title block layout, logo, line widths, text heights; Save title block writes config.json).
 3. Analysis tab, Settings: the line below Solver (ccx) gives the CalculiX executable in use.
 4. Explicit tab, Solve panel: the line below the fields gives the OpenCourant executables
-   found. Settings of this PC are written to config.json > explicit.
+   found. Settings of this PC are written to config.local.json > explicit.
    Without that entry the ORC3 configuration %APPDATA%\ORC3\workspace_config.json is read.
 
 Command line options (run.py, through the environment):
@@ -89,8 +89,10 @@ Package contents
 ----------------
 start.bat, run.py          start of the program
 requirements.txt           Python packages
-config.json                settings and title block (without the projects folder, the open
-                           project and the Explicit settings of the PC it was taken from)
+config.json                settings and title block
+config.local.json          settings of this PC (projects folder, open project, Explicit settings,
+                           browser, CalculiX path); created at the first change, not in the package
+publish.bat                commit and push of the program folder to GitHub (README section 2.2)
 logo.png                   logo of the title block
 README.md                  full manual
 SHINYCAD_functions.png     overview of the functions

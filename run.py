@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """Starts SHINYCAD at http://localhost:<port> and opens the browser: the system default, or the command in
-config.json "browser" (Options dialog, or --browser): an executable path, optionally with {url} where the address goes,
+config.local.json "browser" (Options dialog, or --browser): an executable path, optionally with {url} where the address goes,
 for example "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe" --app={url}."""
 import argparse
 import atexit
@@ -31,6 +31,11 @@ def main():
     here = os.path.dirname(os.path.abspath(__file__))
     with open(os.path.join(here, "config.json"), "r", encoding="utf-8") as f:
         cfg = json.load(f)
+    try:                                   # settings of this PC (browser command)
+        with open(os.path.join(here, "config.local.json"), "r", encoding="utf-8") as f:
+            cfg.update(json.load(f))
+    except (OSError, ValueError):
+        pass
     port = int(cfg.get("port", 8765))
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=port)

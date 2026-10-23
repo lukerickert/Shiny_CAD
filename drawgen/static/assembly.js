@@ -10,7 +10,8 @@ const AS = { asm: null, sel: null, dirty: false, three: null, seq: 0, timer: nul
              dragMode: false,  // Drag: left drag moves unmated, unfixed components
              drag: null };     // {cid, plane, start, delta, objs} during a drag
 const MATE_TYPES = { coincident: "Coincident (faces)", distance: "Distance (faces)", parallel: "Parallel (faces)",
-                     angle: "Angle (faces)", concentric: "Concentric (cylinders)", point: "Point (face centres)" };
+                     angle: "Angle (faces)", concentric: "Concentric (cylinders)", point: "Point (face centres)",
+                     tangent: "Tangent (plane, cylinders)", gear: "Gear (rotation ratio)" };
 const aesc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 const afmt = (v, d = 3) => { let s = Number(v).toFixed(d).replace(/\.?0+$/, ""); return s === "-0" || s === "" ? "0" : s; };
 const PALETTE = ["#9aa7b5", "#c98a4a", "#5b8fc9", "#7bb06a", "#b86a9a", "#c9b24a", "#6ab0b0", "#a07a5a"];
@@ -195,15 +196,28 @@ function dragBlock(c) {
   return c.fixed ? "fixed" : null;
 }
 
+/** Local reference of a mate side: a face, a reference plane or axis, an edge or a vertex of the component. */
+function sideRef(sd, rc) {
+  if (!sd || !rc) return null;
+  if (sd.datum) return (rc.datums || {})[sd.datum];
+  if (sd.edge !== undefined && sd.edge !== null) return (rc.erefs || [])[sd.edge];
+  if (sd.vertex !== undefined && sd.vertex !== null) return (rc.vrefs || [])[sd.vertex];
+  return (rc.refs || [])[sd.face];
+}
+function sideOf(h) {
+  return h.datum ? { comp: h.comp, datum: h.datum } : h.edge !== undefined ? { comp: h.comp, edge: h.edge }
+    : h.vertex !== undefined ? { comp: h.comp, vertex: h.vertex } : { comp: h.comp, face: h.face };
+}
 /** Reference of a mate side in world coordinates: {kind, c, p, n} (THREE vectors), or null. */
 function worldRef(sd) {
   const live = comp(sd.comp), rc = AS.result && AS.result.components.find(x => x.id === sd.comp);
   if (!live || !rc) return null;
-  const r = sd.datum ? (rc.datums || {})[sd.datum] : (rc.refs || [])[sd.face];
+  const r = sideRef(sd, rc);
   if (!r || !r.c) return null;
   const M = compMatrix(live);
   const pt = q => new THREE.Vector3(...q).applyMatrix4(M);
-  return { kind: r.kind, c: pt(r.c), p: pt(r.p || r.c), n: r.n ? new THREE.Vector3(...r.n).transformDirection(M) : null };
+  const kind = r.kind === "line" ? "axis" : r.kind === "circle" ? "cylinder" : r.kind;
+  return { kind, r: r.r, c: pt(r.c), p: pt(r.p || r.c), n: r.n ? new THREE.Vector3(...r.n).transformDirection(M) : null };
 }
 
 /** Components connected to cid by active mates (cid included) and whether one of them is fixed. A group without a
@@ -239,6 +253,12 @@ function lockedDirs(cid) {
     if (m.suppressed || !m.a || !m.b || (m.a.comp !== cid && m.b.comp !== cid) || m.a.comp === m.b.comp) continue;
     const A = worldRef(m.a), B = worldRef(m.b), t = m.type;
     if (!A || !B) continue;
+    if (t === "gear" || !A.n || !B.n) { if (t === "point") dirs.push(new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0, 1)); continue; }
+    if (t === "tangent") {
+      if (A.kind === "plane" || B.kind === "plane") dirs.push((A.kind === "plane" ? A : B).n.clone());
+      else { const d = B.p.clone().sub(A.p); d.addScaledVector(B.n, -d.dot(B.n)); if (d.length() > 1e-9) dirs.push(d.normalize()); }
+      continue;
+    }
     if (t === "point") dirs.push(new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0, 1));
     else if (t === "concentric") { if (B.n) dirs.push(...perp2(B.n)); }
     else if ((A.kind === "axis" || B.kind === "axis") && (t === "coincident" || t === "distance")) {
@@ -287,8 +307,10 @@ function rotAxis(cid) {
   for (const m of AS.asm.mates || []) {
     if (m.suppressed || !m.a || !m.b || (m.a.comp !== cid && m.b.comp !== cid) || m.a.comp === m.b.comp) continue;
     const own = worldRef(m.a.comp === cid ? m.a : m.b), other = worldRef(m.a.comp === cid ? m.b : m.a), t = m.type;
-    if (!own || !other) continue;
+    if (!own || !other || t === "gear") continue;
     if (t === "point") { pivotPoint = other.c; continue; }
+    if (!own.n || !other.n) continue;
+    if (t === "tangent") { use(own.kind === "plane" ? own.n : other.kind === "plane" ? other.n : other.n); continue; }
     if (t === "concentric" || (line(own.kind) && line(other.kind) && (own.kind === "axis" || other.kind === "axis"))) {
       use(other.n);
       if (t === "concentric" || t === "coincident") pivotLine = { p: other.p, d: other.n.clone().normalize() };
@@ -330,7 +352,7 @@ function dragHover(e) {
   if (!AS.drag && !e.buttons && pickSide() && AS.result) {
     const cid = compAt(e);
     if (cid) showPlanesOf(cid);
-    const h = mateHitAt(e), ps = pickSide();
+    const h = mateHitAt(e, true), ps = pickSide();
     const txt = mateHitText(h);
     AS.three.renderer.domElement.style.cursor = h ? (h.ref && h.ref.kind === "other" ? "not-allowed" : "crosshair") : "";
     if (txt) status(ps.side.toUpperCase() + ": " + txt + (h.ref && h.ref.kind === "other" ? "" : " (click to use)"));
@@ -548,11 +570,12 @@ function compAt(e) {
 
 /** What a click would pick for a mate side: {comp, face, ref} for a planar or cylindrical face, {comp, datum, name}
  *  for a reference plane or axis of a component (axes within 6 px first, planes only off the parts), or null. */
-function mateHitAt(e) {
+function mateHitAt(e, geo) {
   const t = AS.three;
   const rc = rayAt(e);
   const r = t.renderer.domElement.getBoundingClientRect();
   const px = (t.camera.right - t.camera.left) / t.camera.zoom / r.width;
+  if (geo && $("#as-edgepick") && $("#as-edgepick").checked) { const g = geoHitAt(e, rc); if (g) return g; }
   rc.params.Line.threshold = px * 6;
   const dh = rc.intersectObjects((t.datumPickables || []).filter(o => o.visible), false);
   const axis = dh.find(h => h.object.isLine);
@@ -570,9 +593,61 @@ function mateHitAt(e) {
   return plane ? { comp: plane.object.userData.cid, datum: plane.object.userData.datum, name: plane.object.userData.name } : null;
 }
 
+/** Vertex within 8 px or edge within 5 px of the cursor on the visible side of the components (Edges and vertices
+ *  checked): {comp, vertex, ref} or {comp, edge, ref}. */
+function geoHitAt(e, rc) {
+  const t = AS.three, r = t.renderer.domElement.getBoundingClientRect();
+  const sx = e.clientX - r.left, sy = e.clientY - r.top;
+  const scr = v => { const q = v.clone().project(t.camera); return [(q.x + 1) / 2 * r.width, (1 - q.y) / 2 * r.height, q.z]; };
+  const front = pickHits(rc);
+  const depth = front.length ? front[0].distance : Infinity;
+  const visible = w => rc.ray.origin.distanceTo(w) <= depth + 1e-3 * Math.max(1, depth) || !isFinite(depth) ||
+    Math.abs(new THREE.Vector3().subVectors(w, rc.ray.origin).dot(rc.ray.direction) - depth) < (AS.bbox ? 1e-3 * Math.hypot(AS.bbox[3] - AS.bbox[0], AS.bbox[4] - AS.bbox[1], AS.bbox[5] - AS.bbox[2]) : 0.01);
+  let best = null, bd = 8;
+  for (const c of (AS.result && AS.result.components) || []) {
+    const live = comp(c.id);
+    if (!live || live.visible === false || !c.mesh) continue;
+    const M = compMatrix(live);
+    (c.vrefs || []).forEach((v, i) => {
+      const w = new THREE.Vector3(...v.c).applyMatrix4(M), s = scr(w);
+      const d = Math.hypot(s[0] - sx, s[1] - sy);
+      if (d < bd && visible(w)) { bd = d; best = { comp: c.id, vertex: i, ref: v }; }
+    });
+  }
+  if (best) return best;
+  bd = 5;
+  for (const c of (AS.result && AS.result.components) || []) {
+    const live = comp(c.id);
+    if (!live || live.visible === false || !c.mesh || !c.mesh.edge_ids) continue;
+    const M = compMatrix(live);
+    c.mesh.edges.forEach((pl, k) => {
+      const ei = c.mesh.edge_ids[k];
+      for (let j = 0; j + 1 < pl.length; j++) {
+        const a = new THREE.Vector3(...pl[j]).applyMatrix4(M), b = new THREE.Vector3(...pl[j + 1]).applyMatrix4(M);
+        const sa = scr(a), sb = scr(b);
+        const dx = sb[0] - sa[0], dy = sb[1] - sa[1], L2 = dx * dx + dy * dy;
+        const u = L2 > 0 ? Math.max(0, Math.min(1, ((sx - sa[0]) * dx + (sy - sa[1]) * dy) / L2)) : 0;
+        const d = Math.hypot(sa[0] + u * dx - sx, sa[1] + u * dy - sy);
+        if (d < bd && visible(a.clone().lerp(b, u))) { bd = d; best = { comp: c.id, edge: ei, ref: (c.erefs || [])[ei] }; }
+      }
+    });
+  }
+  return best && best.ref ? best : null;
+}
+
+function refText(r) {
+  if (!r) return "?";
+  if (r.kind === "point") return "vertex (" + r.c.map(v => afmt(v, 2)).join(", ") + ")";
+  if (r.kind === "line") return "edge, line " + afmt(r.len, 2) + " mm";
+  if (r.kind === "circle") return "edge, circle Ø" + afmt(2 * r.r, 2);
+  if (r.kind === "edge") return "edge, curve " + afmt(r.len, 2) + " mm (Point mate only)";
+  return r.kind + (r.r ? " Ø" + afmt(2 * r.r, 2) : "");
+}
+
 function mateHitText(h) {
   if (!h) return "";
   if (h.datum) return compName(h.comp) + " : " + h.name;
+  if (h.edge !== undefined || h.vertex !== undefined) return compName(h.comp) + " : " + refText(h.ref);
   return compName(h.comp) + " : " + (h.ref.kind === "other" ? "face (not planar or cylindrical)" : h.ref.kind + (h.ref.r ? " Ø" + afmt(2 * h.ref.r, 2) : ""));
 }
 
@@ -589,12 +664,13 @@ function pickComponent(e) {
   if (AS.measure) { measureClick(e); return; }
   const ps = pickSide();
   if (ps) {
-    const h = mateHitAt(e);
+    const h = mateHitAt(e, true);
     if (!h) return;
     if (h.ref && h.ref.kind === "other") return msg("This face is not planar or cylindrical", true);
     const m = mate(ps.mateId);
     if (!m) { AS.matePick = null; return; }
-    m[ps.side] = h.datum ? { comp: h.comp, datum: h.datum } : { comp: h.comp, face: h.face };
+    m[ps.side] = sideOf(h);
+    if (m.type === "gear" && m.a && m.b) setGearRef(m);
     if (ps.side === "a" && !m.b) AS.matePick = { mateId: m.id, side: "b" };
     else AS.matePick = null;
     AS.dirty = true;
@@ -643,13 +719,13 @@ function takeMeshes(res) {
   for (const c of res.components) if (c.mkey && c.mesh) {
     const old = MESHES.get(c.mkey);
     if (old && old.geo) { old.geo.dispose(); old.edgeGeo.dispose(); }
-    MESHES.set(c.mkey, { mesh: c.mesh, refs: c.refs || [], datums: c.datums || {} });
+    MESHES.set(c.mkey, { mesh: c.mesh, refs: c.refs || [], datums: c.datums || {}, erefs: c.erefs || [], vrefs: c.vrefs || [] });
   }
   const used = new Set();
   let missing = false;
   for (const c of res.components) if (c.mkey) {
     const e = MESHES.get(c.mkey);
-    if (e) { c.mesh = e.mesh; c.refs = e.refs; c.datums = e.datums; used.add(c.mkey); }
+    if (e) { c.mesh = e.mesh; c.refs = e.refs; c.datums = e.datums; c.erefs = e.erefs; c.vrefs = e.vrefs; used.add(c.mkey); }
     else { c.error = c.error || "mesh missing"; missing = true; }
   }
   if (missing) scheduleBuild();                       // a mesh was dropped while the request was under way
@@ -737,6 +813,23 @@ function setMeshes(res) {
       const lm = new THREE.LineBasicMaterial({ color: lc, transparent: disp === "transparent", opacity: disp === "transparent" ? 0.7 : 1 });
       inner.add(new THREE.LineSegments(e.edgeGeo, lm));
       t.clipMats.push(lm);
+    }
+    // edges and vertices of the selected mate (orange)
+    if (selM) for (const side of ["a", "b"]) {
+      const sd = selM[side];
+      if (!sd || sd.comp !== c.id) continue;
+      if (sd.edge !== undefined && sd.edge !== null && m.edge_ids) {
+        const pos = [];
+        m.edges.forEach((pl, k) => { if (m.edge_ids[k] === sd.edge) for (let j = 0; j + 1 < pl.length; j++) pos.push(...pl[j], ...pl[j + 1]); });
+        if (pos.length) {
+          const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3)); t.tempGeo.push(g);
+          const lm = new THREE.LineBasicMaterial({ color: 0xe8590c, depthTest: false }); const ls = new THREE.LineSegments(g, lm); ls.renderOrder = 5; inner.add(ls);
+        }
+      }
+      if (sd.vertex !== undefined && sd.vertex !== null && (c.vrefs || [])[sd.vertex]) {
+        const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.Float32BufferAttribute(c.vrefs[sd.vertex].c, 3)); t.tempGeo.push(g);
+        const pm = new THREE.Points(g, new THREE.PointsMaterial({ color: 0xe8590c, size: 9, sizeAttenuation: false, depthTest: false })); pm.renderOrder = 5; inner.add(pm);
+      }
     }
     // reference planes and axes: of the selected mate (orange), of the selected component with Datums (purple)
     const ds = c.datums || {};
@@ -1190,7 +1283,7 @@ function sideHtml(m, side) {
   const U = side.toUpperCase();
   return `<p class="hint" style="margin:6px 0 2px">${U}: ${aesc(faceText(sd))} <button type="button" class="small" id="am-p${side}" style="margin-left:4px" title="Click a face in the 3D view">Pick</button></p>` +
     `<div class="grid2"><label>Component<select id="am-c${side}">${AS.asm.components.map(c => `<option value="${aesc(c.id)}"${c.id === cid ? " selected" : ""}>${aesc(c.name)}</option>`).join("")}</select></label>` +
-    `<label>Plane or axis<select id="am-d${side}"><option value="">${sd && !sd.datum && sd.face !== undefined && sd.face !== null ? "(picked face)" : "(face: Pick)"}</option>` +
+    `<label>Plane or axis<select id="am-d${side}"><option value="">${sd && !sd.datum ? (sd.edge !== undefined && sd.edge !== null ? "(picked edge)" : sd.vertex !== undefined && sd.vertex !== null ? "(picked vertex)" : sd.face !== undefined && sd.face !== null ? "(picked face)" : "(face: Pick)") : "(face: Pick)"}</option>` +
     Object.entries(ds).map(([k, d]) => `<option value="${aesc(k)}"${sd && sd.datum === k ? " selected" : ""}>${aesc(d.name)}</option>`).join("") + `</select></label></div>`;
 }
 
@@ -1199,9 +1292,15 @@ function sideHtml(m, side) {
  *  (outward normals opposite: the faces touch); a concentric mate and reference planes and axes take the current
  *  direction. */
 function autoFlip(m) {
-  if (!m || !m.a || !m.b || m.flipSet || !["coincident", "distance", "parallel", "concentric"].includes(m.type)) return;
+  if (!m || !m.a || !m.b || m.flipSet || !["coincident", "distance", "parallel", "concentric", "tangent"].includes(m.type)) return;
   const A = worldRef(m.a), B = worldRef(m.b);
   if (!A || !B || !A.n || !B.n) return;
+  if (m.type === "tangent") {           // the cylinder stays on its side of the plane; a cylinder inside the other stays inside
+    if (A.kind === "plane" && B.kind === "cylinder") m.flip = B.p.clone().sub(A.c).dot(A.n) < 0;
+    else if (B.kind === "plane" && A.kind === "cylinder") m.flip = A.p.clone().sub(B.c).dot(B.n) < 0;
+    else if (A.r && B.r) { const d = B.p.clone().sub(A.p); d.addScaledVector(A.n, -d.dot(A.n)); m.flip = d.length() < Math.max(A.r, B.r); }
+    return;
+  }
   const line = k => k === "axis" || k === "cylinder";
   if ((A.kind === "plane") !== (B.kind === "plane") && (line(A.kind) || line(B.kind)) && m.type !== "concentric") return;   // plane with axis: no direction
   const faces = !m.a.datum && !m.b.datum && A.kind === "plane" && B.kind === "plane";
@@ -1216,7 +1315,7 @@ function applyFlipped(ids) {
 
 function bindSide(m, side) {
   const cs = $("#am-c" + side), dsel = $("#am-d" + side);
-  const apply = () => { AS.dirty = true; AS.matePick = null; autoFlip(m); renderMates(); setMeshes(AS.result); if (m.a && m.b) solveMates(); };
+  const apply = () => { AS.dirty = true; AS.matePick = null; if (m.type === "gear" && m.a && m.b) setGearRef(m); autoFlip(m); renderMates(); setMeshes(AS.result); if (m.a && m.b) solveMates(); };
   cs.onchange = () => {
     const cid = cs.value, sd = m[side];
     if (sd && sd.datum && datumsOf(cid)[sd.datum]) m[side] = { comp: cid, datum: sd.datum };
@@ -1232,6 +1331,11 @@ function bindSide(m, side) {
 }
 
 function compName(id) { const c = comp(id); return c ? c.name : id; }
+/** Reference rotations of a gear mate: the current rotations of its two components. */
+function setGearRef(m) {
+  const a = comp(m.a.comp), b = comp(m.b.comp);
+  if (a && b) m.ref = { a: (a.rot || [0, 0, 0]).map(Number), b: (b.rot || [0, 0, 0]).map(Number) };
+}
 /** Reference planes and axes of a component (local): {key: {kind, name, c, n, size}}. */
 function datumsOf(cid) {
   const c = AS.result && AS.result.components.find(x => x.id === cid);
@@ -1281,8 +1385,9 @@ function faceText(side) {
   if (!side) return "(pick a face)";
   if (side.datum) { const d = datumsOf(side.comp)[side.datum]; return compName(side.comp) + " : " + (d ? d.name : side.datum + " (lost)"); }
   const c = AS.result && AS.result.components.find(x => x.id === side.comp);
-  const r = c && c.refs ? c.refs[side.face] : null;
-  return compName(side.comp) + " : " + (r ? r.kind + (r.r ? " Ø" + afmt(2 * r.r, 2) : "") : "face " + side.face);
+  const r = sideRef(side, c);
+  const geo = side.edge !== undefined && side.edge !== null ? "edge " + side.edge : side.vertex !== undefined && side.vertex !== null ? "vertex " + side.vertex : "face " + side.face;
+  return compName(side.comp) + " : " + (r ? refText(r) : geo);
 }
 
 function renderMates() {
@@ -1322,7 +1427,9 @@ function renderMates() {
   if (m) {
     h += `<div class="as-mateprops"><label>Type<select id="am-type">${Object.keys(MATE_TYPES).map(k => `<option value="${k}"${k === m.type ? " selected" : ""}>${MATE_TYPES[k]}</option>`).join("")}</select></label>` +
       sideHtml(m, "a") + sideHtml(m, "b") +
-      `<label class="check"><input type="checkbox" id="am-flip"${m.flip ? " checked" : ""}> Flip (same direction instead of facing)</label>` +
+      `<label class="check"><input type="checkbox" id="am-flip"${m.flip ? " checked" : ""}> ${m.type === "gear" ? "Flip (same direction of rotation)" : m.type === "tangent" ? "Flip (cylinder on the other side of the plane; one cylinder inside the other)" : "Flip (same direction instead of facing)"}</label>` +
+      (m.type === "gear" ? `<label title="Rotation of B per rotation of A (number of teeth of A / number of teeth of B)">Ratio (turns of B per turn of A)<input type="text" inputmode="decimal" class="numf" id="am-ratio" value="${afmt(m.value || 1, 6)}"></label>` +
+        `<p class="hint">Rotations are measured from the reference position (set when both sides are picked), within half a turn of it. <button type="button" class="small" id="am-gref" style="margin-left:4px">Set reference position</button></p>` : "") +
       (m.type === "distance" || m.type === "angle"
         ? `<div class="grid3"><label>${m.type === "distance" ? "Distance (mm)" : "Angle (deg)"}<input type="text" inputmode="decimal" class="numf" id="am-val" value="${afmt(m.value || 0, 6)}"></label>` +
           `<label>Min<input type="text" inputmode="decimal" class="numf" id="am-min" value="${m.min === undefined ? "" : m.min}"></label><label>Max<input type="text" inputmode="decimal" class="numf" id="am-max" value="${m.max === undefined ? "" : m.max}"></label></div>` +
@@ -1350,11 +1457,13 @@ function renderMates() {
     };
   });
   if (!m) return;
-  $("#am-type").onchange = () => { m.type = $("#am-type").value; autoFlip(m); AS.dirty = true; renderMates(); solveMates(); };
+  $("#am-type").onchange = () => { m.type = $("#am-type").value; if (m.type === "gear") { if (!m.value) m.value = 1; if (m.a && m.b) setGearRef(m); } autoFlip(m); AS.dirty = true; renderMates(); solveMates(); };
   $("#am-pa").onclick = () => { if (AS.dragMode) setDragMode(false); AS.matePick = { mateId: m.id, side: "a" }; renderMates(); setMeshes(AS.result); };
   $("#am-pb").onclick = () => { if (AS.dragMode) setDragMode(false); AS.matePick = { mateId: m.id, side: "b" }; renderMates(); setMeshes(AS.result); };
   bindSide(m, "a"); bindSide(m, "b");
   $("#am-flip").onchange = () => { m.flip = $("#am-flip").checked; m.flipSet = true; AS.dirty = true; solveMates(); };
+  if ($("#am-ratio")) $("#am-ratio").onchange = () => { const v = numv($("#am-ratio").value); if (isFinite(v) && v > 0) { m.value = v; AS.dirty = true; solveMates(); } else msg("Ratio must be > 0", true); };
+  if ($("#am-gref")) $("#am-gref").onclick = () => { if (m.a && m.b) { setGearRef(m); AS.dirty = true; msg("Gear reference position set"); } };
   if ($("#am-val")) $("#am-val").onchange = () => { m.value = numv($("#am-val").value) || 0; AS.dirty = true; renderMates(); solveMates(); };
   if ($("#am-min")) $("#am-min").onchange = () => { const v = numv($("#am-min").value); if (isFinite(v)) m.min = v; else delete m.min; AS.dirty = true; renderMates(); };
   if ($("#am-max")) $("#am-max").onchange = () => { const v = numv($("#am-max").value); if (isFinite(v)) m.max = v; else delete m.max; AS.dirty = true; renderMates(); };
@@ -1376,7 +1485,7 @@ function addMate(type) {
   const id = "m" + (AS.asm.next++);
   type = MATE_TYPES[type] ? type : "coincident";
   if (AS.measure) setMeasure(false);
-  const m = { id, type, a: null, b: null, value: 0, flip: false, suppressed: false };
+  const m = { id, type, a: null, b: null, value: type === "gear" ? 1 : 0, flip: false, suppressed: false };
   AS.asm.mates.push(m);
   AS.selMate = id;
   AS.matePick = { mateId: id, side: "a" };
@@ -1390,7 +1499,7 @@ function addMate(type) {
   const row = document.querySelector(`#as-mates .as-comp[data-mid="${id}"]`), props = document.querySelector("#as-mates .as-mateprops");
   if (row) row.scrollIntoView({ block: "nearest" });
   if (props) props.scrollIntoView({ block: "nearest" });
-  msg(MATE_TYPES[type].replace(/ \(.*/, "") + " mate " + AS.asm.mates.length + ": click a " + (type === "concentric" ? "cylinder" : "face") + " of the first component (A) in the 3D view, then of the second (B). Esc ends");
+  msg(MATE_TYPES[type].replace(/ \(.*/, "") + " mate " + AS.asm.mates.length + ": click a " + (type === "concentric" || type === "gear" ? "cylinder" : type === "tangent" ? "plane or cylinder" : "face") + " of the first component (A) in the 3D view, then of the second (B). Esc ends");
 }
 
 let solveSeq = 0;
@@ -1703,7 +1812,7 @@ window.asmShown = function () {
   window.addEventListener("beforeunload", e => { if (AS.dirty) { e.preventDefault(); e.returnValue = ""; } });
 })();
 
-window.__asm = { AS, comp, THREE, mateHitAt, orthoBasis, setMeshes, isolateComps };
+window.__asm = { AS, comp, THREE, mateHitAt, orthoBasis, setMeshes, isolateComps, compMatrix };
 window.__asmLoadNamed = async function (name) { loadAsm(await (await api("/api/assembly/file/" + encodeURIComponent(name))).json()); if (FM) FM.markSaved(name); };
 window.__asmSetName = name => { if (AS.asm) { AS.asm.name = name; if (FM) FM.markSaved(name); } };
 window.__asmRefresh = refreshList;
