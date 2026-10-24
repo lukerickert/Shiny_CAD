@@ -230,12 +230,12 @@ def _area(p):
     return 0.5 * float(np.sum(p[:, 0] * np.roll(p[:, 1], -1) - np.roll(p[:, 0], -1) * p[:, 1]))
 
 
-def fit_points(src, dst, bounds):
+def fit_points(src, dst, bounds, reach=5.0):
     """Perspective correction from control points: src lens-corrected pixels q, dst their sketch points (mm, y up),
     at least 4 pairs. The corrected image has k px per mm (the pixel density of the picked points), u along the
     sketch x axis and v against the sketch y axis; dst[0] is at pixel c1. bounds: [umin, vmin, umax, vmax] of the
     lens-corrected image. Returns {"H": q -> corrected pixel, "out": [w, h] px, "k", "c1", "clipped" (the corrected
-    image is cut to 3 x the extent of the points), "rms", "max" (mm, deviation of the points after the fit)}."""
+    image is cut to (1 + 2 reach) x the extent of the points), "rms", "max" (mm, deviation of the points after the fit)}."""
     src, dst = np.asarray(src, float).reshape(-1, 2), np.asarray(dst, float).reshape(-1, 2)
     if len(src) < 4 or len(src) != len(dst):
         raise ValueError("at least 4 point pairs are needed")
@@ -257,7 +257,7 @@ def fit_points(src, dst, bounds):
     mb, wb = apply_h(H0, box)
     tb = [float(t[:, 0].min()), float(t[:, 1].min()), float(t[:, 0].max()), float(t[:, 1].max())]
     ext = max(tb[2] - tb[0], tb[3] - tb[1])
-    rb = [tb[0] - ext, tb[1] - ext, tb[2] + ext, tb[3] + ext]
+    rb = [tb[0] - reach * ext, tb[1] - reach * ext, tb[2] + reach * ext, tb[3] + reach * ext]
     clipped = bool(np.any(wb <= 0))
     if clipped:
         b = rb
@@ -300,6 +300,194 @@ def perspective(pts, width, height, bounds):
     sg = 1.0 if a > 0 else -1.0             # pixels v down: a > 0 turns clockwise on the screen
     dst = [(0, 0), (width, 0), (width, -sg * height), (0, -sg * height)]
     return fit_points(pts, dst, bounds)
+
+
+def fit_ellipse(pts):
+    """Conic matrix C (3 x 3, symmetric, x^T C x = 0 with x = [u, v, 1]) of the ellipse fitted to at least 5 points
+    (direct least squares fit restricted to ellipses, Halir and Flusser 1998)."""
+    pts = np.asarray(pts, float).reshape(-1, 2)
+    if len(pts) < 5:
+        raise ValueError("at least 5 points on each circle are needed")
+    T = _normalise(pts)
+    x = np.c_[pts, np.ones(len(pts))] @ T.T
+    u, v = x[:, 0], x[:, 1]
+    D1 = np.c_[u * u, u * v, v * v]
+    D2 = np.c_[u, v, np.ones(len(u))]
+    S1, S2, S3 = D1.T @ D1, D1.T @ D2, D2.T @ D2
+    if np.linalg.cond(S3) > 1e12:
+        raise ValueError("the points of a circle are on one line")
+    Tm = -np.linalg.solve(S3, S2.T)
+    M = S1 + S2 @ Tm
+    M = np.array([M[2] / 2, -M[1], M[0] / 2])
+    w, V = np.linalg.eig(M)
+    V = np.real(V)
+    cond = 4 * V[0] * V[2] - V[1] ** 2
+    ok = np.where(cond > 0)[0]
+    if not len(ok):
+        raise ValueError("no ellipse fits the points of a circle")
+    a1 = V[:, ok[0]]
+    a, b, c = a1
+    d, e, f = Tm @ a1
+    C = np.array([[a, b / 2, d / 2], [b / 2, c, e / 2], [d / 2, e / 2, f]])
+    C = T.T @ C @ T
+    return C / np.linalg.norm(C)
+
+
+def _ellipse(C):
+    """Centre x0, shape matrix M ((x - x0)^T M (x - x0) = 1) and semi-axes [a, b] (a >= b) of the conic C."""
+    A, b = C[:2, :2], C[:2, 2]
+    if np.linalg.det(A) <= 0:
+        raise ValueError("the fitted conic is not an ellipse")
+    x0 = -np.linalg.solve(A, b)
+    g = C[2, 2] - x0 @ A @ x0
+    M = A / -g
+    w = np.linalg.eigvalsh(M)
+    if np.any(w <= 0):
+        raise ValueError("the fitted conic is not an ellipse")
+    return x0, M, [float(1 / math.sqrt(w[0])), float(1 / math.sqrt(w[1]))]
+
+
+def _inside(C, p):
+    x0 = _ellipse(C)[0]
+    s = lambda q: float(np.r_[q, 1.0] @ C @ np.r_[q, 1.0])
+    return s(p) * s(x0) > 0
+
+
+def _concentric_centre(C1, C2):
+    """Image of the common centre of two concentric circles in one plane from their ellipses C1, C2: the pencil
+    C1 - l C2 holds the double line at infinity; its pole with respect to C1 is the centre."""
+    w = np.linalg.eigvals(np.linalg.solve(C2, C1))
+    i, j = min(((0, 1), (0, 2), (1, 2)), key=lambda ij: abs(w[ij[0]] - w[ij[1]]))
+    lam = float(np.real(w[i] + w[j]) / 2)
+    D = C1 - lam * C2
+    D = (D + D.T) / 2
+    ev, V = np.linalg.eigh(D)
+    line = V[:, int(np.argmax(np.abs(ev)))]
+    c = np.linalg.solve(C1, line)
+    if abs(c[2]) < 1e-12 * np.linalg.norm(c):
+        raise ValueError("the two ellipses do not give a centre (are the circles concentric?)")
+    return c[:2] / c[2]
+
+
+def _sqrtm(M):
+    w, V = np.linalg.eigh(M)
+    return V @ np.diag(np.sqrt(w)) @ V.T
+
+
+def _round_h(C, c, persp, R, N):
+    """q -> plane (mm, v down) of the circle C (normalised coordinates N) with the centre image c: perspective
+    (polar of c as the vanishing line) or affine, ellipse -> circle of radius R at 0, image u axis along +x."""
+    Tc = np.array([[1, 0, -c[0]], [0, 1, -c[1]], [0, 0, 1.0]])
+    P = np.eye(3)
+    if persp:
+        ln = np.linalg.inv(Tc).T @ (C @ np.r_[c, 1.0])              # polar of the centre: the vanishing line
+        P[2] = ln / ln[2]
+    G = P @ Tc
+    Gi = np.linalg.inv(G)
+    C1 = Gi.T @ C @ Gi
+    x0, M, _ = _ellipse(C1 / np.linalg.norm(C1))
+    L = R * _sqrtm(M)
+    Hr = np.r_[np.c_[L, -L @ x0], [[0, 0, 1.0]]] @ G @ N
+    cq = apply_h(np.linalg.inv(N), [c])[0][0]
+    m, _ = apply_h(Hr, [cq, cq + [1.0, 0.0]])
+    d = m[1] - m[0]
+    t = math.atan2(d[1], d[0])
+    Rt = np.array([[math.cos(t), math.sin(t), 0], [-math.sin(t), math.cos(t), 0], [0, 0, 1.0]])
+    return Rt @ Hr
+
+
+def _scale_variation(Hr, C, N):
+    """(max - min) / mean of the linear scale of Hr at 16 points of the ellipse C (normalised coordinates N)."""
+    x0, M, _ = _ellipse(C)
+    w, V = np.linalg.eigh(M)
+    a = np.linspace(0, 2 * math.pi, 16, endpoint=False)
+    p = apply_h(np.linalg.inv(N), x0 + np.c_[np.cos(a) / math.sqrt(w[0]), np.sin(a) / math.sqrt(w[1])] @ V.T)[0]
+    H = np.asarray(Hr, float)
+    s = []
+    for x, y in p:
+        h = H @ [x, y, 1.0]
+        J = (H[:2, :2] * h[2] - np.outer(h[:2], H[2, :2])) / h[2] ** 2
+        s.append(math.sqrt(abs(np.linalg.det(J))))
+    s = np.array(s)
+    return float((s.max() - s.min()) / s.mean())
+
+
+def round_part(rims, diameter, bounds, centre=None):
+    """Correction from a round part: rims = 1 or 2 lists of at least 5 points (lens-corrected pixels q) on circles
+    of one plane (2 lists: concentric circles), diameter (mm) of the first circle, centre = the picked image of the
+    circle centre or None (not used with 2 circles when outside circle 1: "centre_unused"). Correction: perspective
+    from the centre (picked, else from 2 concentric circles), else
+    affine (the ellipse becomes a circle). A perspective correction that changes the scale across circle 1 by more
+    than the ellipse shape allows is replaced by the affine one ("rejected": the reason). The circle centre is dst[0] at the sketch origin; the image u axis at the
+    centre stays along the sketch x axis. Returns fit_points() of points of the corrected circle with "mode"
+    ("affine", "centre", "concentric"), "cq" (centre, q), "axes" (semi-axes px of ellipse 1), "d2" (mm, diameter of
+    circle 2) and "rms", "max" (mm, radial deviation of the rim points from the circles)."""
+    rims = [np.asarray(r, float).reshape(-1, 2) for r in (rims or []) if r is not None and len(r)]
+    if not rims or len(rims) > 2:
+        raise ValueError("points on 1 or 2 circles are needed")
+    if not (diameter and diameter > 0):
+        raise ValueError("diameter must be > 0")
+    N = _normalise(np.concatenate(rims))
+    Ni = np.linalg.inv(N)
+    Cs = [Ni.T @ fit_ellipse(r) @ Ni for r in rims]              # conics in normalised coordinates
+    Cs = [C / np.linalg.norm(C) for C in Cs]
+    axes = [a / N[0, 0] for a in _ellipse(Cs[0])[2]]
+    unused, rejected = False, None
+    if centre is not None:
+        c = apply_h(N, [centre])[0][0]
+        if not _inside(Cs[0], c):
+            if len(rims) < 2:
+                raise ValueError("the picked centre is outside circle 1")
+            unused, centre = True, None
+    x1 = _ellipse(Cs[0])[0]
+    if centre is not None:
+        mode = "centre"
+    elif len(rims) == 2:
+        mode = "concentric"
+        try:
+            c = _concentric_centre(Cs[0], Cs[1])
+            if not (_inside(Cs[0], c) and _inside(Cs[1], c)):
+                raise ValueError
+        except (ValueError, np.linalg.LinAlgError):
+            mode, c, rejected = "affine", x1, "the two ellipses give no common centre"
+    else:
+        mode, c = "affine", x1
+    R = diameter / 2.0
+    Hr = _round_h(Cs[0], c, mode != "affine", R, N)
+    ratio = axes[1] / axes[0]
+    if mode != "affine":
+        # scale change of the correction across circle 1, against the largest the ellipse shape allows (plane tilt
+        # with cos(tilt) = axis ratio, circle diameter up to the camera distance)
+        var = _scale_variation(Hr, Cs[0], N)
+        allowed = math.sqrt(max(0.0, 1 - ratio * ratio)) + 0.02
+        if var > allowed:
+            rejected = ("the %s gives a scale change of %.0f %% across circle 1, the ellipse shape (axis ratio %.3f) "
+                        "allows %.0f %%" % ("picked centre" if mode == "centre" else "pair of circles", 100 * var,
+                                            ratio, 100 * allowed))
+            mode, c = "affine", x1
+            Hr = _round_h(Cs[0], c, False, R, N)
+    cq = apply_h(np.linalg.inv(N), [c])[0][0]
+    devs, d2 = [], None
+    for i, r in enumerate(rims):
+        p, wz = apply_h(Hr, r)
+        if np.any(wz <= 0):
+            raise ValueError("rim points beyond the vanishing line (check the points and the centre)")
+        rr = np.sqrt((p ** 2).sum(1))
+        if i == 0:
+            devs.append(rr - R)
+        else:
+            d2 = float(2 * rr.mean())
+            devs.append(rr - rr.mean())
+    dev = np.abs(np.concatenate(devs))
+    ang = np.linspace(0, 2 * math.pi, 24, endpoint=False)
+    circ = np.c_[R * np.cos(ang), R * np.sin(ang)]
+    src = np.r_[[cq], apply_h(np.linalg.inv(Hr), circ)[0]]
+    dst = np.r_[[[0.0, 0.0]], circ * [1, -1]]
+    out = fit_points(src, dst, bounds)
+    out.update({"mode": mode, "cq": [float(cq[0]), float(cq[1])], "axes": axes, "d2": d2, "centre_unused": unused,
+                "rejected": rejected,
+                "rms": float(math.sqrt((dev ** 2).mean())), "max": float(dev.max())})
+    return out
 
 
 # --------------------------------------------------------------------------- corrected image

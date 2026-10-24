@@ -149,6 +149,84 @@ def test_store_exif_tiff_and_duplicates(tmp_path):
         si.store(str(t), "notes.txt", str(folder))
 
 
+def _rim(Hm, r, a0=0.2, a1=5.6, n=12, c=(0, 0)):
+    a = np.linspace(a0, a1, n)
+    q, _ = si.apply_h(Hm, np.c_[c[0] + r * np.cos(a), c[1] + r * np.sin(a)])
+    return q
+
+
+def _metric_err(r, Hm, pts):
+    """Largest error (mm) of the distances between the object points pts after the correction r."""
+    m, _ = si.apply_h(r["H"], si.apply_h(Hm, pts)[0])
+    m = m / r["k"]
+    D = lambda P: np.sqrt(((P[:, None] - P[None]) ** 2).sum(-1))
+    return float(np.abs(D(m) - D(np.asarray(pts, float))).max())
+
+
+def test_fit_ellipse():
+    a = np.linspace(0, 2 * math.pi, 9, endpoint=False)
+    p = np.c_[500 + 300 * np.cos(a), 400 + 120 * np.sin(a)]
+    x0, M, ax = si._ellipse(si.fit_ellipse(p))
+    assert np.allclose(x0, [500, 400]) and np.allclose(ax, [300, 120])
+    with pytest.raises(ValueError, match="5 points"):
+        si.fit_ellipse(p[:4])
+
+
+def test_round_part_modes():
+    grid = [[x, y] for x in (-30, 0, 30) for y in (-30, 0, 30)]
+    b = [0, 0, 2400, 2000]
+    # affine view: one circle is exact
+    A = np.array([[5.0, 1.2, 900], [0.4, 2.5, 700], [0, 0, 1]])
+    r = si.round_part([_rim(A, 40)], 80, b)
+    assert r["mode"] == "affine" and _metric_err(r, A, grid) < 1e-6 and r["rms"] < 1e-6
+    m, _ = si.apply_h(r["H"], [r["cq"]])
+    assert np.allclose((m[0] - r["c1"]) / r["k"], [0, 0], atol=1e-6)        # centre at dst[0]
+    # perspective view: one circle leaves an error; circle and centre, or 2 concentric circles, are exact
+    assert _metric_err(si.round_part([_rim(HOM, 40)], 80, b), HOM, grid) > 1.0
+    c, _ = si.apply_h(HOM, [[0, 0]])
+    r = si.round_part([_rim(HOM, 40)], 80, b, centre=c[0].tolist())
+    assert r["mode"] == "centre" and _metric_err(r, HOM, grid) < 1e-5
+    r = si.round_part([_rim(HOM, 40), _rim(HOM, 15, 1, 6)], 80, b)
+    assert r["mode"] == "concentric" and _metric_err(r, HOM, grid) < 1e-5
+    assert abs(r["d2"] - 30) < 1e-5 and np.allclose(r["cq"], c[0], atol=1e-6)
+    # the image u axis at the centre stays along the sketch x axis, no mirror image
+    m, _ = si.apply_h(r["H"], [r["cq"], [r["cq"][0] + 1, r["cq"][1]], [r["cq"][0], r["cq"][1] + 1]])
+    assert abs(m[1][1] - m[0][1]) < 1e-9 and m[1][0] > m[0][0] and m[2][1] > m[0][1]
+
+
+def test_round_part_rejects_circles_of_two_planes():
+    """Near frontal view; circle 2 3 mm deeper than circle 1 (bottom of a counterbore): the perspective of the pair
+    is replaced by the affine correction."""
+    th = math.radians(4)
+    Rx = np.array([[1, 0, 0], [0, math.cos(th), -math.sin(th)], [0, math.sin(th), math.cos(th)]])
+    K = np.array([[3000, 0, 1500], [0, 3000, 2000], [0, 0, 1.0]])
+    t = np.array([5, 8, 60.0])
+
+    def rim3(r, z):
+        a = np.linspace(0.3, 5.8, 8)
+        X = (K @ (Rx @ np.c_[r * np.cos(a), r * np.sin(a), np.full(8, z)].T + t[:, None])).T
+        return X[:, :2] / X[:, 2:]
+    b = [0, 0, 3000, 4000]
+    r = si.round_part([rim3(8, 0), rim3(5, 0)], 16, b)
+    assert r["mode"] == "concentric" and r["rejected"] is None
+    r = si.round_part([rim3(8, 0), rim3(5, -3)], 16, b)
+    assert r["mode"] == "affine" and "scale change" in r["rejected"]
+
+
+def test_round_part_errors():
+    b = [0, 0, 2400, 2000]
+    with pytest.raises(ValueError, match="diameter"):
+        si.round_part([_rim(HOM, 40)], 0, b)
+    with pytest.raises(ValueError, match="1 or 2"):
+        si.round_part([], 80, b)
+    with pytest.raises(ValueError, match="outside"):
+        si.round_part([_rim(HOM, 40)], 80, b, centre=si.apply_h(HOM, [[60, 0]])[0][0].tolist())
+    r = si.round_part([_rim(HOM, 40), _rim(HOM, 15, 1, 6)], 80, b, centre=si.apply_h(HOM, [[60, 0]])[0][0].tolist())
+    assert r["mode"] == "concentric" and r["centre_unused"]
+    with pytest.raises(ValueError, match="5 points"):
+        si.round_part([_rim(HOM, 40), _rim(HOM, 15)[:3]], 80, b)
+
+
 def test_api_image_requests(client, tmp_path):
     from PIL import Image
     buf = io.BytesIO()
@@ -175,4 +253,7 @@ def test_api_image_requests(client, tmp_path):
     assert r1["file"].startswith("api photo_c") and r1["file"].endswith(".png")
     assert client.post("/api/sketch/image/render", json={"file": f, "k1": 0, "H": p["H"], "out": p["out"]}).get_json() == r1
     assert client.get("/api/sketch/image/file/" + r1["file"]).status_code == 200
+    rd = client.post("/api/sketch/image/round", json={"file": f, "k1": 0, "diameter": 80, "rims": [_rim(HOM, 40).tolist()]}).get_json()
+    assert rd["mode"] == "affine" and set(rd) >= {"H", "out", "k", "c1", "cq", "rms", "max"}
+    assert client.post("/api/sketch/image/round", json={"file": f, "diameter": 80, "rims": [[[0, 0], [1, 1]]]}).status_code == 400
     assert client.post("/api/sketch/image", json={"path": str(tmp_path / "none.png")}).status_code == 400

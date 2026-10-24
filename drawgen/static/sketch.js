@@ -3426,7 +3426,47 @@ function offsetEnt(e, d, p) {
   return null;
 }
 
+/** Outward unit tangent at the end ref ({e, k}) of a line, arc or open curve, or null. */
+function endTangent(ref) {
+  const e = entById(ref.e);
+  if (!e) return null;
+  if (e.t === "line") {
+    if (ref.k !== "p1" && ref.k !== "p2") return null;
+    const d = [e.x2 - e.x1, e.y2 - e.y1];
+    return unit(ref.k === "p2" ? d : mul(d, -1));
+  }
+  if (e.t === "arc") {
+    if (ref.k === "e") { const a = d2r(e.a1); return [-Math.sin(a), Math.cos(a)]; }
+    if (ref.k === "s") { const a = d2r(e.a0); return [Math.sin(a), -Math.cos(a)]; }
+    return null;
+  }
+  if (CURVE_T.has(e.t) && (ref.k === "s" || ref.k === "e")) {
+    const A = cvAdapter(e);
+    if (A.whole) return null;
+    return ref.k === "e" ? unit(A.tan(A.range[1])) : unit(mul(A.tan(A.range[0]), -1));
+  }
+  return null;
+}
+/** Arc from S with the tangent t at S through E: {ent, sk (key at S), ek (key at E)}, or null (E on the tangent). */
+function tangentArc(S, t, E) {
+  const d = sub(E, S), n = [-t[1], t[0]], dn = dot(d, n);
+  if (Math.abs(dn) < 1e-9 * Math.max(1, len(d))) return null;
+  const rho = dot(d, d) / (2 * dn), C = add(S, mul(n, rho)), r = Math.abs(rho);
+  if (rho > 0) return { ent: { cx: C[0], cy: C[1], r, a0: angOf(C, S), a1: angOf(C, E) }, sk: "s", ek: "e" };
+  return { ent: { cx: C[0], cy: C[1], r, a0: angOf(C, E), a1: angOf(C, S) }, sk: "e", ek: "s" };
+}
+
 // ------------------------------------------------------------------ tools
+
+const SLOT = { tips: false };
+function slotForm() {
+  const box = $("#sk-props");
+  if (!box) return;
+  box.innerHTML = `<p><strong>Slot</strong></p>` +
+    `<label class="check"><input type="checkbox" id="skp-stips"${SLOT.tips ? " checked" : ""}> Points at the ends (tips) of the slot</label>` +
+    `<p class="hint">Unchecked: the first two points are the centres of the end arcs. Checked: the outermost points of the slot ends, for example on the outline of an image. The third point is on a side of the slot (half width from the line through the first two points), or the typed width.</p>`;
+  $("#skp-stips").onchange = e => { SLOT.tips = e.target.checked; updateHint(); overlay(); };
+}
 
 const PARAM = { offset: 5, fillet: 5, chamfer: 2, polygon: 6, p3g: 14, p3g_e: 0.44, p3g_d1_last: 14 };
 
@@ -3766,6 +3806,130 @@ const TOOLS = {
         return [{ t: "arc", cx: c[0], cy: c[1], r: dist(c, s), a0: angOf(c, s), a1: angOf(c, SK.snap.p) }];
       }
       return [];
+    },
+  },
+  rectc: {
+    hint: n => n ? "Corner (or @half width,half height from the centre)" : "Centre",
+    base: () => lastPick() && lastPick().p,
+    click(sn) {
+      if (!SK.pick.length) { SK.pick.push(sn); return; }
+      const c = SK.pick[0].p, b = sn.p, a = sub(mul(c, 2), b);
+      if (Math.abs(a[0] - b[0]) < 1e-9 || Math.abs(a[1] - b[1]) < 1e-9) return;
+      checkpoint();
+      const P = [a, [b[0], a[1]], b, [a[0], b[1]]];
+      const L = [0, 1, 2, 3].map(i => newEnt("line", { x1: P[i][0], y1: P[i][1], x2: P[(i + 1) % 4][0], y2: P[(i + 1) % 4][1] }));
+      const D1 = newEnt("line", { x1: P[0][0], y1: P[0][1], x2: P[2][0], y2: P[2][1], constr: true });
+      const D2 = newEnt("line", { x1: P[1][0], y1: P[1][1], x2: P[3][0], y2: P[3][1], constr: true });
+      const C = newEnt("point", { x: c[0], y: c[1], constr: true });
+      reindex();
+      for (let i = 0; i < 4; i++) addConstraint({ t: "coincident", a: { e: L[i].id, k: "p2" }, b: { e: L[(i + 1) % 4].id, k: "p1" } }, true);
+      addConstraint({ t: "horizontal", l: L[0].id }, true); addConstraint({ t: "horizontal", l: L[2].id }, true);
+      addConstraint({ t: "vertical", l: L[1].id }, true); addConstraint({ t: "vertical", l: L[3].id }, true);
+      addConstraint({ t: "coincident", a: { e: D1.id, k: "p1" }, b: { e: L[0].id, k: "p1" } }, true);
+      addConstraint({ t: "coincident", a: { e: D1.id, k: "p2" }, b: { e: L[2].id, k: "p1" } }, true);
+      addConstraint({ t: "coincident", a: { e: D2.id, k: "p1" }, b: { e: L[1].id, k: "p1" } }, true);
+      addConstraint({ t: "coincident", a: { e: D2.id, k: "p2" }, b: { e: L[3].id, k: "p1" } }, true);
+      addConstraint({ t: "midpoint", a: { e: C.id, k: "p" }, l: D1.id }, true);
+      autoAt({ e: C.id, k: "p" }, SK.pick[0]);
+      autoAt({ e: L[1].id, k: "p2" }, sn);
+      SK.pick = [];
+      changed(true);
+    },
+    preview() {
+      const k = lastPick(); if (!k || !SK.snap) return [];
+      const c = k.p, b = SK.snap.p, a = sub(mul(c, 2), b), P = [a, [b[0], a[1]], b, [a[0], b[1]]];
+      return [0, 1, 2, 3].map(i => ({ t: "line", x1: P[i][0], y1: P[i][1], x2: P[(i + 1) % 4][0], y2: P[(i + 1) % 4][1] }))
+        .concat([{ t: "line", x1: a[0], y1: a[1], x2: b[0], y2: b[1], constr: true }, { t: "line", x1: P[1][0], y1: P[1][1], x2: P[3][0], y2: P[3][1], constr: true }]);
+    },
+  },
+  slot: {
+    hint: n => (SLOT.tips ? ["First end (tip) of the slot", "Second end (tip) of the slot (Shift: horizontal/vertical)"] : ["Centre of the first end", "Centre of the second end (Shift: horizontal/vertical)"]).concat(["Point on a side of the slot, or type the width"])[n],
+    base: () => SK.pick.length === 1 ? SK.pick[0].p : null,
+    move: sn => (SK.pick.length === 1 ? hvSnap(SK.pick[0].p, sn) : sn),
+    value(v) { if (SK.pick.length === 2 && v > 0) this.make(v / 2); },
+    click(sn) {
+      if (SK.pick.length === 1) sn = hvSnap(SK.pick[0].p, sn);
+      if (SK.pick.length < 2) {
+        if (SK.pick.length === 1 && dist(SK.pick[0].p, sn.p) < 1e-9) return;
+        SK.pick.push(sn); return;
+      }
+      const r = this.halfWidth(sn.p);
+      if (r > 1e-9) this.make(r);
+    },
+    halfWidth(p) { const [c1, c2] = SK.pick.map(k => k.p); return Math.abs(crs(sub(p, c1), unit(sub(c2, c1)))); },
+    /** Arc centres from the two picks: the picks themselves, or the tips moved inwards by r. */
+    centres(r) {
+      const [c1, c2] = SK.pick.map(k => k.p);
+      if (!SLOT.tips) return [c1, c2];
+      if (dist(c1, c2) <= 2 * r + 1e-9) return null;
+      const u = unit(sub(c2, c1));
+      return [add(c1, mul(u, r)), sub(c2, mul(u, r))];
+    },
+    geom(c1, c2, r) {
+      const u = unit(sub(c2, c1)), n = [-u[1], u[0]], th = r2d(Math.atan2(u[1], u[0]));
+      const A = add(c1, mul(n, r)), B = add(c2, mul(n, r)), Cq = sub(c2, mul(n, r)), D = sub(c1, mul(n, r));
+      return [{ t: "line", x1: A[0], y1: A[1], x2: B[0], y2: B[1] }, { t: "line", x1: Cq[0], y1: Cq[1], x2: D[0], y2: D[1] },
+              { t: "arc", cx: c1[0], cy: c1[1], r, a0: n360(th + 90), a1: n360(th + 270) },
+              { t: "arc", cx: c2[0], cy: c2[1], r, a0: n360(th - 90), a1: n360(th + 90) }];
+    },
+    make(r) {
+      const [k1, k2] = SK.pick, cc = this.centres(r);
+      if (!cc) return msg("The width is not less than the length of the slot", true);
+      const [c1, c2] = cc;
+      checkpoint();
+      const [g1, g2, g3, g4] = this.geom(c1, c2, r);
+      const L1 = newEnt("line", g1), L2 = newEnt("line", g2), A1 = newEnt("arc", g3), A2 = newEnt("arc", g4);
+      const CL = newEnt("line", { x1: c1[0], y1: c1[1], x2: c2[0], y2: c2[1], constr: true });
+      reindex();
+      const co = (a, ka, b, kb) => addConstraint({ t: "coincident", a: { e: a.id, k: ka }, b: { e: b.id, k: kb } }, true);
+      co(CL, "p1", A1, "c"); co(CL, "p2", A2, "c");
+      co(L1, "p1", A1, "s"); co(L1, "p2", A2, "e"); co(L2, "p1", A2, "s"); co(L2, "p2", A1, "e");
+      addConstraint({ t: "tangent", e1: L1.id, e2: A1.id, ak2: "s" }, true);
+      addConstraint({ t: "tangent", e1: L1.id, e2: A2.id, ak2: "e" }, true);
+      addConstraint({ t: "tangent", e1: L2.id, e2: A2.id, ak2: "s" }, true);
+      addConstraint({ t: "tangent", e1: L2.id, e2: A1.id, ak2: "e" }, true);
+      addConstraint({ t: "equal", e1: A1.id, e2: A2.id }, true);
+      autoHV(CL.id);
+      if (!SLOT.tips) { autoAt({ e: A1.id, k: "c" }, k1); autoAt({ e: A2.id, k: "c" }, k2); }
+      SK.pick = [];
+      changed(true);
+    },
+    preview() {
+      if (!SK.snap || !SK.pick.length) return [];
+      const c1 = SK.pick[0].p;
+      if (SK.pick.length === 1) return [{ t: "line", x1: c1[0], y1: c1[1], x2: SK.snap.p[0], y2: SK.snap.p[1], constr: true }];
+      const r = this.halfWidth(SK.snap.p), cc = r > 1e-9 ? this.centres(r) : null;
+      return cc ? this.geom(cc[0], cc[1], r) : [];
+    },
+  },
+  tarc: {
+    hint: n => n ? "End point of the tangent arc; Esc ends" : "End of a line, arc or curve to continue tangentially",
+    click(sn) {
+      if (!SK.pick.length) {
+        const t = sn.kind === "end" && sn.ref ? endTangent(sn.ref) : null;
+        if (!t) return msg("Click the end of a line, arc or curve", true);
+        SK.pick.push({ p: sn.p, ref: sn.ref, tan: t });
+        return;
+      }
+      const st = SK.pick[0], g = tangentArc(st.p, st.tan, sn.p);
+      if (!g) return msg("The end point is on the tangent line", true);
+      checkpoint();
+      const arc = newEnt("arc", g.ent);
+      reindex();
+      const se = entById(st.ref.e);
+      addConstraint({ t: "coincident", a: { e: arc.id, k: g.sk }, b: st.ref }, true);
+      const tc = { t: "tangent", e1: st.ref.e, e2: arc.id, ak2: g.sk };
+      if (se && se.t !== "line") tc.ak1 = st.ref.k;
+      addConstraint(tc, true);
+      autoAt({ e: arc.id, k: g.ek }, sn);
+      const ref = { e: arc.id, k: g.ek };
+      SK.pick = [{ p: getPt(ref), ref, tan: endTangent(ref) }];
+      changed(true);
+    },
+    preview() {
+      const st = SK.pick[0]; if (!st || !SK.snap) return [];
+      const g = tangentArc(st.p, st.tan, SK.snap.p);
+      return g ? [Object.assign({ t: "arc" }, g.ent)] : [{ t: "line", x1: st.p[0], y1: st.p[1], x2: SK.snap.p[0], y2: SK.snap.p[1] }];
     },
   },
   point: {
@@ -4229,6 +4393,7 @@ async function setTool(name) {
   $("#sk-canvas").classList.toggle("select", name === "select");
   updateHint();
   overlay();
+  if (name === "slot") slotForm();
 }
 // fillet or chamfer of two selected lines; the longer part of each line from the corner is kept
 function applyCorner(name, a, b) {
@@ -4375,6 +4540,7 @@ function bindCanvas(svg) {
       return;
     }
     if (e.button !== 0) return;
+    SK.pan = null;                         // a pan whose button release was missed
     const p = SK.mouse.p;
     // triple click with the Select tool finishes a feature sketch
     SK.clicks = (SK.clicks || []).filter(t => e.timeStamp - t < 600); SK.clicks.push(e.timeStamp);
@@ -4429,6 +4595,9 @@ function bindCanvas(svg) {
     SK.mouse = evScreen(e, svg);
     const p = SK.mouse.p;
     $("#sk-coords").textContent = `x ${fmtN(p[0], 3)}  y ${fmtN(p[1], 3)}`;
+    // a button released outside the canvas or the window: no mouseup reached the page
+    if (SK.pan && !(e.buttons & (SK.pan.button === 1 ? 4 : 2))) SK.pan = null;
+    if ((SK.drag || SK.win || SK.trimSweep) && !(e.buttons & 1)) up(e);
     if (SK.pan) {
       SK.view.ox = SK.pan.ox + SK.mouse.sx - SK.pan.sx;
       SK.view.oy = SK.pan.oy + SK.mouse.sy - SK.pan.sy;
@@ -4479,6 +4648,10 @@ function bindCanvas(svg) {
     }
   };
   svg.addEventListener("mouseup", up);
+  // release outside the canvas
+  if (SK.winUp) window.removeEventListener("mouseup", SK.winUp);
+  SK.winUp = e => { if (!svg.contains(e.target) && (SK.pan || SK.drag || SK.win || SK.trimSweep)) up(e); };
+  window.addEventListener("mouseup", SK.winUp);
   svg.addEventListener("mouseleave", () => { SK.snap = null; SK.hover = null; overlay(); });
 
   svg.addEventListener("dblclick", e => e.preventDefault());
@@ -4640,7 +4813,7 @@ function escape() {
   if (SK.conPick) { setConPick(null); SK.sel.clear(); redraw(); showProps(); return; }
   if (SK.tool === "spline" && SK.pick.length >= 2) { TOOLS.spline.finish(false); return; }
   if (SK.tool === "conic" && SK.pick.length === 3) { TOOLS.conic.make(0.5); return; }
-  if (SK.tool.startsWith("img")) { SK.lens = null; SK.ctrl = null; setTool("select"); showProps(); overlay(); return; }
+  if (SK.tool.startsWith("img")) { SK.lens = null; SK.ctrl = null; SK.round = null; setTool("select"); showProps(); overlay(); return; }
   if (SK.pick.length) { SK.pick = []; updateHint(); overlay(); return; }
   if (SK.tool !== "select") { setTool("select"); return; }
   SK.sel.clear(); redraw(); showProps();
@@ -4765,6 +4938,7 @@ function onKey(e) {
   if (k === "Enter" && SK.tool === "conic" && SK.pick.length === 3) { e.preventDefault(); TOOLS.conic.make(0.5); return; }
   if (k === "Enter" && SK.tool === "imglens") { e.preventDefault(); TOOLS.imglens.enter(); return; }
   if (k === "Enter" && SK.tool === "imgctrl") { e.preventDefault(); ctrlApply(); return; }
+  if (k === "Enter" && SK.tool === "imground") { e.preventDefault(); roundApply(); return; }
   if (k === "Delete" || k === "Backspace") { e.preventDefault(); deleteSelection(); return; }
   // a single selected driving dimension: digits start its value, Enter edits it
   const sd = selectedDrivingDim();
@@ -5663,7 +5837,7 @@ function affFit(pairs) {
 /** Grid of image pixels p of the stored file, for refitting A. */
 function imgGrid(m) {
   const out = [];
-  for (let i = 0; i <= 8; i++) for (let j = 0; j <= 8; j++) out.push([m.w * (0.1 + 0.8 * i / 8), m.h * (0.1 + 0.8 * j / 8)]);
+  for (let i = 0; i <= 24; i++) for (let j = 0; j <= 24; j++) out.push([m.w * (0.02 + 0.96 * i / 24), m.h * (0.02 + 0.96 * j / 24)]);
   return out;
 }
 /** Shown pixel of the image pixel p with the current corrections, or null. */
@@ -5681,11 +5855,15 @@ async function imgSetCorrection(m, c) {
     cfile = (await r.json()).file;
   }
   Object.assign(m, { k1: c ? c.k1 || 0 : 0, qo: c ? c.qo || null : null, H: c ? c.H : null, out: c ? c.out : null, cfile });
-  const pairs = [];
+  // grid points shown in the old image (a corrected image can be cut to the region of the correction)
+  const [ow, oh] = imgSize(old), pairs = [], all = [];
   for (const p of imgGrid(m)) {
     const a = imgShownPx(old, p), b = imgShownPx(m, p);
-    if (a && b) pairs.push([b, affApply(old.A, a)]);
+    if (!a || !b) continue;
+    all.push([b, affApply(old.A, a)]);
+    if (a[0] >= 0 && a[1] >= 0 && a[0] <= ow && a[1] <= oh) pairs.push(all[all.length - 1]);
   }
+  if (pairs.length < 3) pairs.push(...all);
   const A = pairs.length >= 3 ? affFit(pairs) : null;
   if (A) m.A = A;
 }
@@ -5749,6 +5927,15 @@ function imgOverlay() {
       const b = c.dst || (SK.snap ? SK.snap.p : null);
       if (b) { out.push(path([a, b], "#2f74d0")); out.push(dotAt(b, "#2f74d0")); }
     });
+  } else if (SK.tool === "imground") {
+    const Ro = SK.round || { rims: [[], []], centre: null };
+    const cols = ["#d0451b", "#2f74d0"];
+    Ro.rims.forEach((r, i) => {
+      r.forEach(p => out.push(dotAt(affApply(m.A, p), cols[i])));
+      const el = r.length >= 5 ? ellipseFit(r) : null;
+      if (el) out.push(path(ellipsePts(el, 72).map(p => affApply(m.A, p)), cols[i], true));
+    });
+    if (Ro.centre) out.push(dotAt(affApply(m.A, Ro.centre), "#2e7d32"));
   } else if (SK.tool === "imgcircle") {
     const ps = SK.pick.map(k => k.p);
     ps.forEach(p => out.push(dotAt(p, "#d0451b")));
@@ -5819,7 +6006,8 @@ function imgProps() {
   const box = $("#sk-props");
   const [w, h] = imgSize(m), s = imgScale(m), c = imgCentre(m);
   const corr = [m.k1 ? `lens k1 ${fmtN(m.k1, 5)}` : "", m.persp ? `perspective ${fmtN(m.persp.width, 3)} x ${fmtN(m.persp.height, 3)} mm` : "",
-                m.ctrl ? `perspective from ${m.ctrl.n} control points (rms ${fmtN(m.ctrl.rms, 3)} mm)` : ""].filter(Boolean).join(", ") || "none";
+                m.ctrl ? `perspective from ${m.ctrl.n} control points (rms ${fmtN(m.ctrl.rms, 3)} mm)` : "",
+                m.round ? `round part, ${ROUND_MODES[m.round.mode]}, diameter ${fmtN(m.round.d, 4)} mm (rms ${fmtN(m.round.rms, 3)} mm)` : ""].filter(Boolean).join(", ") || "none";
   const f = (k, label, v) => `<label>${label}<input type="text" inputmode="decimal" class="numf" data-ik="${k}" value="${v}"></label>`;
   box.innerHTML = `<p><strong>Image</strong> ${esc(m.name || "")}</p>` +
     `<p class="hint">${esc(m.file)}, ${m.w} x ${m.h} px. Corrections: ${esc(corr)}.${m.cfile ? " Shown: " + esc(m.cfile) + ", " + w + " x " + h + " px." : ""}</p>` +
@@ -5827,6 +6015,7 @@ function imgProps() {
     `${f("scale", "Scale (mm/px)", fmtN(s, 6))}${f("rot", "Rotation (deg)", fmtN(imgRot(m), 4))}` +
     `${f("cx", "Centre x", fmtN(c[0], 4))}${f("cy", "Centre y", fmtN(c[1], 4))}</div>` +
     `<label>Opacity<input type="range" id="skp-iop" min="0.1" max="1" step="0.05" value="${m.opacity === undefined ? 0.6 : m.opacity}"></label>` +
+    `<label class="check" title="Part tab: the image is drawn on the sketch plane in the 3D view while the sketch is closed"><input type="checkbox" id="skp-i3d"${m.show3d ? " checked" : ""}> Show when the sketch is closed</label>` +
     `<div class="buttons"><button type="button" data-ia="imgscale" title="Two points on the image and the distance between them">Scale from distance</button>` +
     `<button type="button" data-ia="imgcircle" title="Three points on a circle on the image and its diameter">Scale from circle</button>` +
     `<button type="button" data-ia="imgalign" title="Two points on an image edge that is horizontal or vertical">Align to axis</button>` +
@@ -5834,6 +6023,7 @@ function imgProps() {
     `<h3 class="sk-h3">Corrections</h3>` +
     `<div class="buttons"><button type="button" data-ia="imglens" title="Points along edges that are straight on the object; fits the radial lens coefficient k1">Lens correction</button>` +
     `<button type="button" data-ia="persp" title="Four corners of a rectangle of known width and height">Perspective</button>` +
+    `<button type="button" data-ia="round" title="Points on the rim of a round part: one circle (affine), one circle and its centre or two concentric circles (perspective)">Round part</button>` +
     `<button type="button" data-ia="imgctrl" title="Points on the image and their positions in the sketch: 2 points scale, rotate and move; 3 points affine; 4 or more points perspective">Control points</button>` +
     `<button type="button" data-ia="reset" title="Shows the image file without corrections"${m.cfile ? "" : " disabled"}>Remove corrections</button></div>` +
     `<p class="hint">Order: lens correction, perspective, then scale, align and move. A lens correction removes the perspective correction.</p>`;
@@ -5853,6 +6043,7 @@ function imgProps() {
     changed(true);
   });
   $("#skp-iop").oninput = e => { m.opacity = +e.target.value; SK.dirty = true; drawImages(); };
+  $("#skp-i3d").onchange = e => { checkpoint(); if (e.target.checked) m.show3d = true; else delete m.show3d; changed(true); };
   box.querySelectorAll("button[data-ia]").forEach(b => b.onclick = () => imgAction(b.dataset.ia));
 }
 
@@ -5864,7 +6055,7 @@ async function imgAction(a) {
       checkpoint();
       busy(true, "Image...");
       await imgSetCorrection(m, null);
-      delete m.persp; delete m.ctrl; delete m.lensOut;
+      delete m.persp; delete m.ctrl; delete m.round; delete m.lensOut;
       changed(true);
       msg("Corrections removed");
     } else if (a === "imgctrl") {
@@ -5873,12 +6064,23 @@ async function imgAction(a) {
       ctrlForm(m);
     } else if (a === "persp") {
       perspForm(m);
+    } else if (a === "round") {
+      if (m.persp || m.ctrl || m.round || (m.cfile && !m.k1)) {       // back to the lens-corrected image
+        busy(true, "Image without perspective correction...");
+        checkpoint();
+        await imgSetCorrection(m, lensOnly(m));
+        delete m.persp; delete m.ctrl; delete m.round;
+        changed(true);
+      }
+      SK.round = { rims: [[], []], centre: null, act: 0 };
+      await setTool("imground");
+      roundForm(m);
     } else if (a === "imglens") {
       if (m.cfile) {
         busy(true, "Image without corrections...");
         checkpoint();
         await imgSetCorrection(m, null);
-        delete m.persp; delete m.ctrl;
+        delete m.persp; delete m.ctrl; delete m.round;
         changed(true);
       }
       SK.lens = { lines: [], cur: [] };
@@ -5904,11 +6106,11 @@ function perspForm(m) {
     rd();
     if (!(PERSP.width > 0 && PERSP.height > 0)) return msg("Width and height must be > 0", true);
     try {
-      if (m.persp || m.ctrl || (m.cfile && !m.k1)) {       // back to the lens-corrected image
+      if (m.persp || m.ctrl || m.round || (m.cfile && !m.k1)) {       // back to the lens-corrected image
         busy(true, "Image without perspective correction...");
         checkpoint();
         await imgSetCorrection(m, lensOnly(m));
-        delete m.persp; delete m.ctrl;
+        delete m.persp; delete m.ctrl; delete m.round;
         changed(true);
       }
       await setTool("imgpersp");
@@ -5968,13 +6170,113 @@ async function perspApply(pts) {
     const rr = await postJSON("/api/sketch/image/render", { file: m.file, k1: m.k1 || 0, H: j.H, out: j.out });
     const cfile = (await rr.json()).file;
     Object.assign(m, { H: j.H, out: j.out, cfile, persp: { width: PERSP.width, height: PERSP.height, pts: q } });
-    delete m.ctrl;
+    delete m.ctrl; delete m.round;
     const k = j.k, P1 = pts[0];
     m.A = [1 / k, 0, 0, -1 / k, P1[0] - j.c1[0] / k, P1[1] + j.c1[1] / k];
     await setTool("select");
     changed(true);
-    msg(`Perspective correction: ${fmtN(PERSP.width, 3)} x ${fmtN(PERSP.height, 3)} mm rectangle, ${fmtN(1 / k, 5)} mm/px` + (j.clipped ? "; the corrected image is cut to 3 times the rectangle" : ""));
+    msg(`Perspective correction: ${fmtN(PERSP.width, 3)} x ${fmtN(PERSP.height, 3)} mm rectangle, ${fmtN(1 / k, 5)} mm/px` + (j.clipped ? "; the corrected image is cut to 11 times the rectangle" : ""));
   } catch (e) { SK.pick = []; showErr(e); }
+  finally { busy(false); }
+}
+
+const ROUND_MODES = { affine: "affine from 1 circle", centre: "perspective from circle and centre", concentric: "perspective from 2 concentric circles" };
+const ROUND = { d: "" };
+/** Ellipse fitted to points (at least 5): {c, a, b, ang} (semi-axes a >= b, angle of a in rad), or null. */
+function ellipseFit(pts) {
+  const n = pts.length;
+  let mx = 0, my = 0;
+  for (const p of pts) { mx += p[0] / n; my += p[1] / n; }
+  let sc = 0;
+  for (const p of pts) sc += Math.hypot(p[0] - mx, p[1] - my) / n;
+  if (!(sc > 0)) return null;
+  // a (x^2 - y^2) + b xy + d x + e y + f = -y^2 (a + c = 1), normalised coordinates
+  const N = Array.from({ length: 5 }, () => [0, 0, 0, 0, 0]), rhs = [0, 0, 0, 0, 0];
+  for (const p of pts) {
+    const x = (p[0] - mx) / sc, y = (p[1] - my) / sc, r = [x * x - y * y, x * y, x, y, 1];
+    for (let i = 0; i < 5; i++) { for (let j = 0; j < 5; j++) N[i][j] += r[i] * r[j]; rhs[i] -= r[i] * y * y; }
+  }
+  const v = gaussSolve(N, rhs);
+  if (!v) return null;
+  const [a, b, d, e, f] = v, c = 1 - a;
+  const det = a * c - b * b / 4;
+  if (!(det > 0)) return null;
+  const x0 = (b * e / 2 - c * d) / (2 * det), y0 = (b * d / 2 - a * e) / (2 * det);
+  const g = f + (d * x0 + e * y0) / 2;
+  const tr = a + c, di = Math.sqrt(Math.max(0, (a - c) * (a - c) + b * b));
+  const l1 = (tr - di) / 2, l2 = (tr + di) / 2;          // l1 <= l2: l1 along the major axis
+  if (!(-g / l1 > 0 && -g / l2 > 0)) return null;
+  const ang = 0.5 * Math.atan2(b, a - c) + Math.PI / 2;
+  return { c: [mx + sc * x0, my + sc * y0], a: sc * Math.sqrt(-g / l1), b: sc * Math.sqrt(-g / l2), ang };
+}
+function ellipseInside(el, p) {
+  const d = sub(p, el.c), co = Math.cos(el.ang), si = Math.sin(el.ang);
+  const u = (d[0] * co + d[1] * si) / el.a, v = (-d[0] * si + d[1] * co) / el.b;
+  return u * u + v * v < 1;
+}
+function ellipsePts(el, n) {
+  const co = Math.cos(el.ang), si = Math.sin(el.ang), out = [];
+  for (let i = 0; i < n; i++) {
+    const t = 2 * Math.PI * i / n, u = el.a * Math.cos(t), v = el.b * Math.sin(t);
+    out.push([el.c[0] + co * u - si * v, el.c[1] + si * u + co * v]);
+  }
+  return out;
+}
+
+function roundForm(m) {
+  const R = SK.round;
+  const box = $("#sk-props");
+  const n1 = R.rims[0].length, n2 = R.rims[1].length;
+  const kind = R.centre && n1 >= 5 ? ROUND_MODES.centre : n2 >= 5 && n1 >= 5 ? ROUND_MODES.concentric : n1 >= 5 ? ROUND_MODES.affine : "-";
+  const el = n1 >= 5 ? ellipseFit(R.rims[0]) : null;
+  const rb = (v, t) => `<label class="check"><input type="radio" name="skp-ract" value="${v}"${String(R.act) === String(v) ? " checked" : ""}> ${t}</label>`;
+  box.innerHTML = `<p><strong>Round part</strong> ${esc(m.name || "")}</p>` +
+    `<label>Diameter of circle 1 (mm)<input type="text" inputmode="decimal" class="numf" id="skp-rd" value="${esc(String(ROUND.d))}" placeholder="${el ? fmtN(2 * el.a * imgScale(m), 4) : ""}"></label>` +
+    `<p class="hint">Points on:</p>${rb(0, `Circle 1 (${n1} points)`)}${rb(1, `Circle 2, concentric (${n2} points)`)}${rb("c", `Centre (${R.centre ? "picked" : "not picked"})`)}` +
+    `<p class="hint">At least 5 points per circle, spread around it, all on one plane face of the part (circle 2 at the same depth as circle 1). Circle 1 only: affine correction (the ellipse becomes a circle). Circle 1 and the centre, or circles 1 and 2: perspective correction. Empty diameter: the current scale. Result: ${kind}.</p>` +
+    (el ? `<p class="hint">Ellipse 1: ${fmtN(2 * el.a, 1)} x ${fmtN(2 * el.b, 1)} px, ratio ${fmtN(el.b / el.a, 3)}.</p>` : "") +
+    `<div class="buttons"><button type="button" id="skp-rapply" class="primary"${n1 >= 5 ? "" : " disabled"}>Apply</button><button type="button" id="skp-rundo"${n1 + n2 || R.centre ? "" : " disabled"}>Remove last</button><button type="button" id="skp-rcancel">Cancel</button></div>`;
+  box.querySelectorAll("input[name=skp-ract]").forEach(r => r.onchange = () => { R.act = r.value === "c" ? "c" : +r.value; updateHint(); });
+  $("#skp-rd").onchange = e => { ROUND.d = e.target.value.trim(); };
+  $("#skp-rapply").onclick = () => roundApply();
+  $("#skp-rundo").onclick = () => {
+    if (R.act === "c") R.centre = null; else R.rims[R.act].pop();
+    roundForm(m); updateHint(); overlay();
+  };
+  $("#skp-rcancel").onclick = () => { SK.round = null; setTool("select"); showProps(); };
+  updateHint(); overlay();
+}
+
+async function roundApply() {
+  const m = imgCur(), R = SK.round;
+  if (!m || !R) return;
+  const di = $("#skp-rd");
+  if (di) ROUND.d = di.value.trim();
+  const rims = R.rims.filter(r => r.length);
+  if (R.rims[0].length < 5) return msg("At least 5 points on circle 1", true);
+  if (R.rims[1].length && R.rims[1].length < 5) return msg("At least 5 points on circle 2", true);
+  let d = ROUND.d === "" ? NaN : numv(ROUND.d.replace(",", "."));
+  if (ROUND.d === "") { const el = ellipseFit(R.rims[0]); d = el ? 2 * el.a * imgScale(m) : NaN; }
+  if (!(d > 0)) return msg("Diameter must be > 0", true);
+  busy(true, "Round part correction...");
+  try {
+    // shown pixels of the lens-corrected image (or the image file) -> lens-corrected pixels q
+    const toQ = r => (m.k1 && m.qo ? [r[0] + m.qo[0], r[1] + m.qo[1]] : r);
+    const body = { file: m.file, k1: m.k1 || 0, diameter: d, rims: rims.map(r => r.map(toQ)), centre: R.centre ? toQ(R.centre) : null };
+    const j = await (await postJSON("/api/sketch/image/round", body)).json();
+    const cfile = (await (await postJSON("/api/sketch/image/render", { file: m.file, k1: m.k1 || 0, H: j.H, out: j.out })).json()).file;
+    checkpoint();
+    const P1 = affApply(m.A, m.k1 && m.qo ? [j.cq[0] - m.qo[0], j.cq[1] - m.qo[1]] : j.cq);
+    Object.assign(m, { H: j.H, out: j.out, cfile, round: { mode: j.mode, d, rms: j.rms, max: j.max, d2: j.d2, rims: body.rims, centre: body.centre } });
+    delete m.persp; delete m.ctrl;
+    const k = j.k;
+    m.A = [1 / k, 0, 0, -1 / k, P1[0] - j.c1[0] / k, P1[1] + j.c1[1] / k];
+    SK.round = null;
+    await setTool("select");
+    changed(true);
+    msg(`Round part, ${ROUND_MODES[j.mode]}: diameter ${fmtN(d, 4)} mm, ${fmtN(1 / k, 5)} mm/px, radial deviation rms ${fmtN(j.rms, 3)} mm, max ${fmtN(j.max, 3)} mm` +
+        (j.d2 ? `; circle 2 diameter ${fmtN(j.d2, 4)} mm` : "") + (j.centre_unused ? "; the picked centre is outside circle 1 and is not used" : "") + (j.rejected ? `; perspective not used: ${j.rejected}` : "") + (j.clipped ? "; the corrected image is cut to 11 times the circle diameter" : ""));
+  } catch (e) { showErr(e); }
   finally { busy(false); }
 }
 
@@ -6041,14 +6343,14 @@ async function ctrlApply() {
     const rr = await postJSON("/api/sketch/image/render", { file: m.file, k1: m.k1 || 0, H: j.H, out: j.out });
     const cfile = (await rr.json()).file;
     Object.assign(m, { H: j.H, out: j.out, cfile, ctrl: { n: P.length, rms: j.rms, max: j.max, src, dst: X } });
-    delete m.persp;
+    delete m.persp; delete m.round;
     const k = j.k;
     m.A = [1 / k, 0, 0, -1 / k, X[0][0] - j.c1[0] / k, X[0][1] + j.c1[1] / k];
     SK.ctrl = null;
     await setTool("select");
     changed(true);
     msg(`Perspective from ${P.length} control points: ${fmtN(1 / k, 5)} mm/px` + (P.length > 4 ? `, deviation rms ${fmtN(j.rms, 3)} mm, max ${fmtN(j.max, 3)} mm` : "") +
-        (j.clipped ? "; the corrected image is cut to 3 times the extent of the points" : ""));
+        (j.clipped ? "; the corrected image is cut to 11 times the extent of the points" : ""));
   } catch (e) { showErr(e); }
   finally { busy(false); }
 }
@@ -6156,6 +6458,22 @@ Object.assign(TOOLS, {
       if (last && !last.dst) last.dst = sn.p;
       else { const r = imgPick(m, sn.p); if (r) P.push({ px: r, at: sn.p, dst: null }); }
       ctrlForm(m);
+    },
+  },
+  imground: {
+    hint: () => { const R = SK.round; if (!R) return ""; return R.act === "c" ? "Centre of the circle (centre hole, centre mark)" : `Point ${R.rims[R.act].length + 1} on circle ${R.act + 1}${R.act ? " (concentric with circle 1)" : ""}; Enter applies, Esc cancels`; },
+    move: RAW,
+    click(sn) {
+      const m = imgCur(), R = SK.round;
+      if (!m || !R) return;
+      const r = imgPick(m, sn.p);
+      if (!r) return;
+      if (R.act === "c") {
+        const el = R.rims[0].length >= 5 ? ellipseFit(R.rims[0]) : null;
+        if (el && !ellipseInside(el, r)) return msg("The centre is outside circle 1", true);
+        R.centre = r;
+      } else R.rims[R.act].push(r);
+      roundForm(m);
     },
   },
   imgpersp: {

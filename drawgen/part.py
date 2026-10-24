@@ -3991,6 +3991,23 @@ def _section_refs_of(shape, plane, project, is_solid):
     return out
 
 
-def export_step(shape, path):
-    from build123d import export_step as _ex
-    _ex(shape, path)
+def export_step(shape, path, surfaces=None, names=None, label="part"):
+    """STEP of the solid and the surface bodies that are not hidden, one labelled component each."""
+    from build123d import Compound, export_step as _ex
+    surfaces = surfaces or []
+    if not surfaces:
+        _ex(shape, path)
+        return
+    children = []
+    if shape is not None:
+        shape.label = label
+        children.append(shape)
+    for fid, b in surfaces:
+        try:
+            b.label = (names or {}).get(fid) or str(fid)
+        except Exception:
+            pass
+        children.append(b)
+    comp = Compound(children=children)
+    comp.label = label
+    _ex(comp, path)

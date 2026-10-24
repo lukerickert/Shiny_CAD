@@ -338,7 +338,34 @@ function drawSketches() {
     const a = add(pos, COL.sketch, false);
     if (a) PT.sketchObjs.push(a);
     add(cpos, 0x2f74d0, true);
+    for (const m of sk.images || []) if (m.show3d && m.show !== false) drawSketchImage(item, m);
   }
+}
+
+/** Reference image of a sketch (images[].show3d) on the sketch plane: the shown file (corrected file, else the
+ * image file) placed by its affine map A (shown pixel -> sketch point). */
+function drawSketchImage(item, m) {
+  const [w, h] = m.cfile && m.out ? m.out : [m.w, m.h];
+  const A = m.A;
+  if (!A || !(w > 0 && h > 0)) return;
+  const sp = (u, v) => to3(item, A[0] * u + A[2] * v + A[4], A[1] * u + A[3] * v + A[5]);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute([...sp(0, 0), ...sp(w, 0), ...sp(w, h), ...sp(0, h)], 3));
+  g.setAttribute("uv", new THREE.Float32BufferAttribute([0, 1, 1, 1, 1, 0, 0, 0], 2));
+  g.setIndex([0, 1, 2, 0, 2, 3]);
+  const url = "/api/sketch/image/file/" + encodeURIComponent(m.cfile || m.file);
+  PT.imgTex = PT.imgTex || {};
+  let tex = PT.imgTex[url];
+  if (!tex) {
+    tex = PT.imgTex[url] = new THREE.TextureLoader().load(url, () => render3(), undefined, () => { delete PT.imgTex[url]; });
+    tex.colorSpace = THREE.SRGBColorSpace;
+  }
+  const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: m.opacity === undefined ? 0.6 : m.opacity,
+                                            side: THREE.DoubleSide, depthWrite: false });
+  const mesh = new THREE.Mesh(g, mat);
+  mesh.renderOrder = 1;
+  mesh.userData = { kind: "sketchimage", id: item.id };
+  PT.three.group.add(mesh);
 }
 
 function planeLabel(text, color) {

@@ -1011,6 +1011,22 @@ def sketch_image_perspective():
         return error("perspective correction: %s" % e)
 
 
+@app.route("/api/sketch/image/round", methods=["POST"])
+def sketch_image_round():
+    """Correction from points (lens-corrected pixels) on 1 or 2 concentric circles, the diameter of the first and
+    the picked centre (optional)."""
+    req = request.get_json(force=True) or {}
+    try:
+        w, h = sketchimage.image_size(_img_path(req.get("file")))
+        k1 = float(req.get("k1") or 0)
+        return jsonify(sketchimage.round_part(req.get("rims") or [], float(req.get("diameter") or 0),
+                                              sketchimage.lens_bounds(k1, w, h), req.get("centre")))
+    except FileNotFoundError as e:
+        return error(str(e), 404)
+    except (ValueError, TypeError, np.linalg.LinAlgError) as e:
+        return error("round part: %s" % e)
+
+
 @app.route("/api/sketch/image/fit", methods=["POST"])
 def sketch_image_fit():
     """Homography from control points: lens-corrected pixels and their sketch points (at least 4 pairs)."""
@@ -1528,13 +1544,17 @@ def part_put(name):
 def part_export():
     req = request.get_json(force=True)
     p = req.get("part") or {}
-    shape, st = part.build(p)
-    if shape is None:
-        return error("the part has no solid")
+    bodies = {}
+    shape, st = part.build(p, surfaces=bodies)
+    hidden = set(p.get("hidden") or [])
+    names = {f.get("id"): f.get("name") for f in p.get("features") or []}
+    surfs = [(fid, b) for fid, b in bodies.items() if b is not None and fid not in hidden]
+    if shape is None and not surfs:
+        return error("the part has no solid and no surface body")
     name = safe_name(p.get("name") or "part") + ".step"
     tmpd = tempfile.mkdtemp(dir=WORK_DIR)
     tmp = os.path.join(tmpd, name)
-    part.export_step(shape, tmp)
+    part.export_step(shape, tmp, surfaces=surfs, names=names, label=p.get("name") or "part")
     with open(tmp, "rb") as f:
         data = f.read()
     folder = (req.get("folder") or "").strip().strip('"') or (PROJECTS.dirs().step or "")

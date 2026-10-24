@@ -2024,6 +2024,196 @@ def test_sketch_image_scale_from_circle(page, tmp_path):
     assert abs(math.hypot(b[0] - a[0], b[1] - a[1]) - 50) < 0.5
 
 
+def test_sketch_image_round_part(page, tmp_path):
+    """Round part: a face with circles of 80 mm and 30 mm diameter in perspective; 8 points on each circle give the
+    perspective correction (concentric circles), 8 points on circle 1 and the centre the same."""
+    import numpy as np
+    from PIL import Image, ImageDraw
+    from drawgen import sketchimage as si
+    Hm = np.array([[6.0, 1.5, 700.0], [0.4, 4.0, 520.0], [0.0009, 0.0035, 1.0]])
+    path = str(tmp_path / "round.png")
+    im = Image.new("RGB", (1600, 1200), (150, 150, 150))
+    dr = ImageDraw.Draw(im)
+    for r in (40, 15):
+        a = np.linspace(0, 2 * math.pi, 200)
+        q, _ = si.apply_h(Hm, np.c_[r * np.cos(a), r * np.sin(a)])
+        dr.line([tuple(x) for x in q], fill=(0, 0, 0), width=3)
+    im.save(path)
+    rim = lambda r: si.apply_h(Hm, [[r * math.cos(t), r * math.sin(t)] for t in np.linspace(0.3, 5.8, 8)])[0]
+    tab(page, "sketch")
+    page.click("#sk-new")
+    page.set_input_files("#sk-img-file", path)
+    page.wait_for_function("window.__sk.SK.doc.images.length === 1 && window.__sk.SK.imgSel")
+    probe = [(-40, 0), (40, 0), (0, -40), (0, 40), (0, 0)]
+    probe_px = si.apply_h(Hm, probe)[0]
+
+    def check(tol):
+        m = [_model_of(page, p) for p in probe_px]
+        for (i, j) in ((0, 1), (2, 3)):
+            assert abs(math.hypot(m[j][0] - m[i][0], m[j][1] - m[i][1]) - 80) < tol, m
+        assert abs(math.hypot(m[4][0] - m[0][0], m[4][1] - m[0][1]) - 40) < tol, m
+    for mode in ("concentric", "centre"):
+        page.click("#sk-props button[data-ia=round]")
+        page.wait_for_function("window.__sk.SK.tool === 'imground'")
+        page.fill("#skp-rd", "80")
+        page.dispatch_event("#skp-rd", "change")
+        for p in rim(40):
+            _click_px(page, p)
+        wait_text(page, "#sk-props", "Circle 1 (8 points)")
+        wait_text(page, "#sk-props", "affine from 1 circle")
+        if mode == "concentric":
+            page.check("input[name=skp-ract][value='1']")
+            for p in rim(15):
+                _click_px(page, p)
+            wait_text(page, "#sk-props", "2 concentric circles")
+            if os.environ.get("DRAWGEN_SHOTS"):
+                page.screenshot(path=os.path.join(os.environ["DRAWGEN_SHOTS"], "sketch_image_round_pick.png"))
+        else:
+            page.check("input[name=skp-ract][value=c]")
+            _click_px(page, si.apply_h(Hm, [[70, 0]])[0][0])         # outside circle 1: refused
+            wait_text(page, "#sk-msg", "outside circle 1")
+            wait_text(page, "#sk-props", "Centre (not picked)")
+            _click_px(page, probe_px[4])
+            wait_text(page, "#sk-props", "circle and centre")
+        page.click("#skp-rapply")
+        page.wait_for_function("window.__sk.SK.tool === 'select' && window.__sk.SK.doc.images[0].cfile", timeout=60000)
+        assert page.evaluate("window.__sk.SK.doc.images[0].round.mode") == mode
+        check(1.5)
+        wait_text(page, "#sk-props", "round part")
+    if os.environ.get("DRAWGEN_SHOTS"):
+        page.screenshot(path=os.path.join(os.environ["DRAWGEN_SHOTS"], "sketch_image_round.png"))
+
+
+def test_sketch_pan_release_missed(page):
+    """A pan whose button release does not reach the page (released outside the window) ends at the next mouse move
+    without the button; a release outside the canvas ends it as well."""
+    tab(page, "sketch")
+    page.click("#sk-new")
+    box = page.locator("#sk-canvas svg").bounding_box()
+    cx, cy = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+    ev = """([type, x, y, button, buttons]) => { const svg = document.querySelector('#sk-canvas svg');
+        svg.dispatchEvent(new MouseEvent(type, {bubbles: true, clientX: x, clientY: y, button, buttons})); }"""
+    page.evaluate(ev, ["mousedown", cx, cy, 1, 4])
+    page.evaluate(ev, ["mousemove", cx + 80, cy + 40, 1, 4])
+    v0 = page.evaluate("JSON.stringify(window.__sk.SK.view)")
+    page.evaluate(ev, ["mousemove", cx + 200, cy + 100, 0, 0])          # button up, no mouseup event
+    assert page.evaluate("window.__sk.SK.pan") is None
+    assert page.evaluate("JSON.stringify(window.__sk.SK.view)") == v0
+    # middle button released over the side panel
+    page.mouse.move(cx, cy)
+    page.mouse.down(button="middle")
+    page.mouse.move(box["x"] + box["width"] + 60, cy, steps=4)
+    page.mouse.up(button="middle")
+    assert page.evaluate("window.__sk.SK.pan") is None
+    # the Line tool takes clicks after the pans
+    page.keyboard.press("q")
+    page.mouse.click(cx - 100, cy)
+    page.mouse.click(cx + 100, cy)
+    page.keyboard.press("Escape")
+    assert page.evaluate("window.__sk.SK.doc.entities.filter(e => e.t === 'line' && !e.axis).length") == 1
+
+
+def test_part_sketch_image_shown_closed(page, tmp_path):
+    """Show when the sketch is closed: the image of a feature sketch is drawn on its plane in the Part view."""
+    from PIL import Image
+    path = str(tmp_path / "ref.png")
+    Image.new("RGB", (400, 300), (200, 120, 40)).save(path)
+    tab(page, "part")
+    page.click("#tab-part [data-add=sketch]")
+    page.get_by_role("button", name="Draw", exact=True).click()
+    page.wait_for_selector("#tab-sketch:not([hidden])")
+    page.set_input_files("#sk-img-file", path)
+    page.wait_for_function("window.__sk.SK.doc.images.length === 1 && window.__sk.SK.imgSel")
+    page.check("#skp-i3d")
+    assert page.evaluate("window.__sk.SK.doc.images[0].show3d") is True
+    corners = page.evaluate("(() => { const m = window.__sk.SK.doc.images[0]; return [[0, 0], [400, 300]].map(p => window.__sk.affApply(m.A, p)); })()")
+    page.click("#sk-canvas")
+    page.keyboard.press("Control+e")
+    page.wait_for_selector("#tab-part:not([hidden])")
+    count = "window.__part.PT.three.group.children.filter(o => o.userData.kind === 'sketchimage').length"
+    page.wait_for_function(count + " === 1")
+    # the quad lies on the XY plane at the corners of the image in the sketch
+    pos = page.evaluate("Array.from(window.__part.PT.three.group.children.find(o => o.userData.kind === 'sketchimage').geometry.attributes.position.array)")
+    assert abs(pos[0] - corners[0][0]) < 1e-3 and abs(pos[1] - corners[0][1]) < 1e-3 and abs(pos[2]) < 1e-9
+    assert abs(pos[6] - corners[1][0]) < 1e-3 and abs(pos[7] - corners[1][1]) < 1e-3
+    # Sketches unchecked: no image
+    if os.environ.get("DRAWGEN_SHOTS"):
+        page.screenshot(path=os.path.join(os.environ["DRAWGEN_SHOTS"], "part_sketch_image.png"))
+    page.evaluate("(() => { const c = document.querySelector('#pt-showsketch'); c.checked = false; c.dispatchEvent(new Event('change')); })()")
+    page.wait_for_function(count + " === 0")
+
+
+def _click_model(pg, x, y):
+    s = pg.evaluate("([x, y]) => window.__sk.S([x, y])", [x, y])
+    box = pg.locator("#sk-canvas svg").bounding_box()
+    pg.mouse.click(box["x"] + s[0], box["y"] + s[1])
+
+
+def _typed(pg, *pts):
+    for t in pts:
+        pg.keyboard.type(t)
+        pg.keyboard.press("Enter")
+
+
+def test_sketch_centre_rectangle_slot_tangent_arc(page):
+    tab(page, "sketch")
+    page.click("#sk-new")
+    ents = "window.__sk.SK.doc.entities.filter(e => !e.axis)"
+    # centre rectangle: centre (10, 5), corner (30, 15); construction diagonals and centre point; DOF 4
+    page.click("#sk-tools-draw button[data-tool=rectc]")
+    _typed(page, "10,5", "30,15")
+    page.keyboard.press("Escape")
+    wait_text(page, "#tab-sketch", "DOF 4")
+    r = page.evaluate(ents + ".map(e => [e.t, !!e.constr])")
+    assert sorted(r) == sorted([["line", False]] * 4 + [["line", True]] * 2 + [["point", True]])
+    xs = page.evaluate(ents + ".filter(e => e.t === 'line' && !e.constr).flatMap(e => [e.x1, e.x2])")
+    assert abs(min(xs) + 10) < 1e-6 and abs(max(xs) - 30) < 1e-6
+    page.keyboard.press("Control+z")
+    page.wait_for_function(ents + ".length === 0")
+    # slot: centres (0, 0) and (40, 0), typed width 10; horizontal centre line; DOF 4
+    page.click("#sk-tools-draw button[data-tool=slot]")
+    _typed(page, "0,0", "40,0", "10")
+    page.keyboard.press("Escape")
+    wait_text(page, "#tab-sketch", "DOF 4")
+    arcs = page.evaluate(ents + ".filter(e => e.t === 'arc').map(e => [e.cx, e.cy, e.r])")
+    assert sorted(arcs) == [[0, 0, 5], [40, 0, 5]]
+    ys = page.evaluate(ents + ".filter(e => e.t === 'line' && !e.constr).map(e => [e.y1, e.y2])")
+    assert sorted(ys) == [[-5, -5], [5, 5]]
+    n_t = page.evaluate("window.__sk.SK.doc.constraints.filter(c => c.t === 'tangent').length")
+    assert n_t == 4
+    page.keyboard.press("Control+z")
+    page.wait_for_function(ents + ".length === 0")
+    # slot by its tips (0, 0) and (40, 0), width 10: arc centres (5, 0) and (35, 0)
+    page.click("#sk-tools-draw button[data-tool=slot]")
+    page.check("#skp-stips")
+    page.focus("#sk-canvas")
+    _typed(page, "0,0", "40,0", "10")
+    page.keyboard.press("Escape")
+    arcs = page.evaluate(ents + ".filter(e => e.t === 'arc').map(e => [e.cx, e.cy, e.r])")
+    assert sorted(arcs) == [[5, 0, 5], [35, 0, 5]], arcs
+    page.click("#sk-tools-draw button[data-tool=slot]")
+    page.uncheck("#skp-stips")
+    page.focus("#sk-canvas")
+    page.keyboard.press("Escape")
+    page.keyboard.press("Control+z")
+    page.wait_for_function(ents + ".length === 0")
+    # tangent arc: line (0, 0) - (20, 0), arc from its end to (30, 10), then a second arc to (40, 20)
+    page.click("#sk-tools-draw button[data-tool=line]")
+    _typed(page, "0,0", "20,0")
+    page.keyboard.press("Escape")
+    page.click("#sk-tools-draw button[data-tool=tarc]")
+    _click_model(page, 20, 0)
+    _typed(page, "30,10", "40,20")
+    page.keyboard.press("Escape")
+    arcs = page.evaluate(ents + ".filter(e => e.t === 'arc').map(e => [e.cx, e.cy, e.r])")
+    assert len(arcs) == 2
+    assert all(abs(a - b) < 1e-6 for a, b in zip(arcs[0], [20, 10, 10])), arcs
+    assert all(abs(a - b) < 1e-6 for a, b in zip(arcs[1], [40, 10, 10])), arcs
+    assert page.evaluate("window.__sk.SK.doc.constraints.filter(c => c.t === 'tangent').length") == 2
+    if os.environ.get("DRAWGEN_SHOTS"):
+        page.screenshot(path=os.path.join(os.environ["DRAWGEN_SHOTS"], "sketch_tangent_arc.png"))
+
+
 def test_sketch_circle_three_points(page):
     """Circle 3P through the typed points (0, 0), (100, 0) and (50, 50): centre (50, 0), radius 50."""
     tab(page, "sketch")
