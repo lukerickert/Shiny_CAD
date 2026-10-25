@@ -488,3 +488,208 @@ def test_polygon_profile_shell():
     area = abs(sum((pts[i - 1][0] * pts[i][1] - pts[i][0] * pts[i - 1][1]) for i in range(len(pts)))) / 2
     per = sum(math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]) for i in range(len(pts)))
     assert s.volume == pytest.approx(area * 1 + (per - math.pi) * 9, rel=5e-3)
+
+
+def _two_cells():
+    """Box 20 x 10 x 10 mm (x -10 to 10) split at x = 0 into two cells that share the face at x = 0."""
+    from build123d import Box, Face, Plane, Shape
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Splitter
+    from drawgen import surfaces as sfm
+    box = Box(20, 10, 10)
+    cut = Face.make_rect(30, 30, Plane.YZ)
+    a, t = sfm._shape_list(), sfm._shape_list()
+    a.Append(box.wrapped)
+    t.Append(cut.wrapped)
+    op = BRepAlgoAPI_Splitter()
+    op.SetArguments(a)
+    op.SetTools(t)
+    op.Build()
+    shape = Shape.cast(op.Shape())
+    assert len(shape.solids()) == 2
+    return shape
+
+
+def test_offset_faces_shared_by_two_cells():
+    """A face between two cells is offset in the cell it was picked on ("cell"), the other cell is unchanged."""
+    from drawgen import part
+    shape = _two_cells()
+    shared = [f for f in shape.faces() if abs(f.center().X) < 1e-9]
+    assert len(shared) == 1
+    sols = shape.solids()
+    right = next(i for i, s in enumerate(sols) if s.center().X > 0)
+    key = dict(part.face_key(shared[0]), cell=right)
+    r = part._offset_faces(shape, {"faces": [key], "distance": 2})
+    vols = sorted(round(s.volume, 6) for s in r.solids())
+    assert vols == [1000.0, 1200.0]
+    grown = next(s for s in r.solids() if abs(s.volume - 1200) < 1e-6)
+    bb = grown.bounding_box()
+    assert bb.min.X == pytest.approx(-2) and bb.max.X == pytest.approx(10)
+
+
+def test_periodic_span_face_rebuilt_on_short_range():
+    """A torus face between the tube circles at v = 0 and v = 270 deg that covers the 270 deg way round is rebuilt on
+    the 90 deg range, as two halves (no seam edge)."""
+    from build123d import Face
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+    from OCP.BRepTools import BRepTools
+    from OCP.Geom import Geom_ToroidalSurface
+    from OCP.gp import gp_Ax3
+    from drawgen import part
+    R, r = 22.0, 0.5
+    surf = Geom_ToroidalSurface(gp_Ax3(), R, r)
+    long = Face(BRepBuilderAPI_MakeFace(surf, 0, 2 * math.pi, 0, 1.5 * math.pi, 1e-7).Face())
+    assert long.area == pytest.approx(2 * math.pi * r * (1.5 * math.pi * R - r), rel=1e-6)    # dA = r (R + r cos v) du dv
+    out = part._periodic_span_face(long)
+    assert out and len(out) == 2
+    assert sum(f.area for f in out) == pytest.approx(2 * math.pi * r * (0.5 * math.pi * R + r), rel=1e-6)
+    for f in out:
+        v0, v1 = BRepTools.UVBounds_s(f.wrapped)[2:]
+        assert v1 - v0 == pytest.approx(0.5 * math.pi)
+    short = Face(BRepBuilderAPI_MakeFace(surf, 0, 2 * math.pi, 1.5 * math.pi, 2 * math.pi, 1e-7).Face())
+    assert part._periodic_span_face(short) is None
+
+
+def test_import_clean_up(tmp_path):
+    """Import clean-up of a STEP file with a box and a small cube: the cube below the minimum volume is removed, fix
+    and merge keep the box valid, the status gives the counts."""
+    from build123d import Box, Compound, Location, export_step
+    path = str(tmp_path / "two.step")
+    export_step(Compound(children=[Box(20, 10, 5), Box(1, 1, 1).moved(Location((30, 0, 0)))]), path)
+    p = part_rec("imp", [{"id": "f1", "name": "Import STEP 1", "type": "import", "path": path, "part": None,
+                          "clean": {"rebuild": True, "fix": True, "unify": True, "min_volume": 10}}])
+    shape, st = build(p)
+    assert len(shape.solids()) == 1 and shape.volume == pytest.approx(1000)
+    assert st[0]["clean"]["removed"] == 1 and st[0]["clean"]["invalid_after"] == 0
+    assert "1 solid(s) below the minimum volume removed" in st[0]["note"]
+    p["features"][0]["clean"] = {}
+    shape, st = build(p)
+    assert len(shape.solids()) == 2 and "clean" not in st[0]
+
+
+def _two_plates(extra=()):
+    """Surface bodies: A on XY (x -20..20, y 0..20), B on XZ (x -20..20, z 0..20): a right angle along the x axis."""
+    return part_rec("sf", [{"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0,
+                            "sketch": {"entities": rect(40, 20, -20, 0)}},
+                           {"id": "b", "name": "B", "type": "surf_sketch", "kind": "planar", "plane": "XZ", "offset": 0,
+                            "sketch": {"entities": rect(40, 20, -20, 0)}}] + list(extra))
+
+
+def test_surface_fillet_between_bodies():
+    """R3 rolling-ball fillet between two plates at a right angle: a quarter cylinder of 3 x pi / 2 x 40 mm^2;
+    trimmed and sewn: the plates lose 3 mm each."""
+    from drawgen import part
+    for trim, area, nf in ((False, math.pi / 2 * 3 * 40, 1), (True, 2 * 40 * 17 + math.pi / 2 * 3 * 40, 3)):
+        p = _two_plates([{"id": "f", "name": "Surface fillet 1", "type": "surf_fillet", "mode": "bodies", "source_a": "a",
+                          "source_b": "b", "radius": 3, "trim": trim}])
+        bodies = {}
+        shape, st = part.build(p, surfaces=bodies)
+        assert st[-1]["error"] is None, st[-1]
+        assert len(bodies["f"].faces()) == nf and bodies["f"].area == pytest.approx(area, rel=1e-5)
+
+
+def test_surface_fillet_plane_and_cylinder():
+    """R2 fillet between a floor and a cylinder face (r 10) standing on it, inside (default sides) and outside
+    (Flip on the cylinder): fillet areas of the torus quarters."""
+    from build123d import Cylinder, Face, Plane, Pos
+    from drawgen import surfaces as sfm
+    cyl = [f for f in Cylinder(10, 20).moved(Pos(0, 0, 10)).faces() if f.geom_type.name == "CYLINDER"][0]
+    bodies = {"a": Face.make_rect(60, 60, Plane.XY), "b": cyl}
+    inside = sfm.fillet(None, bodies, {"source_a": "a", "source_b": "b", "radius": 2, "trim": False}, None)
+    outside = sfm.fillet(None, bodies, {"source_a": "a", "source_b": "b", "radius": 2, "trim": False, "flip_b": True}, None)
+    # torus quarter: area = 2 pi r (R pi / 2 -/+ r) with R the radius of the ball centre circle
+    assert inside.area == pytest.approx(2 * math.pi * 2 * (8 * math.pi / 2 + 2), rel=1e-4)
+    assert outside.area == pytest.approx(2 * math.pi * 2 * (12 * math.pi / 2 - 2), rel=1e-4)
+    trimmed = sfm.fillet(None, bodies, {"source_a": "a", "source_b": "b", "radius": 2, "flip_b": True}, None)
+    assert trimmed.area == pytest.approx(3600 - math.pi * 144 + 2 * math.pi * 10 * 18 + outside.area, rel=1e-4)
+
+
+def test_surface_fillet_edges_of_a_body():
+    """Edges mode: the four vertical edges of an open box (shell of 5 faces) rounded with R3."""
+    from build123d import Box
+    from drawgen import part, surfaces as sfm
+    sh = sfm._sew([f for f in Box(30, 20, 10).faces() if f.center().Z < 4.9])
+    vert = [part.edge_key(e) for e in sh.edges() if abs(e.length - 10) < 1e-6]
+    res = sfm.fillet(None, {"s": sh}, {"mode": "edges", "source": "s", "edges": vert, "radius": 3}, part.find_edges)
+    assert len(res.faces()) == 9
+    # each corner: two 3 x 10 strips and the 3 x 3 floor squares less the quarter discs replaced by quarter cylinders
+    expect = 1600 - 4 * (2 * 3 * 10 - math.pi * 3 / 2 * 10) - 4 * (9 - math.pi * 9 / 4)
+    assert res.area == pytest.approx(expect, rel=1e-4)
+
+
+def test_spline_end_conditions_profile():
+    """Profile with a spline whose ends are tangent and curvature continuous (d0, k0 = 0, d1, k1 = 0) to two lines:
+    the spline edge starts along +x with zero curvature, and the extruded volume matches the sampled profile."""
+    from drawgen import part as P
+    from drawgen.sketch import spline_pts_e, _spline_solve, spline_ends, spline_at
+    sp = {"id": 2, "t": "spline", "layer": "0", "closed": False, "pts": [[20, 0], [30, 10], [20, 20]],
+          "d0": [1, 0], "k0": 0.0, "d1": [-1, 0], "k1": 0.0}
+    ents = [{"id": 1, "t": "line", "layer": "0", "x1": 0, "y1": 0, "x2": 20, "y2": 0}, sp,
+            {"id": 3, "t": "line", "layer": "0", "x1": 20, "y1": 20, "x2": 0, "y2": 20},
+            {"id": 4, "t": "line", "layer": "0", "x1": 0, "y1": 20, "x2": 0, "y2": 0}]
+    S = _spline_solve(sp["pts"], False, spline_ends(sp))
+    assert len(S[0]) == 5 and S[6] == [2, 2]
+    for t, q in ((0, (20, 0)), (1, (30, 10)), (2, (20, 20))):
+        assert spline_at(S, t) == pytest.approx(q, abs=1e-9)
+    p = P.migrate({"name": "t", "features": [
+        {"id": "f1", "name": "Extrude 1", "type": "extrude", "plane": "XY", "offset": 0, "sketch": {"entities": ents}, "depth": 10}]})
+    s, st = P.build(p)
+    assert st[-1]["error"] is None, st[-1]
+    poly = [(0, 0)] + spline_pts_e(sp, 400) + [(0, 20)]
+    area = abs(sum(poly[i - 1][0] * poly[i][1] - poly[i][0] * poly[i - 1][1] for i in range(len(poly)))) / 2
+    assert s.volume == pytest.approx(area * 10, rel=1e-4)
+    # the spline edge on the bottom face: tangent +x and curvature 0 at (20, 0)
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.BRepLProp import BRepLProp_CLProps
+    from OCP.gp import gp_Dir
+    edge = next(e for e in s.edges() if e.geom_type.name != "LINE" and abs(e.center().Z) < 1e-6)
+    ad = BRepAdaptor_Curve(edge.wrapped)
+    for u in (ad.FirstParameter(), ad.LastParameter()):
+        pr = BRepLProp_CLProps(ad, u, 2, 1e-7)
+        pt = pr.Value()
+        if abs(pt.X() - 20) < 1e-6 and abs(pt.Y()) < 1e-6:
+            d = gp_Dir()
+            pr.Tangent(d)
+            assert abs(abs(d.X()) - 1) < 1e-6 and pr.Curvature() < 1e-6
+            break
+    else:
+        raise AssertionError("spline edge end at (20, 0) not found")
+
+
+def test_pattern_bodies():
+    """Pattern of a body: a 20 x 10 x 5 mm block copied twice 30 mm along x as new solids (3 solids, 3000 mm^3)."""
+    from drawgen import part as P
+    sq = [{"id": i, "t": "line", "layer": "0", "x1": a, "y1": b, "x2": c, "y2": d}
+          for i, (a, b, c, d) in enumerate([(0, 0, 20, 0), (20, 0, 20, 10), (20, 10, 0, 10), (0, 10, 0, 0)])]
+    p = P.migrate({"name": "t", "features": [
+        {"id": "f1", "name": "Extrude 1", "type": "extrude", "plane": "XY", "offset": 0, "sketch": {"entities": sq}, "depth": 5},
+        {"id": "f2", "name": "Pattern 1", "type": "pattern", "kind": "linear", "features": [], "bodies": [{"solid": 0}], "count": 3, "step": [30, 0, 0]}]})
+    s, st = P.build(p)
+    assert st[-1]["error"] is None and st[-1]["solids_before"] == 1, st[-1]
+    assert len(s.solids()) == 3 and s.volume == pytest.approx(3000, rel=1e-9)
+    xs = sorted(round(so.center().X, 6) for so in s.solids())
+    assert xs == [10, 40, 70]
+
+
+def test_extrude_cut_bodies():
+    """Extrude and Cut acting on chosen solids: two 20 x 10 x 5 mm blocks (the second a new body at x 30 to 50); a
+    through cut removing z 3 to 5 mm across both with bodies [1] cuts only the second block; an extrude overlapping both with
+    bodies [0] is fused with the first block only (the solids stay separate)."""
+    from drawgen import part as P
+
+    def rect(x0, y0, x1, y1):
+        return [{"id": i, "t": "line", "layer": "0", "x1": a, "y1": b, "x2": c, "y2": d}
+                for i, (a, b, c, d) in enumerate([(x0, y0, x1, y0), (x1, y0, x1, y1), (x1, y1, x0, y1), (x0, y1, x0, y0)])]
+    base = [
+        {"id": "f1", "name": "Extrude 1", "type": "extrude", "plane": "XY", "offset": 0, "sketch": {"entities": rect(0, 0, 20, 10)}, "depth": 5},
+        {"id": "f2", "name": "Extrude 2", "type": "extrude", "plane": "XY", "offset": 0, "sketch": {"entities": rect(30, 0, 50, 10)}, "depth": 5, "new_body": True}]
+    cut = {"id": "f3", "name": "Cut 1", "type": "cut", "plane": "XZ", "offset": 0, "sketch": {"entities": rect(-10, 3, 60, 7)}, "through": True, "bodies": [1]}
+    import copy
+    s, st = P.build(P.migrate({"name": "t", "features": copy.deepcopy(base) + [cut]}))
+    assert st[-1]["error"] is None, st[-1]
+    vols = sorted(round(so.volume, 6) for so in s.solids())
+    assert vols == [600, 1000], vols   # the second block loses 20 x 10 x 2 mm
+    add = {"id": "f3", "name": "Extrude 3", "type": "extrude", "plane": "XY", "offset": 5, "sketch": {"entities": rect(10, 0, 40, 10)}, "depth": 2, "bodies": [0]}
+    s, st = P.build(P.migrate({"name": "t", "features": copy.deepcopy(base) + [add]}))
+    assert st[-1]["error"] is None, st[-1]
+    vols = sorted(round(so.volume, 6) for so in s.solids())
+    assert len(vols) == 2 and vols == [1000, 1000 + 30 * 10 * 2], vols

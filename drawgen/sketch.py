@@ -331,80 +331,180 @@ def _ellipse_pts(e, n=64):
 _SPLINE_CACHE = {}
 
 
-def _spline_solve(pts, closed):
+def spline_ends(e):
+    """End conditions of an open spline entity: (d0, k0, d1, k1) or None. d0, d1: end derivative dP/ds (s the
+    chord-length parameter, d1 in the direction of travel); k0, k1: signed end curvature with respect to d0, d1."""
+    if e.get("closed"):
+        return None
+    d0, d1 = e.get("d0"), e.get("d1")
+    k0 = e.get("k0") if d0 else None
+    k1 = e.get("k1") if d1 else None
+    if not d0 and not d1:
+        return None
+    tup = lambda d: (float(d[0]), float(d[1])) if d else None
+    num = lambda k: None if k is None else float(k)
+    return (tup(d0), num(k0), tup(d1), num(k1))
+
+
+def _spline_solve(pts, closed, ends=None):
     """Cached _spline_solve_now (the same fit points are solved for every span of a profile)."""
-    key = (tuple((float(p[0]), float(p[1])) for p in pts), bool(closed))
+    key = (tuple((float(p[0]), float(p[1])) for p in pts), bool(closed), None if closed else ends)
     S = _SPLINE_CACHE.get(key)
     if S is None:
         if len(_SPLINE_CACHE) > 256:
             _SPLINE_CACHE.clear()
-        S = _SPLINE_CACHE[key] = _spline_solve_now(pts, closed)
+        S = _SPLINE_CACHE[key] = _spline_solve_now(pts, closed, None if closed else ends)
     return S
 
 
-def _spline_solve_now(pts, closed):
-    """Second derivatives of the cubic spline through pts (chord-length parameters, natural ends, periodic when
-    closed). Returns (P, h, m, Mx, My). The same curve as splineSolve in sketch.js."""
+def _dense_solve(A, b):
+    N = len(b)
+    if N > 24:
+        try:
+            import numpy as np
+            return [float(v) for v in np.linalg.solve(np.asarray(A), np.asarray(b))]
+        except Exception:
+            pass
+    A = [row[:] for row in A]
+    b = b[:]
+    for c0 in range(N):
+        piv = max(range(c0, N), key=lambda r: abs(A[r][c0]))
+        A[c0], A[piv] = A[piv], A[c0]
+        b[c0], b[piv] = b[piv], b[c0]
+        if abs(A[c0][c0]) < 1e-14:
+            continue
+        for r in range(c0 + 1, N):
+            f = A[r][c0] / A[c0][c0]
+            if f:
+                for j in range(c0, N):
+                    A[r][j] -= f * A[c0][j]
+                b[r] -= f * b[c0]
+    M = [0.0] * N
+    for r in range(N - 1, -1, -1):
+        sm = b[r] - sum(A[r][j] * M[j] for j in range(r + 1, N))
+        M[r] = 0.0 if abs(A[r][r]) < 1e-14 else sm / A[r][r]
+    return M
+
+
+def _spline_solve_now(pts, closed, ends=None):
+    """Second derivatives of the cubic spline through pts (chord-length parameters; natural ends, clamped end
+    derivatives d0 / d1, end curvature k0 / k1 held with an extra knot at the middle of the end span; periodic when
+    closed). Returns (P, h, m, closed, Mx, My, sub): P, h, m the knots, span lengths and number of spans including
+    the extra knots, sub the number of spans in each span between fit points. The same curve as splineSolve in
+    sketch.js."""
     pts = [tuple(p) for p in pts]
-    P = pts + [pts[0]] if closed else pts
-    m = len(P) - 1
-    h = [max(1e-9, math.hypot(P[i + 1][0] - P[i][0], P[i + 1][1] - P[i][1])) for i in range(m)]
+    P0 = pts + [pts[0]] if closed else pts
+    mu = len(P0) - 1
+    d0, k0, d1, k1 = ends if (ends and not closed) else (None, None, None, None)
+    g0 = d0 is not None and k0 is not None
+    g1 = d1 is not None and k1 is not None
+    sub = [1 + (1 if (i == 0 and g0) else 0) + (1 if (i == mu - 1 and g1) else 0) for i in range(mu)]
+    P, h, hid = [], [], []
+    for i in range(mu):
+        P.append(P0[i])
+        L = max(1e-9, math.hypot(P0[i + 1][0] - P0[i][0], P0[i + 1][1] - P0[i][1])) / sub[i]
+        for j in range(sub[i]):
+            h.append(L)
+            if j > 0:
+                f = j / float(sub[i])
+                hid.append(len(P))
+                P.append((P0[i][0] + (P0[i + 1][0] - P0[i][0]) * f, P0[i][1] + (P0[i + 1][1] - P0[i][1]) * f))
+    if mu >= 0 and P0:
+        P.append(P0[mu])
+    m = len(h)
+    if m < 1:
+        return P, h, m, closed, [0.0], [0.0], sub
+    hidx = {k: n for n, k in enumerate(hid)}
     npts = m if closed else m + 1
+    N = m if closed else m + 1
+    U = N + len(hid)
 
     def solve(c):
-        if m < 1 or (m == 1 and not closed):
-            return [0.0, 0.0]
         y = [q[c] for q in P]
-        N = m if closed else m + 1
-        A = [[0.0] * N for _ in range(N)]
-        b = [0.0] * N
-        if not closed:
-            A[0][0] = 1.0
-            A[N - 1][N - 1] = 1.0
+        A = [[0.0] * U for _ in range(U)]
+        b = [0.0] * U
+
+        def yterm(r, j, coef):
+            j %= npts
+            if j in hidx:
+                A[r][N + hidx[j]] -= coef
+            else:
+                b[r] += coef * y[j]
+
+        r = 0
         for i in range(0 if closed else 1, m):
             hp, hc = h[(i - 1 + m) % m], h[i % m]
-            r = i % N
             A[r][(i - 1 + N) % N] += hp
-            A[r][r] += 2 * (hp + hc)
+            A[r][i % N] += 2 * (hp + hc)
             A[r][(i + 1) % N] += hc
-            b[r] = 6 * ((y[(i + 1) % npts] - y[i]) / hc - (y[i] - y[(i - 1 + npts) % npts]) / hp)
-        if N > 24:
-            # many fit points (a sampled curve): numpy solve of the (cyclic) tridiagonal system
-            try:
-                import numpy as np
-                M = [float(v) for v in np.linalg.solve(np.asarray(A), np.asarray(b))]
-                return M + [M[0]] if closed else M
-            except Exception:
-                pass
-        for c0 in range(N):
-            piv = max(range(c0, N), key=lambda r: abs(A[r][c0]))
-            A[c0], A[piv] = A[piv], A[c0]
-            b[c0], b[piv] = b[piv], b[c0]
-            if abs(A[c0][c0]) < 1e-14:
-                continue
-            for r in range(c0 + 1, N):
-                f = A[r][c0] / A[c0][c0]
-                if f:
-                    for j in range(c0, N):
-                        A[r][j] -= f * A[c0][j]
-                    b[r] -= f * b[c0]
-        M = [0.0] * N
-        for r in range(N - 1, -1, -1):
-            sm = b[r] - sum(A[r][j] * M[j] for j in range(r + 1, N))
-            M[r] = 0.0 if abs(A[r][r]) < 1e-14 else sm / A[r][r]
+            yterm(r, i + 1, 6.0 / hc)
+            yterm(r, i, -6.0 * (1.0 / hc + 1.0 / hp))
+            yterm(r, i - 1, 6.0 / hp)
+            r += 1
+        if not closed:
+            if d0 is None:
+                A[r][0] = 1.0
+            else:
+                A[r][0] = 2 * h[0]
+                A[r][1] += h[0]
+                yterm(r, 1, 6.0 / h[0])
+                yterm(r, 0, -6.0 / h[0])
+                b[r] -= 6.0 * d0[c]
+            r += 1
+            if g0:
+                n0 = math.hypot(d0[0], d0[1])
+                A[r][0] = 1.0
+                b[r] = k0 * n0 * (-d0[1] if c == 0 else d0[0])
+                r += 1
+            if d1 is None:
+                A[r][N - 1] = 1.0
+            else:
+                A[r][N - 2] += h[m - 1]
+                A[r][N - 1] += 2 * h[m - 1]
+                yterm(r, m, -6.0 / h[m - 1])
+                yterm(r, m - 1, 6.0 / h[m - 1])
+                b[r] += 6.0 * d1[c]
+            r += 1
+            if g1:
+                n1 = math.hypot(d1[0], d1[1])
+                A[r][N - 1] = 1.0
+                b[r] = k1 * n1 * (-d1[1] if c == 0 else d1[0])
+                r += 1
+        X = _dense_solve(A, b)
+        M = X[:N]
+        for n, k in enumerate(hid):
+            q = list(P[k])
+            q[c] = X[N + n]
+            P[k] = tuple(q)
         return M + [M[0]] if closed else M
 
-    return P, h, m, closed, solve(0), solve(1)
+    Mx = solve(0)
+    My = solve(1)
+    return P, h, m, closed, Mx, My, sub
+
+
+def _spline_loc(S, t):
+    """Span (counting the extra knots) and fraction of the parameter t (fit point span index plus fraction)."""
+    sub = S[6]
+    mu = len(sub)
+    if mu < 1:
+        return 0, 0.0
+    if S[3]:
+        t = t % mu
+    i = min(mu - 1, max(0, int(math.floor(t))))
+    u = t - i
+    base = sum(sub[:i])
+    n = sub[i]
+    v = u * n
+    j = min(n - 1, max(0, int(math.floor(v))))
+    return base + j, v - j
 
 
 def spline_at(S, t):
-    P, h, m, closed, Mx, My = S
+    P, h, m, closed, Mx, My, sub = S
     if m < 1:
         return P[0]
-    if closed:
-        t = t % m
-    i = min(m - 1, max(0, int(math.floor(t))))
-    u = t - i
+    i, u = _spline_loc(S, t)
     hi = h[i]
     a = 1 - u
     f = lambda y0, y1, M0, M1: a * y0 + u * y1 + ((a ** 3 - a) * M0 + (u ** 3 - u) * M1) * hi * hi / 6.0
@@ -412,8 +512,9 @@ def spline_at(S, t):
 
 
 def spline_span_hermite(S, i):
-    """Span i of the spline as Hermite data in its own parameter u in [0, 1]: (p0, p1, d0, d1) with d = dP/du."""
-    P, h, m, closed, Mx, My = S
+    """Span i (counting the extra knots) of the spline as Hermite data in its own parameter u in [0, 1]:
+    (p0, p1, d0, d1) with d = dP/du."""
+    P, h, m, closed, Mx, My, sub = S
     hi = h[i]
 
     def d(y0, y1, M0, M1, u):
@@ -432,14 +533,14 @@ def spline_range(e):
     return (0.0 if t0 is None else float(t0)), (float(m) if t1 is None else float(t1))
 
 
-def spline_pts(pts, closed, k=12, t0=None, t1=None):
+def spline_pts(pts, closed, k=12, t0=None, t1=None, ends=None):
     """Points of the cubic spline through the fit points between the parameters t0 and t1 (span index plus
     fraction; default the whole curve), k samples per span."""
     pts = [tuple(p) for p in pts]
     if len(pts) < 2:
         return pts
-    S = _spline_solve(pts, closed)
-    m = S[2]
+    S = _spline_solve(pts, closed, ends)
+    m = len(S[6])
     if t0 is None:
         t0 = 0.0
     if t1 is None:
@@ -458,7 +559,7 @@ def spline_pts(pts, closed, k=12, t0=None, t1=None):
 
 def spline_pts_e(e, k=12):
     t0, t1 = spline_range(e)
-    return spline_pts(e["pts"], e.get("closed"), k, t0, t1)
+    return spline_pts(e["pts"], e.get("closed"), k, t0, t1, spline_ends(e))
 
 
 def conic_pts(e, n=32):
@@ -788,7 +889,7 @@ def to_dxf(sk, anns, cfg, opts=None, fields=None):
             msp.add_solid([q[0], q[1], q[3], q[2]], dxfattribs=at)
         elif t == "poly":
             msp.add_lwpolyline([tuple(p) for p in e["pts"]], close=bool(e.get("closed")), dxfattribs=at)
-        elif t == "spline" and e.get("t0") is None and e.get("t1") is None:
+        elif t == "spline" and e.get("t0") is None and e.get("t1") is None and not spline_ends(e):
             fit = [tuple(p) for p in e["pts"]]
             if e.get("closed"):
                 fit = fit + [fit[0]]
@@ -796,7 +897,7 @@ def to_dxf(sk, anns, cfg, opts=None, fields=None):
             if e.get("closed"):
                 sp.closed = True
         elif t == "spline":
-            # a trimmed spline: fitted through sampled points of the kept range
+            # a trimmed spline or a spline with end conditions: fitted through sampled points
             msp.add_spline(fit_points=spline_pts_e(e, 6), degree=3, dxfattribs=at)
         elif t == "conic" and e.get("t0") is None and e.get("t1") is None:
             rho = min(0.999, max(0.001, float(e.get("rho", 0.5) or 0.5)))

@@ -1,7 +1,7 @@
 SHINYCAD - installation and start
 =================================
 
-Full manual: README.md (installation section 1, Explicit tab section 13).
+Full manual: docs\ (contents in README.md; installation docs\01-installation.md, Explicit tab docs\13-explicit.md).
 
 Requirements
 ------------
@@ -10,7 +10,7 @@ Requirements
   "py -0" in a command window lists the installed versions.
 - Internet connection for the first start (approximately 500 MB of packages).
 
-Solvers (not installed by start.bat; README section 1.1)
+Solvers (not installed by start.bat; docs\01-installation.md section 1.1)
 -------------------------------------------------------
 Unpacked in the folder solvers\ of the program, the solvers are found without settings.
 - CalculiX ccx (Analysis tab): PrePoMax, https://prepomax.fs.um.si/downloads/
@@ -92,9 +92,10 @@ requirements.txt           Python packages
 config.json                settings and title block
 config.local.json          settings of this PC (projects folder, open project, Explicit settings,
                            browser, CalculiX path); created at the first change, not in the package
-publish.bat                commit and push of the program folder to GitHub (README section 2.2)
+publish.bat                commit and push of the program folder to GitHub (docs\02-files.md section 2.2)
 logo.png                   logo of the title block
-README.md                  full manual
+README.md                  overview and contents of the manual
+docs\                      manual, one page per section
 SHINYCAD_functions.png     overview of the functions
 drawgen\                   program (server, drawing, part, assembly, analysis modules)
 drawgen\static\            interface (HTML, JavaScript, three.js 0.160.0, MIT licence)

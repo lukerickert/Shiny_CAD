@@ -386,3 +386,69 @@ def test_config_split_local_settings(web, tmp_path, monkeypatch):
     web.save_config(cfg)
     assert json.loads(cp.read_text()) == {"sheet": "A2"}
     assert json.loads(lp.read_text())["browser"] == "edge"
+
+
+def test_part_refs_earlier_sketches(client):
+    """Reference geometry of a sketch in a part with no solid: the curves of an earlier sketch on XY appear as
+    projected lines (kind proj) in a sketch on XY and on XZ (projected along y; the edges along y are left out)."""
+    rect = [{"id": "e%d" % i, "t": "line", "layer": "0", "x1": a, "y1": b, "x2": c, "y2": d}
+            for i, (a, b, c, d) in enumerate([(0, 0, 40, 0), (40, 0, 40, 20), (40, 20, 0, 20), (0, 20, 0, 0)])]
+    p = {"name": "t", "version": 2, "features": [
+        {"id": "s1", "name": "Sketch 1", "type": "sketch", "plane": "XY", "offset": 0, "sketch": {"entities": rect}},
+        {"id": "s2", "name": "Sketch 2", "type": "sketch", "plane": "XY", "offset": 5, "sketch": {"entities": []}},
+        {"id": "s3", "name": "Sketch 3", "type": "sketch", "plane": "XZ", "offset": 0, "sketch": {"entities": []}}]}
+    r = client.post("/api/part/refs", json={"part": p, "index": 1, "path": False, "section": None})
+    lines = [x for x in r.get_json() if x.get("kind") == "proj" and x["t"] == "line"]
+    ends = sorted((round(x["x1"], 6), round(x["y1"], 6)) for x in lines)
+    assert ends == [(0, 0), (0, 20), (40, 0), (40, 20)], ends
+    r = client.post("/api/part/refs", json={"part": p, "index": 2, "path": False, "section": None})
+    lines = [x for x in r.get_json() if x.get("kind") == "proj" and x["t"] == "line"]
+    assert len(lines) == 2 and all(abs(abs(x["x2"] - x["x1"]) - 40) < 1e-6 for x in lines), lines
+    # a sketch used by an extrude is not listed (the solid is)
+    p["features"].insert(1, {"id": "f1", "name": "Extrude 1", "type": "extrude", "sketch_ref": "s1", "depth": 3})
+    r = client.post("/api/part/refs", json={"part": p, "index": 2, "path": False, "section": None})
+    assert r.status_code == 200
+
+
+def test_sketch_loops(client):
+    """Closed profiles and open ends: a triangle, a circle and a single line (two open ends)."""
+    sk = {"entities": [{"t": "line", "x1": 0, "y1": 0, "x2": 10, "y2": 0}, {"t": "line", "x1": 10, "y1": 0, "x2": 10, "y2": 5},
+                       {"t": "line", "x1": 10, "y1": 5, "x2": 0, "y2": 0}, {"t": "line", "x1": 20, "y1": 0, "x2": 30, "y2": 0},
+                       {"t": "circle", "cx": 50, "cy": 0, "r": 3}]}
+    j = ok(client.post("/api/sketch/loops", json={"sketch": sk}))
+    assert len(j["loops"]) == 1 and len(j["loops"][0]) == 3
+    assert j["circles"] == [[50.0, 0.0, 3.0]] and sorted(j["open"]) == [[20.0, 0.0], [30.0, 0.0]]
+
+
+def test_document_move_and_copy_to_project(client, web):
+    """Move an assembly with the parts it uses to another project (versions, annotations and layout go along; a part
+    still used by an assembly that stays is copied); copy a part; a name taken in the target project is refused."""
+    ok(client.post("/api/projects", json={"name": "other_pj", "description": "", "open": False}))
+    pp = plate("mv_part")
+    pp["uid"] = "mvuid000001"
+    save_part(client, pp)
+    save_part(client, plate("mv_shared"))
+    ok(client.post("/api/project/doc", json={"op": "snapshot", "type": "part", "name": "mv_part", "note": "v1"}))
+    comp = lambda cid, part: {"id": cid, "name": cid, "source": {"type": "part", "name": part}, "pos": [0, 0, 0], "rot": [0, 0, 0]}
+    ok(client.put("/api/assembly/file/mv_asm", json={"name": "mv_asm", "components": [comp("c1", "mv_part"), comp("c2", "mv_shared")], "next": 3}))
+    ok(client.put("/api/assembly/file/stay_asm", json={"name": "stay_asm", "components": [comp("c1", "mv_shared")], "next": 2}))
+    src = project_dir(web)
+    uid = json.load(open(os.path.join(src, "work", "mv_part.part.json"))).get("uid") or "mvuid000001"
+    with open(os.path.join(src, "work", "annotations", uid + ".json"), "w") as f:
+        json.dump([{"type": "note", "text": "x"}], f)
+    r = ok(client.post("/api/project/doc", json={"op": "move", "type": "assembly", "name": "mv_asm", "project": "other_pj", "with_uses": True}))
+    assert sorted((d["type"], d["name"], d["mode"]) for d in r["done"]) == [("assembly", "mv_asm", "move"), ("part", "mv_part", "move"), ("part", "mv_shared", "copy")]
+    dst = web.PROJECTS.project_dir("other_pj")
+    for fn in ("mv_asm.asm.json", "mv_part.part.json", "mv_shared.part.json"):
+        assert os.path.isfile(os.path.join(dst, "work", fn)), fn
+    assert not os.path.exists(os.path.join(src, "work", "mv_asm.asm.json")) and not os.path.exists(os.path.join(src, "work", "mv_part.part.json"))
+    assert os.path.isfile(os.path.join(src, "work", "mv_shared.part.json"))
+    assert os.path.isfile(os.path.join(dst, "versions", "mv_part.part.v1.json"))
+    assert os.path.isfile(os.path.join(dst, "work", "annotations", uid + ".json"))
+    assert json.load(open(os.path.join(dst, "project.json")))["docs"]["part:mv_part"]["version"] == 1
+    # copy: the source stays; a second copy is refused (name taken)
+    r = ok(client.post("/api/project/doc", json={"op": "copy_to", "type": "assembly", "name": "stay_asm", "project": "other_pj"}))
+    assert r["done"] == [{"type": "assembly", "name": "stay_asm", "mode": "copy"}]
+    assert os.path.isfile(os.path.join(src, "work", "stay_asm.asm.json"))
+    bad = client.post("/api/project/doc", json={"op": "copy_to", "type": "assembly", "name": "stay_asm", "project": "other_pj"})
+    assert bad.status_code >= 400 and "exists in project other_pj" in bad.get_data(as_text=True)

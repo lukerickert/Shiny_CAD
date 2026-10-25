@@ -533,7 +533,9 @@ def project_docs():
 
 @app.route("/api/project/doc", methods=["POST"])
 def project_doc_op():
-    """{"op": rename | copy | delete | snapshot | restore, "type", "name", "new", "note", "version", "as_copy"}"""
+    """{"op": rename | copy | delete | snapshot | restore | versions | move | copy_to, "type", "name", "new", "note",
+    "version", "as_copy", "project" (move, copy_to: the target project), "with_uses" (move, copy_to: with the documents
+    it uses)}"""
     req = request.get_json(force=True)
     op, t, n = req.get("op"), req.get("type"), req.get("name")
     # document names follow the file names of the tabs (_part_path, _asm_path, ...): letters, digits, _ - .
@@ -554,6 +556,9 @@ def project_doc_op():
             return jsonify({"file": PROJECTS.restore(t, n, req.get("version"), req.get("as_copy"))})
         if op == "versions":
             return jsonify(PROJECTS.versions(t, n))
+        if op in ("move", "copy_to"):
+            return jsonify({"done": PROJECTS.transfer_doc(t, n, req.get("project") or "", "move" if op == "move" else "copy",
+                                                          bool(req.get("with_uses")))})
         raise ValueError("unknown operation %s" % op)
     return _pj_error(go)
 
@@ -606,6 +611,7 @@ def dialog():
     req = request.get_json(force=True) or {}
     filt = (req.get("filter") or "").lower()
     pats = {"step": [("STEP files", "*.step *.stp"), ("All files", "*.*")],
+            "model": [("STEP and STL files", "*.step *.stp *.stl"), ("STEP files", "*.step *.stp"), ("STL files", "*.stl"), ("All files", "*.*")],
             "dxf": [("DXF files", "*.dxf"), ("All files", "*.*")],
             "inp": [("Abaqus input", "*.inp"), ("All files", "*.*")],
             "image": [("Images", "*.png *.jpg *.jpeg *.gif *.webp *.bmp *.tif *.tiff"), ("All files", "*.*")]}.get(filt, [("All files", "*.*")])
@@ -1009,6 +1015,16 @@ def sketch_image_perspective():
         return error(str(e), 404)
     except (ValueError, TypeError, np.linalg.LinAlgError) as e:
         return error("perspective correction: %s" % e)
+
+
+@app.route("/api/sketch/loops", methods=["POST"])
+def sketch_loops_route():
+    """Closed profiles and open ends of the posted sketch (for the indication in the sketch editor)."""
+    req = request.get_json(force=True) or {}
+    try:
+        return jsonify(part.sketch_loops(req.get("sketch") or {}))
+    except Exception as e:
+        return error("sketch loops: %s" % e)
 
 
 @app.route("/api/sketch/image/round", methods=["POST"])
@@ -1470,7 +1486,7 @@ def part_refs():
         bodies, datums = {}, {}
         p = part.migrate(p)
         feats = part.normalize(p)
-        shape, _ = part.build(p, upto=i, surfaces=bodies, datums=datums)
+        shape, st = part.build(p, upto=i, surfaces=bodies, datums=datums)
         f = dict(feats[i])
         f["_datums"] = datums
         if not req.get("path") and req.get("section") is None:
@@ -1480,7 +1496,10 @@ def part_refs():
         if req.get("section") is not None:
             sec = (f.get("sections") or [])[int(req["section"])]
             f = {"plane": sec.get("plane", "XY"), "offset": sec.get("offset", 0)}
-        return jsonify(part.section_refs(shape, f, datums, bodies))
+        out = part.section_refs(shape, f, datums, bodies)
+        if f.get("_project", True):
+            out += part.earlier_sketch_refs(p, feats, i, part.plane_of(f), st, datums)
+        return jsonify(out)
     except Exception as e:
         traceback.print_exc()
         return error("reference geometry failed: %s" % e, 500)

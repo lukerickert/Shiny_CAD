@@ -50,7 +50,7 @@
       rows.map(x => `<tr data-type="${x.type}" data-name="${esc(x.name)}"><td><b>${esc(x.name)}</b></td><td>${TYPE_LABEL[x.type]}</td><td>${x.version ? "v" + x.version : "–"}</td><td>${esc(x.note)}</td><td>${esc(x.modified)}</td><td>${kb(x.size)}</td>` +
         (links ? `<td>${usesHtml(x.links)}</td>` +
           `<td>${x.used_by.map(l => `<span class="pj-link" data-goto="${l.type}:${esc(l.name)}">${esc(l.name)}</span>`).join(", ")}</td><td>${x.exports.map(esc).join(", ")}</td>` : "") +
-        `<td class="pj-actions"><button type="button" data-op="open" title="Open in its tab">Open</button><button type="button" data-op="rename">Rename</button><button type="button" data-op="copy">Copy</button><button type="button" data-op="snapshot" title="Store a numbered version with a note">Version</button><button type="button" data-op="versions" title="List, restore">Versions…</button><button type="button" data-op="delete" title="Move to the project trash folder">×</button></td></tr>`).join("") + `</table>`;
+        `<td class="pj-actions"><button type="button" data-op="open" title="Open in its tab">Open</button><button type="button" data-op="rename">Rename</button><button type="button" data-op="copy">Copy</button><button type="button" data-op="snapshot" title="Store a numbered version with a note">Version</button><button type="button" data-op="versions" title="List, restore">Versions…</button><button type="button" data-op="move" title="Move or copy to another project">Move…</button><button type="button" data-op="delete" title="Move to the project trash folder">×</button></td></tr>`).join("") + `</table>`;
     box.querySelectorAll("button[data-op]").forEach(b => b.onclick = () => docOp(b.dataset.op, b.closest("tr").dataset.type, b.closest("tr").dataset.name));
     box.querySelectorAll(".pj-link").forEach(s => s.onclick = () => { const [t, n] = s.dataset.goto.split(":"); openDoc(t, n); });
   }
@@ -109,6 +109,8 @@
         status(`${name}: version ${r.version} stored`);
       } else if (op === "versions") {
         return showVersions(type, name);
+      } else if (op === "move") {
+        return showMove(type, name);
       } else if (op === "delete") {
         if (!confirm(`Move ${type} ${name} to the project trash folder?`)) return;
         await postJSON("/api/project/doc", { op: "delete", type, name });
@@ -116,6 +118,40 @@
       await refreshDocs();
       for (const fn of ["__partRefresh", "__asmRefresh", "__sketchRefresh", "__feaRefresh", "__xpRefresh"]) { try { if (window[fn]) window[fn](); } catch (e) { /* ignore */ } }
     } catch (e) { showErr(e); }
+  }
+
+  /** Move or copy a document to another project, with its versions, drawing annotations, sketch images and analysis
+   *  folders; optionally with the documents it uses. */
+  function showMove(type, name) {
+    const others = ((PJ.info && PJ.info.projects) || []).filter(p => p.name !== PJ.info.current);
+    if (!others.length) { showErr(new Error("No other project. Create one in the project list first.")); return; }
+    const doc = ((PJ.docs && PJ.docs.docs) || []).find(d => d.type === type && d.name === name) || { links: [], used_by: [] };
+    const uses = doc.links.filter(l => l.type === "part" || l.type === "assembly");
+    const dlg = $("#pj-mdialog");
+    $("#pj-mtitle").textContent = `${TYPE_LABEL[type]} ${name}: move or copy to another project`;
+    $("#pj-mtarget").innerHTML = others.map(p => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("");
+    $("#pj-museslbl").hidden = !uses.length;
+    $("#pj-muses").checked = true;
+    $("#pj-musestext").textContent = "With the documents it uses: " + uses.map(l => l.name).join(", ") + " (moved only when no other document here uses them, else copied)";
+    const note = () => {
+      const mv = dlg.querySelector("input[name=pj-mmode]:checked").value === "move";
+      $("#pj-mgo").textContent = mv ? "Move" : "Copy";
+      $("#pj-mnote").textContent = (mv && doc.used_by.length ? `Used here by ${doc.used_by.map(u => u.name).join(", ")}: after the move these references are missing (Copy keeps them). ` : "") +
+        "Versions, drawing annotations and layouts, sketch images and analysis folders go along. Documents open in their tabs keep their current state; save them only in the project they belong to.";
+    };
+    dlg.querySelectorAll("input[name=pj-mmode]").forEach(r => r.onchange = note);
+    note();
+    dlg.hidden = false;
+    $("#pj-mclose").onclick = () => { dlg.hidden = true; };
+    $("#pj-mgo").onclick = async () => {
+      const mode = dlg.querySelector("input[name=pj-mmode]:checked").value, target = $("#pj-mtarget").value;
+      try {
+        const r = await (await postJSON("/api/project/doc", { op: mode === "move" ? "move" : "copy_to", type, name, project: target, with_uses: uses.length > 0 && $("#pj-muses").checked })).json();
+        dlg.hidden = true;
+        status(r.done.map(d => `${TYPE_LABEL[d.type]} ${d.name} ${d.mode === "move" ? "moved" : "copied"}`).join(", ") + " to project " + target);
+        await refreshProjects();
+      } catch (e) { showErr(e); }
+    };
   }
 
   async function showVersions(type, name) {

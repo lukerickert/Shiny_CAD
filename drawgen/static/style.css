@@ -524,3 +524,14 @@ label > span.row input { flex: 1; min-width: 0; }
 .xp-face { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #xp-ftime { display: inline-block; min-width: 118px; margin-right: 6px; font-variant-numeric: tabular-nums; }
 .fa-tbl tr.sel td { background: #fdebd9; }
+
+.sk-selfilter { margin-left: 6px; }
+.sk-selfilter > .dd-btn { padding: 0 6px; font-size: 12px; line-height: 16px; height: 18px; margin: 0; }
+.sk-selfilter .dd-menu { min-width: 150px; padding: 6px 10px; gap: 4px; }
+#sk-picklist { position: absolute; z-index: 25; background: #fff; border: 1px solid #c7ccd3; border-radius: 4px; box-shadow: 0 2px 8px rgba(0,0,0,0.18); font-size: 12px; padding: 2px 0; min-width: 140px; }
+#sk-picklist div { padding: 3px 10px; cursor: pointer; white-space: nowrap; }
+#sk-picklist div:hover { background: #e8f0fb; }
+#sk-picklist .hint { cursor: default; color: #8a9099; }
+#sk-picklist .hint:hover { background: none; }
+#sk-dof.dof-ok { color: #fff; background: #2e8540; border-radius: 3px; padding: 1px 6px; }
+#sk-dof.dof-under { color: #1d5fc4; }

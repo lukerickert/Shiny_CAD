@@ -380,6 +380,152 @@ class Projects(object):
         (m.get("docs") or {}).pop(dtype + ":" + dname, None)
         self.save_manifest(name, m)
 
+    # ------------------------------------------------------------------ move / copy to another project
+    def _doc_data(self, w, dtype, dname):
+        try:
+            with open(os.path.join(w, safe_name(dname) + TYPES[dtype]), "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    def _uses(self, w, dtype, dname):
+        """Documents a document uses: the parts of an assembly; the part or assembly of an analysis or explicit
+        analysis (with the parts of that assembly). [(type, name)]"""
+        data = self._doc_data(w, dtype, dname)
+        out = []
+        if dtype == "assembly":
+            for c in data.get("components") or []:
+                src = c.get("source") or {}
+                if src.get("type") == "part" and src.get("name") and ("part", src["name"]) not in out:
+                    out.append(("part", src["name"]))
+        elif dtype in ("analysis", "explicit"):
+            src = data.get("source") or {}
+            if (dtype == "analysis" or src.get("kind") == "shinycad") and src.get("name"):
+                t = src.get("type") or "assembly"
+                if t in TYPES:
+                    out.append((t, src["name"]))
+                    if t == "assembly":
+                        out += [x for x in self._uses(w, "assembly", src["name"]) if x not in out]
+        return [x for x in out if os.path.isfile(os.path.join(w, safe_name(x[1]) + TYPES[x[0]]))]
+
+    @staticmethod
+    def _image_files(data):
+        """Image files (work/images) referenced by sketch images anywhere in a document."""
+        out = set()
+
+        def walk(v):
+            if isinstance(v, dict):
+                imgs = v.get("images")
+                if isinstance(imgs, list):
+                    for m in imgs:
+                        if isinstance(m, dict):
+                            for k in ("file", "cfile"):
+                                if isinstance(m.get(k), str) and m[k]:
+                                    out.add(os.path.basename(m[k]))
+                for x in v.values():
+                    walk(x)
+            elif isinstance(v, list):
+                for x in v:
+                    walk(x)
+        walk(data)
+        return out
+
+    def transfer_doc(self, dtype, dname, target, mode="move", with_uses=False):
+        """Moves (mode "move") or copies (mode "copy") a document of the open project to the project target, with
+        its versions, drawing annotations and layouts, sketch images and analysis folders. with_uses: the documents
+        it uses go along (moved only when no other document left in this project uses them, else copied).
+        Returns [{"type", "name", "mode"}]."""
+        if dtype not in TYPES:
+            raise ValueError("unknown document type %s" % dtype)
+        name, w = self._work()
+        target = (target or "").strip()
+        if not target or not os.path.isfile(self.manifest_path(target)):
+            raise ValueError("project %s not found" % target)
+        if safe_name(target) == safe_name(name):
+            raise ValueError("the document is already in project %s" % name)
+        if not os.path.isfile(self.doc_path(dtype, dname)):
+            raise ValueError("%s %s not found" % (dtype, dname))
+        items = [(dtype, dname, mode)]
+        if with_uses:
+            moving = {(dtype, dname)} | set(self._uses(w, dtype, dname))
+            for t, n in self._uses(w, dtype, dname):
+                m = mode
+                if mode == "move":
+                    # used by a document that stays here: copied
+                    for fn in os.listdir(w):
+                        for t2, ext in TYPES.items():
+                            if fn.endswith(ext) and (t2, fn[:-len(ext)]) not in moving and (t, n) in self._uses(w, t2, fn[:-len(ext)]):
+                                m = "copy"
+                items.append((t, n, m))
+        tdir = self.project_dir(target)
+        tw = os.path.join(tdir, "work")
+        for t, n, _ in items:
+            if os.path.exists(os.path.join(tw, safe_name(n) + TYPES[t])):
+                raise ValueError("%s %s exists in project %s" % (t, n, target))
+        self.ensure_dirs(target)
+        src_dir = self.project_dir(name)
+        m_src, m_dst = self.load_manifest(name), self.load_manifest(target)
+        out = []
+        for t, n, md in items:
+            fn = safe_name(n) + TYPES[t]
+            data = self._doc_data(w, t, n)
+            # sketch images (kept here too: other documents may use them)
+            imgs = self._image_files(data)
+            if imgs:
+                os.makedirs(os.path.join(tw, "images"), exist_ok=True)
+                for im in imgs:
+                    a, b = os.path.join(w, "images", im), os.path.join(tw, "images", im)
+                    if os.path.isfile(a) and not os.path.exists(b):
+                        shutil.copy2(a, b)
+            # drawing annotations, layouts and drawing sketches (stored by the uid or the file name)
+            stems = {safe_name(n)} | ({safe_name(data["uid"])} if data.get("uid") else set())
+            ad, bd = os.path.join(w, "annotations"), os.path.join(tw, "annotations")
+            if os.path.isdir(ad):
+                os.makedirs(bd, exist_ok=True)
+                for afn in os.listdir(ad):
+                    if any(afn == st + suf for st in stems for suf in (".json", ".layout.json", ".sketch.json")):
+                        a, b = os.path.join(ad, afn), os.path.join(bd, afn)
+                        if os.path.exists(b):
+                            continue
+                        if md == "move":
+                            shutil.move(a, b)
+                        else:
+                            shutil.copy2(a, b)
+            # versions
+            prefix = safe_name(n) + TYPES[t].replace(".json", "") + ".v"
+            vd, vb = os.path.join(src_dir, "versions"), os.path.join(tdir, "versions")
+            if os.path.isdir(vd):
+                for vfn in os.listdir(vd):
+                    if vfn.startswith(prefix):
+                        a, b = os.path.join(vd, vfn), os.path.join(vb, vfn)
+                        if not os.path.exists(b):
+                            if md == "move":
+                                shutil.move(a, b)
+                            else:
+                                shutil.copy2(a, b)
+            # solver folders of analyses
+            sub = {"analysis": "analysis", "explicit": "explicit"}.get(t)
+            if sub:
+                a, b = os.path.join(src_dir, sub, safe_name(n)), os.path.join(tdir, sub, safe_name(n))
+                if os.path.isdir(a) and not os.path.exists(b):
+                    if md == "move":
+                        shutil.move(a, b)
+                    else:
+                        shutil.copytree(a, b)
+            # the document and its metadata
+            shutil.copy2(os.path.join(w, fn), os.path.join(tw, fn))
+            key = t + ":" + n
+            meta = (m_src.get("docs") or {}).get(key)
+            if meta is not None:
+                m_dst.setdefault("docs", {})[key] = dict(meta)
+            if md == "move":
+                os.remove(os.path.join(w, fn))
+                (m_src.get("docs") or {}).pop(key, None)
+            out.append({"type": t, "name": n, "mode": md})
+        self.save_manifest(target, m_dst)
+        self.save_manifest(name, m_src)
+        return out
+
     # ------------------------------------------------------------------ versions
     def versions(self, dtype, dname):
         name, _ = self._work()

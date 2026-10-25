@@ -19,8 +19,8 @@ const TYPE_NAMES = { sketch: "Sketch", plane: "Plane", point: "Point", axis: "Ax
                      import: "Import STEP", place: "Place", split: "Partition", unify: "Merge faces", heal: "Heal", defeature: "Remove faces", offset_faces: "Offset faces", move_faces: "Move faces", combine: "Combine faces", hole_mesh: "Hole mesh", smooth: "Smooth surfaces", replace: "Replace faces",
                      surf_extract: "Extract surface", surf_fit: "Fit surface", surf_sketch: "Extruded surface", surf_loft: "Loft surface",
                      surf_fill: "Fill surface", surf_offset: "Offset surface", surf_sew: "Sew surfaces", surf_import: "Import surface", thicken: "Thicken", surf_cut: "Cut with surface",
-                     curve_extract: "Extract curve", curve_section: "Intersection curve", surf_from_curve: "Surface from curve", surf_trim: "Trim surface", surf_extend: "Extend surface", surf_bridge: "Bridge surface" };
-const SURFACE_TYPES = new Set(["surf_extract", "surf_fit", "surf_sketch", "surf_loft", "surf_fill", "surf_offset", "surf_sew", "surf_import", "curve_extract", "curve_section", "surf_from_curve", "surf_trim", "surf_extend", "surf_bridge"]);
+                     curve_extract: "Extract curve", curve_section: "Intersection curve", surf_from_curve: "Surface from curve", surf_trim: "Trim surface", surf_extend: "Extend surface", surf_bridge: "Bridge surface", surf_fillet: "Surface fillet" };
+const SURFACE_TYPES = new Set(["surf_extract", "surf_fit", "surf_sketch", "surf_loft", "surf_fill", "surf_offset", "surf_sew", "surf_import", "curve_extract", "curve_section", "surf_from_curve", "surf_trim", "surf_extend", "surf_bridge", "surf_fillet"]);
 const CURVE_TYPES = new Set(["curve_extract", "curve_section"]);
 const SOLID_TYPES = new Set(["extrude", "cut", "revolve", "hole", "sweep", "fillet", "chamfer", "shell", "pattern", "mirror", "boolean", "import", "place", "split", "unify", "heal", "defeature", "smooth", "replace", "thicken", "surf_cut", "hole_mesh", "offset_faces", "move_faces"]);
 const SPLIT_METHODS = { principal: "Principal plane + offset", datum: "Plane feature + offset", face: "Extend a face (planar or curved)", sketch: "Sketch extruded through the part",
@@ -163,14 +163,16 @@ function viewDir(dir, up) {
   render3();
 }
 
-/** A mesh of the given face indices of a mesh record. */
+/** A mesh of the given face indices of a mesh record. userData.tri: mesh triangle index of each triangle of the
+ * geometry (a raycast faceIndex counts the triangles of the geometry). */
 function facesGeometry(m, faceSet) {
-  const tri = [];
-  m.triangles.forEach((tr, i) => { if (faceSet.has(m.face_of_tri[i])) tri.push(...tr); });
+  const tri = [], gi = [];
+  m.triangles.forEach((tr, i) => { if (faceSet.has(m.face_of_tri[i])) { tri.push(...tr); gi.push(i); } });
   const g = new THREE.BufferGeometry();
   g.setAttribute("position", new THREE.Float32BufferAttribute(m.vertices.flat(), 3));
   g.setIndex(tri);
   g.computeVertexNormals();
+  g.userData.tri = gi;
   return g;
 }
 
@@ -730,7 +732,8 @@ function pickAt(e, kinds) {
     if (hit && (!best || hit.distance < best.dist - px * 3 || hit.object.userData.kind === "region")) {
       const u = hit.object.userData;
       if (u.kind === "solid") {
-        const fi = m.face_of_tri[hit.faceIndex];
+        const ti = hit.object.geometry.userData.tri;
+        const fi = m.face_of_tri[ti ? ti[hit.faceIndex] : hit.faceIndex];
         const kind = allow("face") ? "face" : "body";
         const pt = [hit.point.x, hit.point.y, hit.point.z];
         best = kind === "face" ? { kind, fi, key: m.face_keys[fi], solid: u.solid, owner: (m.face_owner || [])[fi], dist: hit.distance, point: pt }
@@ -957,7 +960,8 @@ function fillThreePoints(f, h) {
 }
 
 function refOf(h) {
-  if (h.kind === "face") return { c: h.key.c, n: h.key.n, area: h.key.area };
+  // cell: the solid the face was picked on (a face between two cells belongs to both)
+  if (h.kind === "face") return PT.cells > 1 && h.solid !== undefined ? { c: h.key.c, n: h.key.n, area: h.key.area, cell: h.solid } : { c: h.key.c, n: h.key.n, area: h.key.area };
   if (h.kind === "edge") return { mid: h.key.mid, len: h.key.len };
   if (h.kind === "body") return { solid: h.solid };
   return h.id !== undefined ? h.id : h.point;
@@ -1702,6 +1706,15 @@ function surfaceOrFacesStep(label, hint, before) {
     summary: f => (f.faces || []).length ? (f.faces || []).length + " face(s)" : f.source ? itemName(f.source) : "none" };
 }
 
+/** Optional step of Extrude, Cut, Revolve and Sweep: the solids the feature acts on (none: all solids). */
+function bodiesStep() {
+  return { key: "bodies", label: "Bodies", kinds: ["body"], before: true, optional: true,
+    hint: "Click the solids the feature acts on (click again to deselect), or check them; none: all solids.",
+    accept: (f, h) => { f.bodies = f.bodies || []; const i = f.bodies.indexOf(h.solid); if (i >= 0) f.bodies.splice(i, 1); else f.bodies.push(h.solid); PT.dirty = true; },
+    html: f => { const sel = new Set(f.bodies || []); return (PT.solids.length ? PT.solids.map((s, i) => `<label class="check"><input type="checkbox" data-pbs="${i}"${sel.has(i) ? " checked" : ""}> Solid ${i + 1} (${pfmt(s.volume_mm3 / 1000, 2)} cm^3)</label>`).join("") : '<p class="hint">No solids.</p>') + `<p class="hint">Solids are numbered as in the tree before this feature. Add material: fused with the checked solids only. Remove material: cut from the checked solids only. The other solids are not changed.</p>`; },
+    bind: (f, box) => box.querySelectorAll("input[data-pbs]").forEach(cb => cb.onchange = () => { f.bodies = [...box.querySelectorAll("input[data-pbs]:checked")].map(x => +x.dataset.pbs); changedPart(); }),
+    done: f => (f.bodies || []).length > 0, summary: f => (f.bodies || []).length ? f.bodies.map(i => "Solid " + (i + 1)).join(", ") : "all solids" };
+}
 function profileStep(prop, label) {
   return { key: prop || "sketch_ref", label: label || "Profile", kinds: ["sketch"], prop: prop || "sketch_ref", single: true, before: false,
     hint: "Click a sketch in the view, choose it, or draw a new one.",
@@ -1868,7 +1881,7 @@ const COMMANDS = {
     defaults: () => ({ sketch_ref: null, depth: 10, symmetric: false, reverse: false }),
     steps: f => [profileStep(), regionsStep(), { key: "extent", label: "Extent", html: f => `<div class="grid2">` + num("pf-depth", "Depth (mm)", f.depth) + select("pf-dir", "Direction", [["normal", "Along the normal"], ["reverse", "Against the normal"], ["symmetric", "Symmetric to the plane"]], f.symmetric ? "symmetric" : f.reverse ? "reverse" : "normal") + `</div>` + check("pf-newbody", "New body (not fused with the part; combine later with Boolean)", f.new_body),
       bind: (f, box) => bindAll(box, { "#pf-depth": el => { const v = numv(el.value); if (v > 0) f.depth = v; }, "#pf-dir": el => { f.symmetric = el.value === "symmetric"; f.reverse = el.value === "reverse"; }, "#pf-newbody": el => { f.new_body = el.checked; } }),
-      summary: f => pfmt(f.depth) + " mm" + (f.symmetric ? ", symmetric" : f.reverse ? ", reversed" : "") + (f.new_body ? ", new body" : "") }],
+      summary: f => pfmt(f.depth) + " mm" + (f.symmetric ? ", symmetric" : f.reverse ? ", reversed" : "") + (f.new_body ? ", new body" : "") }].concat(f.new_body ? [] : [bodiesStep()]),
   },
   cut: {
     title: "Cut", needsSolid: true,
@@ -1876,7 +1889,7 @@ const COMMANDS = {
     steps: f => [profileStep(), regionsStep(), { key: "extent", label: "Extent", html: f => select("pf-type", "Type", [["through", "Through all (both directions)"], ["finite", "Finite depth"]], f.through ? "through" : "finite") +
         (f.through ? "" : `<div class="grid2">` + num("pf-depth", "Depth (mm)", f.depth) + select("pf-dir", "Direction", [["normal", "Along the normal"], ["reverse", "Against the normal"], ["symmetric", "Symmetric to the plane"]], f.symmetric ? "symmetric" : f.reverse ? "reverse" : "normal") + `</div>`),
       bind: (f, box) => bindAll(box, { "#pf-type": el => { f.through = el.value === "through"; }, "#pf-depth": el => { const v = numv(el.value); if (v > 0) f.depth = v; }, "#pf-dir": el => { f.symmetric = el.value === "symmetric"; f.reverse = el.value === "reverse"; } }),
-      summary: f => f.through ? "through all" : pfmt(f.depth) + " mm" + (f.symmetric ? ", symmetric" : f.reverse ? ", reversed" : "") }],
+      summary: f => f.through ? "through all" : pfmt(f.depth) + " mm" + (f.symmetric ? ", symmetric" : f.reverse ? ", reversed" : "") }, bodiesStep()],
   },
   revolve: {
     title: "Revolve",
@@ -1889,7 +1902,7 @@ const COMMANDS = {
         html: f => select("pf-axis", "Axis", [["u", "Sketch x axis (u)"], ["v", "Sketch y axis (v)"]].concat(axes.map(e => [e.id, `Construction line ${e.id} (${pfmt(e.x1, 2)}, ${pfmt(e.y1, 2)}) - (${pfmt(e.x2, 2)}, ${pfmt(e.y2, 2)})`])).concat(axisItems(featIndex(f.id)).map(a => ["ref:" + a.id, "Axis feature " + a.name])), f.axis_ref ? "ref:" + f.axis_ref : (f.axis || "v")) +
           `<div class="grid2">` + num("pf-angle", "Angle (deg)", f.angle) + select("pf-mode", "Mode", [["add", "Add material"], ["cut", "Remove material"]], f.mode || "add") + `</div>` + check("pf-newbody", "New body (not fused with the part; combine later with Boolean)", f.new_body) + `<p class="hint">A construction line drawn in the sketch can be the axis.</p>`,
         bind: (f, box) => bindAll(box, { "#pf-axis": el => { if (el.value.startsWith("ref:")) f.axis_ref = el.value.slice(4); else { f.axis = el.value; f.axis_ref = null; } }, "#pf-angle": el => { const v = numv(el.value); if (v > 0 && v <= 360) f.angle = v; }, "#pf-mode": el => { f.mode = el.value; }, "#pf-newbody": el => { f.new_body = el.checked; } }),
-        summary: f => pfmt(f.angle) + " deg about " + (f.axis === "u" ? "x" : f.axis === "v" ? "y" : f.axis) + (f.mode === "cut" ? ", remove" : "") }];
+        summary: f => pfmt(f.angle) + " deg about " + (f.axis === "u" ? "x" : f.axis === "v" ? "y" : f.axis) + (f.mode === "cut" ? ", remove" : "") }].concat(f.new_body && f.mode !== "cut" ? [] : [bodiesStep()]);
     },
   },
   hole: {
@@ -1928,7 +1941,7 @@ const COMMANDS = {
         bind: (f, box) => { bindSketchField(box, f, "path_ref"); bindAll(box, { "#pf-path_source": el => { f.path_source = el.value || null; if (el.value) f.path_ref = null; } }); },
         done: f => !!(f.path_ref || f.path_source), summary: f => f.path_ref ? itemName(f.path_ref) : f.path_source ? itemName(f.path_source) : "none" },
       { key: "mode", label: "Mode", html: f => select("pf-mode", "Mode", [["add", "Add material"], ["cut", "Remove material"]], f.mode || "add") + check("pf-newbody", "New body (not fused with the part; combine later with Boolean)", f.new_body) + `<p class="hint">The profile is swept along the path (one open chain). The profile plane should be normal to the path at its start.</p>`,
-        bind: (f, box) => bindAll(box, { "#pf-mode": el => { f.mode = el.value; }, "#pf-newbody": el => { f.new_body = el.checked; } }), summary: f => (f.mode === "cut" ? "remove material" : "add material") + (f.new_body ? ", new body" : "") }],
+        bind: (f, box) => bindAll(box, { "#pf-mode": el => { f.mode = el.value; }, "#pf-newbody": el => { f.new_body = el.checked; } }), summary: f => (f.mode === "cut" ? "remove material" : "add material") + (f.new_body ? ", new body" : "") }].concat(f.new_body && f.mode !== "cut" ? [] : [bodiesStep()]),
   },
   fillet: { title: "Fillet", needsSolid: true, defaults: () => ({ value: 2, edges: [] }),
     steps: f => [edgesStep("Edges", "edges"), { key: "value", label: "Radius", html: f => `<div class="grid2">` + num("pf-value", "Radius (mm)", f.value) + `<span></span></div>` + resultLine(f), bind: (f, box) => bindAll(box, { "#pf-value": el => { const v = numv(el.value); if (v > 0) f.value = v; } }), summary: f => pfmt(f.value) + " mm" }] },
@@ -2062,6 +2075,25 @@ const COMMANDS = {
       done: f => true, summary: f => f.other ? itemName(f.other) : "the solid" }] },
   surf_extract: { title: "Extract surface", needsSolid: false, defaults: () => ({ faces: [], offset: 0 }),
     steps: f => [facesStep("Faces", "faces", "Click the faces to copy as a surface body: faces of the solid or of surface bodies.", false, true), { key: "offset", label: "Offset", html: f => `<div class="grid2">` + num("pf-xoff", "Offset along the normals (mm)", f.offset || 0) + `<span></span></div>` + resultLine(f), bind: (f, box) => bindAll(box, { "#pf-xoff": el => { f.offset = numv(el.value) || 0; } }), summary: f => pfmt(f.offset || 0) + " mm" }] },
+  surf_fillet: { title: "Surface fillet", defaults: () => ({ mode: "bodies", source_a: null, source_b: null, source: null, edges: [], radius: 2, flip_a: false, flip_b: false, trim: true }),
+    steps: f => {
+      const modeSel = select("pf-sfmode", "Fillet", [["bodies", "Between two surface bodies"], ["edges", "Edges of a surface body"]], f.mode || "bodies");
+      const opts = { key: "opts", label: "Radius",
+        html: f => modeSel + `<div class="grid2">` + num("pf-sfr", "Radius (mm)", f.radius || 2) + `<span></span></div>` +
+          (f.mode === "edges" ? `<p class="hint">The picked edges, where two faces of the surface body meet, are rounded with the radius. The result is a surface body; the source body is hidden.</p>`
+            : check("pf-sffa", "Flip side on surface A", f.flip_a) + check("pf-sffb", "Flip side on surface B", f.flip_b) + check("pf-sftrim", "Trim the surfaces at the fillet and sew them into one body", f.trim !== false) +
+              `<p class="hint">A ball of the radius rolls between the nearest faces of surface A and surface B, on the side of each face that faces the other surface (Flip: the other side; when those sides give no fillet the other combinations are tried). The fillet runs between the curves where the ball touches the faces. Trim: each surface is cut at its contact curve, the part towards the corner is removed and the rest is sewn with the fillet into one surface body (the sources are hidden); else the result is the fillet surface alone.</p>`) + resultLine(f),
+        bind: (f, box) => bindAll(box, { "#pf-sfmode": el => { f.mode = el.value; }, "#pf-sfr": el => { const v = numv(el.value); if (v > 0) f.radius = v; },
+          "#pf-sffa": el => { f.flip_a = el.checked; }, "#pf-sffb": el => { f.flip_b = el.checked; }, "#pf-sftrim": el => { f.trim = el.checked; } }),
+        summary: f => "R" + pfmt(f.radius || 2) + (f.mode === "edges" ? ", edges" : (f.flip_a || f.flip_b ? ", flipped" : "") + (f.trim === false ? ", fillet only" : ", trimmed")) };
+      if (f.mode === "edges") return [sourceStep("Surface", "source", false, "Click the surface body whose edges to round, or choose it."),
+        { key: "edges", label: "Edges", kinds: ["sedge"], prop: "edges", before: false, hint: "Click the edges to round (where two faces of the body meet); click again to deselect.",
+          accept: (f, h) => { if (h.surface !== f.source) { msgPart("Click an edge of " + itemName(f.source), true); return; } applyPick(f, { prop: "edges", kinds: ["edge"], single: false }, h); },
+          html: f => `<p class="hint">${(f.edges || []).length} edge(s) selected.</p><div class="buttons"><button type="button" data-clear="edges">Clear</button></div>`,
+          bind: (f, box) => box.querySelectorAll("button[data-clear]").forEach(b => b.onclick = () => { f.edges = []; changedPart(); }),
+          done: f => (f.edges || []).length > 0, summary: f => (f.edges || []).length + " edge(s)" }, opts];
+      return [sourceStep("Surface A", "source_a", false, "Click surface body A, or choose it."), sourceStep("Surface B", "source_b", false, "Click surface body B, or choose it."), opts];
+    } },
   surf_bridge: { title: "Bridge surface", defaults: () => ({ edges_a: [], curves_a: [], edges_b: [], curves_b: [], flip: false }),
     steps: f => ["a", "b"].map(k => ({ key: "side_" + k, label: "Side " + k.toUpperCase(), kinds: ["edge", "sedge", "curve"], before: false,
         hint: `Click the edges of side ${k.toUpperCase()} (one connected chain): edges of the solid or of surface bodies, or curve bodies. Click again to deselect.`,
@@ -2223,7 +2255,8 @@ function startCommand(type, init, existingId) {
   // start at the first unfinished step
   const steps = commandSteps(f);
   let i = steps.findIndex(st => !st.optional && !stepDone(f, st));
-  if (i < 0) i = def.startStep !== undefined ? def.startStep : existingId ? 0 : steps.length - 1;
+  // all done: the last step that is not optional (a new feature), or the first (an edited one)
+  if (i < 0) { let last = steps.length - 1; while (last > 0 && steps[last].optional) last--; i = def.startStep !== undefined ? def.startStep : existingId ? 0 : last; }
   PT.cmd.step = i;
   if (steps[i].enter) steps[i].enter(f);
   PT.sel = f.id;
@@ -2416,9 +2449,18 @@ function bindPicks(f, box, defs) {
   box.querySelectorAll("button[data-clear]").forEach(b => { if (defs[b.dataset.clear]) b.onclick = () => { f[b.dataset.clear] = []; changedPart(); }; });
 }
 
+/** Check boxes of the solids a pattern can copy: the solids before the pattern (the copies follow them). */
+function patternBodyChecks(f) {
+  const st = PT.status[f.id] || {};
+  const n = st.solids_before !== undefined ? st.solids_before : PT.solids.length;
+  const sel = new Set((f.bodies || []).map(b => (typeof b === "object" ? b.solid : b)));
+  if (!n) return '<p class="hint">No solids.</p>';
+  return PT.solids.slice(0, n).map((s, i) => `<label class="check"><input type="checkbox" data-pb="${i}"${sel.has(i) ? " checked" : ""}> Solid ${i + 1} (${pfmt(s.volume_mm3 / 1000, 2)} cm^3)</label>`).join("") +
+    (PT.solids.length < n ? Array.from({ length: n - PT.solids.length }, (_, k) => `<label class="check"><input type="checkbox" data-pb="${PT.solids.length + k}"${sel.has(PT.solids.length + k) ? " checked" : ""}> Solid ${PT.solids.length + k + 1}</label>`).join("") : "");
+}
 const LEGACY_DEFAULTS = {
   pattern: () => ({ kind: "linear", features: [], count: 3, step: [20, 0, 0], count2: 1, step2: [0, 20, 0], row_offset: 0, axis: "Z", centre: [0, 0, 0], angle: 360 }),
-  import: () => ({ path: "", part: null }),
+  import: () => ({ path: "", part: null, clean: { rebuild: true, fix: true, unify: false, min_volume: 0 } }),
   unify: () => ({ faces: true, edges: true, angle: 0 }),
   heal: () => ({ tolerance: 0, small_faces: 0 }),
   defeature: () => ({ faces: [], min_area: 0, all_small: false }),
@@ -2445,6 +2487,8 @@ const LEGACY_PANELS = {
     box.innerHTML = select("pf-kind", "Kind", [["linear", "Linear"], ["circular", "Circular"]], f.kind || "linear") +
       `<p class="hint" style="margin-bottom:2px">Features to repeat</p>` +
       (cands.length ? cands.map(x => `<label class="check"><input type="checkbox" data-pf="${pesc(x.id)}"${selSet.has(x.id) ? " checked" : ""}> ${pesc(x.name)}</label>`).join("") : '<p class="hint">No sketch features above this one.</p>') +
+      `<p class="hint" style="margin-bottom:2px">Bodies to repeat (copied as new solids)</p>` + pickButtons(f, "body", "bodies", false, "", "Pick bodies") +
+      patternBodyChecks(f) +
       `<div class="grid2">` + num("pf-count", "Count", f.count || 2, 1) + `<span></span></div>` +
       (f.kind === "circular"
         ? `<div class="grid2">` + select("pf-pax", "Axis", [["X", "X"], ["Y", "Y"], ["Z", "Z"]].concat(axisItems(i0).map(a => ["ref:" + a.id, "Axis feature " + a.name])), f.axis_ref ? "ref:" + f.axis_ref : (f.axis || "Z")) + num("pf-pang", "Total angle (deg)", f.angle === undefined ? 360 : f.angle) + `</div>` + (f.axis_ref ? "" : v3("pf-c", "Axis point (mm)", f.centre || [0, 0, 0])) + `<p class="hint">360 deg spreads the instances evenly around the axis.</p>`
@@ -2453,13 +2497,33 @@ const LEGACY_PANELS = {
     bind3(box, "pf-s", v => { f.step = v; }); bind3(box, "pf-s2", v => { f.step2 = v; }); bind3(box, "pf-c", v => { f.centre = v; });
     bindAll(box, { "#pf-count2": el => { const c = parseInt(el.value); if (c >= 1) f.count2 = c; }, "#pf-rowoff": el => { f.row_offset = numv(el.value) || 0; } });
     box.querySelectorAll("input[data-pf]").forEach(cb => cb.onchange = () => { f.features = [...box.querySelectorAll("input[data-pf]:checked")].map(x => x.dataset.pf); changedPart(); });
+    box.querySelectorAll("input[data-pb]").forEach(cb => cb.onchange = () => { f.bodies = [...box.querySelectorAll("input[data-pb]:checked")].map(x => ({ solid: +x.dataset.pb })); changedPart(); });
+    bindPicks(f, box, { bodies: { kind: "body" } });
   },
   import(f, box) {
-    box.innerHTML = `<label>STEP file path on this PC<span class="row"><input type="text" id="pf-path" value="${pesc(f.path || "")}" placeholder="C:\\...\\part.step"><button type="button" id="pf-browse" class="browse" title="Choose the file">…</button></span></label>` +
-      `<label>Solid in the file<input type="text" id="pf-partidx" value="${f.part === null || f.part === undefined ? "" : pesc(f.part)}" placeholder="empty: all solids; or an index 0, 1, ..."></label>` + resultText(PT.status[f.id] || {}) +
-      `<p class="hint">The imported solids are the base geometry; partitions, clean-up and the other features apply to them.</p>`;
-    bindAll(box, { "#pf-path": el => { f.path = el.value.trim(); }, "#pf-partidx": el => { const v = el.value.trim(); f.part = v === "" ? null : v; } });
-    box.querySelector("#pf-browse").onclick = async () => { try { const p = await window.browse("open", "step", "", "STEP file to import"); if (p) { f.path = p; changedPart(); } } catch (e) { showErr(e); } };
+    const cl = f.clean || {};
+    const isStl = /\.stl$/i.test(f.path || ""), so = f.stl || {};
+    box.innerHTML = `<label>STEP or STL file path on this PC<span class="row"><input type="text" id="pf-path" value="${pesc(f.path || "")}" placeholder="C:\\...\\part.step"><button type="button" id="pf-browse" class="browse" title="Choose the file">…</button></span></label>` +
+      (isStl ? `<p class="hint" style="margin-bottom:2px">STL</p>` +
+        check("pf-sfit", "Fit cylinders, cones and spheres to curved areas", so.fit !== false) +
+        `<div class="grid2">` + num("pf-stol", "Tolerance (mm, 0: 1/1000 of the size)", so.tolerance || 0) + num("pf-sang", "Flat face: angle between triangles (deg)", so.angle || 0.5) + `</div>` +
+        `<div class="grid2">` + num("pf-ssmooth", "Curved area: angle between neighbouring triangles (deg)", so.smooth || 30) + `<span></span></div>` +
+        `<p class="hint">The closed mesh is converted to a solid: triangles in one plane within the tolerance form one planar face; with fitting, smooth curved areas that a cylinder, cone or sphere fits within the tolerance form one face (closed cylinders and cones in two halves); other curved areas stay as flat facets. The edges between the faces are the intersection curves of their surfaces.</p>` : "") +
+      (isStl ? "" : `<label>Solid in the file<input type="text" id="pf-partidx" value="${f.part === null || f.part === undefined ? "" : pesc(f.part)}" placeholder="empty: all solids; or an index 0, 1, ..."></label>`) +
+      `<p class="hint" style="margin-bottom:2px">Clean-up</p>` +
+      check("pf-crebuild", "Rebuild faces on the wrong range of a periodic surface (torus, cylinder, cone, sphere)", !!cl.rebuild) +
+      check("pf-cfix", "Fix topology, tolerances and edge curves on faces", !!cl.fix) +
+      check("pf-cunify", "Merge coplanar faces and collinear edges", !!cl.unify) +
+      `<div class="grid2">` + num("pf-cminvol", "Remove solids below (mm^3, 0: off)", cl.min_volume || 0) + `<span></span></div>` + resultText(PT.status[f.id] || {}) +
+      `<p class="hint">Each clean-up step is kept only when the solid stays one solid, its volume changes by less than 1 % (rebuilt faces: 5 %) and it does not make a valid solid invalid. The result line gives the invalid solids and faces before and after. The imported solids are the base geometry; partitions and the other features apply to them.</p>`;
+    const setClean = (k, v) => { f.clean = Object.assign({}, f.clean || {}, { [k]: v }); };
+    const setStl = (k, v) => { f.stl = Object.assign({ fit: true }, f.stl || {}, { [k]: v }); };
+    bindAll(box, { "#pf-sfit": el => setStl("fit", el.checked), "#pf-stol": el => setStl("tolerance", Math.max(0, numv(el.value) || 0)),
+                   "#pf-sang": el => { const v = numv(el.value); if (v > 0) setStl("angle", v); }, "#pf-ssmooth": el => { const v = numv(el.value); if (v > 0) setStl("smooth", v); } });
+    bindAll(box, { "#pf-path": el => { f.path = el.value.trim(); if (/\.stl$/i.test(f.path) && !f.stl) f.stl = { fit: true }; }, "#pf-partidx": el => { const v = el.value.trim(); f.part = v === "" ? null : v; },
+                   "#pf-crebuild": el => setClean("rebuild", el.checked), "#pf-cfix": el => setClean("fix", el.checked), "#pf-cunify": el => setClean("unify", el.checked),
+                   "#pf-cminvol": el => setClean("min_volume", Math.max(0, numv(el.value) || 0)) });
+    box.querySelector("#pf-browse").onclick = async () => { try { const p = await window.browse("open", "model", "", "STEP or STL file to import"); if (p) { f.path = p; if (/\.stl$/i.test(p) && !f.stl) f.stl = { fit: true }; changedPart(); } } catch (e) { showErr(e); } };
   },
   unify(f, box) {
     box.innerHTML = check("pf-uf", "Merge coplanar and co-cylindrical faces", f.faces !== false) + check("pf-ue", "Merge collinear and co-circular edges", f.edges !== false) +
@@ -2768,6 +2832,7 @@ function consumedSources(f) {
   if (!f || f.suppressed) return [];
   if (f.type === "surf_trim" || f.type === "surf_extend" || f.type === "thicken") return f.source ? [f.source] : [];
   if (f.type === "surf_sew") return f.sources || [];
+  if (f.type === "surf_fillet") return f.mode === "edges" ? (f.source ? [f.source] : []) : f.trim === false ? [] : [f.source_a, f.source_b].filter(Boolean);
   return [];
 }
 
@@ -2836,7 +2901,7 @@ window.__partRefresh = refreshList;
 /** Assembly tab: a new (unsaved) part whose base geometry is one solid of a STEP file (Import STEP feature). */
 window.__partNewFromStep = function (name, path, index) {
   const p = blankPart(name);
-  p.features.push({ id: "f" + (p.next++), name: "Import STEP 1", type: "import", suppressed: false, path, part: index === undefined ? null : index });
+  p.features.push({ id: "f" + (p.next++), name: "Import STEP 1", type: "import", suppressed: false, path, part: index === undefined ? null : index, clean: { rebuild: true, fix: true, unify: false, min_volume: 0 } });
   loadPart(p);
   if (FM) FM.markUnsaved();
 };
@@ -2899,7 +2964,7 @@ window.partShown = function () {
   window.addEventListener("beforeunload", e => { if (PT.dirty) { e.preventDefault(); e.returnValue = ""; } });
 })();
 // exposed for tests
-window.__part = { PT, feat, THREE, viewXdir, setMeasure, measureClick, startCommand, finishCommand, cancelCommand, gotoStep, selectItem, pickAt, commandSteps, changedPart, viewDir, hoverText };
+window.__part = { PT, feat, THREE, loadPart, setMesh, viewXdir, setMeasure, measureClick, startCommand, finishCommand, cancelCommand, gotoStep, selectItem, pickAt, commandSteps, changedPart, viewDir, hoverText };
 
 // ------------------------------------------------------------------ mesh preview
 

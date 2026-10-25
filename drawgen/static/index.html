@@ -263,6 +263,7 @@
           <button type="button" data-tool="select" title="Select (S). Click, Shift+click, window drag. Drag points and lines">Select</button>
           <button type="button" data-tool="line" title="Line (L). Chain of lines; Esc ends">Line</button>
           <button type="button" data-tool="rect" title="Rectangle: two corners">Rectangle</button>
+          <button type="button" data-tool="rect3" title="3-point rectangle: two corners give the first side at any angle, a third point or the typed value gives the width; perpendicular and parallel constraints">3-pt rect.</button>
           <button type="button" data-tool="rectc" title="Centre rectangle: centre, corner; construction diagonals with the centre point at their midpoint">Centre rect.</button>
           <button type="button" data-tool="slot" title="Straight slot: centres of the two ends, then a point on a side or the typed width; lines tangent to equal end arcs">Slot</button>
           <button type="button" data-tool="circle" title="Circle (C): centre, radius point">Circle</button>
@@ -292,7 +293,7 @@
           <button type="button" data-tool="dim" title="Dimension (D): line, circle, arc, two points, point and line, two lines (angle)">Dimension</button>
           <button type="button" data-tool="dimh" title="Horizontal dimension">Horizontal</button>
           <button type="button" data-tool="dimv" title="Vertical dimension">Vertical</button>
-          <button type="button" data-con="coincident" title="Coincident: two or more points, or points and a line, circle or arc">Coincident</button>
+          <button type="button" data-con="coincident" title="Coincident: two or more points, points and a line, circle or arc (point on object), or two lines (collinear)">Coincident</button>
           <button type="button" data-con="horizontal" title="Horizontal: lines, or two points">Horiz.</button>
           <button type="button" data-con="vertical" title="Vertical: lines, or two points">Vert.</button>
           <button type="button" data-con="parallel" title="Parallel: two or more lines">Parallel</button>
@@ -325,6 +326,13 @@
         <label class="check inline"><input type="checkbox" id="sk-driving" checked> Driving dimensions</label>
         <label class="check inline"><input type="checkbox" id="sk-showcon" checked> Show constraints</label>
         <label class="check inline" title="Fillet and chamfer add construction lines to the original corner"><input type="checkbox" id="sk-cornerlines" checked> Corner construction lines</label>
+        <span class="dd sk-selfilter"><button type="button" class="dd-btn small" id="sk-filter-btn" title="Selection filter of the Select tool (clicks, window selection and the list of overlapping items)">Filter ▾</button>
+          <span class="dd-menu">
+            <label class="check" title="End points, centres, fit points and point entities"><input type="checkbox" id="sk-fpt" checked> Points</label>
+            <label class="check" title="Lines, arcs, circles, curves, polylines and text"><input type="checkbox" id="sk-fln" checked> Lines</label>
+            <label class="check"><input type="checkbox" id="sk-fdim" checked> Dimensions</label>
+            <label class="check" title="Constraint symbols"><input type="checkbox" id="sk-fcon" checked> Constraints</label>
+          </span></span>
       </div>
       <div class="ann-body">
         <div class="sk-left">
@@ -365,7 +373,7 @@
           </div>
         </div>
         <div class="toolbar">
-          <button type="button" data-add="import" title="Base geometry from a STEP file">Import STEP</button>
+          <button type="button" data-add="import" title="Base geometry from a STEP or STL file">Import STEP</button>
           <button type="button" data-add="place" title="Move the part so that its faces lie on the principal planes XY, XZ, YZ (and bounding box centre or minimum to the planes)">Place</button>
           <button type="button" data-add="sketch" title="Sketch on a reference plane, a plane feature, a planar face or normal to an edge">Sketch</button>
           <button type="button" data-add="plane" title="Datum plane for sketches and partitions">Plane</button>
@@ -409,6 +417,7 @@
           <button type="button" data-add="surf_loft" title="Loft through sketch curves">Loft surface</button>
           <button type="button" data-add="surf_fill" title="N-sided patch over a loop of edges">Fill surface</button>
           <button type="button" data-add="surf_bridge" title="Ruled surface between two chains of edges, corner to corner">Bridge surface</button>
+          <button type="button" data-add="surf_fillet" title="Rolling-ball fillet between two surface bodies (trimmed and sewn), or rounded edges of a surface body">Surface fillet</button>
           <button type="button" data-add="surf_offset" title="Offset a surface body">Offset surface</button>
           <button type="button" data-add="surf_sew" title="Sew surface bodies into one shell">Sew surfaces</button>
           <button type="button" data-add="surf_import" title="Faces of a STEP file (one component) as a surface body">Import surface</button>
@@ -734,6 +743,16 @@
   <div class="modal-box">
     <div class="ref-head"><strong id="pj-vtitle">Versions</strong><button type="button" id="pj-vclose">Close</button></div>
     <div id="pj-vlist"></div>
+  </div>
+</div>
+<div id="pj-mdialog" class="modal" hidden>
+  <div class="modal-box">
+    <div class="ref-head"><strong id="pj-mtitle">Move to project</strong><button type="button" id="pj-mclose">Close</button></div>
+    <label>Project<select id="pj-mtarget"></select></label>
+    <div class="row"><label class="check"><input type="radio" name="pj-mmode" value="move" checked> Move</label><label class="check"><input type="radio" name="pj-mmode" value="copy"> Copy</label></div>
+    <label class="check" id="pj-museslbl"><input type="checkbox" id="pj-muses" checked> <span id="pj-musestext">With the documents it uses</span></label>
+    <p class="hint" id="pj-mnote"></p>
+    <div class="buttons"><button type="button" id="pj-mgo" class="primary">Move</button></div>
   </div>
 </div>
 <div id="tb-dialog" class="modal" hidden>

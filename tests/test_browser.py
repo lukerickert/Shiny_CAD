@@ -122,6 +122,8 @@ def test_part_sketch_extrude_save(page, client):
     page.keyboard.press("Control+e")
     page.wait_for_selector("#tab-part:not([hidden])")
     wait_text(page, "#pt-props", "Extrude")                         # Next: Extrude (1)
+    # the closed profile is known once the build status of the sketch has arrived
+    page.wait_for_function("(() => { const s = window.__part.PT.status; return Object.values(s).some(x => x.sketch && x.profiles === 1); })()")
     page.keyboard.press("1")
     page.wait_for_selector("#pf-depth")
     page.fill("#pf-depth", "20")
@@ -1635,6 +1637,35 @@ def test_part_bridge_surface_command(page, client):
         const st = f && PT.status[f.id]; return st && !st.error && PT.surfaces[f.id]; })()""", timeout=60000)
 
 
+def test_part_surface_fillet_command(page, client):
+    """Surface fillet: surface A and surface B chosen, radius 3, Finish: one sewn surface body of three faces; the
+    sources are hidden."""
+    from conftest import part_rec, rect
+    p = part_rec("ui_sf", [{"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(40, 20, -20, 0)}},
+                           {"id": "b", "name": "B", "type": "surf_sketch", "kind": "planar", "plane": "XZ", "offset": 0, "sketch": {"entities": rect(40, 20, -20, 0)}}])
+    client.put("/api/part/file/ui_sf", json=p)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_sf')")
+    page.wait_for_function("window.__part.PT.surfaces && Object.keys(window.__part.PT.surfaces).length === 2")
+    page.evaluate("window.__part.startCommand('surf_fillet')")
+    page.wait_for_function("window.__part.PT.cmd && window.__part.feat(window.__part.PT.cmd.id).type === 'surf_fillet'")
+    page.select_option("#pf-source_a", "a")
+    page.evaluate("window.__part.gotoStep(1)")
+    page.wait_for_selector("#pf-source_b")
+    page.select_option("#pf-source_b", "b")
+    page.evaluate("window.__part.gotoStep(2)")
+    page.wait_for_selector("#pf-sfr")
+    page.fill("#pf-sfr", "3")
+    page.dispatch_event("#pf-sfr", "change")
+    page.evaluate("window.__part.finishCommand()")
+    page.wait_for_function("!window.__part.PT.cmd")
+    page.wait_for_function("""(() => { const PT = window.__part.PT; const f = PT.part.features.find(x => x.type === 'surf_fillet');
+        const st = f && PT.status[f.id]; return st && !st.error && st.faces === 3; })()""", timeout=60000)
+    assert page.evaluate("window.__part.PT.hidden.a && window.__part.PT.hidden.b")
+    area = page.evaluate("window.__part.PT.status[window.__part.PT.part.features.find(x => x.type === 'surf_fillet').id].area")
+    assert abs(area - (2 * 40 * 17 + math.pi / 2 * 3 * 40)) < 0.01
+
+
 def test_explicit_tab_model_build_run_results(page, client, tmp_path):
     """Explicit tab: geometry, rigid impactor, support on a face, Write .inp, New run, Build, Run with the stand-in
     OpenCourant executables, status board, results on the 3D view and the energy curve."""
@@ -2214,6 +2245,91 @@ def test_sketch_centre_rectangle_slot_tangent_arc(page):
         page.screenshot(path=os.path.join(os.environ["DRAWGEN_SHOTS"], "sketch_tangent_arc.png"))
 
 
+def test_part_pick_face_of_second_solid(page):
+    """Faces are picked by their triangle in the whole mesh: with solid 1 hidden, a click on solid 2 gives a face of
+    solid 2 (the triangle index of the solid's own mesh is mapped to the mesh triangle)."""
+    tab(page, "part")
+    mesh = {"vertices": [[-10, 0, 0], [0, 0, 0], [0, 10, 0], [-10, 10, 0], [0, 0, 0], [10, 0, 0], [10, 10, 0], [0, 10, 0]],
+            "triangles": [[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7]], "face_of_tri": [0, 0, 1, 1], "face_solid": [0, 1],
+            "face_keys": [{"c": [-5, 5, 0], "n": [0, 0, 1], "area": 100}, {"c": [5, 5, 0], "n": [0, 0, 1], "area": 100}],
+            "face_owner": [None, None], "edges": [], "edge_keys": [], "edge_solids": [], "bbox": [-10, 0, 0, 10, 10, 0]}
+    hit = page.evaluate("""m => { const P = window.__part.PT, T = window.__part.THREE;
+        P.hidden = {"solid:0": true}; window.__part.setMesh(m);
+        const t = P.three, r = t.renderer.domElement.getBoundingClientRect(), q = new T.Vector3(5, 5, 0).project(t.camera);
+        const h = window.__part.pickAt({ clientX: r.left + (q.x + 1) / 2 * r.width, clientY: r.top + (1 - q.y) / 2 * r.height }, ["face"]);
+        return h && [h.fi, h.solid]; }""", mesh)
+    assert hit == [1, 1]
+
+
+def test_part_import_step_clean_up(page, tmp_path):
+    """Import STEP: clean-up options (rebuild and fix on for a new import); a minimum volume removes the small solid
+    and the result line reports it."""
+    from build123d import Box, Compound, Location, export_step
+    path = str(tmp_path / "two.step")
+    export_step(Compound(children=[Box(20, 10, 5), Box(1, 1, 1).moved(Location((30, 0, 0)))]), path)
+    tab(page, "part")
+    page.click("#tab-part [data-add=import]")
+    page.wait_for_selector("#pf-crebuild")
+    assert page.is_checked("#pf-crebuild") and page.is_checked("#pf-cfix") and not page.is_checked("#pf-cunify")
+    page.fill("#pf-path", path)
+    page.dispatch_event("#pf-path", "change")
+    wait_text(page, "#pt-info", "2 cells")
+    page.fill("#pf-cminvol", "10")
+    page.dispatch_event("#pf-cminvol", "change")
+    wait_text(page, "#pt-props", "1 solid(s) below the minimum volume removed")
+    wait_text(page, "#pt-info", "Volume 1 cm^3")
+    assert page.evaluate("window.__part.PT.part.features[0].clean.min_volume") == 10
+
+
+def test_sketch_fillet_fixed_radius_option(page):
+    """Fillet properties: Radius 6 gives R6 fillets; the setting stays for the next use of the tool; Radius from the
+    click positions returns to the automatic radius."""
+    tab(page, "sketch")
+    page.click("#sk-new")
+    page.keyboard.press("w")
+    _typed(page, "0,0", "100,60")
+    page.keyboard.press("Escape")
+    page.click("#tab-sketch [data-tool=fillet]")
+    page.wait_for_selector("#skp-frad")
+    assert page.is_checked("input[name=skp-fmode][value=auto]") and page.is_disabled("#skp-frad")
+    page.check("input[name=skp-fmode][value=fixed]")
+    page.fill("#skp-frad", "6")
+    page.dispatch_event("#skp-frad", "change")
+    wait_text(page, "#sk-hint", "radius 6")
+    _click_model(page, 92, 0)
+    _click_model(page, 100, 12)
+    page.wait_for_function("window.__sk.SK.doc.entities.some(e => e.t === 'arc')")
+    assert page.evaluate("window.__sk.SK.doc.entities.find(e => e.t === 'arc').r") == pytest.approx(6)
+    page.keyboard.press("Escape")
+    page.click("#tab-sketch [data-tool=fillet]")
+    page.wait_for_selector("#skp-frad")
+    assert page.is_checked("input[name=skp-fmode][value=fixed]") and page.input_value("#skp-frad") == "6"
+    page.check("input[name=skp-fmode][value=auto]")
+    wait_text(page, "#sk-hint", "radius automatic")
+    page.keyboard.press("Escape")
+
+
+def test_part_import_stl(page, tmp_path):
+    """Import of an STL file: the STL options appear for a .stl path; the plate with a hole and a countersink gives
+    planar, cylindrical and conical faces."""
+    from build123d import Box, Cylinder, Cone, Pos, export_stl
+    path = str(tmp_path / "plate.stl")
+    export_stl(Box(60, 40, 10) - Pos(-15, 0, 0) * Cylinder(5, 10) - Pos(15, 0, 3) * Cone(2, 6, 4), path,
+               tolerance=0.01, angular_tolerance=0.2)
+    tab(page, "part")
+    page.click("#tab-part [data-add=import]")
+    page.wait_for_selector("#pf-path")
+    assert page.locator("#pf-sfit").count() == 0
+    page.fill("#pf-path", path)
+    page.dispatch_event("#pf-path", "change")
+    page.wait_for_selector("#pf-sfit")
+    assert page.is_checked("#pf-sfit")
+    wait_text(page, "#pt-props", "7 planar, 2 cylindrical, 2 conical")
+    wait_text(page, "#pt-info", "Volume 22.99")
+    page.uncheck("#pf-sfit")
+    page.wait_for_function("window.__part.PT.status && Object.values(window.__part.PT.status).some(s => s.stl && s.stl.fit === false)", timeout=60000)
+
+
 def test_sketch_circle_three_points(page):
     """Circle 3P through the typed points (0, 0), (100, 0) and (50, 50): centre (50, 0), radius 50."""
     tab(page, "sketch")
@@ -2422,3 +2538,373 @@ def test_sketch_trim_by_sweep(page):
     page.focus("#sk-canvas")
     page.keyboard.press("Control+z")
     page.wait_for_function("window.__sk.SK.doc.entities.filter(e => e.t === 'line' && Math.abs(e.x1 - e.x2) < 1e-9 && Math.max(e.y1, e.y2) > 19).length === 3")
+
+
+def test_sketch_spline_conic_end_conditions(page):
+    """Spline and Conic tools: tangent (default) and G2 at a point on the end of a line or arc; end conditions in the
+    properties of the curve; a conic with both ends tangent gets the tangent intersection of the two tangents."""
+    tab(page, "sketch")
+    page.click("#sk-new")
+    sp = "window.__sk.SK.doc.entities.find(e => e.t === 'spline')"
+    cons = "window.__sk.SK.doc.constraints"
+    # line (0, 0) - (20, 0), spline from its end: tangent by default
+    page.click("#sk-tools-draw button[data-tool=line]")
+    _typed(page, "0,0", "20,0")
+    page.keyboard.press("Escape")
+    page.click("#sk-tools-draw button[data-tool=spline]")
+    assert page.input_value("#skp-endc") == "tangent"
+    page.focus("#sk-canvas")
+    _click_model(page, 20, 0)
+    _typed(page, "40,10", "60,0")
+    page.keyboard.press("Enter")
+    page.keyboard.press("Escape")
+    r = page.evaluate("() => { const e = %s, A = cvAdapter(e); return [e.d0, A.tan(0), %s.filter(c => c.t === 'tangent' && c.e2 === e.id && c.ak2 === 's').length]; }" % (sp, cons))
+    assert abs(r[0][1]) < 1e-9 and r[0][0] > 0, r
+    assert abs(r[1][1]) < 1e-9 and r[2] == 1, r
+    # G2 from the properties: zero curvature at the start (k0 0), the fit points unchanged
+    page.evaluate("() => { const e = %s; SK.sel.clear(); SK.sel.add('e:' + e.id); showProps(); }" % sp)
+    assert page.input_value("#sk-props select[data-endc=s]") == "tangent"
+    page.select_option("#sk-props select[data-endc=s]", "g2")
+    r = page.evaluate("""() => { const e = %s, A = cvAdapter(e), h = 1e-4;
+        const p0 = A.at(h), p1 = A.at(2 * h), p2 = A.at(3 * h);
+        const d1 = [(p2[0] - p0[0]) / (2 * h), (p2[1] - p0[1]) / (2 * h)], d2 = [(p0[0] - 2 * p1[0] + p2[0]) / (h * h), (p0[1] - 2 * p1[1] + p2[1]) / (h * h)];
+        return [e.k0, (d1[0] * d2[1] - d1[1] * d2[0]) / Math.pow(Math.hypot(...d1), 3), e.pts, %s.filter(c => c.t === 'curvature').length]; }""" % (sp, cons))
+    assert abs(r[0]) < 1e-9 and abs(r[1]) < 1e-4, r
+    assert all(abs(a - b) < 1e-9 for p, q in zip(r[2], [[20, 0], [40, 10], [60, 0]]) for a, b in zip(p, q)) and r[3] == 1, r
+    assert page.input_value("#sk-props select[data-endc=s]") == "g2"
+    page.select_option("#sk-props select[data-endc=s]", "coincident")
+    r = page.evaluate("() => { const e = %s; return [e.d0 === undefined, %s.filter(c => c.t === 'tangent' || c.t === 'curvature').length]; }" % (sp, cons))
+    assert r == [True, 0], r
+    # spline from the end of a tangent arc (centre (20, 10), R 10, end (30, 10)) with G2: curvature 0.1 1/mm
+    page.keyboard.press("Escape")
+    page.click("#sk-new")
+    page.click("#sk-tools-draw button[data-tool=line]")
+    _typed(page, "0,0", "20,0")
+    page.keyboard.press("Escape")
+    page.click("#sk-tools-draw button[data-tool=tarc]")
+    _click_model(page, 20, 0)
+    _typed(page, "30,10")
+    page.keyboard.press("Escape")
+    page.click("#sk-tools-draw button[data-tool=spline]")
+    page.select_option("#skp-endc", "g2")
+    page.focus("#sk-canvas")
+    _click_model(page, 30, 10)
+    _typed(page, "40,30", "50,30")
+    page.keyboard.press("Enter")
+    page.keyboard.press("Escape")
+    r = page.evaluate("""() => { const e = %s, A = cvAdapter(e), h = 1e-4;
+        const p0 = A.at(h), p1 = A.at(2 * h), p2 = A.at(3 * h);
+        const d1 = [(p2[0] - p0[0]) / (2 * h), (p2[1] - p0[1]) / (2 * h)], d2 = [(p0[0] - 2 * p1[0] + p2[0]) / (h * h), (p0[1] - 2 * p1[1] + p2[1]) / (h * h)];
+        return [e.k0, (d1[0] * d2[1] - d1[1] * d2[0]) / Math.pow(Math.hypot(...d1), 3), A.tan(0), %s.filter(c => c.t === 'curvature').length]; }""" % (sp, cons))
+    assert abs(r[0] - 0.1) < 1e-6 and abs(r[1] - 0.1) < 1e-3, r
+    assert abs(r[2][0]) < 1e-6 and r[3] == 1, r
+    # conic between the ends of two lines, both tangent: tangent intersection (40, 0), then rho 0.4
+    page.keyboard.press("Escape")
+    page.click("#sk-new")
+    page.click("#sk-tools-draw button[data-tool=line]")
+    _typed(page, "0,0", "20,0")
+    page.keyboard.press("Escape")
+    page.click("#sk-tools-draw button[data-tool=line]")
+    _typed(page, "40,20", "40,40")
+    page.keyboard.press("Escape")
+    page.click("#sk-tools-draw button[data-tool=conic]")
+    page.select_option("#skp-endc", "tangent")
+    page.focus("#sk-canvas")
+    _click_model(page, 20, 0)
+    _click_model(page, 40, 20)
+    _typed(page, "0.4")
+    page.keyboard.press("Escape")
+    r = page.evaluate("() => { const e = window.__sk.SK.doc.entities.find(e => e.t === 'conic'); return [e.xt, e.yt, e.rho, %s.filter(c => c.t === 'tangent' && c.e2 === e.id).length]; }" % cons)
+    assert abs(r[0] - 40) < 1e-6 and abs(r[1]) < 1e-6 and abs(r[2] - 0.4) < 1e-9 and r[3] == 2, r
+
+
+def test_sketch_check_open_ends_tiny_merge_crossings(page):
+    """Sketch check: open ends closed (two lines extended to meet, a line extended to another), crossings and
+    T-junctions split, a tiny line removed with its neighbours joined, collinear lines and co-circular arcs merged."""
+    tab(page, "sketch")
+    page.click("#sk-new")
+    kinds = "() => sketchCheck().map(x => x.kind)"
+    # rectangle with 2 mm corner gaps and a line 3 mm short of the bottom and top edges
+    page.evaluate("""() => {
+        for (const [a, b, c, d] of [[0, 0, 18, 0], [20, 2, 20, 18], [18, 20, 2, 20], [0, 18, 0, 2], [10, 3, 10, 17]]) newEnt('line', { x1: a, y1: b, x2: c, y2: d });
+        reindex(); changed(true); }""")
+    page.click("#sk-check")
+    k = page.evaluate(kinds)
+    assert k.count("open") == 6, k
+    assert page.locator("#sk-props button[data-fix=open]").inner_text() == "Close open ends (6)"
+    page.click("#sk-props button[data-fix=open]")
+    k = page.evaluate(kinds)
+    assert "open" not in k and k.count("cross") == 2, k
+    corners = page.evaluate("() => SK.doc.entities.filter(e => e.t === 'line').map(e => [e.x1, e.y1, e.x2, e.y2])")
+    assert [0, 0, 20, 0] in corners and [20, 0, 20, 20] in corners and [20, 20, 0, 20] in corners and [0, 20, 0, 0] in corners, corners
+    assert [10, 0, 10, 20] in corners, corners
+    page.click("#sk-props button[data-fix=cross]")
+    k = page.evaluate(kinds)
+    assert k == [], k
+    r = page.evaluate("() => [SK.doc.entities.filter(e => e.t === 'line').length, SK.doc.constraints.filter(c => c.t === 'coincident').length]")
+    assert r[0] == 7 and r[1] >= 8, r
+    # crossing of two lines: four lines joined at (10, 10)
+    page.click("#sk-new")
+    page.evaluate("() => { newEnt('line', { x1: 0, y1: 0, x2: 20, y2: 20 }); newEnt('line', { x1: 0, y1: 20, x2: 20, y2: 0 }); reindex(); changed(true); }")
+    assert page.evaluate(kinds).count("cross") == 1
+    page.evaluate("() => { fixIssues(sketchCheck().filter(x => x.kind === 'cross')); changed(true); }")
+    r = page.evaluate("() => SK.doc.entities.filter(e => e.t === 'line').map(e => [e.x1, e.y1, e.x2, e.y2])")
+    assert len(r) == 4 and all([10, 10] in ([a, b], [c, d]) for a, b, c, d in r), r
+    # chain with a tiny line (0.05 mm) between two collinear lines: removed, then the two lines merged
+    page.click("#sk-new")
+    page.click("#sk-tools-draw button[data-tool=line]")
+    _typed(page, "0,0", "10,0", "10.05,0", "20,0")
+    page.keyboard.press("Escape")
+    k = page.evaluate(kinds)
+    assert k.count("tiny") == 1, k
+    page.evaluate("() => { fixIssues(sketchCheck().filter(x => x.kind === 'tiny')); changed(true); }")
+    k = page.evaluate(kinds)
+    assert k.count("merge") == 1, k
+    page.evaluate("() => { fixIssues(sketchCheck().filter(x => x.kind === 'merge')); changed(true); }")
+    r = page.evaluate("() => SK.doc.entities.filter(e => e.t === 'line').map(e => [e.x1, e.y1, e.x2, e.y2])")
+    assert len(r) == 1 and abs(r[0][0]) < 1e-9 and abs(r[0][2] - 20) < 1e-9, r
+    # co-circular arcs 0-90 deg and 90-180 deg (R 10): one arc 0-180 deg
+    page.click("#sk-new")
+    page.evaluate("""() => { const a = newEnt('arc', { cx: 0, cy: 0, r: 10, a0: 0, a1: 90 }), b = newEnt('arc', { cx: 0, cy: 0, r: 10, a0: 90, a1: 180 });
+        reindex(); addConstraint({ t: 'coincident', a: { e: a.id, k: 'e' }, b: { e: b.id, k: 's' } }, true); changed(true); }""")
+    assert sorted(page.evaluate(kinds)) == ["merge", "open", "open"], page.evaluate(kinds)
+    page.evaluate("() => { fixIssues(sketchCheck().filter(x => x.kind === 'merge')); changed(true); }")
+    r = page.evaluate("() => SK.doc.entities.filter(e => e.t === 'arc').map(e => [e.a0, e.a1])")
+    assert r == [[0, 180]], r
+
+
+def test_sketch_three_point_rectangle_and_hv_capture(page):
+    """3-pt rect.: inclined first side (DOF 5: perpendicular and two parallel constraints), horizontal first side
+    (DOF 4); a line clicked 1.7 deg from horizontal gets a horizontal constraint."""
+    tab(page, "sketch")
+    page.click("#sk-new")
+    lines = "() => SK.doc.entities.filter(e => e.t === 'line').map(e => [e.x1, e.y1, e.x2, e.y2])"
+    page.click("#sk-tools-draw button[data-tool=rect3]")
+    page.focus("#sk-canvas")
+    _typed(page, "0,0", "30,10", "0,10")
+    page.keyboard.press("Escape")
+    wait_text(page, "#tab-sketch", "DOF 5")
+    r = page.evaluate(lines)
+    w = 10 * 30 / math.hypot(30, 10)
+    assert len(r) == 4 and abs(math.hypot(r[1][2] - r[1][0], r[1][3] - r[1][1]) - w) < 1e-6, r
+    ts = page.evaluate("() => SK.doc.constraints.map(c => c.t)")
+    assert ts.count("perpendicular") == 1 and ts.count("parallel") == 2 and ts.count("coincident") == 4, ts
+    page.click("#sk-new")
+    page.click("#sk-tools-draw button[data-tool=rect3]")
+    page.focus("#sk-canvas")
+    _typed(page, "0,0", "40,0", "@0,15")
+    page.keyboard.press("Escape")
+    wait_text(page, "#tab-sketch", "DOF 4")
+    r = page.evaluate(lines)
+    assert [40, 0, 40, 15] in r, r
+    # horizontal capture
+    page.click("#sk-new")
+    page.click("#sk-tools-draw button[data-tool=line]")
+    _click_model(page, 0, 0)
+    _click_model(page, 50, 1.5)
+    page.keyboard.press("Escape")
+    r = page.evaluate(lines)
+    assert len(r) == 1 and abs(r[0][3] - r[0][1]) < 1e-9, r
+    assert page.evaluate("() => SK.doc.constraints.filter(c => c.t === 'horizontal').length") == 1
+
+
+def test_sketch_selection_filter_pick_list_and_constraint_pick(page):
+    """Selection filter (Lines off: a click on a line selects nothing, a click on an end selects the point); the list
+    of overlapping items after the cursor rests on two lines; Coincident with one point selected continues in the
+    pick mode and the next click adds the second point without Shift."""
+    tab(page, "sketch")
+    page.click("#sk-new")
+    page.evaluate("""() => { for (const [a, b, c, d] of [[0, 0, 20, 0], [0, 0, 20, 0], [30, 0, 30, 10]]) newEnt('line', { x1: a, y1: b, x2: c, y2: d });
+        reindex(); changed(true); fit(); }""")
+    sel = "() => [...SK.sel]"
+    page.click("#sk-filter-btn")
+    page.uncheck("#sk-fln")
+    page.click("#sk-filter-btn")
+    _click_model(page, 10, 0)
+    assert page.evaluate(sel) == []
+    _click_model(page, 30, 10)
+    assert page.evaluate(sel) == ["p:e3:p2"], page.evaluate(sel)
+    page.click("#sk-filter-btn")
+    page.check("#sk-fln")
+    page.click("#sk-filter-btn")
+    page.keyboard.press("Escape")
+    # list of the two overlapping lines at (10, 0)
+    s = page.evaluate("() => window.__sk.S([10, 0])")
+    box = page.locator("#sk-canvas svg").bounding_box()
+    page.mouse.move(box["x"] + s[0] + 1, box["y"] + s[1])
+    page.mouse.move(box["x"] + s[0], box["y"] + s[1])
+    page.wait_for_selector("#sk-picklist div[data-pl]")
+    items = page.locator("#sk-picklist div[data-pl]").all_inner_texts()
+    assert items == ["Line e1", "Line e2"] or items == ["Line e2", "Line e1"], items
+    page.locator("#sk-picklist div[data-pl]").nth(1).dispatch_event("mousedown")
+    assert page.evaluate(sel) == ["e:" + items[1].split()[-1]], page.evaluate(sel)
+    assert page.locator("#sk-picklist").count() == 0
+    # Coincident: one point selected, then the pick mode
+    page.keyboard.press("Escape")
+    _click_model(page, 30, 0)
+    page.click("#tab-sketch [data-con=coincident]")
+    assert page.evaluate("() => SK.conPick") == "coincident"
+    _click_model(page, 20, 0)
+    r = page.evaluate("() => [SK.doc.constraints.filter(c => c.t === 'coincident').length, SK.conPick, SK.doc.entities[2].x1, SK.doc.entities[2].y1]")
+    assert r[0] == 1 and r[1] == "coincident" and abs(r[2] - 20) < 1e-6 and abs(r[3]) < 1e-6, r
+
+
+def test_sketch_drag_keeps_driving_dimensions_and_collinear(page):
+    """A drag of a fully constrained line (fixed start, horizontal, driving length 20 mm) leaves it in place while the
+    mouse is down; Coincident on two lines makes them collinear."""
+    tab(page, "sketch")
+    page.click("#sk-new")
+    page.evaluate("""() => { const l = newEnt('line', { x1: 0, y1: 0, x2: 20, y2: 0 }); reindex();
+        addConstraint({ t: 'fix', a: { e: l.id, k: 'p1' }, v: [0, 0] }, true); addConstraint({ t: 'horizontal', l: l.id }, true);
+        SK.doc.dims.push({ id: 'd1', type: 'linear', line: l.id, orient: 'a', off: [0, 5], driving: true, value: 20 }); changed(true); fit(); }""")
+    wait_text(page, "#tab-sketch", "Fully constrained")
+    s = page.evaluate("() => window.__sk.S([20, 0])")
+    t = page.evaluate("() => window.__sk.S([30, 6])")
+    box = page.locator("#sk-canvas svg").bounding_box()
+    page.mouse.move(box["x"] + s[0], box["y"] + s[1])
+    page.mouse.down()
+    for k in range(1, 6):
+        page.mouse.move(box["x"] + s[0] + (t[0] - s[0]) * k / 5, box["y"] + s[1] + (t[1] - s[1]) * k / 5)
+    r = page.evaluate("() => { const e = SK.doc.entities[0]; return [e.x2, e.y2]; }")
+    page.mouse.up()
+    assert abs(r[0] - 20) < 1e-6 and abs(r[1]) < 1e-6, r
+    # collinear
+    page.click("#sk-new")
+    page.evaluate("() => { newEnt('line', { x1: 0, y1: 0, x2: 20, y2: 0 }); newEnt('line', { x1: 30, y1: 3, x2: 50, y2: 5 }); reindex(); changed(true); fit(); }")
+    page.evaluate("() => { SK.sel.clear(); SK.sel.add('e:' + SK.doc.entities[0].id); SK.sel.add('e:' + SK.doc.entities[1].id); }")
+    page.click("#tab-sketch [data-con=coincident]")
+    r = page.evaluate("() => { const e = SK.doc.entities[1]; return [e.y1, e.y2, SK.doc.constraints.filter(c => c.t === 'pointon').length]; }")
+    assert abs(r[0]) < 1e-6 and abs(r[1]) < 1e-6 and r[2] == 2, r
+
+
+def test_sketch_constrained_colour_closed_profile_marks(page):
+    """Under-constrained geometry blue, fully constrained geometry in its colour and the green Fully constrained
+    badge; a closed triangle filled, the open ends of a line marked red; a dimension change keeps the view."""
+    tab(page, "sketch")
+    page.click("#sk-new")
+    page.evaluate("""() => { for (const [a, b, c, d] of [[0, 0, 40, 0], [40, 0, 40, 30], [40, 30, 0, 0], [60, 0, 90, 0]]) newEnt('line', { x1: a, y1: b, x2: c, y2: d });
+        reindex(); const L = SK.doc.entities;
+        for (let i = 0; i < 3; i++) addConstraint({ t: 'coincident', a: { e: L[i].id, k: 'p2' }, b: { e: L[(i + 1) % 3].id, k: 'p1' } }, true);
+        changed(true); fit(); }""")
+    page.wait_for_selector("#sk-geo path.sk-loops")
+    assert page.locator("#sk-geo circle.sk-open").count() == 2
+    assert page.evaluate("() => [...SK.under].length") == 4
+    assert page.locator("#sk-dof.dof-under").count() == 1
+    # fix the line (60, 0) - (90, 0): it is drawn in its layer colour, the triangle stays blue
+    page.evaluate("() => { const l = SK.doc.entities[3]; addConstraint({ t: 'fix', e: l.id, vals: entVals(l) }, true); changed(true); }")
+    assert page.evaluate("() => [...SK.under].sort()") == page.evaluate("() => SK.doc.entities.slice(0, 3).map(e => e.id).sort()")
+    # fully constrained triangle: fixed start, horizontal base, vertical side, driving lengths
+    page.evaluate("""() => { const L = SK.doc.entities;
+        addConstraint({ t: 'fix', a: { e: L[0].id, k: 'p1' }, v: [0, 0] }, true); addConstraint({ t: 'horizontal', l: L[0].id }, true); addConstraint({ t: 'vertical', l: L[1].id }, true);
+        SK.doc.dims.push({ id: 'd1', type: 'linear', line: L[0].id, orient: 'a', off: [0, -5], driving: true, value: 40 }, { id: 'd2', type: 'linear', line: L[1].id, orient: 'a', off: [5, 0], driving: true, value: 30 });
+        changed(true); }""")
+    wait_text(page, "#tab-sketch", "Fully constrained")
+    assert page.locator("#sk-dof.dof-ok").count() == 1 and page.evaluate("() => SK.under.size") == 0
+    # a dimension change keeps the view
+    v0 = page.evaluate("() => [SK.view.s, SK.view.ox, SK.view.oy]")
+    page.evaluate("() => window.__sk.setDimValue(SK.doc.dims[0], 4)")
+    assert page.evaluate("() => [SK.view.s, SK.view.ox, SK.view.oy]") == v0
+    assert abs(page.evaluate("() => SK.doc.entities[0].x2") - 4) < 1e-6
+
+
+def test_part_pattern_bodies_pick(page, client):
+    """Pattern: Pick bodies, a click on the solid adds it; the copies are new solids."""
+    client.put("/api/part/file/ui_patb", json=plate("ui_patb"))
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_patb')")
+    page.wait_for_function("window.__part.PT.mesh && window.__part.PT.mesh.vertices.length")
+    page.evaluate("() => window.__part.startCommand('pattern')")
+    page.wait_for_selector("#tab-part button[data-pick=bodies]")
+    page.click("#tab-part button[data-pick=bodies]")
+    time.sleep(0.5)
+    xy = page.evaluate("""() => { const P = window.__part, t = P.PT.three, r = t.renderer.domElement.getBoundingClientRect();
+        for (let i = 0; i < 900; i++) { const sx = r.left + r.width * (0.05 + 0.9 * (i % 30) / 30), sy = r.top + r.height * (0.05 + 0.9 * Math.floor(i / 30) / 30);
+          const h = P.pickAt({ clientX: sx, clientY: sy }, ['body']); if (h && h.kind === 'body' && document.elementFromPoint(sx, sy) === t.renderer.domElement) return [sx, sy]; } return null; }""")
+    assert xy
+    page.mouse.click(*xy)
+    page.wait_for_function("(() => { const P = window.__part; return JSON.stringify(P.feat(P.PT.cmd.id).bodies) === '[{\"solid\":0}]'; })()")
+    page.click("#pt-cmdfinish")
+    page.wait_for_function("window.__part.PT.solids.length === 3", timeout=60000)
+
+
+def test_part_cut_bodies_step(page, client):
+    """Cut: the Bodies step lists the solids before the cut; a click on a solid adds it, and the cut changes only
+    that solid."""
+    def rect(x0, y0, x1, y1):
+        return [{"id": "e%d" % i, "t": "line", "layer": "0", "x1": a, "y1": b, "x2": c, "y2": d}
+                for i, (a, b, c, d) in enumerate([(x0, y0, x1, y0), (x1, y0, x1, y1), (x1, y1, x0, y1), (x0, y1, x0, y0)])]
+    p = {"name": "ui_cutb", "features": [
+        {"id": "f1", "name": "Extrude 1", "type": "extrude", "plane": "XY", "offset": 0, "sketch": {"entities": rect(0, 0, 20, 10)}, "depth": 5},
+        {"id": "f2", "name": "Extrude 2", "type": "extrude", "plane": "XY", "offset": 0, "sketch": {"entities": rect(30, 0, 50, 10)}, "depth": 5, "new_body": True},
+        {"id": "f3", "name": "Cut 1", "type": "cut", "plane": "XZ", "offset": 0, "sketch": {"entities": rect(-10, 3, 60, 7)}, "through": True}]}
+    client.put("/api/part/file/ui_cutb", json=p)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_cutb')")
+    page.wait_for_function("window.__part.PT.mesh && window.__part.PT.solids.length === 2")
+    vols = page.evaluate("() => window.__part.PT.solids.map(s => Math.round(s.volume_mm3))")
+    assert sorted(vols) == [600, 600], vols
+    page.evaluate("""() => { const P = window.__part, f = P.PT.part.features.find(x => x.type === 'cut'); P.startCommand('cut', null, f.id);
+        P.gotoStep(P.commandSteps(f).length - 1); }""")
+    page.wait_for_selector("#tab-part input[data-pbs]")
+    assert page.locator("#tab-part input[data-pbs]").count() == 2
+    page.check("#tab-part input[data-pbs='1']")
+    page.click("#pt-cmdfinish")
+    page.wait_for_function("window.__part.PT.mesh && !window.__part.PT.cmd && window.__part.PT.solids.length === 2 && window.__part.PT.solids.some(s => Math.round(s.volume_mm3) === 1000)", timeout=60000)
+
+
+def test_project_move_document_dialog(page, client, web):
+    """Project tab: Move… on a part opens the dialog; Move puts the part in the other project."""
+    import os
+    client.post("/api/projects", json={"name": "ui_other", "description": "", "open": False})
+    client.put("/api/part/file/ui_mv", json=plate("ui_mv"))
+    tab(page, "project")
+    page.wait_for_selector("#pj-docs tr[data-name='ui_mv'] button[data-op=move]", timeout=10000)
+    page.click("#pj-docs tr[data-name='ui_mv'] button[data-op=move]")
+    page.wait_for_selector("#pj-mdialog:not([hidden])")
+    page.select_option("#pj-mtarget", "ui_other")
+    page.click("#pj-mgo")
+    page.wait_for_selector("#pj-mdialog[hidden]", state="attached")
+    dst = web.PROJECTS.project_dir("ui_other")
+    page.wait_for_function("() => !document.querySelector(\"#pj-docs tr[data-name='ui_mv']\")")
+    assert os.path.isfile(os.path.join(dst, "work", "ui_mv.part.json"))
+
+
+def test_sketch_check_fixed_geometry_and_speed(page):
+    """Check on a sketch with 150 fixed lines joined end to end (as included edges) and two free touching lines:
+    the fixed joints are not listed as missing constraints, the free joint is fixed, and the fix takes under 5 s."""
+    tab(page, "sketch")
+    page.click("#sk-new")
+    page.evaluate("""() => { for (let i = 0; i < 150; i++) { const l = newEnt('line', { x1: i * 2, y1: (i % 2) * 3, x2: (i + 1) * 2, y2: ((i + 1) % 2) * 3 });
+          SK.doc.constraints.push({ id: 'cf' + i, t: 'fix', e: l.id, vals: entVals(l) }); }
+        newEnt('line', { x1: 0, y1: 50, x2: 20, y2: 50 }); newEnt('line', { x1: 20, y1: 50, x2: 20, y2: 70 });
+        reindex(); changed(true); fit(); }""")
+    k = page.evaluate("() => sketchCheck().map(x => x.kind)")
+    assert k.count("nocoincident") == 1 and "notangent" not in k, k
+    t = page.evaluate("() => { const t0 = performance.now(); const n = fixIssues(sketchCheck().filter(x => x.kind === 'nocoincident')); changed(true); return [n, performance.now() - t0]; }")
+    assert t[0] == 1 and t[1] < 5000, t
+    assert "nocoincident" not in page.evaluate("() => sketchCheck().map(x => x.kind)")
+
+
+def test_sketch_check_failed_fix_marked(page):
+    """A tiny line between two fixed lines that are not collinear: the fix is not offered (neighbours fixed); a tiny
+    line between free lines held by a conflicting dimension: the failed fix is marked and the button disappears."""
+    tab(page, "sketch")
+    page.click("#sk-new")
+    page.evaluate("""() => { const a = newEnt('line', { x1: 0, y1: 0, x2: 10, y2: 0 }), t = newEnt('line', { x1: 10, y1: 0, x2: 10.05, y2: 0.02 }), b = newEnt('line', { x1: 10.05, y1: 0.02, x2: 20, y2: 5 });
+        reindex();
+        for (const l of [a, b]) SK.doc.constraints.push({ id: 'f' + l.id, t: 'fix', e: l.id, vals: entVals(l) });
+        changed(true); }""")
+    x = page.evaluate("() => sketchCheck().filter(x => x.kind === 'tiny').map(x => [x.text, fixKind(x)])")
+    assert len(x) == 1 and "(neighbours fixed)" in x[0][0] and x[0][1] is None, x
+    # free neighbours, but each with a fixed start and a driving length: joining them is impossible
+    page.click("#sk-new")
+    page.evaluate("""() => { const a = newEnt('line', { x1: 0, y1: 0, x2: 10, y2: 0 }), t = newEnt('line', { x1: 10, y1: 0, x2: 10.05, y2: 0 }), b = newEnt('line', { x1: 10.05, y1: 0, x2: 20, y2: 0 });
+        reindex();
+        addConstraint({ t: 'fix', a: { e: a.id, k: 'p1' }, v: [0, 0] }, true); addConstraint({ t: 'fix', a: { e: b.id, k: 'p2' }, v: [20, 0] }, true);
+        SK.doc.dims.push({ id: 'd1', type: 'linear', line: a.id, orient: 'a', off: [0, 3], driving: true, value: 10 }, { id: 'd2', type: 'linear', line: b.id, orient: 'a', off: [0, 3], driving: true, value: 9.95 });
+        changed(true); }""")
+    page.click("#sk-check")
+    page.wait_for_selector("#sk-props button[data-fix=tiny]")
+    page.click("#sk-props button[data-fix=tiny]")
+    wait_text(page, "#sk-props", "fix not possible")
+    assert page.locator("#sk-props button[data-fix=tiny]").count() == 0

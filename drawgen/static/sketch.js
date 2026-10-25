@@ -63,57 +63,98 @@ function ellPoly(e, n) {
   for (let i = 0; i <= n; i++) out.push(ellPt(e, a0 + sp * i / n));
   return out;
 }
-/** Cubic spline through the fit points (chord-length parameters, natural ends; periodic when closed).
- *  Parameter t: span index plus fraction, 0..m (m spans; closed: periodic in m). */
-function splineSolve(pts, closed) {
-  const n = pts.length;
-  const P = closed ? pts.concat([pts[0]]) : pts.slice();
-  const m = P.length - 1;
-  const h = [];
-  for (let i = 0; i < m; i++) h.push(Math.max(1e-9, dist(P[i], P[i + 1])));
-  const solve = (cIdx) => {
-    if (m < 1) return [0, 0];
-    if (m === 1 && !closed) return [0, 0];
-    const y = P.map(p => p[cIdx]);
-    const N = closed ? m : m + 1, np = closed ? m : m + 1;
-    const A = Array.from({ length: N }, () => new Array(N).fill(0)), b = new Array(N).fill(0);
-    if (!closed) { A[0][0] = 1; A[N - 1][N - 1] = 1; }
-    for (let i = closed ? 0 : 1; i < m; i++) {
-      const hp = h[(i - 1 + m) % m], hc = h[i % m], r = i % N;
-      A[r][(i - 1 + N) % N] += hp; A[r][r] += 2 * (hp + hc); A[r][(i + 1) % N] += hc;
-      b[r] = 6 * ((y[(i + 1) % np] - y[i]) / hc - (y[i] - y[(i - 1 + np) % np]) / hp);
+/** Cubic spline through the fit points (chord-length parameters; periodic when closed). Open ends: natural, or
+ *  ends {d0, k0, d1, k1}: d0 / d1 clamp the end derivative dP/ds (s the chord-length parameter, d1 in the direction
+ *  of travel); k0 / k1 hold the signed end curvature (with respect to d0 / d1) with an extra knot at the middle of
+ *  the end span. Parameter t: fit point span index plus fraction, 0..mu (closed: periodic in mu). The same curve as
+ *  _spline_solve in sketch.py. */
+function splineSolve(pts, closed, ends) {
+  ends = (!closed && ends) || {};
+  const P0 = closed ? pts.concat([pts[0]]) : pts.slice();
+  const mu = P0.length - 1;
+  const d0 = ends.d0 || null, d1 = ends.d1 || null;
+  const g0 = !!d0 && ends.k0 !== undefined && ends.k0 !== null, g1 = !!d1 && ends.k1 !== undefined && ends.k1 !== null;
+  const nsub = [], cum = [0];
+  for (let i = 0; i < mu; i++) { nsub.push(1 + (i === 0 && g0 ? 1 : 0) + (i === mu - 1 && g1 ? 1 : 0)); cum.push(cum[i] + nsub[i]); }
+  const P = [], h = [], hid = [];
+  for (let i = 0; i < mu; i++) {
+    P.push(P0[i].slice());
+    const L = Math.max(1e-9, dist(P0[i], P0[i + 1])) / nsub[i];
+    for (let j = 0; j < nsub[i]; j++) {
+      h.push(L);
+      if (j > 0) { hid.push(P.length); P.push(add(P0[i], mul(sub(P0[i + 1], P0[i]), j / nsub[i]))); }
     }
-    for (let c = 0; c < N; c++) {
-      let piv = c; for (let r = c + 1; r < N; r++) if (Math.abs(A[r][c]) > Math.abs(A[piv][c])) piv = r;
-      [A[c], A[piv]] = [A[piv], A[c]]; [b[c], b[piv]] = [b[piv], b[c]];
-      if (Math.abs(A[c][c]) < 1e-14) continue;
-      for (let r = c + 1; r < N; r++) { const f = A[r][c] / A[c][c]; if (!f) continue; for (let j = c; j < N; j++) A[r][j] -= f * A[c][j]; b[r] -= f * b[c]; }
+  }
+  if (P0.length) P.push(P0[mu].slice());
+  const m = h.length;
+  const S = { P, h, m, mu, sub: nsub, cum, closed, Mx: [0, 0], My: [0, 0] };
+  if (m < 1) return S;
+  const hidx = new Map(hid.map((k, n) => [k, n]));
+  const npts = closed ? m : m + 1, N = closed ? m : m + 1, U = N + hid.length;
+  const solve = (c) => {
+    const y = P.map(q => q[c]);
+    const A = Array.from({ length: U }, () => new Array(U).fill(0)), b = new Array(U).fill(0);
+    const yterm = (r, j, coef) => { j = ((j % npts) + npts) % npts; if (hidx.has(j)) A[r][N + hidx.get(j)] -= coef; else b[r] += coef * y[j]; };
+    let r = 0;
+    for (let i = closed ? 0 : 1; i < m; i++, r++) {
+      const hp = h[(i - 1 + m) % m], hc = h[i % m];
+      A[r][(i - 1 + N) % N] += hp; A[r][i % N] += 2 * (hp + hc); A[r][(i + 1) % N] += hc;
+      yterm(r, i + 1, 6 / hc); yterm(r, i, -6 * (1 / hc + 1 / hp)); yterm(r, i - 1, 6 / hp);
     }
-    const M = new Array(N).fill(0);
-    for (let r = N - 1; r >= 0; r--) { let sm = b[r]; for (let j = r + 1; j < N; j++) sm -= A[r][j] * M[j]; M[r] = Math.abs(A[r][r]) < 1e-14 ? 0 : sm / A[r][r]; }
+    if (!closed) {
+      if (!d0) A[r][0] = 1;
+      else { A[r][0] = 2 * h[0]; A[r][1] += h[0]; yterm(r, 1, 6 / h[0]); yterm(r, 0, -6 / h[0]); b[r] -= 6 * d0[c]; }
+      r++;
+      if (g0) { const n0 = Math.hypot(d0[0], d0[1]); A[r][0] = 1; b[r] = ends.k0 * n0 * (c === 0 ? -d0[1] : d0[0]); r++; }
+      if (!d1) A[r][N - 1] = 1;
+      else { A[r][N - 2] += h[m - 1]; A[r][N - 1] += 2 * h[m - 1]; yterm(r, m, -6 / h[m - 1]); yterm(r, m - 1, 6 / h[m - 1]); b[r] += 6 * d1[c]; }
+      r++;
+      if (g1) { const n1 = Math.hypot(d1[0], d1[1]); A[r][N - 1] = 1; b[r] = ends.k1 * n1 * (c === 0 ? -d1[1] : d1[0]); r++; }
+    }
+    for (let k = 0; k < U; k++) {
+      let piv = k; for (let q = k + 1; q < U; q++) if (Math.abs(A[q][k]) > Math.abs(A[piv][k])) piv = q;
+      [A[k], A[piv]] = [A[piv], A[k]]; [b[k], b[piv]] = [b[piv], b[k]];
+      if (Math.abs(A[k][k]) < 1e-14) continue;
+      for (let q = k + 1; q < U; q++) { const f = A[q][k] / A[k][k]; if (!f) continue; for (let j = k; j < U; j++) A[q][j] -= f * A[k][j]; b[q] -= f * b[k]; }
+    }
+    const X = new Array(U).fill(0);
+    for (let q = U - 1; q >= 0; q--) { let sm = b[q]; for (let j = q + 1; j < U; j++) sm -= A[q][j] * X[j]; X[q] = Math.abs(A[q][q]) < 1e-14 ? 0 : sm / A[q][q]; }
+    hid.forEach((k, n) => { P[k][c] = X[N + n]; });
+    const M = X.slice(0, N);
     return closed ? M.concat([M[0]]) : M;
   };
-  return { P, h, m, closed, Mx: solve(0), My: solve(1) };
+  S.Mx = solve(0); S.My = solve(1);
+  return S;
+}
+/** End conditions of a spline entity for splineSolve. */
+function splineEnds(e) { return e.closed ? null : { d0: e.d0, k0: e.d0 ? e.k0 : undefined, d1: e.d1, k1: e.d1 ? e.k1 : undefined }; }
+function splineOf(e) { return splineSolve(e.pts, e.closed, splineEnds(e)); }
+/** Span of the solution (counting the extra knots) and fraction at the parameter t. */
+function splineLoc(S, t) {
+  const mu = S.mu;
+  if (mu < 1) return [0, 0];
+  if (S.closed) t = ((t % mu) + mu) % mu;
+  const i = Math.min(mu - 1, Math.max(0, Math.floor(t))), u = t - i, n = S.sub[i], v = u * n;
+  const j = Math.min(n - 1, Math.max(0, Math.floor(v)));
+  return [S.cum[i] + j, v - j];
 }
 function splineAt(S, t) {
-  const m = S.m;
-  if (m < 1) return S.P[0].slice();
-  if (S.closed) t = ((t % m) + m) % m;
-  let i = Math.min(m - 1, Math.max(0, Math.floor(t))), u = t - i;
-  if (!S.closed) { if (t <= 0) { i = 0; u = t; } else if (t >= m) { i = m - 1; u = t - i; } }
-  const hi = S.h[i], a = 1 - u;
+  if (S.m < 1) return S.P[0].slice();
+  const [i, u] = splineLoc(S, t), hi = S.h[i], a = 1 - u;
   const f = (y0, y1, M0, M1) => a * y0 + u * y1 + ((a * a * a - a) * M0 + (u * u * u - u) * M1) * hi * hi / 6;
   return [f(S.P[i][0], S.P[i + 1][0], S.Mx[i], S.Mx[i + 1]), f(S.P[i][1], S.P[i + 1][1], S.My[i], S.My[i + 1])];
 }
-/** Tangent direction (unit) at t. */
-function splineTan(S, t) {
-  const m = S.m;
-  if (m < 1) return [1, 0];
-  if (S.closed) t = ((t % m) + m) % m;
-  const i = Math.min(m - 1, Math.max(0, Math.floor(t))), u = Math.min(1, Math.max(0, t - i)), hi = S.h[i], a = 1 - u;
-  const d = (y0, y1, M0, M1) => (y1 - y0) + ((-(3 * a * a - 1)) * M0 + (3 * u * u - 1) * M1) * hi * hi / 6;
-  return unit([d(S.P[i][0], S.P[i + 1][0], S.Mx[i], S.Mx[i + 1]), d(S.P[i][1], S.P[i + 1][1], S.My[i], S.My[i + 1])]);
+/** First and second derivative with respect to the chord-length parameter s at t: [dP/ds, d2P/ds2]. */
+function splineDer(S, t) {
+  if (S.m < 1) return [[1, 0], [0, 0]];
+  const [i, u] = splineLoc(S, t), hi = S.h[i], a = 1 - u;
+  const d = (y0, y1, M0, M1) => ((y1 - y0) + ((-(3 * a * a - 1)) * M0 + (3 * u * u - 1) * M1) * hi * hi / 6) / hi;
+  const dd = (M0, M1) => a * M0 + u * M1;
+  return [[d(S.P[i][0], S.P[i + 1][0], S.Mx[i], S.Mx[i + 1]), d(S.P[i][1], S.P[i + 1][1], S.My[i], S.My[i + 1])],
+          [dd(S.Mx[i], S.Mx[i + 1]), dd(S.My[i], S.My[i + 1])]];
 }
+/** Tangent direction (unit) at t. */
+function splineTan(S, t) { return unit(splineDer(S, t)[0]); }
 /** Parameter range of a spline entity: [t0, t1] (default the whole curve). */
 function splineRange(e) {
   const m = e.closed ? e.pts.length : e.pts.length - 1;
@@ -121,26 +162,26 @@ function splineRange(e) {
   return [t0, t1];
 }
 /** Sample points of the spline (k per span) between t0 and t1, with the parameter of each: [{p, t}]. */
-function splineSamples(pts, closed, k, t0, t1) {
-  const S = splineSolve(pts, closed);
+function splineSamples(pts, closed, k, t0, t1, ends) {
+  const S = splineSolve(pts, closed, ends);
   k = k || 12;
   if (t0 === undefined) t0 = 0;
-  if (t1 === undefined) t1 = S.m;
+  if (t1 === undefined) t1 = S.mu;
   const out = [{ p: splineAt(S, t0), t: t0 }];
-  if (S.m >= 1 && (pts.length > 2 || closed)) {
+  if (S.mu >= 1 && (pts.length > 2 || closed || S.m > S.mu || (ends && (ends.d0 || ends.d1)))) {
     for (let i = Math.floor(t0 * k) + 1; i < t1 * k - 1e-9; i++) { const t = i / k; if (t > t0 + 1e-9) out.push({ p: splineAt(S, t), t }); }
   }
   out.push({ p: splineAt(S, t1), t: t1 });
   return out;
 }
-function splinePoly(pts, closed, k, t0, t1) {
+function splinePoly(pts, closed, k, t0, t1, ends) {
   if (pts.length < 2) return pts.slice();
-  return splineSamples(pts, closed, k, t0, t1).map(q => q.p);
+  return splineSamples(pts, closed, k, t0, t1, ends).map(q => q.p);
 }
-function splinePolyE(e, k) { const [t0, t1] = splineRange(e); return splinePoly(e.pts, e.closed, k, t0, t1); }
+function splinePolyE(e, k) { const [t0, t1] = splineRange(e); return splinePoly(e.pts, e.closed, k, t0, t1, splineEnds(e)); }
 /** Parameter of the spline point nearest to q (within the range of e). */
 function splineParam(e, q, k) {
-  const sm = splineSamples(e.pts, e.closed, k || 24, ...splineRange(e));
+  const sm = splineSamples(e.pts, e.closed, k || 24, ...splineRange(e), splineEnds(e));
   let best = 0, bd = Infinity;
   for (let i = 0; i + 1 < sm.length; i++) {
     const a = sm[i].p, b = sm[i + 1].p, d = sub(b, a), L2 = dot(d, d) || 1, u = Math.max(0, Math.min(1, dot(sub(q, a), d) / L2));
@@ -154,10 +195,10 @@ function splineParam(e, q, k) {
  *  curve that has not been trimmed. */
 function cvAdapter(e) {
   if (e.t === "spline") {
-    const S = splineSolve(e.pts, e.closed), [t0, t1] = splineRange(e);
-    return { range: [t0, t1], period: e.closed ? S.m : null, whole: !!e.closed && e.t0 === undefined && e.t1 === undefined,
+    const S = splineOf(e), [t0, t1] = splineRange(e);
+    return { range: [t0, t1], period: e.closed ? S.mu : null, whole: !!e.closed && e.t0 === undefined && e.t1 === undefined,
       at: t => splineAt(S, t), tan: t => splineTan(S, t), param: q => splineParam(e, q),
-      samples: k => splineSamples(e.pts, e.closed, k, t0, t1), trim: (lo, hi) => { e.t0 = lo; e.t1 = hi; } };
+      samples: k => splineSamples(e.pts, e.closed, k, t0, t1, splineEnds(e)), trim: (lo, hi) => { e.t0 = lo; e.t1 = hi; } };
   }
   if (e.t === "ellipse") {
     const closed = ellClosed(e), a0 = e.a0 || 0, span = closed ? 360 : ellSpan(e), a1 = a0 + span;
@@ -543,7 +584,12 @@ function entVals(e) {
   switch (e.t) {
     case "conic": return [e.x0, e.y0, e.x1, e.y1, e.xt, e.yt, e.rho === undefined ? 0.5 : e.rho];
     case "ellipse": { const v = [e.cx, e.cy, e.rx, e.ry, d2r(e.rot || 0)]; if (!ellClosed(e)) v.push(d2r(e.a0), d2r(e.a1)); return v; }
-    case "spline": return e.pts.flat();
+    case "spline": {
+      const v = e.pts.flat();
+      if (!e.closed && e.d0) { v.push(e.d0[0], e.d0[1]); if (e.k0 !== undefined) v.push(e.k0); }
+      if (!e.closed && e.d1) { v.push(e.d1[0], e.d1[1]); if (e.k1 !== undefined) v.push(e.k1); }
+      return v;
+    }
     default: return PARAMS[e.t].map(q => e.t === "arc" && (q === "a0" || q === "a1") ? d2r(e[q]) : e[q]);
   }
 }
@@ -555,7 +601,16 @@ function setEntVals(e, v) {
       e.cx = v[0]; e.cy = v[1]; e.rx = Math.abs(v[2]); e.ry = Math.abs(v[3]); e.rot = n360(r2d(v[4]));
       if (v.length > 6) { e.a0 = n360(r2d(v[5])); e.a1 = n360(r2d(v[6])); if (Math.abs(n360(e.a1 - e.a0)) < 1e-9) e.a1 = e.a0 + 1e-6; }
       return;
-    case "spline": { const pts = []; for (let i = 0; i + 1 < v.length; i += 2) pts.push([v[i], v[i + 1]]); e.pts = pts; return; }
+    case "spline": {
+      // fit points, then the end conditions present on the entity (d0, k0, d1, k1)
+      const n = e.pts.length, pts = [];
+      for (let i = 0; i < n; i++) pts.push([v[2 * i], v[2 * i + 1]]);
+      e.pts = pts;
+      let j = 2 * n;
+      if (!e.closed && e.d0 && j + 1 < v.length) { e.d0 = [v[j], v[j + 1]]; j += 2; if (e.k0 !== undefined) e.k0 = v[j++]; }
+      if (!e.closed && e.d1 && j + 1 < v.length) { e.d1 = [v[j], v[j + 1]]; j += 2; if (e.k1 !== undefined) e.k1 = v[j++]; }
+      return;
+    }
     default:
       PARAMS[e.t].forEach((q, i) => { let val = v[i]; if (e.t === "arc" && (q === "a0" || q === "a1")) val = n360(r2d(val)); e[q] = val; });
       if (e.r !== undefined && e.r < 0) e.r = -e.r;
@@ -572,6 +627,40 @@ function curveEnds(e) {
 /** Whether the tangent constraint record needs an end key for this entity (arc or curve). */
 function needsEndKey(e) { return !!e && (e.t === "arc" || CURVE_T.has(e.t)); }
 const DRAG_WEIGHT = 0.02;
+/** Curvature vector from the first and second derivative of a curve: the normal part of P'' over |P'|^2. */
+function curvFromDer(d1, d2) {
+  const L2 = dot(d1, d1);
+  if (L2 < 1e-30) return [0, 0];
+  const T = mul(d1, 1 / Math.sqrt(L2));
+  return mul(sub(d2, mul(T, dot(d2, T))), 1 / L2);
+}
+/** Curvature vector (towards the centre of curvature, length 1/R) of an entity at its end k ("s"/"e"; line 0). */
+function curvVec(e, k) {
+  const atEnd = k === "e";
+  if (e.t === "line") return [0, 0];
+  if (e.t === "arc" || e.t === "circle") { const a = d2r(atEnd ? e.a1 : e.a0 || 0); return [-Math.cos(a) / e.r, -Math.sin(a) / e.r]; }
+  const untrimmed = atEnd ? e.t1 === undefined || e.t1 === null : e.t0 === undefined || e.t0 === null;
+  if (e.t === "spline") {
+    const d = atEnd ? e.d1 : e.d0, kv = atEnd ? e.k1 : e.k0;
+    if (!e.closed && untrimmed && d && kv !== undefined && kv !== null) { const u = unit(d); return [-u[1] * kv, u[0] * kv]; }
+    const r = splineRange(e), D = splineDer(splineOf(e), r[atEnd ? 1 : 0]);
+    return curvFromDer(D[0], D[1]);
+  }
+  if (e.t === "conic" && untrimmed) {
+    // rational quadratic Bezier: curvature at the start (P0, control T, end P2, weight w) crs(a, P2 - P0) / (2 w^2 |a|^3), a = T - P0
+    const w = conicW(e), T = [e.xt, e.yt];
+    const [P0, P2] = atEnd ? [[e.x1, e.y1], [e.x0, e.y0]] : [[e.x0, e.y0], [e.x1, e.y1]];
+    const a = sub(T, P0), la = len(a);
+    if (la < 1e-12) return [0, 0];
+    const kap = crs(a, sub(P2, P0)) / (2 * w * w * la * la * la), u = mul(a, 1 / la);
+    return [-u[1] * kap, u[0] * kap];
+  }
+  const A = cvAdapter(e);
+  if (!A) return [0, 0];
+  const t = A.range[atEnd ? 1 : 0], h = 1e-3 * Math.max(1e-6, Math.abs(A.range[1] - A.range[0]));
+  const pm = A.at(t - h), p = A.at(t), pp = A.at(t + h);
+  return curvFromDer(mul(sub(pp, pm), 1 / (2 * h)), mul(add(sub(pp, mul(p, 2)), pm), 1 / (h * h)));
+}
 
 class System {
   constructor() { this.x = []; this.base = new Map(); this.count = new Map(); this.res = []; this.bad = false; this.naux = 0; }
@@ -611,6 +700,24 @@ class System {
       const K = this.K(id); if (!K) return null;
       if (cvAdapter(e).whole) { this.bad = true; return null; }
       return { deps: K.deps, f: x => { const A = K.A(x); return A.tan(A.range[k === "e" ? 1 : 0]); } };
+    }
+    this.bad = true;
+    return null;
+  }
+  /** Curvature vector (towards the centre of curvature, length 1/R) at an end: line 0, arc end k, curve end k. */
+  Kv(id, k) {
+    const e = entById(id);
+    if (!e) { this.bad = true; return null; }
+    if (e.t === "line") { this.ensure(id); return { deps: [], f: () => [0, 0] }; }
+    if (e.t === "arc") {
+      const b = this.ensure(id); if (b === null) return null;
+      const j = k === "e" ? b + 4 : b + 3;
+      return { deps: [b + 2, j], f: x => [-Math.cos(x[j]) / x[b + 2], -Math.sin(x[j]) / x[b + 2]] };
+    }
+    if (CURVE_T.has(e.t)) {
+      const K = this.K(id); if (!K) return null;
+      if (cvAdapter(e).whole) { this.bad = true; return null; }
+      return { deps: K.deps, f: x => curvVec(K.ent(x), k) };
     }
     this.bad = true;
     return null;
@@ -762,6 +869,12 @@ class System {
           return c.mode === "int" ? d - Math.abs(a[2] - b[2]) : d - (a[2] + b[2]);
         }, tag);
       }
+    } else if (t === "curvature") {
+      // equal curvature at a shared end (with the tangent constraint: curvature continuity, G2): the curvature
+      // vectors have the same component along the normal of the first entity's end tangent
+      const T1 = S.T(c.e1, c.ak1), K1 = S.Kv(c.e1, c.ak1), K2 = S.Kv(c.e2, c.ak2);
+      if (!T1 || !K1 || !K2) return;
+      S.add([...T1.deps, ...K1.deps, ...K2.deps], x => { const u = T1.f(x); return crs(u, K1.f(x)) - crs(u, K2.f(x)); }, tag);
     } else if (t === "equal") {
       const e1 = entById(c.e1);
       if (!e1) { S.bad = true; return; }
@@ -1007,21 +1120,88 @@ function dimCon(d) {
   return null;
 }
 
-function buildSystem(extra) {
+/** System of the constraints and driving dimensions (only: a Set of entity ids; then only the records touching
+ *  them, which is the whole system of a connected component). */
+function buildSystem(extra, only) {
   const S = new System();
-  for (const c of SK.doc.constraints) S.addCon(c, c.id);
-  for (const d of SK.doc.dims) { const c = dimCon(d); if (c) S.addCon(c, "d:" + d.id); }
+  const take = c => !only || conEnts(c).some(id => only.has(id));
+  for (const c of SK.doc.constraints) if (take(c)) S.addCon(c, c.id);
+  for (const d of SK.doc.dims) { const c = dimCon(d); if (c && take(d)) S.addCon(c, "d:" + d.id); }
   for (const c of extra || []) S.addCon(c, c.tag || "extra");
   return S;
 }
+/** Entities connected to the seed ids through constraints and driving dimensions (a Set). */
+function conComponent(seeds) {
+  const adj = new Map();
+  const link = ids => { for (const a of ids) { if (!adj.has(a)) adj.set(a, new Set()); for (const b of ids) if (a !== b) adj.get(a).add(b); } };
+  for (const c of SK.doc.constraints) link(conEnts(c));
+  for (const d of SK.doc.dims) if (d.driving) link(conEnts(d));
+  const out = new Set(), stack = [...seeds].filter(Boolean);
+  while (stack.length) { const id = stack.pop(); if (out.has(id)) continue; out.add(id); for (const b of adj.get(id) || []) if (!out.has(b)) stack.push(b); }
+  return out;
+}
 
-// solve and write back; returns true when all constraints are satisfied
-function solveAll(extra) {
-  const S = buildSystem(extra);
+// solve and write back; returns true when all constraints are satisfied (only: entity ids, see buildSystem)
+function solveAll(extra, only) {
+  const S = buildSystem(extra, only);
   if (!S.res.length) return true;
   const res = S.solve();
   if (res.ok || extra) S.write(res.x);
   return res.ok;
+}
+
+/** Closed profiles and open chain ends of the sketch (server: the same chains the profile features use), checked
+ *  0.25 s after a change; drawn as a light fill and red circles. */
+function scheduleLoops() {
+  clearTimeout(SK.loopTimer);
+  const doc = SK.doc;
+  if (!doc) return;
+  SK.loopTimer = setTimeout(async () => {
+    try {
+      const r = await postJSON("/api/sketch/loops", { sketch: { entities: doc.entities.filter(e => !e.axis && !e.constr), layers: doc.layers } });
+      if (!r.ok || SK.doc !== doc) return;
+      const j = await r.json();
+      SK.loops = Object.assign(j, { doc });
+      redraw();
+    } catch (e) { /* the indication is optional */ }
+  }, 250);
+}
+/** Solver variables that the constraints leave free: a basis of the null space of the Jacobian (reduced row
+ *  echelon form); returns a Set of the free variable indices, or null when the system is too large. */
+function freeVars(S) {
+  const n = S.x.length;
+  if (n > 900 || S.res.length > 1200) return null;
+  const J = S.jac(S.x.slice());
+  const R = J.map(row => { const a = new Float64Array(n); for (const [j, v] of row) a[j] = v; return a; });
+  let mx = 0;
+  R.forEach(r => r.forEach(v => { mx = Math.max(mx, Math.abs(v)); }));
+  const tol = 1e-8 * Math.max(1, mx);
+  const pivCol = [];
+  let row = 0;
+  for (let c = 0; c < n && row < R.length; c++) {
+    let p = -1, best = tol;
+    for (let i = row; i < R.length; i++) if (Math.abs(R[i][c]) > best) { best = Math.abs(R[i][c]); p = i; }
+    if (p < 0) continue;
+    [R[row], R[p]] = [R[p], R[row]];
+    const inv = 1 / R[row][c];
+    for (let k = c; k < n; k++) R[row][k] *= inv;
+    for (let i = 0; i < R.length; i++) {
+      if (i === row) continue;
+      const f = R[i][c];
+      if (Math.abs(f) < 1e-300) continue;
+      for (let k = c; k < n; k++) R[i][k] -= f * R[row][k];
+    }
+    pivCol.push(c);
+    row++;
+  }
+  const isPiv = new Set(pivCol), free = new Set();
+  for (let f = 0; f < n; f++) {
+    if (isPiv.has(f)) continue;
+    // null space vector of the free column f: 1 at f, -R[i][f] at the pivot column of row i
+    free.add(f);
+    pivCol.forEach((c, i) => { if (Math.abs(R[i][f]) > 1e-7) free.add(c); });
+  }
+  return free;
 }
 
 function updateDof() {
@@ -1031,7 +1211,24 @@ function updateDof() {
   const rank = S.res.length ? S.rank() : 0;
   SK.dof = total + S.naux - rank;
   const n = SK.doc.constraints.length + SK.doc.dims.filter(d => d.driving).length;
-  $("#sk-dof").textContent = n ? (SK.dof === 0 ? "Fully constrained" : "DOF " + SK.dof) : "";
+  const el = $("#sk-dof");
+  el.textContent = n ? (SK.dof === 0 ? "Fully constrained" : "DOF " + SK.dof) : "";
+  el.classList.toggle("dof-ok", !!n && SK.dof === 0);
+  el.classList.toggle("dof-under", !!n && SK.dof > 0);
+  // entities with free solver variables (drawn in the under-constrained colour)
+  SK.under = null;
+  if (n) {
+    const fv = SK.dof === 0 ? new Set() : freeVars(S);
+    if (fv) {
+      SK.under = new Set();
+      for (const e of ents()) {
+        if (!isSolver(e) || e.axis) continue;
+        if (!S.base.has(e.id)) { SK.under.add(e.id); continue; }
+        const b = S.base.get(e.id), k = S.count.get(e.id);
+        for (let i = 0; i < k; i++) if (fv.has(b + i)) { SK.under.add(e.id); break; }
+      }
+    }
+  }
 }
 
 // ------------------------------------------------------------------ dimensions and notes
@@ -1359,7 +1556,9 @@ function primSvg(g, color, k) {        // dimension primitive (paper mm) -> svg
   return "";
 }
 
-const GLYPH = { horizontal: "H", vertical: "V", parallel: "∥", perpendicular: "⊥", tangent: "T", equal: "=",
+/** Colour of under-constrained solver geometry once the sketch has constraints or driving dimensions. */
+const UNDER_COLOR = "#1d5fc4";
+const GLYPH = { horizontal: "H", vertical: "V", parallel: "∥", perpendicular: "⊥", tangent: "T", curvature: "G2", equal: "=",
                 pointon: "On", midpoint: "M", concentric: "◎", symmetric: "S", fix: "F" };
 
 function entMid(id) {
@@ -1376,7 +1575,7 @@ function conAnchors(c) {
     case "coincident": return [getPt(c.a)];
     case "horizontal": case "vertical": return [c.l ? entMid(c.l) : (getPt(c.a) && getPt(c.b) ? mul(add(getPt(c.a), getPt(c.b)), 0.5) : null)];
     case "parallel": case "perpendicular": return [entMid(c.l1), entMid(c.l2)];
-    case "tangent": case "equal": return [entMid(c.e1), entMid(c.e2)];
+    case "tangent": case "curvature": case "equal": return [entMid(c.e1), entMid(c.e2)];
     case "pointon": case "midpoint": return [getPt(c.a)];
     case "concentric": return [getPt({ e: c.e1, k: "c" })];
     case "symmetric": return [getPt(c.a) && getPt(c.b) ? mul(add(getPt(c.a), getPt(c.b)), 0.5) : null];
@@ -1516,6 +1715,14 @@ function redraw() {
     else if (e.kind === "datum") { const q = S([e.x, e.y]); out.push(`<circle cx="${N(q[0])}" cy="${N(q[1])}" r="3.5" fill="none" stroke="#6a3fa0" stroke-width="1.4"/><path d="M${N(q[0] - 6)} ${N(q[1])} H${N(q[0] + 6)} M${N(q[0])} ${N(q[1] - 6)} V${N(q[1] + 6)}" stroke="#6a3fa0" stroke-width="1"/>`); }
     else out.push(entSvg(e, "#6b7480", 1.2, "2 3"));
   }
+  // closed profiles (light fill, nested profiles alternate) from the last loop check
+  const L = SK.loops;
+  if (L && L.doc === SK.doc && (L.loops.length || L.circles.length)) {
+    let d = "";
+    for (const poly of L.loops) if (poly.length > 2) d += "M" + poly.map(q => S(q).map(N).join(" ")).join("L") + "Z";
+    for (const [cx, cy, r] of L.circles) { const c = S([cx, cy]), rr = r * SK.view.s; d += `M${N(c[0] - rr)} ${N(c[1])}a${N(rr)} ${N(rr)} 0 1 0 ${N(2 * rr)} 0a${N(rr)} ${N(rr)} 0 1 0 ${N(-2 * rr)} 0Z`; }
+    if (d) out.push(`<path class="sk-loops" d="${d}" fill="#2e8540" fill-opacity="0.08" fill-rule="evenodd" stroke="none"/>`);
+  }
   // geometry
   for (const e of ents()) {
     if (!layerOn(e)) continue;
@@ -1523,12 +1730,16 @@ function redraw() {
     const bb = bbox(e);
     if (!bboxOverlap(bb, vb, 0)) continue;
     const st = entStyle(e);
+    // constrained state: entities that can still move are blue, fully constrained ones keep their colour
+    if (SK.under && SK.under.has(e.id) && !e.constr && !e.included) st.color = UNDER_COLOR;
     if (e.included && e.constr) out.push(entSvg(e, "#0b7a75", 1.2, "6 3"));
     else if (e.constr) out.push(entSvg(e, "#2f74d0", 1, "5 4"));
     else if (e.included) out.push(entSvg(e, "#0b7a75", 1.6, ""));
     else out.push(entSvg(e, st.color, st.w, st.dash));
     if (selE.has(e.id)) out.push(entSvg(e, "#e8590c", 3, "", ' stroke-opacity="0.85"'));
   }
+  // open chain ends (the profile is not enclosed there)
+  if (L && L.doc === SK.doc) for (const q of L.open) { const c = S(q); out.push(`<circle class="sk-open" cx="${N(c[0])}" cy="${N(c[1])}" r="5" fill="none" stroke="#d32f2f" stroke-width="1.5"/>`); }
   // grips of selected entities and selected points
   for (const e of ents()) {
     if (!selE.has(e.id) || e.t === "text") continue;
@@ -1638,6 +1849,65 @@ function glyphAt(sx, sy) {
   return null;
 }
 
+// ---- selection filter and the list of overlapping items (Select tool)
+function selOn(id) { const el = $(id); return !el || el.checked; }
+/** Entity passes the selection filter: point entities with Points, the others with Lines. */
+function selEntOk(e) { return e.t === "point" ? selOn("#sk-fpt") : selOn("#sk-fln"); }
+const PT_NAMES = { p1: "start", p2: "end", s: "start", e: "end", c: "centre", m: "midpoint", t: "tangent intersection", ma: "axis end", mb: "axis end", na: "axis end", nb: "axis end", p: "point" };
+function ptName(k) { const m = /^v(\d+)$/.exec(k); return m ? "fit point " + (+m[1] + 1) : PT_NAMES[k] || k; }
+/** Items under the cursor that pass the selection filter: points (grips) and entities, nearest first:
+ *  [{key, label, p (point) or id (entity), d}]. */
+function pickCandidates(p) {
+  const out = [], gt = SNAP_PX / SK.view.s, tol = HIT_PX / SK.view.s;
+  for (const e of visibleEnts()) {
+    if (e.axis || e.t === "text") continue;
+    if (selOn("#sk-fpt")) for (const [k, q] of grips(e)) {
+      const d = dist(p, q);
+      if (d < gt) out.push({ key: e.t === "point" ? "e:" + e.id : refKey({ e: e.id, k }), label: e.t === "point" ? `Point ${e.id}` : `${TYPE_NAMES[e.t] || e.t} ${e.id}: ${ptName(k)}`, p: q, d, pt: true });
+    }
+  }
+  for (const e of visibleEnts()) {
+    if (e.axis || e.t === "point" || !selEntOk(e)) continue;
+    const d = entDist(e, p);
+    if (d <= tol) out.push({ key: "e:" + e.id, label: `${TYPE_NAMES[e.t] || e.t} ${e.id}${e.constr ? " (construction)" : ""}`, id: e.id, d });
+  }
+  const seen = new Set();
+  return out.sort((a, b) => a.d - b.d).filter(x => !seen.has(x.key) && seen.add(x.key));
+}
+function hidePickList() {
+  clearTimeout(SK.plTimer);
+  const el = $("#sk-picklist");
+  if (el) el.remove();
+  SK.pl = null;
+}
+/** After the cursor rests over two or more items: a list of them at the cursor; hovering an entry highlights it, a
+ *  click selects it (Shift or Ctrl adds). */
+function schedulePickList() {
+  clearTimeout(SK.plTimer);
+  if (SK.tool !== "select" || SK.drag || SK.win || SK.pan) return;
+  const m = SK.mouse;
+  if (SK.pl && Math.abs(m.sx - SK.pl.sx) + Math.abs(m.sy - SK.pl.sy) < 24) return;
+  if (SK.pl) hidePickList();
+  SK.plTimer = setTimeout(() => {
+    if (SK.tool !== "select" || SK.drag || SK.win || !SK.mouse) return;
+    const c = pickCandidates(SK.mouse.p);
+    if (c.length < 2) return;
+    const box = $("#sk-canvas");
+    const el = document.createElement("div");
+    el.id = "sk-picklist";
+    el.innerHTML = `<div class="hint">${c.length} items here</div>` + c.map((x, i) => `<div data-pl="${i}">${esc(x.label)}</div>`).join("");
+    el.style.left = Math.min(SK.mouse.sx + 14, box.clientWidth - 180) + "px";
+    el.style.top = Math.min(SK.mouse.sy + 14, Math.max(0, box.clientHeight - 24 - 22 * c.length)) + "px";
+    box.appendChild(el);
+    SK.pl = { sx: SK.mouse.sx, sy: SK.mouse.sy };
+    el.querySelectorAll("div[data-pl]").forEach(d => {
+      const x = c[+d.dataset.pl];
+      d.onmouseenter = () => { SK.hover = x.pt ? { kind: "p", p: x.p } : { kind: "e", id: x.id }; overlay(); };
+      d.onmousedown = ev => { ev.preventDefault(); ev.stopPropagation(); hidePickList(); toggleSel(x.key, ev.shiftKey || ev.ctrlKey); $("#sk-canvas").focus(); };
+    });
+  }, 500);
+}
+
 function snapAt(p, opts) {
   opts = opts || {};
   if (!$("#sk-snap").checked || opts.nosnap) return { p, kind: null, ref: null };
@@ -1723,6 +1993,11 @@ function overlay() {
     }[SK.snap.kind];
     if (m) out.push(m);
   }
+  if (SK.snap && SK.snap.hv && SK.mouse) {
+    // horizontal / vertical capture of the line being drawn
+    const q = S(SK.snap.p);
+    out.push(`<text x="${N(q[0] + 9)}" y="${N(q[1] - 9)}" font-size="12" font-weight="bold" fill="#d0451b">${SK.snap.hv.toUpperCase()}</text>`);
+  }
   ov.innerHTML = out.join("");
 }
 
@@ -1746,6 +2021,7 @@ function changed(keepSel) {
     }
   }
   updateDof();
+  scheduleLoops();
   redraw();
   showProps();
   // the first geometry drawn in an empty sketch sets the view scale
@@ -1806,7 +2082,7 @@ function holdOf(c) {
     case "pointon": ref = [c.e2]; moving.add(c.a.e); break;
     case "midpoint": case "symmetric": ref = [c.l]; if (c.a) moving.add(c.a.e); if (c.b) moving.add(c.b.e); break;
     case "parallel": case "perpendicular": ref = [c.l1]; moving.add(c.l2); break;
-    case "tangent": case "equal": case "concentric": ref = [c.e1]; moving.add(c.e2); break;
+    case "tangent": case "curvature": case "equal": case "concentric": ref = [c.e1]; moving.add(c.e2); break;
     case "horizontal": case "vertical": if (c.a && c.b) { ref = [c.a.e]; moving.add(c.b.e); } break;
   }
   return ref.filter(id => id && !moving.has(id));
@@ -1815,9 +2091,14 @@ function holdOf(c) {
 function addConstraint(c, silent) {
   c.id = c.id || newId("c");
   const before = JSON.stringify({ e: SK.doc.entities });
-  const r0 = buildSystem().rank();
+  // only the connected component of the new constraint is solved and ranked (the rest shares no unknowns)
   SK.doc.constraints.push(c);
-  const S1 = buildSystem();
+  const comp = conComponent(conEnts(c));
+  SK.doc.constraints.pop();
+  const only = new Set(comp);
+  const r0 = buildSystem(null, only).rank();
+  SK.doc.constraints.push(c);
+  const S1 = buildSystem(null, only);
   if (S1.bad) { SK.doc.constraints.pop(); if (!silent) msg("Constraint not applicable to this geometry", true); return false; }
   // the reference entity is held where possible, so the other entity moves to it
   let res = null, Sx = null;
@@ -1828,8 +2109,8 @@ function addConstraint(c, silent) {
     ? [c.e2, c.e1].map(id => entById(id)).filter(e => e && (e.t === "circle" || e.t === "arc") && !holds.some(h => h.e === e.id))
         .map(e => ({ t: "fix", e: e.id, param: 2, v: e.r, tag: "hold" }))
     : [];
-  if (radii.length) { Sx = buildSystem(holds.concat(radii)); res = Sx.solve(); if (!res.ok) res = null; }
-  if (!res && holds.length) { Sx = buildSystem(holds); res = Sx.solve(); if (!res.ok) res = null; }
+  if (radii.length) { Sx = buildSystem(holds.concat(radii), only); res = Sx.solve(); if (!res.ok) res = null; }
+  if (!res && holds.length) { Sx = buildSystem(holds, only); res = Sx.solve(); if (!res.ok) res = null; }
   if (!res) { Sx = S1; res = S1.solve(); }
   if (!res.ok) {
     SK.doc.constraints.pop();
@@ -1837,7 +2118,7 @@ function addConstraint(c, silent) {
     return false;
   }
   Sx.write(res.x);
-  const r1 = buildSystem().rank();
+  const r1 = buildSystem(null, only).rank();
   if (r1 <= r0) {
     SK.doc.constraints.pop();
     SK.doc.entities = JSON.parse(before).e; reindex();
@@ -1885,7 +2166,12 @@ function applyConstraint(t, quiet) {
           need(list.length, "Coincident: the point belongs to this entity");
           break;
         }
-        need(pts.length >= 2, "Coincident: select two or more points, or points and one line, circle or arc");
+        if (lines.length === 2 && es.length === 2 && !pts.length) {
+          // two lines: collinear (both ends of the second line on the first line)
+          list.push({ t: "pointon", a: { e: lines[1].id, k: "p1" }, e2: lines[0].id }, { t: "pointon", a: { e: lines[1].id, k: "p2" }, e2: lines[0].id });
+          break;
+        }
+        need(pts.length >= 2, "Coincident: select two or more points, points and one line, circle or arc, or two lines");
         for (let i = 1; i < pts.length; i++) list.push({ t, a: pts[0], b: pts[i] });
         break;
       case "horizontal": case "vertical":
@@ -1975,13 +2261,24 @@ function applyConstraint(t, quiet) {
 
 /** Constraint pick mode: a constraint button pressed with nothing selected; the points and entities clicked next
  *  are collected and the constraint is applied as soon as the selection fits it. Esc or a drawing tool ends it. */
-function setConPick(t) {
+function setConPick(t, keepSel) {
   SK.conPick = t || null;
   document.querySelectorAll("#tab-sketch [data-con]").forEach(b => b.classList.toggle("active", b.dataset.con === SK.conPick));
-  if (SK.conPick) { SK.sel.clear(); redraw(); showProps(); }
+  if (SK.conPick && !keepSel) { SK.sel.clear(); redraw(); showProps(); }
   updateHint();
 }
-const CON_PICK_HINT = { coincident: "two or more points, or points and one line, circle or arc", horizontal: "a line, or two points", vertical: "a line, or two points",
+/** A constraint button, key or menu entry: applied to the selection when it fits; otherwise (nothing selected, or
+ *  the selection is not complete) the pick mode starts with the selection kept, and the next clicks add to it
+ *  without Shift. The same button again ends the pick mode. */
+function requestConstraint(t) {
+  if (SK.conPick === t) { setConPick(null); return; }
+  if (SK.tool !== "select") setTool("select");
+  if (!SK.sel.size) { setConPick(t); return; }
+  const r = applyConstraint(t, true);
+  if (r === "need") { setConPick(t, true); msg(`${CON_NAMES[t] || t}: click ${CON_PICK_HINT[t] || "the remaining items"}`); }
+  else if (SK.conPick) setConPick(null);
+}
+const CON_PICK_HINT = { coincident: "two or more points, points and one line, circle or arc, or two lines (collinear)", horizontal: "a line, or two points", vertical: "a line, or two points",
   parallel: "two lines", perpendicular: "two lines", tangent: "a line and a circle/arc, two circles/arcs, or a conic and the entity at its end", equal: "two lines, or two circles/arcs",
   pointon: "a point and a line, circle or arc", midpoint: "a point and a line", concentric: "two circles/arcs, or a circle/arc and a point", symmetric: "two points and the mirror line", fix: "points or entities" };
 function conPickClick() {
@@ -2052,13 +2349,21 @@ function autoHV(lineId) {
   else if (Math.abs(a - 90) < 1e-6) addConstraint({ t: "vertical", l: lineId }, true);
 }
 
-// snap the second point of a line to horizontal/vertical when within 1.5 deg and not snapped to geometry
+/** Angle (deg) within which the second point of a line snaps to horizontal or vertical: the angle of HV_PX
+ *  pixels across the line on the screen, between HV_DEG[0] and HV_DEG[1]. */
+const HV_PX = 8, HV_DEG = [3, 8];
+function hvTol(lenModel) {
+  const px = lenModel * SK.view.s;
+  return Math.max(HV_DEG[0], Math.min(HV_DEG[1], px > 0 ? r2d(Math.atan(HV_PX / px)) : HV_DEG[1]));
+}
+// snap the second point of a line to horizontal/vertical (hvTol) when not snapped to geometry
 function hvSnap(base, sn) {
   if (!$("#sk-auto").checked || (sn.kind && sn.kind !== "on")) return sn;
-  const d = sub(sn.p, base);
-  const a = Math.abs(r2d(Math.atan2(d[1], d[0])));
-  if (Math.min(a, 180 - a) < 1.5) return { p: [sn.p[0], base[1]], kind: null, ref: null };
-  if (Math.abs(a - 90) < 1.5) return { p: [base[0], sn.p[1]], kind: null, ref: null };
+  const d = sub(sn.p, base), L = Math.hypot(d[0], d[1]);
+  if (L < 1e-12) return sn;
+  const a = Math.abs(r2d(Math.atan2(d[1], d[0]))), tol = hvTol(L);
+  if (Math.min(a, 180 - a) < tol) return { p: [sn.p[0], base[1]], kind: null, ref: null, hv: "h" };
+  if (Math.abs(a - 90) < tol) return { p: [base[0], sn.p[1]], kind: null, ref: null, hv: "v" };
   return sn;
 }
 
@@ -2077,6 +2382,17 @@ function xformEnt(e, f, opts) {
     if (e.t === "text" && opts.rot) e.rot = n360((e.rot || 0) + opts.rot);
   }
   else if (e.t === "poly" || e.t === "spline") {
+    if (e.t === "spline" && (e.d0 || e.d1) && e.pts.length) {
+      // end derivatives turn with the linear part of f (length kept); curvatures change sign with a mirror and
+      // scale with 1 / the scale factor
+      const o = e.pts[0], fo = f(o), ax = sub(f(add(o, [1, 0])), fo), ay = sub(f(add(o, [0, 1])), fo);
+      const det = crs(ax, ay), sc = Math.sqrt(Math.abs(det)) || 1, sg = det < 0 ? -1 : 1;
+      const lin = d => mul(unit(add(mul(ax, d[0]), mul(ay, d[1]))), len(d));
+      for (const i of [0, 1]) {
+        if (e["d" + i]) e["d" + i] = lin(e["d" + i]);
+        if (e["k" + i] !== undefined && e["k" + i] !== null) e["k" + i] = e["k" + i] * sg / sc;
+      }
+    }
     e.pts = e.pts.map(p => f(p));
     if (e.pprof) {
       const c = P(e.pprof.cx, e.pprof.cy); [e.pprof.cx, e.pprof.cy] = c;
@@ -3022,9 +3338,9 @@ function chamfer(l1, p1, l2, p2, d) {
   return null;
 }
 
-// ---- sketch check: gaps, open ends, near tangents
+// ---- sketch check: gaps, open ends, near tangents, tiny entities, collinear and co-circular chains, crossings
 
-const CHECK = { gap: 0.5, angle: 2, conic: 0.05 };     // mm, deg; conic: tolerance of Convert to conics (mm)
+const CHECK = { gap: 0.5, angle: 2, conic: 0.05, reach: 5, tiny: 0.1 };     // mm, deg; conic: tolerance of Convert to conics (mm); reach: open end closing distance (mm); tiny: length (mm)
 
 /** Ends of an entity with the outward tangent direction at each end: [{ref, p, t}]; t null when unknown. */
 function endsWithTangents(e) {
@@ -3041,17 +3357,74 @@ function endsWithTangents(e) {
   }
   return out;
 }
+function tolAt(p) { return 1e-4 * Math.max(1, Math.abs(p[0]), Math.abs(p[1])); }
+/** Length of a line, arc, circle or curve (mm). */
+function entLength(e) {
+  if (e.t === "line") return dist([e.x1, e.y1], [e.x2, e.y2]);
+  if (e.t === "arc") return e.r * d2r(arcSpan(e));
+  if (e.t === "circle") return 2 * Math.PI * e.r;
+  const A = cvAdapter(e);
+  if (!A) return Infinity;
+  const sm = A.samples(24);
+  let L = 0;
+  for (let i = 0; i + 1 < sm.length; i++) L += dist(sm[i].p, sm[i + 1].p);
+  return L;
+}
+/** Extension of the end k of a line or arc to the nearest other entity: {len (mm, along the extension), q, o}, or null. */
+function extendTarget(e, k) {
+  const others = ents().filter(o => o.id !== e.id && o.t !== "text" && o.t !== "point" && !o.axis && !o.constr && layerOn(o));
+  let best = null;
+  if (e.t === "line") {
+    const a = [e.x1, e.y1], b = [e.x2, e.y2], atEnd = k === "p2";
+    const from = atEnd ? b : a, dir = unit(atEnd ? sub(b, a) : sub(a, b)), ray = { s: "seg", a: from, b: add(from, dir) };
+    for (const o of others) for (const co of curves(o)) for (const q of intersect(ray, co, true, false)) {
+      const t = dot(sub(q, from), dir);
+      if (t > tolAt(from) && (!best || t < best.len)) best = { len: t, q, o };
+    }
+  } else if (e.t === "arc") {
+    const atEnd = k === "e", circ = { s: "circ", c: [e.cx, e.cy], r: e.r, a0: 0, span: 360 };
+    for (const o of others) for (const co of curves(o)) for (const q of intersect(circ, co, true, false)) {
+      const a = angOf([e.cx, e.cy], q), off = atEnd ? n360(a - e.a1) : n360(e.a0 - a), len = e.r * d2r(off);
+      if (len > tolAt(q) && off < 360 - arcSpan(e) && (!best || len < best.len)) best = { len, q, o, ang: a };
+    }
+  }
+  return best;
+}
+/** Points where a line, arc or circle is crossed by other entities away from its ends (crossings and
+ *  T-junctions): [{p, o}] (o: the other entity). */
+function interiorCuts(e) {
+  const others = ents().filter(o => !o.constr && o.t !== "poly");
+  const out = [];
+  for (const c of cutParams(e, others)) {
+    if (c.o.constr || c.o.id === e.id) continue;
+    const tol = tolAt(c.p);
+    if (e.t === "line") { const L = entLength(e); if (c.v * L <= tol || (1 - c.v) * L <= tol) continue; }
+    else if (e.t === "arc") { const off = e.r * d2r(c.v), L = entLength(e); if (off <= tol || L - off <= tol || c.v > arcSpan(e) + 1e-7) continue; }
+    if (!out.some(x => dist(x.p, c.p) < tol)) out.push({ p: c.p, o: c.o });
+  }
+  return out;
+}
 
-/** Issues of the sketch: gaps (two ends within CHECK.gap mm, not coincident), open ends (no other end nearby),
- *  near tangents (shared end, tangents within CHECK.angle deg but not equal, or equal without a tangent constraint). */
+/** Issues of the sketch: gaps (two ends within CHECK.gap mm, not coincident), open ends (no other end nearby;
+ *  closed by extending to an entity or joining another open end within CHECK.reach mm), near tangents (shared
+ *  end, tangents within CHECK.angle deg but not equal, or equal without a tangent constraint), tiny entities
+ *  (shorter than CHECK.tiny mm), consecutive collinear lines and co-circular arcs (merge), crossings and
+ *  T-junctions of lines, arcs and circles (split), overlaps. */
 function sketchCheck() {
   const es = ents().filter(e => !e.axis && !e.constr && layerOn(e) && e.t !== "text" && e.t !== "point" && e.t !== "poly" && e.t !== "circle");
   const ends = [];
   for (const e of es) for (const x of endsWithTangents(e)) ends.push(Object.assign(x, { ent: e }));
-  const issues = [];
+  const issues = [], opens = [];
   const seen = new Set();
   const hasTangent = (a, b) => SK.doc.constraints.some(c => c.t === "tangent" && ((c.e1 === a && c.e2 === b) || (c.e1 === b && c.e2 === a)));
-  const hasCoincident = (ra, rb) => SK.doc.constraints.some(c => c.t === "coincident" && ((c.a.e === ra.e && c.a.k === ra.k && c.b.e === rb.e && c.b.k === rb.k) || (c.a.e === rb.e && c.a.k === rb.k && c.b.e === ra.e && c.b.k === ra.k)));
+  const hasCoincident = (ra, rb) => SK.doc.constraints.some(c => c.t === "coincident" && ((sameEndRef(c.a, ra) && sameEndRef(c.b, rb)) || (sameEndRef(c.a, rb) && sameEndRef(c.b, ra))));
+  // entities that cannot move (a fix constraint on the whole entity, or fully constrained): a missing tangent or
+  // coincident constraint between two of them is redundant, and a gap or a near tangent between them cannot be closed
+  const locked = id => SK.doc.constraints.some(c => c.t === "fix" && c.e === id && c.vals) || (!!SK.under && isSolver(entById(id)) && !SK.under.has(id));
+  const lockedPair = (a, b) => locked(a) && locked(b);
+  const tiny = new Set(es.filter(e => entLength(e) < CHECK.tiny).map(e => e.id));
+  const merges = mergePairs(es);
+  const merged = new Set(merges.map(m => m.key));
   for (let i = 0; i < ends.length; i++) {
     const a = ends[i];
     let best = null, bd = Infinity;
@@ -3063,22 +3436,116 @@ function sketchCheck() {
     // an end on the interior of another entity (T junction) is not open
     const onOther = () => es.some(o => o.id !== a.ent.id && entDist(o, a.p) < 1e-4 * Math.max(1, Math.abs(a.p[0]), Math.abs(a.p[1])));
     const key = best ? [a.ref.e + ":" + a.ref.k, best.ref.e + ":" + best.ref.k].sort().join("|") : null;
-    const tol = 1e-4 * Math.max(1, Math.abs(a.p[0]), Math.abs(a.p[1]));
-    if (!best || bd > CHECK.gap) { if (!onOther()) issues.push({ kind: "open", p: a.p, refs: [a.ref], text: `Open end of ${TYPE_NAMES[a.ent.t] || a.ent.t} ${a.ent.id}` }); continue; }
+    const tol = tolAt(a.p);
+    if (!best || bd > CHECK.gap) { if (!onOther() && !tiny.has(a.ent.id)) opens.push(a); continue; }
     if (seen.has(key)) continue;
     seen.add(key);
-    if (bd > tol) { issues.push({ kind: "gap", p: a.p, refs: [a.ref, best.ref], d: bd, a, b: best, text: `Gap ${fmtN(bd, 4)} mm between ${a.ent.id} and ${best.ent.id}` }); continue; }
+    const lk = lockedPair(a.ent.id, best.ent.id);
+    if (bd > tol) { issues.push({ kind: "gap", p: a.p, refs: [a.ref, best.ref], d: bd, a, b: best, locked: lk, text: `Gap ${fmtN(bd, 4)} mm between ${a.ent.id} and ${best.ent.id}${lk ? " (both fixed)" : ""}` }); continue; }
     if (a.t && best.t) {
       // tangents point away from the shared end: tangent continuity when they are opposite
       const ang = r2d(Math.acos(Math.max(-1, Math.min(1, -dot(a.t, best.t)))));
       const solver = isSolver(a.ent) && isSolver(best.ent);
-      if (ang > 1e-4 && ang < CHECK.angle) issues.push({ kind: "neartangent", p: a.p, refs: [a.ref, best.ref], ang, a, b: best, solver, text: `Nearly tangent (${fmtN(ang, 3)} deg) at ${a.ent.id} / ${best.ent.id}` });
-      else if (ang <= 1e-4 && solver && !hasTangent(a.ent.id, best.ent.id)) issues.push({ kind: "notangent", p: a.p, refs: [a.ref, best.ref], a, b: best, solver, text: `Tangent without constraint at ${a.ent.id} / ${best.ent.id}` });
-      if (solver && !hasCoincident(a.ref, best.ref)) issues.push({ kind: "nocoincident", p: a.p, refs: [a.ref, best.ref], a, b: best, text: `Touching without coincident constraint at ${a.ent.id} / ${best.ent.id}` });
+      const lines = a.ent.t === "line" && best.ent.t === "line";
+      if (!merged.has(key) && !lines) {
+        if (ang > 1e-4 && ang < CHECK.angle) issues.push({ kind: "neartangent", p: a.p, refs: [a.ref, best.ref], ang, a, b: best, solver, locked: lk, text: `Nearly tangent (${fmtN(ang, 3)} deg) at ${a.ent.id} / ${best.ent.id}${lk ? " (both fixed)" : ""}` });
+        else if (ang <= 1e-4 && solver && !lk && !hasTangent(a.ent.id, best.ent.id)) issues.push({ kind: "notangent", p: a.p, refs: [a.ref, best.ref], a, b: best, solver, text: `Tangent without constraint at ${a.ent.id} / ${best.ent.id}` });
+      }
+      if (solver && !lk && !hasCoincident(a.ref, best.ref)) issues.push({ kind: "nocoincident", p: a.p, refs: [a.ref, best.ref], a, b: best, text: `Touching without coincident constraint at ${a.ent.id} / ${best.ent.id}` });
     }
   }
+  issues.push(...openIssues(opens));
+  for (const id of tiny) {
+    const e = entById(id), bb = bbox(e);
+    // the neighbours are joined when it is removed: not possible when both cannot move
+    const nbs = endsWithTangents(e).map(q => endNeighbour(e, q.ref.k)).filter(Boolean);
+    const lk = nbs.length === 2 && nbs[0].e !== nbs[1].e && lockedPair(nbs[0].e, nbs[1].e);
+    issues.push({ kind: "tiny", p: [(bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2], refs: [{ e: id, k: "s" }], ent: e, locked: lk, text: `Tiny ${(TYPE_NAMES[e.t] || e.t).toLowerCase()} ${id} (${fmtN(entLength(e), 4)} mm)${lk ? " (neighbours fixed)" : ""}` });
+  }
+  for (const m of merges) issues.push(m);
+  issues.push(...crossIssues());
   issues.push(...overlapIssues());
+  const failed = SK.checkFailed || new Set();
+  for (const x of issues) if (failed.has(issueKey(x))) { x.failed = true; x.text += " (fix not possible with the present constraints)"; }
   return issues;
+}
+
+/** Open ends with the way each is closed: extended to the nearest entity (lines and arcs) or joined to another
+ *  open end (two lines meet at the intersection of their extensions, otherwise a connecting line) within
+ *  CHECK.reach mm; no fix beyond that. */
+function openIssues(opens) {
+  const out = [], done = new Set();
+  const name = a => `${TYPE_NAMES[a.ent.t] || a.ent.t} ${a.ent.id}`;
+  for (const a of opens) {
+    const ka = a.ref.e + ":" + a.ref.k;
+    if (done.has(ka)) continue;
+    const ext = (a.ent.t === "line" || a.ent.t === "arc") ? extendTarget(a.ent, a.ref.k) : null;
+    // the nearest other open end
+    let nb = null, nd = Infinity;
+    for (const b of opens) { if (b === a || b.ent.id === a.ent.id || done.has(b.ref.e + ":" + b.ref.k)) continue; const d = dist(a.p, b.p); if (d < nd) { nd = d; nb = b; } }
+    let fix = null;
+    if (nb && nd <= CHECK.reach && (!ext || ext.len > CHECK.reach || nd < ext.len)) {
+      let X = null;
+      if (a.ent.t === "line" && nb.ent.t === "line") {
+        const den = crs(a.t, nb.t);
+        if (Math.abs(den) > 1e-9) {
+          const d = sub(nb.p, a.p), sa = crs(d, nb.t) / den, sb = crs(d, a.t) / den;
+          if (sa > -tolAt(a.p) && sb > -tolAt(a.p) && sa <= CHECK.reach && sb <= CHECK.reach) X = add(a.p, mul(a.t, sa));
+        }
+      }
+      fix = X ? { how: "meet", X } : { how: "bridge" };
+      done.add(nb.ref.e + ":" + nb.ref.k);
+      out.push({ kind: "open", p: a.p, refs: [a.ref, nb.ref], a, b: nb, fix, text: `Open ends of ${name(a)} and ${name(nb)}: ${X ? "extended to meet" : "joined by a line"} (${fmtN(nd, 3)} mm apart)` });
+    } else if (ext && ext.len <= CHECK.reach) {
+      fix = { how: "extend", ext };
+      out.push({ kind: "open", p: a.p, refs: [a.ref], a, fix, text: `Open end of ${name(a)}: extended ${fmtN(ext.len, 3)} mm to ${ext.o.id}` });
+    } else out.push({ kind: "open", p: a.p, refs: [a.ref], a, text: `Open end of ${name(a)}` });
+    done.add(ka);
+  }
+  return out;
+}
+
+/** Consecutive collinear lines (directions within CHECK.angle deg) and co-circular arcs (centres and radii within
+ *  CHECK.gap mm, the end of one at the start of the other) with no other entity at the shared end. */
+function mergePairs(es) {
+  const out = [];
+  const lines = es.filter(e => e.t === "line" || e.t === "arc");
+  const all = ents().filter(o => !o.axis && layerOn(o) && o.t !== "text");
+  for (let i = 0; i < lines.length; i++) for (let j = i + 1; j < lines.length; j++) {
+    const a = lines[i], b = lines[j];
+    if (a.t !== b.t) continue;
+    for (const ea of endsWithTangents(a)) for (const eb of endsWithTangents(b)) {
+      const tol = tolAt(ea.p);
+      if (dist(ea.p, eb.p) > tol) continue;
+      if (a.t === "line") { const ang = r2d(Math.acos(Math.max(-1, Math.min(1, -dot(ea.t, eb.t))))); if (ang >= CHECK.angle) continue; }
+      else {
+        if (dist([a.cx, a.cy], [b.cx, b.cy]) > CHECK.gap || Math.abs(a.r - b.r) > CHECK.gap) continue;
+        if (!((ea.ref.k === "e" && eb.ref.k === "s") || (ea.ref.k === "s" && eb.ref.k === "e"))) continue;
+      }
+      // no third entity at the junction
+      if (all.some(o => o.id !== a.id && o.id !== b.id && entDist(o, ea.p) < tol)) continue;
+      const key = [ea.ref.e + ":" + ea.ref.k, eb.ref.e + ":" + eb.ref.k].sort().join("|");
+      out.push({ kind: "merge", key, p: ea.p, refs: [ea.ref, eb.ref], a, b, ka: ea.ref.k, kb: eb.ref.k, text: `${a.t === "line" ? "Collinear lines" : "Co-circular arcs"} ${a.id} / ${b.id}: merged into one` });
+    }
+  }
+  return out;
+}
+
+/** Crossings and T-junctions of lines, arcs and circles (circles with two or more points), one issue per point. */
+function crossIssues() {
+  const out = [];
+  const es = ents().filter(e => !e.axis && !e.constr && layerOn(e) && (e.t === "line" || e.t === "arc" || e.t === "circle"));
+  for (const e of es) {
+    const cuts = interiorCuts(e);
+    if (e.t === "circle" && cuts.length < 2) continue;
+    for (const c of cuts) {
+      const x = out.find(q => dist(q.p, c.p) < tolAt(c.p));
+      if (x) { if (!x.split.includes(e.id)) x.split.push(e.id); continue; }
+      out.push({ kind: "cross", p: c.p, refs: [{ e: e.id, k: "s" }, { e: c.o.id, k: "s" }], split: [e.id], o: c.o.id, text: "" });
+    }
+  }
+  for (const x of out) x.text = x.split.length > 1 ? `Crossing of ${x.split[0]} and ${x.split[1]}: split` : `T-junction of ${x.o} on ${x.split[0]}: split`;
+  return out;
 }
 
 /** Overlapping geometry: collinear lines whose segments overlap, arcs and circles with the same centre and radius
@@ -3124,45 +3591,171 @@ function overlapIssues() {
   return out;
 }
 
+/** Fix buttons of the sketch check, in the order Fix all applies them. */
+const FIX_KINDS = [
+  ["overlap", "Remove overlaps"], ["tiny", "Remove tiny entities"], ["gap", "Close gaps"], ["open", "Close open ends"],
+  ["merge", "Merge chains"], ["cross", "Split at crossings"], ["tangent", "Add tangent constraints"], ["nocoincident", "Add coincident constraints"]];
+/** Key of an issue (kind and point references): a fix that failed is not offered again until the next Check. */
+function issueKey(x) { return x.kind + "|" + (x.refs || []).map(r => r.e + ":" + r.k).join(","); }
+function fixKind(x) { if (x.locked || x.failed) return null; return x.kind === "neartangent" || x.kind === "notangent" ? (x.solver ? "tangent" : null) : x.kind === "open" ? (x.fix ? "open" : null) : x.kind; }
+
 function showCheck(issues) {
   const box = $("#sk-props");
-  const fixable = issues.filter(x => x.kind !== "open");
-  box.innerHTML = `<p><strong>Sketch check</strong></p><p class="hint">Gap tolerance ${fmtN(CHECK.gap, 3)} mm, tangent tolerance ${fmtN(CHECK.angle, 2)} deg.</p>` +
-    (issues.length ? `<ul class="check-list">${issues.map((x, i) => `<li><a href="#" data-ci="${i}">${esc(x.text)}</a></li>`).join("")}</ul>` : `<p class="hint">No gaps, open ends, near tangents or overlaps.</p>`) +
-    (fixable.length ? `<div class="buttons"><button type="button" id="skp-fixall">Fix ${fixable.length} issue(s)</button></div>` : "") +
+  const fixable = issues.filter(x => fixKind(x));
+  const count = k => fixable.filter(x => fixKind(x) === k).length;
+  box.innerHTML = `<p><strong>Sketch check</strong></p><p class="hint">Gap tolerance ${fmtN(CHECK.gap, 3)} mm, tangent tolerance ${fmtN(CHECK.angle, 2)} deg, open end reach ${fmtN(CHECK.reach, 3)} mm, tiny length ${fmtN(CHECK.tiny, 3)} mm.</p>` +
+    (issues.length ? `<ul class="check-list">${issues.map((x, i) => `<li><a href="#" data-ci="${i}">${esc(x.text)}</a></li>`).join("")}</ul>` : `<p class="hint">No gaps, open ends, near tangents, tiny entities, chains to merge, crossings or overlaps.</p>`) +
+    (fixable.length ? `<div class="buttons">${FIX_KINDS.filter(([k]) => count(k)).map(([k, label]) => `<button type="button" class="small" data-fix="${k}">${label} (${count(k)})</button>`).join("")}<button type="button" id="skp-fixall">Fix all (${fixable.length})</button></div>` : "") +
     (SK.doc.entities.some(x => x.t === "poly" && !x.pprof && !x.fill) ? `<div class="buttons"><button type="button" id="skp-convpoly" title="Polylines become arcs, circles, splines or lines (solver geometry for constraints, trim, fillet and profiles)">Convert ${SK.doc.entities.filter(x => x.t === "poly" && !x.pprof && !x.fill).length} polyline(s)</button></div>` : "") +
-    `<div class="grid2"><label>Gap tolerance (mm)<input type="text" inputmode="decimal" class="numf" id="skp-ckgap" value="${CHECK.gap}"></label><label>Tangent tolerance (deg)<input type="text" inputmode="decimal" class="numf" id="skp-ckang" value="${CHECK.angle}"></label></div>` +
+    `<div class="grid2"><label>Gap tolerance (mm)<input type="text" inputmode="decimal" class="numf" id="skp-ckgap" value="${CHECK.gap}"></label><label>Tangent tolerance (deg)<input type="text" inputmode="decimal" class="numf" id="skp-ckang" value="${CHECK.angle}"></label>` +
+    `<label>Open end reach (mm)<input type="text" inputmode="decimal" class="numf" id="skp-ckreach" value="${CHECK.reach}"></label><label>Tiny length (mm)<input type="text" inputmode="decimal" class="numf" id="skp-cktiny" value="${CHECK.tiny}"></label></div>` +
     conicButtonHtml();
   bindConicButton(() => showCheck(sketchCheck()));
   if ($("#skp-convpoly")) $("#skp-convpoly").onclick = () => { checkpoint(); const n = convertAllPolys(); changed(); msg(n + " polyline(s) converted"); showCheck(sketchCheck()); };
   box.querySelectorAll("a[data-ci]").forEach(a => a.onclick = ev => {
     ev.preventDefault();
     const x = issues[+a.dataset.ci];
-    SK.sel.clear(); x.refs.forEach(r => SK.sel.add("e:" + r.e));
+    SK.sel.clear(); x.refs.forEach(r => { if (entById(r.e)) SK.sel.add("e:" + r.e); });
     // centre the view on the issue
     const svg = $("#sk-canvas svg"), r = svg.getBoundingClientRect();
     SK.view.ox = r.width / 2 - SK.view.s * x.p[0]; SK.view.oy = r.height / 2 + SK.view.s * x.p[1];
     redraw();
     msg(x.text);
   });
-  const fa = $("#skp-fixall"); if (fa) fa.onclick = () => { checkpoint(); const n = fixIssues(fixable); changed(true); const rest = sketchCheck(); showCheck(rest); msg(`${n} issue(s) fixed, ${rest.length} remaining`); };
-  $("#skp-ckgap").onchange = () => { const v = numv($("#skp-ckgap").value); if (v > 0) { CHECK.gap = v; showCheck(sketchCheck()); } };
-  $("#skp-ckang").onchange = () => { const v = numv($("#skp-ckang").value); if (v > 0) { CHECK.angle = v; showCheck(sketchCheck()); } };
+  const run = kinds => {
+    checkpoint();
+    let n = 0;
+    fixIssues.failed = 0;
+    for (const k of kinds) n += fixIssues(sketchCheck().filter(x => fixKind(x) === k));
+    changed(true);
+    const rest = sketchCheck();
+    showCheck(rest);
+    msg(`${n} issue(s) fixed` + (fixIssues.failed ? `, ${fixIssues.failed} not possible with the present constraints` : "") + `, ${rest.length} remaining`, !!fixIssues.failed);
+  };
+  box.querySelectorAll("button[data-fix]").forEach(b => b.onclick = () => run([b.dataset.fix]));
+  const fa = $("#skp-fixall"); if (fa) fa.onclick = () => run(FIX_KINDS.map(k => k[0]));
+  const num = (id, key) => { $(id).onchange = () => { const v = numv($(id).value); if (v > 0) { CHECK[key] = v; showCheck(sketchCheck()); } }; };
+  num("#skp-ckgap", "gap"); num("#skp-ckang", "angle"); num("#skp-ckreach", "reach"); num("#skp-cktiny", "tiny");
+}
+
+/** Splits a line, arc or circle at the points qs (on it, away from its ends). The pieces are joined with coincident
+ *  constraints and held together (lines: parallel, or the horizontal / vertical constraint of the line; arcs:
+ *  concentric and equal). Constraints and dimensions at the far end move to the last piece; a length dimension
+ *  becomes the distance between the outer ends; equal and midpoint constraints of a split line are removed.
+ *  Returns the junctions [{p, ref}] (ref: an end of a piece at p). */
+function splitEnt(e, qs) {
+  const out = [];
+  if (e.t === "line") {
+    const A = [e.x1, e.y1], d = [e.x2 - e.x1, e.y2 - e.y1], L2 = dot(d, d);
+    const vs = qs.map(q => dot(sub(q, A), d) / L2).filter(v => v > 1e-9 && v < 1 - 1e-9).sort((a, b) => a - b);
+    if (!vs.length) return out;
+    const P = v => add(A, mul(d, v)), end = [e.x2, e.y2];
+    const hv = SK.doc.constraints.find(c => (c.t === "horizontal" || c.t === "vertical") && c.l === e.id);
+    SK.doc.constraints = SK.doc.constraints.filter(c => !((c.t === "equal" && (c.e1 === e.id || c.e2 === e.id)) || (c.t === "midpoint" && c.l === e.id)));
+    const pieces = [e];
+    for (let i = 0; i < vs.length; i++) { const n = cloneEnt(e); const a = P(vs[i]), b = i + 1 < vs.length ? P(vs[i + 1]) : end; n.x1 = a[0]; n.y1 = a[1]; n.x2 = b[0]; n.y2 = b[1]; SK.doc.entities.push(n); pieces.push(n); }
+    const last = pieces[pieces.length - 1];
+    moveRefs({ e: e.id, k: "p2" }, { e: last.id, k: "p2" });
+    for (const dm of SK.doc.dims) if (dm.line === e.id) { delete dm.line; dm.r1 = { e: e.id, k: "p1" }; dm.r2 = { e: last.id, k: "p2" }; }
+    const q1 = P(vs[0]); e.x2 = q1[0]; e.y2 = q1[1];
+    reindex();
+    for (let i = 0; i + 1 < pieces.length; i++) {
+      const a = pieces[i], b = pieces[i + 1];
+      SK.doc.constraints.push({ id: newId("c"), t: "coincident", a: { e: a.id, k: "p2" }, b: { e: b.id, k: "p1" } });
+      SK.doc.constraints.push(hv ? { id: newId("c"), t: hv.t, l: b.id } : { id: newId("c"), t: "parallel", l1: e.id, l2: b.id });
+      out.push({ p: [a.x2, a.y2], ref: { e: a.id, k: "p2" } });
+    }
+    return out;
+  }
+  if (e.t === "arc" || e.t === "circle") {
+    const c = [e.cx, e.cy];
+    let angs;
+    if (e.t === "arc") {
+      const sp = arcSpan(e), tol = 1e-7;
+      const offs = qs.map(q => n360(angOf(c, q) - e.a0)).filter(o => o > tol && o < sp - tol).sort((a, b) => a - b);
+      if (!offs.length) return out;
+      angs = [e.a0, ...offs.map(o => e.a0 + o), e.a0 + sp];
+    } else {
+      const as = [...new Set(qs.map(q => +angOf(c, q).toFixed(9)))].sort((a, b) => a - b);
+      if (as.length < 2) return out;
+      angs = [...as, as[0] + 360];
+      e.t = "arc";
+    }
+    const lastK = { e: e.id, k: "e" };
+    const pieces = [e];
+    for (let i = 1; i + 1 < angs.length; i++) { const n = cloneEnt(e); n.a0 = n360(angs[i]); n.a1 = n360(angs[i + 1]); SK.doc.entities.push(n); pieces.push(n); }
+    const last = pieces[pieces.length - 1];
+    if (last !== e) {
+      moveRefs(lastK, { e: last.id, k: "e" });
+      for (const q of SK.doc.constraints) if (q.t === "tangent" || q.t === "curvature") { if (q.e1 === e.id && q.ak1 === "e") q.e1 = last.id; if (q.e2 === e.id && q.ak2 === "e") q.e2 = last.id; }
+    }
+    e.a0 = n360(angs[0]); e.a1 = n360(angs[1]);
+    reindex();
+    for (let i = 0; i + 1 < pieces.length; i++) {
+      const a = pieces[i], b = pieces[i + 1];
+      SK.doc.constraints.push({ id: newId("c"), t: "coincident", a: { e: a.id, k: "e" }, b: { e: b.id, k: "s" } });
+      SK.doc.constraints.push({ id: newId("c"), t: "concentric", e1: e.id, e2: b.id }, { id: newId("c"), t: "equal", e1: e.id, e2: b.id });
+      out.push({ p: arcPt(a, a.a1), ref: { e: a.id, k: "e" } });
+    }
+    if (angs.length > 2 && Math.abs(angs[angs.length - 1] - angs[0] - 360) < 1e-9) {
+      // a split circle: the last piece ends at the start of the first
+      SK.doc.constraints.push({ id: newId("c"), t: "coincident", a: { e: last.id, k: "e" }, b: { e: e.id, k: "s" } });
+      out.push({ p: arcPt(e, e.a0), ref: { e: e.id, k: "s" } });
+    }
+    return out;
+  }
+  return out;
 }
 
 /** Fixes: a gap closes at the midpoint (at the curve end when one side is a spline or ellipse) with a coincident
- *  constraint (a fix constraint on the curve side); near tangents and tangents without constraint get a tangent
- *  constraint; touching ends get a coincident constraint. Each fix is kept only when the solver accepts it. */
+ *  constraint; near tangents and tangents without constraint get a tangent constraint; touching ends get a
+ *  coincident constraint; overlaps are merged; open ends are extended or joined; tiny entities are removed and
+ *  their neighbours joined; collinear lines and co-circular arcs are merged; lines, arcs and circles are split at
+ *  crossings and T-junctions. Each fix is kept only when the solver accepts it. Returns the number fixed. */
 function fixIssues(list) {
   let n = 0;
-  const tryFix = (apply) => {
+  // ids: entities of the issue; only their connected component is solved (all when not given)
+  SK.checkFailed = SK.checkFailed || new Set();
+  let cur = null;      // the issue being fixed (a failure is remembered by its key)
+  const tryFix = (apply, ids) => {
     const before = JSON.stringify(SK.doc);
-    try { apply(); } catch (err) { SK.doc = JSON.parse(before); reindex(); return false; }
-    if (solveAll()) { n++; return true; }
-    SK.doc = JSON.parse(before); reindex();
-    return false;
+    const fail = () => { SK.doc = JSON.parse(before); reindex(); if (cur) SK.checkFailed.add(issueKey(cur)); fixIssues.failed = (fixIssues.failed || 0) + 1; return false; };
+    try { apply(); } catch (err) { return fail(); }
+    if (solveAll(undefined, ids ? conComponent(ids.filter(id => entById(id))) : undefined)) { n++; return true; }
+    return fail();
   };
+  const coin = (ra, rb) => { if (!SK.doc.constraints.some(q => q.t === "coincident" && ((sameEndRef(q.a, ra) && sameEndRef(q.b, rb)) || (sameEndRef(q.a, rb) && sameEndRef(q.b, ra))))) SK.doc.constraints.push({ id: newId("c"), t: "coincident", a: ra, b: rb }); };
+  // merges and splits change the entities: they are found again after each change
+  const kinds = new Set(list.map(fixKind));
+  if (kinds.has("merge")) {
+    for (let guard = 0; guard < 500; guard++) {
+      const m = mergePairs(ents().filter(e => !e.axis && !e.constr && layerOn(e) && (e.t === "line" || e.t === "arc")))[0];
+      if (!m || !tryFix(() => mergeEnts(m))) break;
+    }
+  }
+  if (kinds.has("cross")) {
+    tryFix(() => {
+      const es = ents().filter(e => !e.axis && !e.constr && layerOn(e) && (e.t === "line" || e.t === "arc" || e.t === "circle"));
+      const plan = es.map(e => [e, interiorCuts(e)]).filter(([e, cuts]) => cuts.length && (e.t !== "circle" || cuts.length >= 2));
+      if (!plan.length) throw new Error("nothing to split");
+      const juncs = [];
+      for (const [e, cuts] of plan) juncs.push(...splitEnt(e, cuts.map(c => c.p)));
+      // the junctions at one point are tied together, and to an end of another entity there
+      const all = ents().filter(o => !o.axis && !o.constr && layerOn(o));
+      const used = new Set();
+      for (let i = 0; i < juncs.length; i++) {
+        if (used.has(i)) continue;
+        const J = juncs[i], tol = tolAt(J.p);
+        for (let j = i + 1; j < juncs.length; j++) if (!used.has(j) && dist(juncs[j].p, J.p) < tol) { used.add(j); coin(J.ref, juncs[j].ref); }
+        for (const o of all) for (const x of endsWithTangents(o)) if (dist(x.p, J.p) < tol && x.ref.e !== J.ref.e && !juncs.some(q => q.ref.e === x.ref.e) ) {
+          coin(J.ref, x.ref);
+          SK.doc.constraints = SK.doc.constraints.filter(q => !(q.t === "pointon" && sameEndRef(q.a, x.ref)));
+        }
+      }
+    });
+  }
   for (const x of list) {
+    cur = x;
     if (x.kind === "gap") {
       tryFix(() => {
         // a spline fit point or a curve end can be moved directly; a trimmed curve end is moved by the solver
@@ -3170,19 +3763,53 @@ function fixIssues(list) {
         const m = mul(add(x.a.p, x.b.p), 0.5);
         if (movable(x.a.ref)) setPt(x.a.ref, movable(x.b.ref) ? m : x.b.p);
         if (movable(x.b.ref)) setPt(x.b.ref, movable(x.a.ref) ? m : x.a.p);
-        addConstraint({ t: "coincident", a: x.a.ref, b: x.b.ref }, true);
-      });
+        if (!addConstraint({ t: "coincident", a: x.a.ref, b: x.b.ref }, true)) throw new Error("not added");
+      }, [x.a.ref.e, x.b.ref.e]);
     } else if ((x.kind === "neartangent" || x.kind === "notangent") && x.solver) {
       tryFix(() => {
         const c = { t: "tangent", e1: x.a.ent.id, e2: x.b.ent.id };
         if (needsEndKey(x.a.ent)) c.ak1 = x.a.ref.k;
         if (needsEndKey(x.b.ent)) c.ak2 = x.b.ref.k;
-        if (!SK.doc.constraints.some(q => q.t === "coincident" && ((q.a.e === x.a.ref.e && q.a.k === x.a.ref.k && q.b.e === x.b.ref.e && q.b.k === x.b.ref.k) || (q.b.e === x.a.ref.e && q.b.k === x.a.ref.k && q.a.e === x.b.ref.e && q.a.k === x.b.ref.k))))
+        if (!SK.doc.constraints.some(q => q.t === "coincident" && ((sameEndRef(q.a, x.a.ref) && sameEndRef(q.b, x.b.ref)) || (sameEndRef(q.b, x.a.ref) && sameEndRef(q.a, x.b.ref)))))
           addConstraint({ t: "coincident", a: x.a.ref, b: x.b.ref }, true);
-        addConstraint(c, true);
-      });
+        if (!addConstraint(c, true)) throw new Error("not added");
+      }, [x.a.ent.id, x.b.ent.id]);
     } else if (x.kind === "nocoincident") {
-      tryFix(() => addConstraint({ t: "coincident", a: x.a.ref, b: x.b.ref }, true));
+      tryFix(() => { if (!addConstraint({ t: "coincident", a: x.a.ref, b: x.b.ref }, true)) throw new Error("not added"); }, [x.a.ref.e, x.b.ref.e]);
+    } else if (x.kind === "open" && x.fix) {
+      tryFix(() => {
+        if (!entById(x.a.ent.id) || (x.b && !entById(x.b.ent.id))) throw new Error("gone");
+        if (x.fix.how === "extend") {
+          const ext = x.fix.ext, e = entById(x.a.ent.id);
+          if (e.t === "line") setPt(x.a.ref, ext.q);
+          else if (x.a.ref.k === "e") e.a1 = n360(ext.ang); else e.a0 = n360(ext.ang);
+          const end = endsWithTangents(ext.o).find(q => dist(q.p, ext.q) < tolAt(ext.q));
+          if (end) coin(x.a.ref, end.ref);
+          else if (isSolver(ext.o)) SK.doc.constraints.push({ id: newId("c"), t: "pointon", a: x.a.ref, e2: ext.o.id });
+        } else if (x.fix.how === "meet") {
+          setPt(x.a.ref, x.fix.X); setPt(x.b.ref, x.fix.X);
+          coin(x.a.ref, x.b.ref);
+        } else {
+          const e = entById(x.a.ent.id);
+          const l = newEnt("line", { x1: x.a.p[0], y1: x.a.p[1], x2: x.b.p[0], y2: x.b.p[1], layer: e.layer });
+          reindex();
+          coin({ e: l.id, k: "p1" }, x.a.ref); coin({ e: l.id, k: "p2" }, x.b.ref);
+        }
+      });
+    } else if (x.kind === "tiny") {
+      tryFix(() => {
+        const e = entById(x.ent.id);
+        if (!e) throw new Error("gone");
+        const nbs = endsWithTangents(e).map(q => endNeighbour(e, q.ref.k)).filter(Boolean);
+        const ep = endsWithTangents(e).map(q => q.p), m = ep.length === 2 ? mul(add(ep[0], ep[1]), 0.5) : null;
+        SK.doc.entities = SK.doc.entities.filter(o => o.id !== e.id);
+        removeRefs([e.id]);
+        reindex();
+        if (nbs.length === 2 && nbs[0].e !== nbs[1].e) {
+          for (const r of nbs) if (entById(r.e).t === "line") setPt(r, m);
+          coin(nbs[0], nbs[1]);
+        }
+      });
     } else if (x.kind === "overlap") {
       // the entity with fewer constraints is removed; two lines or two arcs are merged into the kept one
       const ca = SK.doc.constraints.filter(c => conEnts(c).includes(x.a.id)).length, cb = SK.doc.constraints.filter(c => conEnts(c).includes(x.b.id)).length;
@@ -3210,6 +3837,28 @@ function fixIssues(list) {
     }
   }
   return n;
+}
+/** Merge of two consecutive collinear lines or co-circular arcs (mergePairs record m): the first is extended over
+ *  the second, which is removed; the constraints at the far end of the second move to the first. */
+function mergeEnts(m) {
+  const a = entById(m.a.id), b = entById(m.b.id);
+  if (!a || !b) throw new Error("gone");
+  const far = { p1: "p2", p2: "p1", s: "e", e: "s" }[m.kb];
+  removePointRefs({ e: a.id, k: m.ka });
+  if (a.t === "line") {
+    const q = getPt({ e: b.id, k: far });
+    setPt({ e: a.id, k: m.ka }, q);
+  } else if (m.ka === "e") a.a1 = b.a1; else a.a0 = b.a0;
+  moveRefs({ e: b.id, k: far }, { e: a.id, k: m.ka });
+  for (const q of SK.doc.constraints) if ((q.t === "tangent" || q.t === "curvature") && a.t === "arc") {
+    if (q.e1 === b.id && q.ak1 === far) { q.e1 = a.id; q.ak1 = m.ka; }
+    if (q.e2 === b.id && q.ak2 === far) { q.e2 = a.id; q.ak2 = m.ka; }
+  }
+  if (a.t === "arc" && arcSpan(a) >= 360 - 1e-6) { a.t = "circle"; delete a.a0; delete a.a1; }
+  SK.doc.entities = SK.doc.entities.filter(e => e.id !== b.id);
+  removeRefs([b.id]);
+  SK.doc.constraints = SK.doc.constraints.filter(q => !(q.t === "coincident" && q.a.e === a.id && q.b.e === a.id));
+  reindex();
 }
 
 /** Extends the selection to the tangent (or connected) chains through the selected lines and arcs. */
@@ -3447,6 +4096,136 @@ function endTangent(ref) {
   }
   return null;
 }
+// ---- end conditions of splines and conics at the end of another entity
+
+/** End condition applied by the Spline and Conic tools at a point snapped to the end of a line, arc or curve:
+ *  "coincident", "tangent" (default) or "g2" (curvature continuous). */
+const ENDCOND = { mode: "tangent" };
+const ENDCOND_NAMES = { coincident: "Coincident", tangent: "Tangent", g2: "Curvature continuous (G2)" };
+function isUntrimmedEnd(e, k) { return k === "e" ? e.t1 === undefined || e.t1 === null : e.t0 === undefined || e.t0 === null; }
+/** The end reference {e, k} (line p1/p2, arc s/e, open curve s/e) for a point reference, or null; the first and
+ *  last fit point of an untrimmed open spline count as its ends. */
+function endRef(ref) {
+  const e = ref && entById(ref.e);
+  if (!e) return null;
+  if (e.t === "line") return ref.k === "p1" || ref.k === "p2" ? { e: e.id, k: ref.k } : null;
+  if (e.t === "arc") return ref.k === "s" || ref.k === "e" ? { e: e.id, k: ref.k } : null;
+  if (CURVE_T.has(e.t) && !cvAdapter(e).whole) {
+    if (ref.k === "s" || ref.k === "e") return { e: e.id, k: ref.k };
+    if (e.t === "spline" && !e.closed) {
+      if (ref.k === "v0" && isUntrimmedEnd(e, "s")) return { e: e.id, k: "s" };
+      if (ref.k === "v" + (e.pts.length - 1) && isUntrimmedEnd(e, "e")) return { e: e.id, k: "e" };
+    }
+  }
+  return null;
+}
+function sameEndRef(r, ref) { if (!r || !ref || r.e !== ref.e) return false; const a = endRef(r); return r.k === ref.k || (!!a && a.k === ref.k); }
+/** The end of another entity joined to the end k of e: {e, k} (by a coincident constraint, else an end at the same
+ *  point), or null. */
+function endNeighbour(e, k) {
+  const ref = { e: e.id, k };
+  for (const c of SK.doc.constraints) {
+    if (c.t !== "coincident") continue;
+    const o = sameEndRef(c.a, ref) ? c.b : sameEndRef(c.b, ref) ? c.a : null;
+    const r = o && o.e !== e.id ? endRef(o) : null;
+    if (r) return r;
+  }
+  const me = endsWithTangents(e).find(x => x.ref.k === k);
+  if (!me) return null;
+  const tol = 1e-6 * Math.max(1, Math.abs(me.p[0]), Math.abs(me.p[1]));
+  for (const o of ents()) {
+    if (o.id === e.id || o.axis || !!o.constr !== !!e.constr || !isSolver(o)) continue;
+    const x = endsWithTangents(o).find(q => dist(q.p, me.p) < tol);
+    if (x) return { e: o.id, k: x.ref.k };
+  }
+  return null;
+}
+/** End condition at the end k of the curve e: {nb (the joined end), mode, cons (tangent and curvature constraints
+ *  there), coincident (whether a coincident constraint joins them)}, or null when no other entity ends there. */
+function endCond(e, k) {
+  const nb = endNeighbour(e, k);
+  if (!nb) return null;
+  const at = c => (c.e1 === e.id && c.e2 === nb.e && (!needsEndKey(e) || c.ak1 === k)) || (c.e2 === e.id && c.e1 === nb.e && (!needsEndKey(e) || c.ak2 === k));
+  const cons = SK.doc.constraints.filter(c => (c.t === "tangent" || c.t === "curvature") && at(c));
+  const coincident = SK.doc.constraints.some(c => c.t === "coincident" && ((sameEndRef(c.a, { e: e.id, k }) && sameEndRef(c.b, nb)) || (sameEndRef(c.b, { e: e.id, k }) && sameEndRef(c.a, nb))));
+  const mode = cons.some(c => c.t === "curvature") ? "g2" : cons.some(c => c.t === "tangent") ? "tangent" : "coincident";
+  return { nb, mode, cons, coincident };
+}
+/** Clamped end of a spline for the end condition: tangent and G2 hold the end derivative d0 / d1 (set to the
+ *  present one), G2 also the end curvature k0 / k1; coincident removes both. A trimmed end has neither. */
+function clampEnd(e, k, mode) {
+  if (e.t !== "spline") return;
+  const i = k === "e" ? 1 : 0, dk = "d" + i, kk = "k" + i;
+  if (e.closed || !isUntrimmedEnd(e, k) || mode === "coincident") { delete e[dk]; delete e[kk]; return; }
+  const D = splineDer(splineOf(e), splineRange(e)[i]);
+  if (!e[dk]) e[dk] = D[0].slice();
+  if (mode === "g2") { if (e[kk] === undefined || e[kk] === null) e[kk] = crs(unit(e[dk]), curvFromDer(D[0], D[1])); }
+  else delete e[kk];
+}
+/** Sets the end condition of the curve e at its end k (mode coincident / tangent / g2). Returns false (nothing
+ *  changed) when the solver cannot satisfy it. */
+function setEndCond(e, k, mode) {
+  const info = endCond(e, k);
+  if (!info) return false;
+  const before = JSON.stringify(SK.doc);
+  const fail = () => { SK.doc = JSON.parse(before); reindex(); return false; };
+  SK.doc.constraints = SK.doc.constraints.filter(c => !info.cons.includes(c));
+  clampEnd(e, k, mode);
+  const nbe = entById(info.nb.e);
+  if (!info.coincident && !addConstraint({ t: "coincident", a: { e: e.id, k }, b: info.nb }, true)) return fail();
+  if (mode !== "coincident") {
+    const c = { t: "tangent", e1: info.nb.e, e2: e.id, ak2: k };
+    if (needsEndKey(nbe)) c.ak1 = info.nb.k;
+    if (!addConstraint(c, true)) return fail();
+  }
+  if (mode === "g2" && !addConstraint({ t: "curvature", e1: info.nb.e, ak1: info.nb.k, e2: e.id, ak2: k }, true)) return fail();
+  if (!solveAll()) return fail();
+  return true;
+}
+/** Removes the end conditions of a spline (when it is closed or its fit points are replaced). */
+function dropEndConds(e) {
+  delete e.d0; delete e.k0; delete e.d1; delete e.k1;
+  SK.doc.constraints = SK.doc.constraints.filter(c => !((c.t === "tangent" || c.t === "curvature") && ((c.e1 === e.id && c.ak1) || (c.e2 === e.id && c.ak2))));
+}
+/** Start derivative (k "s") or end derivative (k "e", direction of travel) of a new curve that starts or ends at
+ *  the end nb of another entity, with the signed curvature there: {d, kap}, or null. */
+function endDirFrom(nb, k) {
+  const t = endTangent(nb);
+  if (!t) return null;
+  const d = k === "s" ? t : mul(t, -1);
+  return { d, kap: crs(d, curvVec(entById(nb.e), nb.k)) };
+}
+function endCondForm() {
+  const box = $("#sk-props");
+  if (!box || (SK.tool !== "spline" && SK.tool !== "conic")) return;
+  box.innerHTML = `<p><strong>${SK.tool === "spline" ? "Spline" : "Conic"}</strong></p>` +
+    `<label>End condition<select id="skp-endc">${Object.entries(ENDCOND_NAMES).map(([k, v]) => `<option value="${k}"${ENDCOND.mode === k ? " selected" : ""}>${v}</option>`).join("")}</select></label>` +
+    `<p class="hint">Applies at a first or last point snapped to the end of a line, arc or curve. Coincident: the ends are joined. Tangent: joined with the same direction. Curvature continuous (G2): joined with the same direction and curvature. ` +
+    (SK.tool === "conic" ? "A tangent start or end puts the tangent intersection on that tangent; with both ends tangent the tangent intersection is set and the next point gives rho." : "A tangent end holds the end derivative of the spline; a G2 end also holds the end curvature (an extra knot in the end span).") +
+    ` The end conditions of a curve are changed in its properties.</p>`;
+  $("#skp-endc").onchange = () => { ENDCOND.mode = $("#skp-endc").value; };
+}
+/** End condition rows of the properties of a spline or conic. */
+function endCondHtml(e) {
+  const rows = [];
+  for (const k of ["s", "e"]) {
+    const info = endCond(e, k);
+    if (!info) continue;
+    const nbe = entById(info.nb.e);
+    rows.push(`<label>${k === "s" ? "Start" : "End"} (joined to ${(TYPE_NAMES[nbe.t] || nbe.t).toLowerCase()} ${esc(nbe.id)})<select data-endc="${k}">` +
+      Object.entries(ENDCOND_NAMES).map(([m, v]) => `<option value="${m}"${info.mode === m ? " selected" : ""}>${v}</option>`).join("") + `</select></label>`);
+  }
+  return rows.length ? `<p class="hint">End conditions</p>` + rows.join("") : "";
+}
+function bindEndCond(e) {
+  document.querySelectorAll("#sk-props select[data-endc]").forEach(sel => sel.onchange = () => {
+    checkpoint();
+    const mode = sel.value;
+    if (!setEndCond(e, sel.dataset.endc, mode)) msg(`${ENDCOND_NAMES[mode]}: not possible with the present constraints`, true);
+    changed(true);
+    showProps();
+  });
+}
 /** Arc from S with the tangent t at S through E: {ent, sk (key at S), ek (key at E)}, or null (E on the tangent). */
 function tangentArc(S, t, E) {
   const d = sub(E, S), n = [-t[1], t[0]], dn = dot(d, n);
@@ -3458,6 +4237,26 @@ function tangentArc(S, t, E) {
 
 // ------------------------------------------------------------------ tools
 
+const FILLET = { r: null };               // fillet radius of the Fillet tool (null: automatic), kept for the session
+function filletForm() {
+  const box = $("#sk-props");
+  if (!box || SK.tool !== "fillet") return;
+  const auto = FILLET.r === null || FILLET.r === undefined;
+  box.innerHTML = `<p><strong>Fillet</strong></p>` +
+    `<label class="check"><input type="radio" name="skp-fmode" value="auto"${auto ? " checked" : ""}> Radius from the click positions</label>` +
+    `<label class="check"><input type="radio" name="skp-fmode" value="fixed"${auto ? "" : " checked"}> Radius</label>` +
+    `<label>Radius (mm)<input type="text" inputmode="decimal" class="numf" id="skp-frad" value="${auto ? "" : fmtN(FILLET.r, 6)}" placeholder="${fmtN(PARAM.fillet, 6)}"${auto ? " disabled" : ""}></label>` +
+    `<p class="hint">Radius from the click positions: the arc starts at the nearer click (R = t tan(φ/2)), rounded; drag the arc or dimension it afterwards. Radius: every fillet of the tool gets this radius (0 between two lines: sharp corner). A number typed while the tool is active sets the radius.</p>`;
+  const set = () => {
+    const mode = box.querySelector("input[name=skp-fmode]:checked").value;
+    if (mode === "auto") FILLET.r = null;
+    else { const v = numv($("#skp-frad").value.replace(",", ".")); FILLET.r = v >= 0 ? v : (PARAM.fillet >= 0 ? PARAM.fillet : 1); PARAM.fillet = FILLET.r; }
+    SK.filletR = FILLET.r;
+    filletForm(); updateHint();
+  };
+  box.querySelectorAll("input[name=skp-fmode]").forEach(r => r.onchange = set);
+  $("#skp-frad").onchange = set;
+}
 const SLOT = { tips: false };
 function slotForm() {
   const box = $("#sk-props");
@@ -3646,9 +4445,22 @@ const TOOLS = {
       SK.pick = [];
       if (P.length < 2) { updateHint(); overlay(); return; }
       checkpoint();
-      const e = newEnt("spline", { pts: P, closed: !!closed });
+      // end conditions at a first or last point on the end of another entity: the end derivative (and curvature)
+      // of that entity
+      const props = { pts: P, closed: !!closed }, joins = [];
+      if (!closed && ENDCOND.mode !== "coincident") {
+        [["s", picks[0]], ["e", picks[picks.length - 1]]].forEach(([k, pk], i) => {
+          const nb = pk && pk.ref && endRef(pk.ref), ed = nb && endDirFrom(nb, k);
+          if (!ed) return;
+          props["d" + i] = ed.d;
+          if (ENDCOND.mode === "g2") props["k" + i] = ed.kap;
+          joins.push(k);
+        });
+      }
+      const e = newEnt("spline", props);
       reindex();
       picks.forEach((pk, i) => autoAt({ e: e.id, k: "v" + i }, pk));
+      for (const k of joins) if (!setEndCond(e, k, ENDCOND.mode)) { clampEnd(e, k, "coincident"); msg(`Spline: ${ENDCOND_NAMES[ENDCOND.mode]} at the ${k === "s" ? "start" : "end"} not possible`, true); }
       SK.sel.clear(); SK.sel.add("e:" + e.id);
       changed(true);
       showProps();
@@ -3656,7 +4468,14 @@ const TOOLS = {
     preview() {
       const a = lastPick(); if (!a || !SK.snap) return [];
       const P = SK.pick.map(q => q.p).concat([SK.snap.p]);
-      return [{ t: "spline", pts: P, closed: false }];
+      const c = { t: "spline", pts: P, closed: false };
+      if (ENDCOND.mode !== "coincident") {
+        const nb = SK.pick[0].ref && endRef(SK.pick[0].ref), ed = nb && endDirFrom(nb, "s");
+        if (ed) { c.d0 = ed.d; if (ENDCOND.mode === "g2") c.k0 = ed.kap; }
+        const nb1 = SK.snap.ref && endRef(SK.snap.ref), ed1 = nb1 && endDirFrom(nb1, "e");
+        if (ed1) { c.d1 = ed1.d; if (ENDCOND.mode === "g2") c.k1 = ed1.kap; }
+      }
+      return [c];
     },
   },
   ellipse: {
@@ -3698,6 +4517,32 @@ const TOOLS = {
       : "Shoulder point on the curve, or type rho (0.5 parabola, below 0.5 ellipse, above 0.5 hyperbola); Enter: 0.5",
     base: () => lastPick() && lastPick().p,
     value(v) { if (SK.pick.length === 3 && v > 0 && v < 1) this.make(v); },
+    /** Tangent rays of the end condition: {s: [P0, direction to T], e: [P1, direction to T]} for the ends picked on
+     *  the end of another entity. */
+    rays() {
+      const out = {};
+      if (ENDCOND.mode === "coincident") return out;
+      [["s", 0], ["e", 1]].forEach(([k, i]) => {
+        const pk = SK.pick[i], nb = pk && pk.ref && endRef(pk.ref), t = nb && endTangent(nb);
+        if (t) out[k] = [pk.p, t];
+      });
+      return out;
+    },
+    /** The tangent intersection for a point p: projected onto the tangent ray of a tangent end. */
+    tPoint(p) {
+      const R = this.rays(), r = R.s || R.e;
+      if (!r) return p;
+      return add(r[0], mul(r[1], Math.max(1e-6, dot(sub(p, r[0]), r[1]))));
+    },
+    /** With both ends tangent: the intersection of the two tangent rays, or null. */
+    autoT() {
+      const R = this.rays();
+      if (!R.s || !R.e) return null;
+      const den = crs(R.s[1], R.e[1]);
+      if (Math.abs(den) < 1e-9) return null;
+      const d = sub(R.e[0], R.s[0]), mu = crs(d, R.e[1]) / den, la = crs(d, R.s[1]) / den;
+      return mu > 1e-9 && la > 1e-9 ? add(R.s[0], mul(R.s[1], mu)) : null;
+    },
     ent() {
       const [a, b, t] = SK.pick.map(q => q.p);
       return { x0: a[0], y0: a[1], x1: b[0], y1: b[1], xt: t[0], yt: t[1], rho: 0.5 };
@@ -3705,8 +4550,16 @@ const TOOLS = {
     click(sn) {
       if (SK.pick.length < 3) {
         if (SK.pick.length && SK.pick.some(q => dist(q.p, sn.p) < 1e-9)) return;
-        if (SK.pick.length === 2) { const a = SK.pick[0].p, b = SK.pick[1].p; if (Math.abs(crs(sub(b, a), sub(sn.p, a))) < 1e-9 * Math.max(1, dist(a, b))) return msg("Conic: the tangent intersection cannot lie on the chord", true); }
+        if (SK.pick.length === 2) {
+          sn = { p: this.tPoint(sn.p), kind: null, ref: null };
+          const a = SK.pick[0].p, b = SK.pick[1].p; if (Math.abs(crs(sub(b, a), sub(sn.p, a))) < 1e-9 * Math.max(1, dist(a, b))) return msg("Conic: the tangent intersection cannot lie on the chord", true);
+        }
         SK.pick.push(sn);
+        if (SK.pick.length === 2) {
+          const T = this.autoT();
+          if (T) SK.pick.push({ p: T, kind: null, ref: null });
+          else if (this.rays().s && this.rays().e) msg("Conic: the tangents at the start and end do not meet ahead of both ends; click the tangent intersection");
+        }
         return;
       }
       this.make(conicRhoAt(this.ent(), sn.p));
@@ -3720,6 +4573,14 @@ const TOOLS = {
       const picks = SK.pick.slice();
       SK.pick = [];
       autoAt({ e: e.id, k: "s" }, picks[0]); autoAt({ e: e.id, k: "e" }, picks[1]);
+      if (ENDCOND.mode !== "coincident") {
+        [["s", picks[0]], ["e", picks[1]]].forEach(([k, pk]) => {
+          if (!(pk.ref && endRef(pk.ref) && endTangent(endRef(pk.ref)))) return;
+          if (setEndCond(e, k, ENDCOND.mode)) return;
+          if (ENDCOND.mode === "g2" && setEndCond(e, k, "tangent")) msg(`Conic: curvature continuity at the ${k === "s" ? "start" : "end"} not possible; tangent applied`, true);
+          else msg(`Conic: ${ENDCOND_NAMES[ENDCOND.mode]} at the ${k === "s" ? "start" : "end"} not possible`, true);
+        });
+      }
       SK.sel.clear(); SK.sel.add("e:" + e.id);
       changed(true);
       showProps();
@@ -3728,7 +4589,7 @@ const TOOLS = {
       const a = lastPick(); if (!a || !SK.snap) return [];
       if (SK.pick.length === 1) return [{ t: "line", x1: a.p[0], y1: a.p[1], x2: SK.snap.p[0], y2: SK.snap.p[1] }];
       const p0 = SK.pick[0].p, p1 = SK.pick[1].p;
-      if (SK.pick.length === 2) return [{ t: "line", x1: p0[0], y1: p0[1], x2: SK.snap.p[0], y2: SK.snap.p[1] }, { t: "line", x1: p1[0], y1: p1[1], x2: SK.snap.p[0], y2: SK.snap.p[1] }];
+      if (SK.pick.length === 2) { const q = this.tPoint(SK.snap.p); return [{ t: "line", x1: p0[0], y1: p0[1], x2: q[0], y2: q[1] }, { t: "line", x1: p1[0], y1: p1[1], x2: q[0], y2: q[1] }]; }
       const c = this.ent();
       c.rho = conicRhoAt(c, SK.snap.p);
       return [Object.assign({ t: "conic" }, c), { t: "line", x1: p0[0], y1: p0[1], x2: c.xt, y2: c.yt }, { t: "line", x1: p1[0], y1: p1[1], x2: c.xt, y2: c.yt }];
@@ -3840,6 +4701,53 @@ const TOOLS = {
       const c = k.p, b = SK.snap.p, a = sub(mul(c, 2), b), P = [a, [b[0], a[1]], b, [a[0], b[1]]];
       return [0, 1, 2, 3].map(i => ({ t: "line", x1: P[i][0], y1: P[i][1], x2: P[(i + 1) % 4][0], y2: P[(i + 1) % 4][1] }))
         .concat([{ t: "line", x1: a[0], y1: a[1], x2: b[0], y2: b[1], constr: true }, { t: "line", x1: P[1][0], y1: P[1][1], x2: P[3][0], y2: P[3][1], constr: true }]);
+    },
+  },
+  rect3: {
+    hint: n => ["First corner", "Second corner: the first side (horizontal or vertical within the capture angle)", "Point on the opposite side, or type the width"][n],
+    base: () => lastPick() && lastPick().p,
+    move: sn => (SK.pick.length === 1 ? hvSnap(SK.pick[0].p, sn) : sn),
+    /** Corners for the width point q (signed distance from the first side). */
+    corners(q, w) {
+      const a = SK.pick[0].p, b = SK.pick[1].p, u = unit(sub(b, a)), n = [-u[1], u[0]];
+      if (w === undefined) w = dot(sub(q, a), n);
+      return [a, b, add(b, mul(n, w)), add(a, mul(n, w))];
+    },
+    value(v) {
+      if (SK.pick.length !== 2 || !(v > 0)) return;
+      const a = SK.pick[0].p, b = SK.pick[1].p, u = unit(sub(b, a)), n = [-u[1], u[0]];
+      const side = SK.snap ? Math.sign(dot(sub(SK.snap.p, a), n)) || 1 : 1;
+      this.make(this.corners(null, side * v));
+    },
+    click(sn) {
+      if (SK.pick.length === 1) sn = hvSnap(SK.pick[0].p, sn);
+      if (SK.pick.length < 2) {
+        if (SK.pick.length === 1 && dist(SK.pick[0].p, sn.p) < 1e-9) return;
+        SK.pick.push(sn); return;
+      }
+      const P = this.corners(sn.p);
+      if (dist(P[1], P[2]) < 1e-9) return;
+      this.make(P);
+    },
+    make(P) {
+      checkpoint();
+      const L = [0, 1, 2, 3].map(i => newEnt("line", { x1: P[i][0], y1: P[i][1], x2: P[(i + 1) % 4][0], y2: P[(i + 1) % 4][1] }));
+      reindex();
+      for (let i = 0; i < 4; i++) addConstraint({ t: "coincident", a: { e: L[i].id, k: "p2" }, b: { e: L[(i + 1) % 4].id, k: "p1" } }, true);
+      autoHV(L[0].id);
+      addConstraint({ t: "perpendicular", l1: L[0].id, l2: L[1].id }, true);
+      addConstraint({ t: "parallel", l1: L[0].id, l2: L[2].id }, true);
+      addConstraint({ t: "parallel", l1: L[1].id, l2: L[3].id }, true);
+      autoAt({ e: L[0].id, k: "p1" }, SK.pick[0]);
+      autoAt({ e: L[0].id, k: "p2" }, SK.pick[1]);
+      SK.pick = [];
+      changed(true);
+    },
+    preview() {
+      if (!SK.snap || !SK.pick.length) return [];
+      if (SK.pick.length === 1) { const a = SK.pick[0].p, b = SK.snap.p; return [{ t: "line", x1: a[0], y1: a[1], x2: b[0], y2: b[1] }]; }
+      const P = this.corners(SK.snap.p);
+      return [0, 1, 2, 3].map(i => ({ t: "line", x1: P[i][0], y1: P[i][1], x2: P[(i + 1) % 4][0], y2: P[(i + 1) % 4][1] }));
     },
   },
   slot: {
@@ -4074,7 +4982,7 @@ const TOOLS = {
     pickEnt: true,
     hint: n => (n ? "Second line or arc, on the side to keep" : "First line or arc, on the side to keep") +
       (SK.filletR === null || SK.filletR === undefined ? " (radius automatic; type a radius to set it)" : ` (radius ${fmtN(SK.filletR)}; 0 gives a sharp corner between lines)`),
-    value(v) { if (v >= 0) { SK.filletR = PARAM.fillet = v; updateHint(); } },
+    value(v) { if (v >= 0) { SK.filletR = FILLET.r = PARAM.fillet = v; updateHint(); filletForm(); } },
     click(sn, ev, hit) {
       hit = solidHit(hit, SK.mouse.p);
       if (!hit || !["line", "arc", "circle", "spline", "ellipse", "conic"].includes(hit.t)) return msg("Fillet: click a line, an arc, a spline, an ellipse or a conic", true);
@@ -4289,7 +5197,6 @@ function setDimValue(d, v, first) {
     if (isFinite(k) && k > 0) d.off = mul(d.off, k);
   }
   changed(true);
-  if (ok) fitIfNeeded();
 }
 
 function previewEnts() {
@@ -4362,7 +5269,7 @@ async function setTool(name) {
   if (!t) return;
   if (name === "p3g") { SK.tool = name; SK.pick = []; document.querySelectorAll("#tab-sketch [data-tool]").forEach(b => b.classList.toggle("active", b.dataset.tool === name)); $("#sk-canvas").classList.remove("select"); pprofForm(); updateHint(); overlay(); return; }
   if (name === "fillet") {
-    SK.filletR = null;                    // automatic radius until a value is typed
+    SK.filletR = FILLET.r;                // null: automatic radius from the clicks
     const lines = selected().es.filter(e => e.t === "line"), la = selected().es.filter(e => e.t === "line" || e.t === "arc");
     if (selectedEntityIds().length === 2 && lines.length === 2) { applyCorner(name, lines[0], lines[1]); return; }
     if (selectedEntityIds().length === 2 && la.length === 2) { applyCurveFillet(la[0], la[1]); return; }
@@ -4394,6 +5301,8 @@ async function setTool(name) {
   updateHint();
   overlay();
   if (name === "slot") slotForm();
+  if (name === "fillet") filletForm();
+  if (name === "spline" || name === "conic") endCondForm();
 }
 // fillet or chamfer of two selected lines; the longer part of each line from the corner is kept
 function applyCorner(name, a, b) {
@@ -4557,14 +5466,15 @@ function bindCanvas(svg) {
       return;
     }
     // double click with the Spline tool: the second click repeats the last point, which ends the spline (TOOLS.spline.click)
+    hidePickList();
     if (SK.tool === "select") {
       const add = e.shiftKey || e.ctrlKey;
-      const gp = gripAt(p);
-      const g = gp ? null : glyphAt(SK.mouse.sx, SK.mouse.sy);
+      const gp = selOn("#sk-fpt") ? gripAt(p) : null;
+      const g = gp || !selOn("#sk-fcon") ? null : glyphAt(SK.mouse.sx, SK.mouse.sy);
       if (g) { toggleSel("c:" + g, add); return; }
-      const dId = dimAt(SK.mouse.sx, SK.mouse.sy);
+      const dId = selOn("#sk-fdim") ? dimAt(SK.mouse.sx, SK.mouse.sy) : null;
       if (dId) { toggleSel("d:" + dId, add, true); SK.drag = { kind: "dim", id: dId, start: p, moved: false }; return; }
-      const hit = entityAt(p);
+      const hit = entityAt(p, selEntOk);
       if (gp && (!hit || hit.id === gp.e || dist(p, gp.p) * SK.view.s < 6 || entById(gp.e).t === "point")) {
         const key = entById(gp.e).t === "point" ? "e:" + gp.e : refKey(gp);
         if (SK.conPick) { toggleSel(key, true); conPickClick(); return; }
@@ -4610,10 +5520,11 @@ function bindCanvas(svg) {
     if (SK.tool === "trim" && SK.trimSweep && (e.buttons & 1)) { trimSweep(p); SK.hover = null; overlay(); return; }
     if (SK.tool === "select") {
       SK.snap = null;
-      const gp = gripAt(p);
-      const g = gp ? null : (glyphAt(SK.mouse.sx, SK.mouse.sy) || dimAt(SK.mouse.sx, SK.mouse.sy));
-      const hit = g || gp ? null : entityAt(p);
+      const gp = selOn("#sk-fpt") ? gripAt(p) : null;
+      const g = gp ? null : ((selOn("#sk-fcon") && glyphAt(SK.mouse.sx, SK.mouse.sy)) || (selOn("#sk-fdim") && dimAt(SK.mouse.sx, SK.mouse.sy)));
+      const hit = g || gp ? null : entityAt(p, selEntOk);
       SK.hover = gp ? { kind: "p", p: gp.p } : hit ? { kind: "e", id: hit.id } : null;
+      schedulePickList();
     } else {
       const t = TOOLS[SK.tool];
       SK.snap = toolSnap(e);
@@ -4652,7 +5563,7 @@ function bindCanvas(svg) {
   if (SK.winUp) window.removeEventListener("mouseup", SK.winUp);
   SK.winUp = e => { if (!svg.contains(e.target) && (SK.pan || SK.drag || SK.win || SK.trimSweep)) up(e); };
   window.addEventListener("mouseup", SK.winUp);
-  svg.addEventListener("mouseleave", () => { SK.snap = null; SK.hover = null; overlay(); });
+  svg.addEventListener("mouseleave", ev => { clearTimeout(SK.plTimer); if (!(ev.relatedTarget && ev.relatedTarget.closest && ev.relatedTarget.closest("#sk-picklist"))) { hidePickList(); SK.snap = null; SK.hover = null; overlay(); } });
 
   svg.addEventListener("dblclick", e => e.preventDefault());
   async function doubleClick(e) {
@@ -4688,7 +5599,7 @@ function windowSelect(w, m) {
   const edges = [[[r[0], r[1]], [r[2], r[1]]], [[r[2], r[1]], [r[2], r[3]]], [[r[2], r[3]], [r[0], r[3]]], [[r[0], r[3]], [r[0], r[1]]]]
     .map(([p, q]) => ({ s: "seg", a: p, b: q }));
   for (const e of visibleEnts()) {
-    if (e.axis) continue;
+    if (e.axis || !selEntOk(e)) continue;
     const bb = bbox(e);
     const inside = bb[0] >= r[0] && bb[2] <= r[2] && bb[1] >= r[1] && bb[3] <= r[3];
     let take = inside;
@@ -4698,7 +5609,7 @@ function windowSelect(w, m) {
     }
     if (take) SK.sel.add("e:" + e.id);
   }
-  for (const h of SK.dimHits) {
+  if (selOn("#sk-fdim")) for (const h of SK.dimHits) {
     const d = SK.doc.dims.find(x => x.id === h.id);
     const a2 = resolveDim(d);
     if (a2 && a2.pos[0] >= r[0] && a2.pos[0] <= r[2] && a2.pos[1] >= r[1] && a2.pos[1] <= r[3]) SK.sel.add("d:" + h.id);
@@ -4786,11 +5697,24 @@ function holdNeighbours(id) {
   return out;
 }
 
+/** Drag: the dragged points are pulled towards the cursor (weak residuals), then the constraints and driving
+ *  dimensions are solved again from that position without the pull, so the geometry moves only in its free
+ *  directions (a fully constrained sketch stays in place). */
 function solveDrag(extra) {
   extra.forEach(c => { if (!c.tag) c.tag = "drag"; });
+  const before = SK.doc.entities.map(e => JSON.stringify(e));
   const S = buildSystem(extra);
   const res = S.solve(30);
   S.write(res.x);
+  const S2 = buildSystem();
+  if (!S2.res.length) return;
+  const r2 = S2.solve(30);
+  if (r2.ok) S2.write(r2.x);
+  else {
+    // the constraints cannot be met from the dragged position: the geometry stays where it was
+    SK.doc.entities = before.map(t => JSON.parse(t));
+    reindex();
+  }
 }
 
 function endDrag() {
@@ -4910,7 +5834,7 @@ window.SHORTCUTS.push({ tab: "Sketch", rows: () => activeKeys().map(k => [keyLab
   .concat([["Esc", "End / cancel, then Select"], ["Delete", "Delete"], ["Ctrl+Z / Ctrl+Y", "Undo / Redo"]]) });
 function runAction(a) {
   if (a.startsWith("tool:")) return setTool(a.slice(5));
-  if (a.startsWith("con:")) return applyConstraint(a.slice(4));
+  if (a.startsWith("con:")) return requestConstraint(a.slice(4));
   switch (a) {
     case "construction": return toggleConstruction();
     case "delete": return deleteSelection();
@@ -4933,7 +5857,7 @@ function onKey(e) {
   if ((e.ctrlKey || e.metaKey) && k.toLowerCase() === "y") { e.preventDefault(); redoOp(); return; }
   if ((e.ctrlKey || e.metaKey) && (k === "Enter" || k.toLowerCase() === "e") && SK.partEdit) { e.preventDefault(); endPartEdit(true); return; }
   if (e.ctrlKey || e.metaKey || e.altKey) return;
-  if (k === "Escape") { closeMenu(); escape(); return; }
+  if (k === "Escape") { closeMenu(); hidePickList(); escape(); return; }
   if (k === "Enter" && SK.tool === "spline" && SK.pick.length >= 2) { e.preventDefault(); TOOLS.spline.finish(false); return; }
   if (k === "Enter" && SK.tool === "conic" && SK.pick.length === 3) { e.preventDefault(); TOOLS.conic.make(0.5); return; }
   if (k === "Enter" && SK.tool === "imglens") { e.preventDefault(); TOOLS.imglens.enter(); return; }
@@ -5161,7 +6085,7 @@ async function editDimValue(d, initial, first) {
 
 const TYPE_NAMES = { line: "Line", circle: "Circle", arc: "Arc", point: "Point", poly: "Polyline", text: "Text", ellipse: "Ellipse", spline: "Spline", conic: "Conic" };
 const CON_NAMES = { coincident: "Coincident", horizontal: "Horizontal", vertical: "Vertical", parallel: "Parallel", perpendicular: "Perpendicular",
-                    tangent: "Tangent", equal: "Equal", pointon: "Point on object", midpoint: "Midpoint", concentric: "Concentric",
+                    tangent: "Tangent", curvature: "Curvature (G2)", equal: "Equal", pointon: "Point on object", midpoint: "Midpoint", concentric: "Concentric",
                     symmetric: "Symmetric", fix: "Fix" };
 const STD_LT = ["Continuous", "DASHED", "HIDDEN", "CENTER", "PHANTOM", "DASHDOT", "DOT"];
 
@@ -5239,7 +6163,7 @@ function entProps(e) {
     const trimmed = e.t0 !== undefined || e.t1 !== undefined, rho = e.rho === undefined ? 0.5 : e.rho;
     const kind = Math.abs(rho - 0.5) < 1e-9 ? "parabola" : rho < 0.5 ? "ellipse" : "hyperbola";
     geo = `<p class="hint">Conic section (${kind})${trimmed ? ", trimmed to the parameter range " + fmtN(conicRange(e)[0], 3) + " to " + fmtN(conicRange(e)[1], 3) : ""}. Rho 0.5: parabola, below 0.5: ellipse, above 0.5: hyperbola. Constraints and dimensions use the start, the end and the tangent intersection; tangent constraints hold the end directions.</p>` + (trimmed ? `<button type="button" id="skp-untrim" class="small">Restore the whole conic</button>` : "") +
-          `<div class="grid2">${numField("skp-x0", "Start x", e.x0)}${numField("skp-y0", "Start y", e.y0)}${numField("skp-x1", "End x", e.x1)}${numField("skp-y1", "End y", e.y1)}${numField("skp-xt", "Tangent intersection x", e.xt)}${numField("skp-yt", "Tangent intersection y", e.yt)}${numField("skp-rho", "Rho", rho)}</div>`;
+          `<div class="grid2">${numField("skp-x0", "Start x", e.x0)}${numField("skp-y0", "Start y", e.y0)}${numField("skp-x1", "End x", e.x1)}${numField("skp-y1", "End y", e.y1)}${numField("skp-xt", "Tangent intersection x", e.xt)}${numField("skp-yt", "Tangent intersection y", e.yt)}${numField("skp-rho", "Rho", rho)}</div>` + endCondHtml(e);
   } else if (e.t === "text") {
     geo = `<label>Text<textarea id="skp-text" rows="3">${esc(e.text)}</textarea></label><div class="grid2">${numField("skp-x", "x", e.x)}${numField("skp-y", "y", e.y)}${numField("skp-h", "Height", e.h)}${numField("skp-rot", "Rotation (deg)", e.rot || 0)}</div>`;
   } else if (e.t === "poly" && e.pprof) {
@@ -5252,8 +6176,9 @@ function entProps(e) {
   } else if (e.t === "spline") {
     const trimmed = e.t0 !== undefined || e.t1 !== undefined;
     let cf = null;
-    geo = `<p class="hint">Cubic spline through ${e.pts.length} fit points${trimmed ? ", trimmed to the parameter range " + fmtN(splineRange(e)[0], 3) + " to " + fmtN(splineRange(e)[1], 3) : ""}. Drag a fit point to change the shape. Constraints and dimensions use the fit points; tangent constraints hold the end directions.</p>` + (trimmed ? `<button type="button" id="skp-untrim" class="small">Restore the whole spline</button>` : "") + `<label class="check"><input type="checkbox" id="skp-closed"${e.closed ? " checked" : ""}> Closed</label>` +
+    geo = `<p class="hint">Cubic spline through ${e.pts.length} fit points${trimmed ? ", trimmed to the parameter range " + fmtN(splineRange(e)[0], 3) + " to " + fmtN(splineRange(e)[1], 3) : ""}. Drag a fit point to change the shape. Constraints and dimensions use the fit points; tangent constraints hold the end directions.${!e.closed && (e.d0 || e.d1) ? " Clamped end derivative at the " + [e.d0 ? "start" : "", e.d1 ? "end" : ""].filter(Boolean).join(" and ") + "." : ""}</p>` + (trimmed ? `<button type="button" id="skp-untrim" class="small">Restore the whole spline</button>` : "") + `<label class="check"><input type="checkbox" id="skp-closed"${e.closed ? " checked" : ""}> Closed</label>` +
           `<div class="grid2">${e.pts.map((p, i) => numField("skp-sx" + i, "Point " + (i + 1) + " x", p[0]) + numField("skp-sy" + i, "Point " + (i + 1) + " y", p[1])).join("")}</div>` +
+          endCondHtml(e) +
           `<div class="buttons">` + (!e.closed && (cf = fitConic(splinePolyE(e, 8))) ? `<button type="button" id="skp-toconic" class="small" title="Conic through the spline ends with the end tangents of the spline">Convert to conic (deviation ${fmtN(cf.dev, 3)} mm)</button>` : "") +
           `<button type="button" id="skp-explode" class="small" title="One line per sampled segment">Explode to lines</button></div>`;
   } else if (e.t === "poly") {
@@ -5300,13 +6225,15 @@ function entProps(e) {
   } else if (e.t === "conic") {
     const set = (id, k, ok) => { const el = $(id); if (el) el.onchange = () => { const v = val(id); if (isFinite(v) && (!ok || ok(v))) { setCurveVals(e, () => { e[k] = v; }); showProps(); } }; };
     set("#skp-x0", "x0"); set("#skp-y0", "y0"); set("#skp-x1", "x1"); set("#skp-y1", "y1"); set("#skp-xt", "xt"); set("#skp-yt", "yt"); set("#skp-rho", "rho", v => v > 0 && v < 1);
+    bindEndCond(e);
     const ut = $("#skp-untrim"); if (ut) ut.onclick = () => { checkpoint(); delete e.t0; delete e.t1; changed(true); showProps(); };
   } else if (e.t === "text") {
     const set = (id, k) => { $(id).onchange = () => { const v = val(id); if (isFinite(v)) { checkpoint(); e[k] = v; changed(true); } }; };
     set("#skp-x", "x"); set("#skp-y", "y"); set("#skp-h", "h"); set("#skp-rot", "rot");
     $("#skp-text").onchange = () => { checkpoint(); e.text = $("#skp-text").value; changed(true); };
   } else if (e.t === "spline") {
-    $("#skp-closed").onchange = () => { checkpoint(); e.closed = $("#skp-closed").checked; delete e.t0; delete e.t1; changed(true); };
+    $("#skp-closed").onchange = () => { checkpoint(); e.closed = $("#skp-closed").checked; delete e.t0; delete e.t1; if (e.closed) dropEndConds(e); changed(true); };
+    bindEndCond(e);
     const ut = $("#skp-untrim"); if (ut) ut.onclick = () => { checkpoint(); delete e.t0; delete e.t1; changed(true); showProps(); };
     e.pts.forEach((p, i) => {
       const set = (id, c) => { const el = $(id); if (el) el.onchange = () => { const v = val(id); if (isFinite(v)) setCurveVals(e, () => { p[c] = v; }); }; };
@@ -5500,6 +6427,7 @@ function blankSketch(name) {
 }
 
 function loadDoc(doc) {
+  SK.checkFailed = null;
   SK.firstFit = !(doc.entities || []).some(e => !e.axis && e.t !== "text");
   doc.constraints = doc.constraints || [];
   doc.dims = doc.dims || [];
@@ -5568,7 +6496,7 @@ async function refreshList() {
 window.__sketchLoadNamed = async function (name) { const r = await api("/api/sketch/file/" + encodeURIComponent(name)); loadDoc(await r.json()); refreshList(); };
 window.__sketchRefresh = () => refreshList();
 window.__sketchCurrent = () => ({ name: (SK.doc && SK.doc.name) || "" });
-window.__sk = { SK, fitIfNeeded, fit, S, imgShownPx, affApply, showProps };
+window.__sk = { SK, fitIfNeeded, fit, S, imgShownPx, affApply, showProps, setDimValue };
 
 async function loadSaved() {
   const name = $("#sk-list").value;
@@ -6011,11 +6939,11 @@ function imgProps() {
   const f = (k, label, v) => `<label>${label}<input type="text" inputmode="decimal" class="numf" data-ik="${k}" value="${v}"></label>`;
   box.innerHTML = `<p><strong>Image</strong> ${esc(m.name || "")}</p>` +
     `<p class="hint">${esc(m.file)}, ${m.w} x ${m.h} px. Corrections: ${esc(corr)}.${m.cfile ? " Shown: " + esc(m.cfile) + ", " + w + " x " + h + " px." : ""}</p>` +
+    (SK.partEdit && !SK.partEdit.drawing ? `<label class="check" title="The image is drawn on the sketch plane in the 3D view of the Part tab while the sketch is closed"><input type="checkbox" id="skp-i3d"${m.show3d ? " checked" : ""}> Show when the sketch is closed</label>` : "") +
     `<div class="grid2">${f("width", "Width (mm)", fmtN(w * s, 4))}${f("height", "Height (mm)", fmtN(h * s, 4))}` +
     `${f("scale", "Scale (mm/px)", fmtN(s, 6))}${f("rot", "Rotation (deg)", fmtN(imgRot(m), 4))}` +
     `${f("cx", "Centre x", fmtN(c[0], 4))}${f("cy", "Centre y", fmtN(c[1], 4))}</div>` +
     `<label>Opacity<input type="range" id="skp-iop" min="0.1" max="1" step="0.05" value="${m.opacity === undefined ? 0.6 : m.opacity}"></label>` +
-    `<label class="check" title="Part tab: the image is drawn on the sketch plane in the 3D view while the sketch is closed"><input type="checkbox" id="skp-i3d"${m.show3d ? " checked" : ""}> Show when the sketch is closed</label>` +
     `<div class="buttons"><button type="button" data-ia="imgscale" title="Two points on the image and the distance between them">Scale from distance</button>` +
     `<button type="button" data-ia="imgcircle" title="Three points on a circle on the image and its diameter">Scale from circle</button>` +
     `<button type="button" data-ia="imgalign" title="Two points on an image edge that is horizontal or vertical">Align to axis</button>` +
@@ -6043,7 +6971,7 @@ function imgProps() {
     changed(true);
   });
   $("#skp-iop").oninput = e => { m.opacity = +e.target.value; SK.dirty = true; drawImages(); };
-  $("#skp-i3d").onchange = e => { checkpoint(); if (e.target.checked) m.show3d = true; else delete m.show3d; changed(true); };
+  if ($("#skp-i3d")) $("#skp-i3d").onchange = e => { checkpoint(); if (e.target.checked) m.show3d = true; else delete m.show3d; changed(true); };
   box.querySelectorAll("button[data-ia]").forEach(b => b.onclick = () => imgAction(b.dataset.ia));
 }
 
@@ -6694,11 +7622,7 @@ window.sketchShown = function () {
 
 (function bindSketch() {
   document.querySelectorAll("#tab-sketch [data-tool]").forEach(b => b.onclick = () => setTool(b.dataset.tool));
-  document.querySelectorAll("#tab-sketch [data-con]").forEach(b => b.onclick = () => {
-    if (SK.conPick === b.dataset.con) { setConPick(null); return; }
-    if (!SK.sel.size) { if (SK.tool !== "select") setTool("select"); setConPick(b.dataset.con); return; }
-    applyConstraint(b.dataset.con);
-  });
+  document.querySelectorAll("#tab-sketch [data-con]").forEach(b => b.onclick = () => requestConstraint(b.dataset.con));
   $("#sk-new").onclick = () => { if (confirmDiscard()) loadDoc(blankSketch("sketch")); };
   $("#sk-file").onchange = e => { if (e.target.files[0]) importDxfFile(e.target.files[0]); e.target.value = ""; };
   $("#sk-path-open").onclick = importDxfPath;
@@ -6745,7 +7669,7 @@ window.sketchShown = function () {
   document.addEventListener("keydown", onKey);
   window.addEventListener("optionschanged", () => { skKeyTitles(); if (SK.doc) redraw(); });
   $("#sk-axes").onclick = toggleAxes;
-  $("#sk-check").onclick = () => showCheck(sketchCheck());
+  $("#sk-check").onclick = () => { SK.checkFailed = new Set(); showCheck(sketchCheck()); };
   $("#sk-filetoggle").onclick = () => document.querySelector("#tab-sketch .sk-file").classList.toggle("collapsed");
   $("#sk-pattern").onclick = patternForm;
   $("#sk-partfinish").onclick = () => endPartEdit(true);
@@ -6797,5 +7721,5 @@ function applyDimValues(sketch, values) {
 
 // exposed for tests and for app.js / part.js
 Object.assign(window, { SK, S, Minv, redraw, fit, newEnt, reindex, addConstraint, buildSystem, tryDriving, TOOLS,
-                        resolveDim, measure, snapAt, updateDof, changed, selected, applyConstraint, askValue, askText, applyDimValues, cutParams, trimAt, trimConstraint, ents, dimAt, evScreen, ellPt, splinePoly, splinePolyE, PPROF, conicPt, conicTan, conicShoulder, fitConic, convertToConic, showProps, filletParam, cvAdapter, dist, arcPt, unit, solveAll, updateDof, entVals, isSolver, sharedEnd, sketchCheck, fixIssues });
+                        resolveDim, measure, snapAt, updateDof, changed, selected, applyConstraint, askValue, askText, applyDimValues, cutParams, trimAt, trimConstraint, ents, dimAt, evScreen, ellPt, splinePoly, splinePolyE, PPROF, conicPt, conicTan, conicShoulder, fitConic, convertToConic, showProps, filletParam, cvAdapter, dist, arcPt, unit, solveAll, updateDof, entVals, isSolver, sharedEnd, sketchCheck, fixIssues, fixKind, FIX_KINDS, endsWithTangents, endNeighbour, conEnts });
 })();

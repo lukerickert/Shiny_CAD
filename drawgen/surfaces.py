@@ -18,6 +18,9 @@ Surface features (part.py build dispatches here):
    "smooth_angle": deg (default 15)}   loft through sketch curves; with smooth the edges of a section that meet at
    less than smooth_angle are joined into one B-spline (one smooth face instead of one face per segment)
   {"type": "surf_fill", "edges": [edge keys], "tangent": bool}             N-sided patch over a closed loop of edges
+  {"type": "surf_fillet", "mode": "bodies" | "edges", "radius": mm, bodies: "source_a", "source_b", "flip_a",
+   "flip_b", "trim": bool (default true); edges: "source", "edges": [edge keys]}   rolling-ball fillet between two
+   surface bodies (trimmed and sewn into one body), or rounded edges of one surface body
   {"type": "surf_offset", "source": feature id, "distance": mm}            offset of a surface body
   {"type": "surf_sew", "sources": [feature ids], "tolerance": mm}          sewn shell of several bodies
   {"type": "surf_import", "path": STEP file, "label": component name | ""}  faces of a STEP file (of the component
@@ -1427,3 +1430,310 @@ def inspect(body, gap_tol=0.1, min_area=0.01, min_edge=0.01):
                "free_length": round(total_free, 3), "area": round(body.area, 3), "valid": valid, "shells": len(closed), "closed_shells": sum(1 for c in closed if c),
                "gaps": sum(1 for x in issues if x["kind"] in ("gap", "pointgap")), "nonmanifold": len(nonman)}
     return {"summary": summary, "issues": issues}
+
+
+# --------------------------------------------------------------------------- surface fillet
+
+def _oriented_surface(face):
+    """Geometric surface of a face and the sign that turns its natural normal into the face normal."""
+    from OCP.BRep import BRep_Tool
+    from OCP.TopAbs import TopAbs_REVERSED
+    return BRep_Tool.Surface_s(face.wrapped), (-1.0 if face.wrapped.Orientation() == TopAbs_REVERSED else 1.0)
+
+
+def _project(surf, p):
+    """(point, u, v, distance) of the projection of p onto the surface, or None."""
+    from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
+    from OCP.gp import gp_Pnt
+    pr = GeomAPI_ProjectPointOnSurf(gp_Pnt(*p), surf)
+    if not pr.NbPoints():
+        return None
+    q = pr.NearestPoint()
+    u, v = pr.LowerDistanceParameters()
+    return (q.X(), q.Y(), q.Z()), u, v, pr.LowerDistance()
+
+
+def _inside(face, surf, uv):
+    from OCP.BRepClass import BRepClass_FaceClassifier
+    from OCP.TopAbs import TopAbs_IN, TopAbs_ON
+    from OCP.gp import gp_Pnt2d
+    u, v = uv
+    us = [u + k * surf.UPeriod() for k in (-1, 0, 1)] if surf.IsUPeriodic() else [u]
+    vs = [v + k * surf.VPeriod() for k in (-1, 0, 1)] if surf.IsVPeriodic() else [v]
+    return any(BRepClass_FaceClassifier(face.wrapped, gp_Pnt2d(a, b), 1e-6).State() in (TopAbs_IN, TopAbs_ON)
+               for a in us for b in vs)
+
+
+def _closest_faces(ba, bb):
+    """The faces of the two bodies nearest to each other."""
+    best = None
+    for fa in ba.faces():
+        for fb in bb.faces():
+            d = fa.distance_to(fb)
+            if best is None or d < best[0]:
+                best = (d, fa, fb)
+    return best[1], best[2]
+
+
+def _default_side(face, other):
+    """+1 when the other body lies mostly along the face normal, else -1."""
+    c = other.center()
+    p = face.center()
+    n = face.normal_at(p)
+    return 1.0 if (c - p).dot(n) >= 0 else -1.0
+
+
+def _interp_closed(pts):
+    """Periodic cubic B-spline through the points (the first point not repeated)."""
+    from OCP.GeomAPI import GeomAPI_Interpolate
+    from OCP.gp import gp_Pnt
+    try:
+        from OCP.TColgp import TColgp_HArray1OfPnt as HArr
+    except ImportError:
+        from OCP.collections import HArray1_gp_Pnt as HArr
+    a = HArr(1, len(pts))
+    for i, p in enumerate(pts):
+        a.SetValue(i + 1, gp_Pnt(*p))
+    it = GeomAPI_Interpolate(a, True, 1e-7)
+    it.Perform()
+    if not it.IsDone():
+        raise ValueError("closed fillet curve failed")
+    return it.Curve()
+
+
+def _interp(pts):
+    from OCP.GeomAPI import GeomAPI_PointsToBSpline
+    from OCP.GeomAbs import GeomAbs_C2
+    from OCP.gp import gp_Pnt
+    try:
+        from OCP.TColgp import TColgp_Array1OfPnt as Arr
+    except ImportError:
+        from OCP.collections import Array1_gp_Pnt as Arr
+    a = Arr(1, len(pts))
+    for i, p in enumerate(pts):
+        a.SetValue(i + 1, gp_Pnt(*p))
+    return GeomAPI_PointsToBSpline(a, 3, 8, GeomAbs_C2, 1e-6).Curve()
+
+
+def fillet_faces(fa, fb, r, sa, sb, n=48):
+    """Rolling-ball fillet of radius r between the faces fa and fb, the ball on side sa of fa and sb of fb
+    (+1 along the face normal). Returns (fillet face, contact curve on fa, contact curve on fb) as build123d
+    shapes; the spine is the intersection of the two offset surfaces, the fillet a pipe of radius r along it
+    between the contact curves."""
+    from OCP.Geom import Geom_OffsetSurface
+    from OCP.GeomAPI import GeomAPI_IntSS
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+    from build123d import Edge
+    ga, ka = _oriented_surface(fa)
+    gb, kb = _oriented_surface(fb)
+    oa = Geom_OffsetSurface(ga, sa * ka * r)
+    ob = Geom_OffsetSurface(gb, sb * kb * r)
+    inter = GeomAPI_IntSS(oa, ob, 1e-7)
+    if not inter.IsDone() or inter.NbLines() == 0:
+        raise ValueError("the faces have no fillet of radius %g on these sides (the offset surfaces do not meet; "
+                         "try Flip or a smaller radius)" % r)
+    best = None
+    for i in range(1, inter.NbLines() + 1):
+        cu = inter.Line(i)
+        t0, t1 = cu.FirstParameter(), cu.LastParameter()
+        if abs(t0) > 1e50 or abs(t1) > 1e50:
+            # an infinite line (two planes): bounded to the size of the faces
+            big = 2 * (fa.bounding_box().diagonal + fb.bounding_box().diagonal) + 10
+            t0, t1 = max(t0, -big), min(t1, big)
+        # the part of the spine whose contact points lie on both faces
+        def good(t):
+            p = cu.Value(t)
+            pa = _project(ga, (p.X(), p.Y(), p.Z()))
+            pb = _project(gb, (p.X(), p.Y(), p.Z()))
+            return (pa is not None and pb is not None and abs(pa[3] - r) < 1e-3 * max(r, 1) + 1e-6 and
+                    abs(pb[3] - r) < 1e-3 * max(r, 1) + 1e-6 and _inside(fa, ga, pa[1:3]) and _inside(fb, gb, pb[1:3]))
+        rows = [(good(t), t, None, None) for t in (t0 + (t1 - t0) * k / n for k in range(n + 1))]
+        runs, cur = [], []
+        for row in rows:
+            if row[0]:
+                cur.append(row)
+            elif cur:
+                runs.append(cur)
+                cur = []
+        if cur:
+            runs.append(cur)
+        for run in runs:
+            if len(run) >= 2 and (best is None or len(run) > len(best[1])):
+                # the ends of the run moved to the face boundaries (bisection to the neighbouring samples)
+                i0 = rows.index(run[0])
+                i1 = rows.index(run[-1])
+                lo, hi = run[0][1], run[-1][1]
+                if i0 > 0:
+                    a, b = rows[i0 - 1][1], lo
+                    for _ in range(40):
+                        mid = 0.5 * (a + b)
+                        a, b = (a, mid) if good(mid) else (mid, b)
+                    lo = b
+                if i1 < len(rows) - 1:
+                    a, b = hi, rows[i1 + 1][1]
+                    for _ in range(40):
+                        mid = 0.5 * (a + b)
+                        a, b = (mid, b) if good(mid) else (a, mid)
+                    hi = a
+                best = (cu, run, lo, hi)
+    if best is None:
+        raise ValueError("the fillet does not touch both faces (radius %g; try Flip or a smaller radius)" % r)
+    cu, run, ta, tb = best
+    closed = len(run) == n + 1 and cu.IsClosed() and cu.Value(cu.FirstParameter()).Distance(cu.Value(cu.LastParameter())) < 1e-7
+    m = max(24, len(run) * 2)
+    if closed:
+        # a fillet all the way round (a plane and a cylinder, a cone): two halves (no seam edge)
+        t0, t1 = cu.FirstParameter(), cu.LastParameter()
+        tm = 0.5 * (t0 + t1)
+        f1, a1, b1 = _arc_patch(cu, t0, tm, ga, gb, r, m // 2)
+        f2, a2, b2 = _arc_patch(cu, tm, t1, ga, gb, r, m // 2)
+        return [f1, f2], [a1, a2], [b1, b2]
+    face, _, _ = _arc_patch(cu, ta, tb, ga, gb, r, m)
+    # trimming curves: the contact curves extended a little beyond the face boundaries
+    ext = 0.02 * (tb - ta)
+    pts_a, pts_b = [], []
+    for k in range(m + 1):
+        p = cu.Value(ta - ext + (tb - ta + 2 * ext) * k / m)
+        p = (p.X(), p.Y(), p.Z())
+        qa, qb = _project(ga, p), _project(gb, p)
+        if qa is None or qb is None:
+            continue
+        pts_a.append(qa[0])
+        pts_b.append(qb[0])
+    ea = Edge(BRepBuilderAPI_MakeEdge(_interp(pts_a)).Edge())
+    eb = Edge(BRepBuilderAPI_MakeEdge(_interp(pts_b)).Edge())
+    return [face], [ea], [eb]
+
+
+def _arc_patch(cu, ta, tb, ga, gb, r, m, nu=9):
+    """Fillet patch along the spine cu from ta to tb: at each spine point the circular arc of radius r from the
+    contact point on surface A to the one on surface B (the shorter arc), fitted with a B-spline surface. Returns
+    (face, contact edge A, contact edge B); the contact edges are the boundary curves of the face."""
+    from OCP.GeomAPI import GeomAPI_PointsToBSplineSurface
+    from OCP.GeomAbs import GeomAbs_C2
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace, BRepBuilderAPI_MakeEdge
+    import numpy as np
+    from OCP.gp import gp_Pnt
+    from build123d import Face, Edge
+    try:
+        from OCP.TColgp import TColgp_Array2OfPnt as Arr2
+    except ImportError:
+        from OCP.collections import Array2_gp_Pnt as Arr2
+    pts = Arr2(1, nu, 1, m + 1)
+    for k in range(m + 1):
+        q = cu.Value(ta + (tb - ta) * k / m)
+        P = np.array([q.X(), q.Y(), q.Z()])
+        A = np.array(_project(ga, tuple(P))[0]) - P
+        B = np.array(_project(gb, tuple(P))[0]) - P
+        th = math.acos(max(-1.0, min(1.0, float(A @ B) / (np.linalg.norm(A) * np.linalg.norm(B)))))
+        for j in range(nu):
+            s = j / (nu - 1)
+            if th < 1e-9:
+                X = P + A
+            else:
+                X = P + (math.sin((1 - s) * th) * A + math.sin(s * th) * B) / math.sin(th)
+            pts.SetValue(j + 1, k + 1, gp_Pnt(*X))
+    sf = GeomAPI_PointsToBSplineSurface(pts, 3, 8, GeomAbs_C2, 1e-6).Surface()
+    u0, u1, v0, v1 = sf.Bounds()
+    face = Face(BRepBuilderAPI_MakeFace(sf, u0, u1, v0, v1, 1e-6).Face())
+    ea = Edge(BRepBuilderAPI_MakeEdge(sf.UIso(u0)).Edge())
+    eb = Edge(BRepBuilderAPI_MakeEdge(sf.UIso(u1)).Edge())
+    return face, ea, eb
+
+
+def _trim_at(face, edges, centre_side):
+    """The face split by the contact edges; the pieces on the far side of the corner kept. centre_side(p) > 0 for
+    points between the contact curve and the corner."""
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Splitter
+    from build123d import Shape
+    args, tools = _shape_list(), _shape_list()
+    args.Append(face.wrapped)
+    for e in edges:
+        tools.Append(e.wrapped)
+    op = BRepAlgoAPI_Splitter()
+    op.SetArguments(args)
+    op.SetTools(tools)
+    op.Build()
+    if not op.IsDone():
+        raise ValueError("the face could not be trimmed at the fillet")
+    pieces = list(Shape.cast(op.Shape()).faces())
+    keep = [pc for pc in pieces if centre_side(_point_on(pc)) <= 0]
+    if not keep or len(keep) == len(pieces):
+        raise ValueError("the fillet does not cut the face across (extend the face or use a smaller radius)")
+    return keep
+
+
+def fillet(shape, bodies, f, find_edges):
+    """Surface fillet. "mode": "bodies": rolling-ball fillet of "radius" between the surface bodies "source_a" and
+    "source_b" (their nearest faces), the ball on the side of each face facing the other ("flip_a", "flip_b"
+    turn it); "trim": the bodies trimmed at the contact curves and sewn with the fillet into one body (else the
+    fillet alone). "edges": the edges "edges" of the surface body "source" rounded with "radius"."""
+    from build123d import Shape, Vector
+    r = float(f.get("radius") or 0)
+    if r <= 0:
+        raise ValueError("radius must be > 0")
+    if f.get("mode") == "edges":
+        from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet
+        body = (bodies or {}).get(f.get("source"))
+        if body is None:
+            raise ValueError("choose the surface body")
+        edges = find_edges(body, f.get("edges") or [])
+        if not edges:
+            raise ValueError("pick the edges to round")
+        mk = BRepFilletAPI_MakeFillet(body.wrapped)
+        for e in edges:
+            mk.Add(r, e.wrapped)
+        try:
+            mk.Build()
+        except Exception:
+            pass
+        if not mk.IsDone():
+            raise ValueError("the fillet of radius %g failed on these edges (the edges must join two faces of the "
+                             "body; a smaller radius can work)" % r)
+        res = Shape.cast(mk.Shape())
+        res._kind = "%d edge(s) rounded" % len(edges)
+        return res
+    ba, bb = (bodies or {}).get(f.get("source_a")), (bodies or {}).get(f.get("source_b"))
+    if ba is None or bb is None:
+        raise ValueError("choose surface A and surface B")
+    fa, fb = _closest_faces(ba, bb)
+    sa = _default_side(fa, bb) * (-1 if f.get("flip_a") else 1)
+    sb = _default_side(fb, ba) * (-1 if f.get("flip_b") else 1)
+    try:
+        faces, eas, ebs = fillet_faces(fa, fb, r, sa, sb)
+    except ValueError as e:
+        if f.get("flip_a") or f.get("flip_b"):
+            raise
+        # the sides facing each other give no fillet (for example a face that curves away): the other sides
+        for ta, tb in ((sa, -sb), (-sa, sb), (-sa, -sb)):
+            try:
+                faces, eas, ebs = fillet_faces(fa, fb, r, ta, tb)
+                break
+            except ValueError:
+                continue
+        else:
+            raise e
+    if not f.get("trim", True):
+        res = faces[0] if len(faces) == 1 else _sew(faces, max(1e-4, r * 1e-3))
+        res._kind = "fillet face"
+        return res
+
+    def side_fn(fc, es, other_face):
+        # positive towards the corner: along the face, from the contact curve towards the other face
+        def g(p):
+            p = Vector(*p) if not hasattr(p, "X") else p
+            e, t = min(((e, k / 32) for e in es for k in range(33)), key=lambda x: (x[0].position_at(x[1]) - p).length)
+            c = e.position_at(t)
+            n = fc.normal_at(c)
+            tan = e.tangent_at(t)
+            d = n.cross(tan)
+            towards = (other_face.distance_to(c + d * (r * 0.1)) < other_face.distance_to(c - d * (r * 0.1)))
+            return (p - c).dot(d) * (1 if towards else -1)
+        return g
+    ka = _trim_at(fa, eas, side_fn(fa, eas, fb))
+    kb = _trim_at(fb, ebs, side_fn(fb, ebs, fa))
+    others = [x for x in ba.faces() if not x.wrapped.IsSame(fa.wrapped)] + \
+             [x for x in bb.faces() if not x.wrapped.IsSame(fb.wrapped)]
+    res = _sew(ka + kb + faces + others, max(1e-4, r * 1e-3))
+    res._kind = "fillet between the surfaces, trimmed and sewn (%d faces)" % len(res.faces())
+    return res
