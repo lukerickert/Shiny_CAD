@@ -246,5 +246,22 @@
   "options": {
     "units": "mm",
     "keys": "default"
-  }
+  },
+  "recent_roots": [
+    {
+      "path": "C:\\Users\\ricke\\Documents\\000000000000_ORG_STRUCTURE\\BUSINESS\\VISE\\LITA_CAD\\WHEEL_COVER",
+      "used": "2026-10-25 09:32",
+      "project": "STL_IMPORT"
+    },
+    {
+      "path": "C:\\Users\\ricke\\Documents\\000000000000_ORG_STRUCTURE\\BUSINESS\\VISE\\LITA_CAD\\VISE",
+      "used": "2026-10-25 09:22",
+      "project": ""
+    },
+    {
+      "path": "C:\\Users\\ricke\\Documents\\000000000000_ORG_STRUCTURE\\BUSINESS\\GENERAL_WORKING",
+      "used": "2026-10-25 09:08",
+      "project": "GATE"
+    }
+  ]
 }

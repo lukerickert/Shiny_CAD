@@ -452,3 +452,54 @@ def test_document_move_and_copy_to_project(client, web):
     assert os.path.isfile(os.path.join(src, "work", "stay_asm.asm.json"))
     bad = client.post("/api/project/doc", json={"op": "copy_to", "type": "assembly", "name": "stay_asm", "project": "other_pj"})
     assert bad.status_code >= 400 and "exists in project other_pj" in bad.get_data(as_text=True)
+
+
+def test_recent_projects_folders(client, web, tmp_path):
+    """Projects folders are remembered with the project last opened in each (newest first)."""
+    root0, cur0 = web.PROJECTS.root(), web.PROJECTS.current_name()
+    other = str(tmp_path / "other_root")
+    try:
+        ok(client.put("/api/projects/root", json={"path": other}))
+        ok(client.post("/api/projects", json={"name": "rb", "description": "", "open": True}))
+        ok(client.put("/api/projects/root", json={"path": root0}))
+        j = ok(client.post("/api/projects/open", json={"name": cur0}))
+        rr = j["recent_roots"]
+        assert os.path.normcase(rr[0]["path"]) == os.path.normcase(root0) and rr[0]["project"] == cur0
+        o = next(r for r in rr if os.path.normcase(r["path"]) == os.path.normcase(other))
+        assert o["project"] == "rb" and o["projects"] == 1 and o["exists"]
+    finally:
+        web.PROJECTS.set_root(root0)
+        web.PROJECTS.open(cur0)
+
+
+def test_projects_scan_known_open_path(client, web, tmp_path):
+    """Find projects lists the projects in subfolders; they open by path and can be removed from the list."""
+    root0, cur0 = web.PROJECTS.root(), web.PROJECTS.current_name()
+    base = tmp_path / "base"
+    for sub in ("a/p1", "b/c/p2"):
+        d = base / sub
+        (d / "work").mkdir(parents=True)
+        (d / "project.json").write_text(json.dumps({"name": d.name, "description": "d " + d.name}), encoding="utf-8")
+    (base / "a" / "p1" / "work" / "x.part.json").write_text("{}", encoding="utf-8")
+    p1, p2 = str(base / "a" / "p1"), str(base / "b" / "c" / "p2")
+    key = os.path.normcase
+    try:
+        j = ok(client.post("/api/projects/scan", json={"folder": str(base)}))
+        assert sorted(map(key, j["found"])) == sorted(map(key, [p1, p2]))
+        kn = {key(r["path"]): r for r in j["known"]}
+        assert kn[key(p1)]["exists"] and kn[key(p1)]["docs"] == 1 and kn[key(p1)]["description"] == "d p1"
+        j = ok(client.post("/api/projects/open", json={"path": p2}))
+        assert key(j["root"]) == key(str(base / "b" / "c")) and j["current"] == "p2"
+        r2 = next(r for r in j["known"] if key(r["path"]) == key(p2))
+        assert r2["current"] and r2["opened"] and [r["name"] for r in j["known"] if r["current"]] == ["p2"]
+        j = ok(client.put("/api/projects/root", json={"path": p1}))
+        assert key(j["root"]) == key(str(base / "a")) and j["current"] == "p1"
+        j = ok(client.post("/api/projects/forget", json={"path": p2}))
+        assert key(p2) not in {key(r["path"]) for r in j["known"]}
+        assert client.post("/api/projects/scan", json={"folder": str(tmp_path / "none")}).status_code >= 400
+        assert client.post("/api/projects/open", json={"path": str(base / "a")}).status_code >= 400
+    finally:
+        web.PROJECTS.set_root(root0)
+        web.PROJECTS.open(cur0)
+        web.PROJECTS.forget(p1)
+        web.PROJECTS.forget(p2)

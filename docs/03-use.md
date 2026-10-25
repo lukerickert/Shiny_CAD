@@ -30,6 +30,8 @@ With **Auto** sheet size the smallest sheet from A4 to A0 is used where the scal
 
 Path fields (**Folder or STEP file path on this PC**, **Output folder**, the **Folder** fields of the **Sketches** pane and the Part and Assembly tabs, **DXF path**, **STEP file path** of **Import STEP**) have a **…** button that opens the Windows file or folder dialog on this PC; **Add STEP** in the Assembly tab opens it directly. The dialog needs tkinter, which is part of the python.org installation.
 
+**Search ⌕** at the right end of the tab bar, or Ctrl+K, opens the command search. It lists the buttons of all tabs whose text, tooltip, tab or menu name, or other name (for example `stl` for **Import STEP**, `array` for **Pattern**, `pocket` for **Cut**) contain every typed word, best match first, with the tab and menu and the tooltip. Up and Down select, Enter or a click runs the command in its tab, Esc or a click outside closes the window. A command that is not available in the current state is shown dimmed and is not run.
+
 The status line in the header is one line; a longer message is cut off and its full text is the tooltip.
 
 ## 3.1 Options

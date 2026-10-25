@@ -5,10 +5,10 @@
 | File | Function |
 |---|---|
 | `start.bat` | Creates the environment on first start and starts the server |
-| `run.py` | Starts the server and the worker processes |
+| `run.py` | Starts the server and the worker processes; `--open <file>` opens a document file ([section 2.2](#22-document-files)) |
 | `config.json` | Defaults: sheet, scale, views, line widths, sheet sizes, frame, title block layout and field values, options |
-| `config.local.json` | Settings of this PC: projects folder, open project, Explicit settings, browser command, CalculiX path. Created at the first change; settings of this PC found in `config.json` (older versions) are moved here at start. Not in the repository |
-| `publish.bat` | Publishes the program folder to GitHub ([section 2.2](#22-publishing-to-github)) |
+| `config.local.json` | Settings of this PC: projects folder, open project, recent projects folders, known projects (**All projects**), Explicit settings, browser command, CalculiX path. Created at the first change; settings of this PC found in `config.json` (older versions) are moved here at start. Not in the repository |
+| `publish.bat` | Publishes the program folder to GitHub ([section 2.3](#23-publishing-to-github)) |
 | `requirements.txt` | Python packages |
 | `logo.png` | Logo of the title block |
 | `solvers/` | Solver packages: PrePoMax (CalculiX) and OpenCourant, unpacked here ([section 1.1](01-installation.md#11-solvers)); `solvers/README.txt` |
@@ -41,9 +41,11 @@
 | `drawgen/explicit/` | Explicit tab ([section 13](13-explicit.md#13-explicit)): `routes.py` server requests, `host.py` settings, console and status board, `build.py` deck build, `materials.py` material, failure and time step cards, `runs.py` run folders and settings report, `solve.py` local and remote runs, `post.py` post-processing, `constants.py` material library and modes, `modes.py` analysis types, `scripts.py` ParaView scripts, `model_inp.py` .inp of the ShinyCAD geometry, `meshview.py` mesh view data and .inp and VTK readers, `results.py` frames and fields, `inp2rad.py` and `inp2rad_run.py` .inp to .rad converter, `inp_to_linear.py` second-order to first-order elements, `inertia_calc.py` concentrated mass from primitives, `deck.py` deck generator source (check, model .inp, STEP and part), `deck_mesh.py` and `deck_stepgen.py` DECK_GENERATOR mesh and geometry |
 | `drawgen/femesh.py` | Analysis mesh of the bodies and plates (gmsh) |
 | `drawgen/projects.py` | Projects: folders, documents, versions, states ([section 2.1](#21-projects)) |
+| `drawgen/packages.py` | Document files (.scpart, .scasm, ...): writing, reading, synchronisation with `work/` ([section 2.2](#22-document-files)) |
+| `drawgen/fileassoc.py` | Windows file types of the document files ([section 2.2](#22-document-files)) |
 | `drawgen/dialogs.py` | Windows file and folder dialogs (tkinter) |
 | `drawgen/static/index.html`, `style.css` | Web interface |
-| `drawgen/static/app.js` | Models, settings, preview, tabs, File menus of the Part and Assembly tabs |
+| `drawgen/static/app.js` | Models, settings, preview, tabs, File menus of the document tabs, **Open file…** and **Save as file…** |
 | `drawgen/static/annotate.js` | Drawings tab: dimensions, notes, balloons, detail views |
 | `drawgen/static/project.js` | Project tab |
 | `drawgen/static/sketch.js` | Sketch editor and constraint solver: **Sketches** pane, sketches on drawings, feature sketches of the Part tab |
@@ -53,6 +55,7 @@
 | `drawgen/static/explicit.js` | Explicit tab |
 | `drawgen/static/reference.js`, `refdiagrams.js` | Thread and hole reference tables and profile diagrams |
 | `drawgen/static/icons.js` | Toolbar icons |
+| `drawgen/static/cmdsearch.js` | Command search ([section 3](03-use.md#3-use)) |
 | `drawgen/static/navcube.js`, `axes.js` | Navigation cube and coordinate axes of the 3D views |
 | `run_tests.bat`, `tests/` | Automatic tests ([section 14](14-tests.md#14-tests)) |
 | `drawgen/static/vendor/` | three.js 0.160.0 (MIT licence, `three.LICENSE`) and `TumbleControls.js` for the 3D views |
@@ -67,7 +70,8 @@ The **Project** tab is the first tab. A project is a folder under the projects f
 | Folder | Content |
 |---|---|
 | `project.json` | Name, description, creation date, document versions and notes |
-| `work/` | The working documents: `<name>.part.json`, `<name>.sketch.json`, `<name>.asm.json`, `<name>.fea.json`, `<name>.exp.json` |
+| `<name>.scpart`, `<name>.scasm`, `<name>.scsketch`, `<name>.scfea`, `<name>.scexp` | Document files of the parts, assemblies, sketches, analyses and explicit analyses ([section 2.2](#22-document-files)) |
+| `work/` | The working documents: `<name>.part.json`, `<name>.sketch.json`, `<name>.asm.json`, `<name>.fea.json`, `<name>.exp.json`; `work/.packages.json` records the state of the document files at the last synchronisation |
 | `work/annotations/` | Dimensions, notes and view layouts of the drawings |
 | `work/images/` | Reference images of the sketches and their corrected files `<image>_c<key>.png` / `.jpg` ([section 9.5](09-sketch.md#95-images)) |
 | `drawings/` | Exported PDF, DXF, SVG and FCStd files (the default output folder of **Export** when the folder field is empty) |
@@ -81,18 +85,65 @@ The **Project** tab is the first tab. A project is a folder under the projects f
 
 | Control | Function |
 |---|---|
-| **Projects folder**, **…**, **Set** | The folder that holds the projects |
+| **Projects folder**, **…**, **Set** | The folder that holds the projects. A project folder (a folder with `project.json`) entered here sets its parent folder as the projects folder and opens the project |
+| **Recent folders** | The last 10 projects folders used, newest first, each with the number of projects in it and the project last opened there (**last**). Choosing one sets it as the projects folder and opens that project. A folder that no longer exists is shown as (not found) and cannot be chosen |
+| **All projects** | Every project known on this PC, in any folder: the projects of each projects folder used, the projects opened, and the projects found by **Find projects**. Columns **Project**, **Folder** (full path as tooltip), **Description**, **Documents**, **Last change** (newest document in `work/`) and **Last opened**; a click on a heading sorts by that column, a second click reverses (the order is kept in this browser). The open project is marked (open). A project whose folder no longer exists is shown as not found. **Open** sets the parent folder of the project as the projects folder and opens the project. **×** removes the project from the list (the folder is not changed). The list shows 8 rows; **Show all** shows every row. The filter field limits the list to the projects whose name, folder or description contain the text |
+| **Find projects** | Searches the folder in the field next to it (**…** to choose it) and its subfolders, 6 levels deep, for folders with `project.json` and adds them to **All projects**. The folders `work`, `versions`, `trash`, `drawings`, `step`, `step_import`, `analysis`, `explicit`, `states`, hidden folders and links are not searched |
 | **Project**, **Open** | Opens a project. The saved lists of the **Sketches** pane, the Part and Assembly tabs and **Models** follow the open project; `config.local.json` > `current_project` keeps it for the next start |
 | **New…** | Creates and opens a project (name, description) |
 | **Take over existing files…** | Shown while the projects folder has no project: creates a project and moves the parts, sketches, assemblies, stacks and annotations of the program folder into it |
 | **Rename**, **Description**, **Open folder** | Of the open project |
-| **Documents** | All documents of the project: name, type, version, note, date, size, **Uses** (parts of an assembly and the solids of its STEP files, each with the number of components using it as ×N, below the STEP file name; imported STEP files of a part), **Used by** (assemblies using the part, analyses using the part or assembly), **Exports** (files in `drawings/` and `step/` named after the document). **Open** loads the document in its tab; **Rename** (assemblies referencing a renamed part, and analyses referencing a renamed part or assembly, are updated); **Copy** (a part copy gets a new uid and an empty drawing); **Version** stores a numbered snapshot with a note; **Versions…** lists the snapshots with **Restore** (replaces the working file) and **Restore as copy…**; **Move…** moves or copies the document to another project (**Project**, **Move** or **Copy**; its versions, drawing annotations and layouts, sketch images and analysis folders go along; **With the documents it uses**: the parts of an assembly, the part or assembly of an analysis, each moved only when no other document left in the project uses it, else copied; a name that exists in the target project is refused); **×** moves the document to `trash/` |
+| **Documents** | All documents of the project (a click on the **Name**, **Type**, **Version**, **Note**, **Modified** or **Size** heading sorts by that column; a second click reverses; the order is kept in this browser): name, type, version, note, date, size, **File** (the document file in the project folder, its path as tooltip; ↔ and the path of a linked file outside the project, **×** ends the link and leaves the file unchanged), **Uses** (parts of an assembly and the solids of its STEP files, each with the number of components using it as ×N, below the STEP file name; imported STEP files of a part), **Used by** (assemblies using the part, analyses using the part or assembly), **Exports** (files in `drawings/` and `step/` named after the document). **Open** loads the document in its tab; **Rename** (assemblies referencing a renamed part, and analyses referencing a renamed part or assembly, are updated); **Copy** (a part copy gets a new uid and an empty drawing); **Version** stores a numbered snapshot with a note; **Versions…** lists the snapshots with **Restore** (replaces the working file) and **Restore as copy…**; **File…** saves the document as a document file in a folder chosen in the file dialog ([section 2.2](#22-document-files)); **Move…** moves or copies the document to another project (**Project**, **Move** or **Copy**; its versions, drawing annotations and layouts, sketch images and analysis folders go along; **With the documents it uses**: the parts of an assembly, the part or assembly of an analysis, each moved only when no other document left in the project uses it, else copied; a name that exists in the target project is refused); **×** moves the document to `trash/` |
+| **Open file…** | Opens a document file from any folder ([section 2.2](#22-document-files)) |
 | **Exports** | The files in `drawings/`, `step/` and `step_import/`, with buttons that open the folders on this PC |
 | **Project states** | **Save current state** stores which documents are open in the Part, Assembly and Analysis tabs and the **Sketches** pane, the **Models** list with the checked parts, the drawing settings (sheet, scale, mode, views, density) and the active tab. **Load** restores all of it: parts and assemblies are rebuilt from their saved files, STEP files reopened from their paths |
 
 Without an open project the documents are read from and written to the folders of the program: `parts/`, `sketches/`, `assemblies/` and `annotations/`. File locations in the following sections are given for an open project.
 
-## 2.2 Publishing to GitHub
+## 2.2 Document files
+
+Each part, assembly, sketch, analysis and explicit analysis of a project is also stored as one document file in the project folder, next to `project.json`. The file is a zip file:
+
+| Extension | Document |
+|---|---|
+| `.scpart` | Part |
+| `.scasm` | Assembly |
+| `.scsketch` | Sketch |
+| `.scfea` | Analysis |
+| `.scexp` | Explicit analysis |
+
+| Entry in the file | Content |
+|---|---|
+| `shinycad.json` | Format (`shinycad-package`, version 1), type, name, uid, save time |
+| `document.json` | The document (the content of `work/<name>.<type>.json`) |
+| `annotations/` | Dimensions, notes, layouts and drawing sketches of the drawing of the document |
+| `images/` | Sketch images used by the document |
+| `step_import/` | The STEP, STL, IGES and BREP files the document references |
+| `uses/` | Document files of the parts an assembly uses, and of the part or assembly (with its parts) an analysis uses |
+
+Results of analyses (`analysis/`, `explicit/`) and versions (`versions/`) are not in the file.
+
+While the program runs, the document files of the open project are synchronised with `work/` every 2 s. Changes outside the program are also read at **Refresh** of **Documents** and at the opening of the project:
+
+| Change | Result |
+|---|---|
+| A document saved in the program (part, drawing annotations, sketch images) | The document file is written 1 s after the last change |
+| A document file changed outside the program (replaced in Explorer, copied over) | The document is read from the file. When the document was also changed in the program since the last synchronisation, that state is stored as a version with the note "before the change of `<file>` outside the program" |
+| A document file copied into the project folder | A new document named after the file. A file name with characters other than letters, digits, `_`, `-` and `.` is renamed (other characters to `_`). A part that has the uid of another part of the project gets a new uid and its own copy of the drawing. Used documents in `uses/` are added when the project has no document of that name |
+| A document file deleted outside the program | The document is moved to `trash/` |
+| A document renamed, moved to another project or deleted in the program | The document file is renamed, removed, or moved to `trash/` |
+| A project from an earlier version without document files | The document files are written at the first synchronisation |
+
+STEP files referenced from a document file are placed in `step_import/` of the project the file is opened in, and the paths in the document are changed to the local copies. A STEP file of the same name and other content is placed as `<name>_<n>.step`.
+
+| Control | Function |
+|---|---|
+| **Open file…** (Project tab **Documents**, and the **File ▾** menu of the Part, Assembly, Analysis and Explicit tabs) | Opens a document file chosen in the file dialog. A file in a project folder: that project is opened and the document is opened in its tab. A file in another folder: the document is added to the open project under the file name (`<name>_2` when the name exists) and opened in its tab; the document stays linked to the file, and every save in the program writes the file too. A change of the linked file outside the program is read at the next synchronisation. Opening the same file again opens the same document |
+| **Save as file…** (**File ▾** menu), **File…** (Project tab **Documents**) | Saves the document first when it has changes, then writes the document file to the path chosen in the file dialog. In the folder of the open project: a copy of the document under the file name. In another project folder: the file only, read when that project is opened. In any other folder: the document is linked to the file |
+
+`run.py` registers the file types for the current user at each start (`HKEY_CURRENT_USER\Software\Classes`, no administrator rights; icon from `logo.png` when Pillow is installed). A double-click on a document file in Explorer runs `run.py --open "<file>"` with the Python of the program. When the program is running, the file opens in a new browser tab of it; otherwise the program starts with the file. The browser opens `http://localhost:<port>/?open=<file>`, and the page opens the file as **Open file…** does. Without an open project a file outside a project folder is refused (open or create a project first). After moving the program folder, a start with `start.bat` updates the registration.
+
+## 2.3 Publishing to GitHub
 
 The program folder is a clone of https://github.com/lukerickert/Shiny_CAD (git remote `origin`). `publish.bat` (double-click) adds all changed, new and deleted files except those of `.gitignore`, lists them, asks for a description (Enter: `Update <date>`), commits, pulls the repository with rebase and pushes; `publish.bat "text"` takes the description from the command line. With no changes it pushes the commits not yet pushed. The window stays open with the result.
 

@@ -782,9 +782,9 @@ window.exportMesh = async function (payload, folder, name, onPreview) {
 
 // ---------------------------------------------------------------- native file / folder dialogs on this PC
 /** Opens a native dialog on the PC running the server. kind: open | folder | save. Returns the path or "". */
-window.browse = async function (kind, filter, initial, title) {
+window.browse = async function (kind, filter, initial, title, saveName) {
   const r = await fetch("/api/dialog", { method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ kind, filter: filter || "", initial: initial || "", title: title || "" }) });
+    body: JSON.stringify({ kind, filter: filter || "", initial: initial || "", title: title || "", save_name: saveName || "" }) });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || r.statusText);
   return j.path || "";
@@ -799,6 +799,33 @@ document.addEventListener("DOMContentLoaded", () => {
     } catch (e) { showErr(e); }
   });
 });
+
+// ------------------------------------------------------------------ document files (.scpart, .scasm, ...)
+const DOC_EXT = { part: ".scpart", sketch: ".scsketch", assembly: ".scasm", analysis: ".scfea", explicit: ".scexp" };
+/** Opens a document file from any folder (path empty: file dialog). In a project folder that project is opened;
+ *  elsewhere the document is added to the open project and stays linked to the file. */
+window.openDocFile = async function (path) {
+  try {
+    if (!path) path = await window.browse("open", "shinycad", "", "Open a ShinyCAD document");
+    if (!path) return null;
+    const r = await (await postJSON("/api/file/open", { path })).json();
+    if (window.projectRefresh) await window.projectRefresh();
+    if (window.projectOpenDoc) await window.projectOpenDoc(r.type, r.name, true);
+    status(`Opened ${path}` + (r.linked ? ` (in project ${r.project}, saves write the file too)` : ` (project ${r.project})`));
+    return r;
+  } catch (e) { showErr(e); return null; }
+};
+/** Writes the document file of a saved document to a folder chosen in the file dialog (or to path). */
+window.saveDocFile = async function (type, name, path) {
+  try {
+    if (!path) path = await window.browse("save", DOC_EXT[type].slice(1), "", "Save " + name + " as a document file", name + DOC_EXT[type]);
+    if (!path) return null;
+    const r = await (await postJSON("/api/file/saveas", { type, name, path })).json();
+    status(`Saved ${r.path}` + (r.linked ? " (linked: later saves write this file too)" : ""));
+    if (window.projectRefreshDocs) window.projectRefreshDocs();
+    return r;
+  } catch (e) { showErr(e); return null; }
+};
 
 // ------------------------------------------------------------------ document file menu (Part, Assembly)
 /** File menu of a document tab, linked to the open project of the Project tab.
@@ -869,6 +896,14 @@ function docFileMenu(o) {
     if (!name) return;
     if (!discard()) { render(); return; }
     try { await o.load(name); markSaved(name); status(`Loaded ${o.label} ${name}`); } catch (e) { showErr(e); render(); }
+  };
+  el("rename").parentElement.insertAdjacentHTML("afterend", `<div class="row"><button type="button" id="${o.pre}-openfile" title="Open a ShinyCAD document file (${Object.values(DOC_EXT).join(" ")}) from any folder">Open file…</button><button type="button" id="${o.pre}-savefile" title="Save the ${o.label} as a document file (${DOC_EXT[o.type]}) in any folder">Save as file…</button></div>`);
+  el("openfile").onclick = () => { if (discard()) window.openDocFile(); };
+  el("savefile").onclick = async () => {
+    const c = o.cur() || {};
+    if (!project().current) { showErr(new Error("Open or create a project first")); return; }
+    if (!isSaved(c) || c.dirty) { if (!(await save())) return; }
+    window.saveDocFile(o.type, (o.cur() || {}).name);
   };
   el("new").onclick = () => { if (discard()) { o.blank(); markUnsaved(); } };
   el("save").onclick = save;

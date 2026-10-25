@@ -41,26 +41,47 @@ class Dirs(object):
         self.analysis = analysis
 
 
+_CFG_LOCK = threading.RLock()
+
+
+def _cfg_locked(fn):
+    """Read-modify-write of the configuration in one step (requests run in parallel threads)."""
+    def wrap(*a, **k):
+        with _CFG_LOCK:
+            return fn(*a, **k)
+    wrap.__name__, wrap.__doc__ = fn.__name__, fn.__doc__
+    return wrap
+
+
 class Projects(object):
+    _cfg_lock = _CFG_LOCK
+
     def __init__(self, app_dir, load_config, save_config):
         self.app_dir = app_dir
         self.load_config = load_config
-        self.save_config = save_config
+        self._save_config = save_config
+
+    def save_config(self, cfg):
+        with self._cfg_lock:
+            self._save_config(cfg)
 
     # ------------------------------------------------------------------ settings
     def root(self):
         return (self.load_config().get("projects_root") or "").strip()
 
+    @_cfg_locked
     def set_root(self, path):
         cfg = self.load_config()
         cfg["projects_root"] = path
         self.save_config(cfg)
         os.makedirs(path, exist_ok=True)
+        self._remember_root(path)
 
     def current_name(self):
         name = (self.load_config().get("current_project") or "").strip()
         return name if name and os.path.isfile(self.manifest_path(name)) else ""
 
+    @_cfg_locked
     def set_current(self, name):
         cfg = self.load_config()
         cfg["current_project"] = name or ""
@@ -139,7 +160,167 @@ class Projects(object):
             raise ValueError("project %s not found" % name)
         self.ensure_dirs(name)
         self.set_current(name)
+        self._remember_root(self.root(), name)
+        self.register(self.project_dir(name), opened=True)
+        self.sync(pack=False)
         return name
+
+    # ------------------------------------------------------------------ document files (packages.py)
+    _sync_lock = threading.Lock()
+
+    def sync(self, force=False, pack=True, only=None):
+        """Writes the document files of changed documents (pack) and reads document files changed outside the
+        program."""
+        from . import packages
+        with self._sync_lock:
+            return packages.sync(self, force, pack, only)
+
+    # ------------------------------------------------------------------ all known projects (any folder)
+    SKIP_DIRS = {"work", "versions", "trash", "drawings", "step", "step_import", "analysis", "explicit", "states",
+                 "node_modules", "__pycache__", ".git", "$recycle.bin", "appdata"}
+
+    @_cfg_locked
+    def register(self, path, opened=False):
+        """Adds a project folder to the list of known projects (config "known_projects": [{"path", "name",
+        "opened"}]); opened: the time it was last opened is set."""
+        path = os.path.abspath(path)
+        cfg = self.load_config()
+        lst = [r for r in cfg.get("known_projects") or [] if isinstance(r, dict) and r.get("path")]
+        r = next((x for x in lst if self._key(x["path"]) == self._key(path)), None)
+        if r is None:
+            r = {"path": path, "name": os.path.basename(path), "opened": ""}
+            lst.append(r)
+        elif not opened:
+            return
+        if opened:
+            r["opened"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        cfg["known_projects"] = lst
+        self.save_config(cfg)
+
+    @_cfg_locked
+    def forget(self, path):
+        cfg = self.load_config()
+        cfg["known_projects"] = [r for r in cfg.get("known_projects") or [] if isinstance(r, dict) and self._key(r.get("path")) != self._key(path)]
+        self.save_config(cfg)
+
+    def known(self):
+        """All known projects (registered, and those of the projects folder) with folder, description, number of
+        documents, last change and whether the folder still exists; last opened first."""
+        root = self.root()
+        if root and os.path.isdir(root):
+            for p in self.list_projects():
+                self.register(os.path.join(root, safe_name(p["name"])))
+        cur = self.current_name()
+        cur_key = self._key(self.project_dir(cur)) if cur else None
+        out = []
+        for r in self.load_config().get("known_projects") or []:
+            if not isinstance(r, dict) or not r.get("path"):
+                continue
+            path = r["path"]
+            mp = os.path.join(path, "project.json")
+            info = {"path": path, "name": r.get("name") or os.path.basename(path), "folder": os.path.dirname(path),
+                    "opened": r.get("opened", ""), "exists": os.path.isfile(mp), "docs": 0, "modified": "", "description": "",
+                    "current": self._key(path) == cur_key}
+            if info["exists"]:
+                try:
+                    with open(mp, "r", encoding="utf-8") as f:
+                        info["description"] = json.load(f).get("description", "")
+                except (OSError, ValueError):
+                    pass
+                w = os.path.join(path, "work")
+                latest = 0
+                if os.path.isdir(w):
+                    for fn in os.listdir(w):
+                        if any(fn.endswith(ext) for ext in TYPES.values()):
+                            info["docs"] += 1
+                            latest = max(latest, os.path.getmtime(os.path.join(w, fn)))
+                if latest:
+                    info["modified"] = time.strftime("%Y-%m-%d %H:%M", time.localtime(latest))
+            out.append(info)
+        return sorted(out, key=lambda x: (x["opened"] or "", x["modified"] or ""), reverse=True)
+
+    def scan(self, folder, depth=6, limit=20000):
+        """Registers every project (a folder with project.json) found in folder and its subfolders (up to depth
+        levels). Returns the project folders found."""
+        folder = os.path.abspath((folder or "").strip().strip('"'))
+        if not os.path.isdir(folder):
+            raise ValueError("folder not found: %s" % folder)
+        found, seen = [], 0
+        stack = [(folder, 0)]
+        while stack and seen < limit:
+            d, lev = stack.pop()
+            seen += 1
+            if os.path.isfile(os.path.join(d, "project.json")):
+                found.append(d)
+                continue
+            if lev >= depth:
+                continue
+            try:
+                subs = sorted(os.listdir(d), reverse=True)
+            except OSError:
+                continue
+            for n in subs:
+                p = os.path.join(d, n)
+                if n.lower() in self.SKIP_DIRS or n.startswith(".") or not os.path.isdir(p) or os.path.islink(p):
+                    continue
+                stack.append((p, lev + 1))
+        for p in found:
+            self.register(p)
+        return found
+
+    def open_path(self, path):
+        """Opens the project in the folder path (its parent folder becomes the projects folder)."""
+        path = os.path.abspath((path or "").strip().strip('"').rstrip("\\/"))
+        if not os.path.isfile(os.path.join(path, "project.json")):
+            raise ValueError("no project in %s (project.json missing)" % path)
+        root, name = os.path.split(path)
+        if self._key(root) != self._key(self.root()):
+            self.set_root(root)
+        return self.open(name)
+
+    RECENT_MAX = 10
+
+    @staticmethod
+    def _key(p):
+        return os.path.normcase(os.path.abspath(p or ""))
+
+    @_cfg_locked
+    def _remember_root(self, path, project=None):
+        """Recently used projects folders, newest first, with the project last opened in each (config
+        "recent_roots": [{"path", "used", "project"}])."""
+        cfg = self.load_config()
+        old = next((r for r in cfg.get("recent_roots") or [] if isinstance(r, dict) and self._key(r.get("path")) == self._key(path)), {})
+        rec = [r for r in cfg.get("recent_roots") or [] if isinstance(r, dict) and r.get("path") and self._key(r["path"]) != self._key(path)]
+        rec.insert(0, {"path": path, "used": time.strftime("%Y-%m-%d %H:%M"), "project": project or old.get("project") or ""})
+        cfg["recent_roots"] = rec[:self.RECENT_MAX]
+        self.save_config(cfg)
+
+    def recent_roots(self):
+        """Recently used projects folders (the current one first when it is not listed) with "exists", "projects"
+        (number of projects in the folder) and "project" (the project last opened there, when it still exists)."""
+        out = []
+        rows = [r for r in self.load_config().get("recent_roots") or [] if isinstance(r, dict) and r.get("path")]
+        cur = self.root()
+        if cur and not any(self._key(r["path"]) == self._key(cur) for r in rows):
+            rows.insert(0, {"path": cur, "used": "", "project": self.current_name()})
+        for r in rows:
+            p = r["path"]
+            if os.path.isfile(os.path.join(p, "project.json")):
+                # a project folder set as the projects folder by mistake: its parent
+                p = os.path.dirname(p)
+                if any(self._key(x["path"]) == self._key(p) for x in out):
+                    continue
+            n = 0
+            if os.path.isdir(p):
+                try:
+                    n = sum(1 for d in os.listdir(p) if os.path.isfile(os.path.join(p, d, "project.json")))
+                except OSError:
+                    pass
+            pr = r.get("project") or ""
+            if pr and not os.path.isfile(os.path.join(p, safe_name(pr), "project.json")):
+                pr = ""
+            out.append({"path": p, "used": r.get("used", ""), "exists": os.path.isdir(p), "projects": n, "project": pr})
+        return out
 
     def close(self):
         self.set_current("")
@@ -160,6 +341,8 @@ class Projects(object):
         self.save_manifest(new, m)
         if self.load_config().get("current_project") == old:
             self.set_current(new)
+        self.forget(os.path.join(self.root(), safe_name(old)))
+        self.register(self.project_dir(new))
         return new
 
     def adopt_legacy(self, name, move=True):
@@ -238,11 +421,11 @@ class Projects(object):
                             elif s.get("path"):
                                 f = os.path.basename(s["path"])
                                 solid = s.get("part")
-                                name = re.sub(r"\s+\d+$", "", str(c.get("name") or "")) if solid not in (None, "") else ""
-                                key = "" if solid in (None, "") else str(solid)
-                                link = next((l for l in doc["links"] if l["type"] == "step" and l["name"] == f and l.get("key") == key), None)
+                                sname = re.sub(r"\s+\d+$", "", str(c.get("name") or "")) if solid not in (None, "") else ""
+                                skey = "" if solid in (None, "") else str(solid)
+                                link = next((l for l in doc["links"] if l["type"] == "step" and l["name"] == f and l.get("key") == skey), None)
                                 if link is None:
-                                    doc["links"].append({"type": "step", "name": f, "path": s["path"], "solid": name or key, "key": key, "count": 1})
+                                    doc["links"].append({"type": "step", "name": f, "path": s["path"], "solid": sname or skey, "key": skey, "count": 1})
                                 else:
                                     link["count"] += 1
                         asms[dname] = doc
@@ -278,9 +461,15 @@ class Projects(object):
                 for fn in sorted(os.listdir(dd)):
                     st = os.stat(os.path.join(dd, fn))
                     exports[sub].append({"name": fn, "size": st.st_size, "modified": time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))})
+        from . import packages
+        links = packages.linked(pdir)
         for doc in docs:
             stem = doc["name"].lower()
             doc["exports"] = [e["name"] for e in exports["drawings"] + exports["step"] if e["name"].lower().startswith(stem)]
+            pf = os.path.join(pdir, packages.pkg_name(doc["name"], doc["type"]))
+            doc["package"] = os.path.basename(pf) if os.path.isfile(pf) else ""
+            doc["package_path"] = pf
+            doc["linked"] = links.get(doc["id"], "")
         return {"project": m, "docs": docs, "exports": exports}
 
     def _meta(self, name, key):
@@ -302,6 +491,8 @@ class Projects(object):
         with open(dst, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=1)
         os.remove(src)
+        from . import packages
+        packages.rename_doc(self.project_dir(name), dtype, safe_name(old), new)
         m = self.load_manifest(name)
         docs = m.setdefault("docs", {})
         if dtype + ":" + old in docs:
@@ -367,7 +558,8 @@ class Projects(object):
             json.dump(data, f, indent=1)
         return new
 
-    def delete_doc(self, dtype, dname):
+    def delete_doc(self, dtype, dname, packages=True):
+        """Moves a document to trash/ (packages: its document file in the project folder too)."""
         name, w = self._work()
         src = self.doc_path(dtype, dname)
         if not os.path.isfile(src):
@@ -379,6 +571,9 @@ class Projects(object):
         m = self.load_manifest(name)
         (m.get("docs") or {}).pop(dtype + ":" + dname, None)
         self.save_manifest(name, m)
+        if packages:
+            from . import packages as pk
+            pk.forget_doc(self.project_dir(name), dtype, dname)
 
     # ------------------------------------------------------------------ move / copy to another project
     def _doc_data(self, w, dtype, dname):
@@ -521,6 +716,8 @@ class Projects(object):
             if md == "move":
                 os.remove(os.path.join(w, fn))
                 (m_src.get("docs") or {}).pop(key, None)
+                from . import packages
+                packages.forget_doc(src_dir, t, safe_name(n), trash=False)
             out.append({"type": t, "name": n, "mode": md})
         self.save_manifest(target, m_dst)
         self.save_manifest(name, m_src)

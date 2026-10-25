@@ -60,7 +60,7 @@ LOCK = threading.Lock()
 # settings of this PC: config.local.json next to config.json (not in the repository); the other settings (sheet, views,
 # title block, options) stay in config.json
 LOCAL_PATH = os.path.splitext(CONFIG_PATH)[0] + ".local.json"
-LOCAL_KEYS = ("projects_root", "current_project", "explicit", "browser", "ccx_path")
+LOCAL_KEYS = ("projects_root", "current_project", "explicit", "browser", "ccx_path", "recent_roots", "known_projects")
 
 
 def load_config():
@@ -453,7 +453,7 @@ def _pj_error(fn):
 def projects_list():
     d = PROJECTS.dirs()
     return jsonify({"root": PROJECTS.root(), "current": PROJECTS.current_name(), "projects": PROJECTS.list_projects(),
-                    "dirs": {"work": str(d.parts), "step": d.step, "drawings": d.drawings}})
+                    "recent_roots": PROJECTS.recent_roots(), "known": PROJECTS.known(), "dirs": {"work": str(d.parts), "step": d.step, "drawings": d.drawings}})
 
 
 @app.route("/api/projects/root", methods=["PUT"])
@@ -463,8 +463,13 @@ def projects_root():
     if not path:
         return error("path required")
     try:
-        PROJECTS.set_root(path)
-    except OSError as e:
+        if os.path.isfile(os.path.join(path, "project.json")):
+            # a project folder: its parent becomes the projects folder and the project is opened
+            PROJECTS.open_path(path)
+            _clear_models()
+        else:
+            PROJECTS.set_root(path)
+    except (OSError, ValueError) as e:
         return error("cannot use %s: %s" % (path, e))
     return projects_list()
 
@@ -499,11 +504,35 @@ def projects_adopt():
 def projects_open():
     req = request.get_json(force=True)
     def go():
-        if req.get("name"):
+        if req.get("path"):
+            PROJECTS.open_path(req["path"])
+        elif req.get("name"):
             PROJECTS.open(req["name"])
         else:
             PROJECTS.close()
         _clear_models()
+        return projects_list()
+    return _pj_error(go)
+
+
+@app.route("/api/projects/scan", methods=["POST"])
+def projects_scan():
+    """Finds the projects in a folder and its subfolders and adds them to the list of known projects."""
+    req = request.get_json(force=True)
+    def go():
+        found = PROJECTS.scan(req.get("folder") or "", int(req.get("depth") or 6))
+        r = projects_list().get_json()
+        r["found"] = found
+        return jsonify(r)
+    return _pj_error(go)
+
+
+@app.route("/api/projects/forget", methods=["POST"])
+def projects_forget():
+    """Removes a project folder from the list of known projects (the folder is not changed)."""
+    req = request.get_json(force=True)
+    def go():
+        PROJECTS.forget(req.get("path") or "")
         return projects_list()
     return _pj_error(go)
 
@@ -528,7 +557,136 @@ def _clear_models():
 
 @app.route("/api/project/docs", methods=["GET"])
 def project_docs():
-    return _pj_error(lambda: jsonify(PROJECTS.documents()))
+    if not PROJECTS.current_name():
+        return jsonify({"project": {}, "docs": [], "exports": {"drawings": [], "step": [], "step_import": []}})
+    def go():
+        PROJECTS.sync(pack=False)
+        return jsonify(PROJECTS.documents())
+    return _pj_error(go)
+
+
+# ------------------------------------------------------------------ document files (packages.py)
+def sync_loop(interval=2.0):
+    """Background thread of run.py: writes the document files of changed documents of the open project and reads
+    document files changed outside the program."""
+    while True:
+        time.sleep(interval)
+        try:
+            if PROJECTS.current_name():
+                r = PROJECTS.sync()
+                if r["unpacked"] or r["deleted"]:
+                    print("Document files read: %s" % ", ".join(r["unpacked"] + ["deleted " + k for k in r["deleted"]]))
+        except Exception as e:  # noqa: BLE001 (the thread keeps running)
+            print("Document files: %s" % e)
+
+
+def _same(a, b):
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def file_open(path):
+    """Opens a document file (.scpart, .scasm, .scsketch, .scfea, .scexp). In a project folder: that project is
+    opened. Elsewhere: the document is added to the open project and linked to the file (saves write it too).
+    Returns {"type", "name", "project", "linked"}."""
+    from . import packages
+    path = os.path.abspath((path or "").strip().strip('"'))
+    t = packages.pkg_type(path)
+    if not t:
+        raise ValueError("not a ShinyCAD document file: %s" % path)
+    if not os.path.isfile(path):
+        raise ValueError("file not found: %s" % path)
+    packages.header(path)
+    d = os.path.dirname(path)
+    stem = safe_name(os.path.splitext(os.path.basename(path))[0])
+    cur = PROJECTS.current_name()
+    if os.path.isfile(os.path.join(d, "project.json")):
+        if not cur or not _same(d, PROJECTS.project_dir(cur)):
+            PROJECTS.open_path(d)
+            _clear_models()
+        PROJECTS.sync(force=True, pack=False)
+        if not os.path.isfile(PROJECTS.doc_path(t, stem)):
+            raise ValueError("%s could not be read" % path)
+        return {"type": t, "name": stem, "project": PROJECTS.current_name(), "linked": ""}
+    if not cur:
+        raise ValueError("Open or create a project first: the document of %s is added to the open project and "
+                         "stays linked to the file" % path)
+    pdir = PROJECTS.project_dir(cur)
+    for key, f in packages.linked(pdir).items():
+        kt, kn = key.split(":", 1)
+        if kt == t and _same(f, path) and os.path.isfile(PROJECTS.doc_path(t, kn)):
+            PROJECTS.sync(force=True, pack=False)
+            return {"type": t, "name": kn, "project": cur, "linked": path}
+    name, k = stem, 1
+    while os.path.exists(PROJECTS.doc_path(t, name)):
+        k += 1
+        name = "%s_%d" % (stem, k)
+    with PROJECTS._sync_lock:
+        packages.extract(PROJECTS, pdir, path, name)
+        packages.link(pdir, t, name, path)
+    PROJECTS.sync(force=True, only={t + ":" + name})
+    return {"type": t, "name": name, "project": cur, "linked": path}
+
+
+def file_save_as(dtype, dname, path):
+    """Writes the document file of a document of the open project to path. In the open project folder: a copy of the
+    document under the file name. In another project folder: the file only (read when that project is opened).
+    Elsewhere: the document is linked to the file (saves write it too). Returns {"path", "name", "linked"}."""
+    from . import packages
+    if dtype not in packages.PKG_EXT:
+        raise ValueError("unknown document type %s" % dtype)
+    path = os.path.abspath((path or "").strip().strip('"'))
+    if packages.pkg_type(path) != dtype:
+        path = (os.path.splitext(path)[0] if packages.pkg_type(path) else path) + packages.PKG_EXT[dtype]
+    cur = PROJECTS.current_name()
+    if not cur:
+        raise ValueError("no project is open")
+    if not os.path.isfile(PROJECTS.doc_path(dtype, dname)):
+        raise ValueError("%s %s is not saved in the project" % (dtype, dname))
+    pdir = PROJECTS.project_dir(cur)
+    d = os.path.dirname(path)
+    stem = safe_name(os.path.splitext(os.path.basename(path))[0])
+    if _same(d, pdir):
+        if stem != safe_name(dname):
+            PROJECTS.copy_doc(dtype, dname, stem)
+        PROJECTS.sync(force=True, only={dtype + ":" + stem})
+        return {"path": os.path.join(pdir, packages.pkg_name(stem, dtype)), "name": stem, "linked": ""}
+    with PROJECTS._sync_lock:
+        packages.write(PROJECTS, os.path.join(pdir, "work"), dtype, safe_name(dname), path)
+        if os.path.isfile(os.path.join(d, "project.json")):
+            return {"path": path, "name": dname, "linked": ""}
+        packages.link(pdir, dtype, safe_name(dname), path)
+    return {"path": path, "name": dname, "linked": path}
+
+
+@app.route("/api/file/open", methods=["POST"])
+def api_file_open():
+    req = request.get_json(force=True)
+    return _pj_error(lambda: jsonify(file_open(req.get("path") or "")))
+
+
+@app.route("/api/file/saveas", methods=["POST"])
+def api_file_save_as():
+    req = request.get_json(force=True)
+    return _pj_error(lambda: jsonify(file_save_as(req.get("type"), req.get("name") or "", req.get("path") or "")))
+
+
+@app.route("/api/file/unlink", methods=["POST"])
+def api_file_unlink():
+    """Ends the link of a document to a file outside the project (the file is not changed)."""
+    from . import packages
+    req = request.get_json(force=True)
+    def go():
+        name, _ = PROJECTS._work()
+        w = os.path.join(PROJECTS.project_dir(name), "work")
+        with PROJECTS._sync_lock:
+            st = packages.load_state(w)
+            rec = st.get("%s:%s" % (req.get("type"), req.get("name")))
+            if rec:
+                rec.pop("file", None)
+                rec.pop("link", None)
+                packages.save_state(w, st)
+        return jsonify({"ok": True})
+    return _pj_error(go)
 
 
 @app.route("/api/project/doc", methods=["POST"])
@@ -565,6 +723,8 @@ def project_doc_op():
 
 @app.route("/api/project/states", methods=["GET"])
 def project_states():
+    if not PROJECTS.current_name():
+        return jsonify([])             # no project open (for example while the projects folder changes)
     return _pj_error(lambda: jsonify(PROJECTS.states()))
 
 
@@ -614,7 +774,11 @@ def dialog():
             "model": [("STEP and STL files", "*.step *.stp *.stl"), ("STEP files", "*.step *.stp"), ("STL files", "*.stl"), ("All files", "*.*")],
             "dxf": [("DXF files", "*.dxf"), ("All files", "*.*")],
             "inp": [("Abaqus input", "*.inp"), ("All files", "*.*")],
-            "image": [("Images", "*.png *.jpg *.jpeg *.gif *.webp *.bmp *.tif *.tiff"), ("All files", "*.*")]}.get(filt, [("All files", "*.*")])
+            "image": [("Images", "*.png *.jpg *.jpeg *.gif *.webp *.bmp *.tif *.tiff"), ("All files", "*.*")],
+            "shinycad": [("ShinyCAD documents", "*.scpart *.scasm *.scsketch *.scfea *.scexp"), ("All files", "*.*")],
+            "scpart": [("ShinyCAD part", "*.scpart")], "scasm": [("ShinyCAD assembly", "*.scasm")],
+            "scsketch": [("ShinyCAD sketch", "*.scsketch")], "scfea": [("ShinyCAD analysis", "*.scfea")],
+            "scexp": [("ShinyCAD explicit analysis", "*.scexp")]}.get(filt, [("All files", "*.*")])
     try:
         path = dialogs.ask(req.get("kind") or "open", req.get("title") or "", req.get("initial") or "", pats, req.get("save_name") or "")
     except Exception as e:

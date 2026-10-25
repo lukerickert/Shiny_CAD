@@ -23,7 +23,7 @@ Details and troubleshooting: [1. Installation](docs/01-installation.md), `INSTAL
 | Page | Sections |
 |---|---|
 | [1. Installation (Windows)](docs/01-installation.md) | [1.1 Solvers](docs/01-installation.md#11-solvers) |
-| [2. Files](docs/02-files.md) | [2.1 Projects](docs/02-files.md#21-projects), [2.2 Publishing to GitHub](docs/02-files.md#22-publishing-to-github) |
+| [2. Files](docs/02-files.md) | [2.1 Projects](docs/02-files.md#21-projects), [2.2 Document files](docs/02-files.md#22-document-files), [2.3 Publishing to GitHub](docs/02-files.md#23-publishing-to-github) |
 | [3. Use](docs/03-use.md) | [3.1 Options](docs/03-use.md#31-options) |
 | [4. Title block editor](docs/04-title-block-editor.md) | - |
 | [5. Views and layout](docs/05-views-and-layout.md) | - |

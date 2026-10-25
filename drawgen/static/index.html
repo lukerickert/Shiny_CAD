@@ -106,6 +106,7 @@
           <label class="inline">Projects folder<input type="text" id="pj-root" class="sk-path" placeholder="folder that holds the projects"></label>
           <button type="button" class="browse" data-browse="folder" data-target="#pj-root" title="Choose the projects folder">…</button>
           <button type="button" id="pj-setroot">Set</button>
+          <select id="pj-recent" title="Recently used projects folders; choosing one sets it as the projects folder and opens the project last opened there"></select>
           <span class="sk-sep"></span>
           <label class="inline">Project<select id="pj-list"></select></label>
           <button type="button" id="pj-open">Open</button>
@@ -115,6 +116,17 @@
         </div>
       </div>
       <div class="pj-body">
+        <section class="pj-section" id="pj-allsec">
+          <div class="row"><h2>All projects</h2>
+            <input type="text" id="pj-allfilter" placeholder="filter: name, folder, description" class="sk-short">
+            <span class="sk-sep"></span>
+            <input type="text" id="pj-scanpath" class="sk-path" placeholder="folder to search for projects (subfolders included)">
+            <button type="button" class="browse" data-browse="folder" data-target="#pj-scanpath" title="Choose the folder">…</button>
+            <button type="button" id="pj-scan" class="small" title="Adds every project found in the folder and its subfolders (6 levels) to this list">Find projects</button>
+            <label class="check inline"><input type="checkbox" id="pj-allshow"> Show all</label>
+          </div>
+          <div id="pj-all"></div>
+        </section>
         <section class="pj-section" id="pj-info">
           <div class="row"><h2 id="pj-title">No project open</h2><button type="button" id="pj-rename" class="small">Rename</button><button type="button" id="pj-folder" class="small" title="Open the project folder on this PC">Open folder</button></div>
           <label>Description<textarea id="pj-desc" rows="2" placeholder="purpose, customer, notes"></textarea></label>
@@ -125,6 +137,7 @@
             <input type="text" id="pj-filter" placeholder="filter" class="sk-short">
             <label class="check inline"><input type="checkbox" id="pj-showlinks" checked> Links</label>
             <button type="button" id="pj-refresh" class="small">Refresh</button>
+            <button type="button" id="pj-openfile" class="small" title="Open a ShinyCAD document file (.scpart .scasm .scsketch .scfea .scexp) from any folder: in a project folder that project is opened; elsewhere the document is added to the open project and stays linked to the file">Open file…</button>
           </div>
           <div id="pj-docs"></div>
         </section>
@@ -869,6 +882,7 @@
 <script src="/static/project.js"></script>
 <script src="/static/reference.js"></script>
 <script src="/static/icons.js"></script>
+<script src="/static/cmdsearch.js"></script>
 <script type="module" src="/static/part.js"></script>
 <script type="module" src="/static/assembly.js"></script>
 <script type="module" src="/static/analysis.js"></script>

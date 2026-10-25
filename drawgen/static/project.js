@@ -3,7 +3,9 @@
 (function () {
   const $ = s => document.querySelector(s);
   const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-  const PJ = { info: null, docs: null, states: [] };
+  const PJ = { info: null, docs: null, states: [], sort: { key: "name", dir: 1 }, allSort: { key: "opened", dir: -1 } };
+  try { const as = JSON.parse(localStorage.getItem("pj-allsort") || "null"); if (as && as.key && (as.dir === 1 || as.dir === -1)) PJ.allSort = as; } catch (e) { /* default order */ }
+  try { const ps = JSON.parse(localStorage.getItem("pj-sort") || "null"); if (ps && ps.key && (ps.dir === 1 || ps.dir === -1)) PJ.sort = ps; } catch (e) { /* default order */ }
   const TYPE_LABEL = { part: "Part", sketch: "Sketch", assembly: "Assembly", analysis: "Analysis", explicit: "Explicit" };
   const TAB_OF = { part: "part", sketch: "sketch", assembly: "asm", analysis: "fea", explicit: "xp" };
   const kb = n => n > 1048576 ? (n / 1048576).toFixed(1) + " MB" : n > 1024 ? (n / 1024).toFixed(0) + " kB" : n + " B";
@@ -15,6 +17,8 @@
     } catch (e) { showErr(e); return; }
     const i = PJ.info;
     $("#pj-root").value = i.root || "";
+    const rr = i.recent_roots || [];
+    $("#pj-recent").innerHTML = `<option value="">Recent folders (${rr.length})</option>` + rr.map((r, k) => `<option value="${k}"${r.exists ? "" : " disabled"}>${esc(r.path)} (${r.projects} project${r.projects === 1 ? "" : "s"}${r.project ? ", last: " + esc(r.project) : ""})${r.exists ? "" : " (not found)"}</option>`).join("");
     const sel = $("#pj-list");
     sel.innerHTML = i.projects.length ? i.projects.map(p => `<option value="${esc(p.name)}"${p.name === i.current ? " selected" : ""}>${esc(p.name)} (${p.docs} docs, ${esc(p.modified)})</option>`).join("") : '<option value="">(no projects)</option>';
     $("#pj-current").textContent = i.current ? "Open: " + i.current : (i.root ? "No project open: the documents are read from the program folder" : "Set the projects folder");
@@ -26,10 +30,63 @@
     $("#pj-folder").disabled = !cur;
     $("#pj-paths").textContent = cur ? `${i.root}\\${cur.name}\\  work (documents), drawings (PDF, DXF, SVG, FCStd), step (STEP and mesh exports), step_import (copies of imported STEP files), analysis (solver files and reports), explicit (OpenCourant model and run folders), versions, states` : "";
     $("#pj-adopt").hidden = !(i.root && !i.projects.length);
+    renderAll();
     if (i.current) { await refreshDocs(); await refreshStates(); }
     else { $("#pj-docs").innerHTML = ""; $("#pj-exports").innerHTML = ""; $("#pj-states").innerHTML = ""; }
     // the saved lists of the tabs follow the project
     for (const fn of ["__partRefresh", "__asmRefresh", "__sketchRefresh", "__feaRefresh", "__xpRefresh"]) { try { if (window[fn]) window[fn](); } catch (e) { /* tab not initialised */ } }
+  }
+
+  /** All known projects of this PC (any folder): open, sort, filter, find in a folder, remove from the list. */
+  function renderAll() {
+    const box = $("#pj-all");
+    const list = (PJ.info && PJ.info.known) || [];
+    const filt = ($("#pj-allfilter").value || "").toLowerCase();
+    let rows = list.filter(x => !filt || [x.name, x.folder, x.description].join(" ").toLowerCase().includes(filt));
+    const S = PJ.allSort;
+    rows = rows.slice().sort((a, b) => {
+      const va = a[S.key], vb = b[S.key];
+      const c = typeof va === "number" ? va - vb : String(va || "").localeCompare(String(vb || ""), undefined, { numeric: true, sensitivity: "base" });
+      return (c || a.name.localeCompare(b.name)) * S.dir;
+    });
+    const limit = $("#pj-allshow").checked || filt ? rows.length : 8;
+    if (!list.length) { box.innerHTML = '<p class="hint">No projects known yet. Use Find projects with the folder that holds your projects (for example the folder above the project folders).</p>'; return; }
+    const th = (key, label) => `<th class="pj-sort${S.key === key ? " on" : ""}" data-asort="${key}">${label}${S.key === key ? (S.dir > 0 ? " ▲" : " ▼") : ""}</th>`;
+    box.innerHTML = `<table class="pj-table"><tr>${th("name", "Project")}${th("folder", "Folder")}${th("description", "Description")}${th("docs", "Documents")}${th("modified", "Last change")}${th("opened", "Last opened")}<th></th></tr>` +
+      rows.slice(0, limit).map((x, k) => `<tr class="${x.current ? "pj-cur" : ""}${x.exists ? "" : " pj-missing"}" data-k="${list.indexOf(x)}"><td><b>${esc(x.name)}</b>${x.current ? " (open)" : ""}</td><td title="${esc(x.path)}">${esc(x.folder)}</td><td>${esc(x.description || "")}</td><td>${x.exists ? x.docs : "not found"}</td><td>${esc(x.modified)}</td><td>${esc((x.opened || "").slice(0, 16))}</td>` +
+        `<td class="pj-actions">${x.exists && !x.current ? '<button type="button" data-aop="open">Open</button>' : ""}<button type="button" data-aop="forget" title="Remove from this list (the folder is not changed)">×</button></td></tr>`).join("") + `</table>` +
+      (rows.length > limit ? `<p class="hint">${rows.length - limit} more: filter, or check Show all.</p>` : "");
+    box.querySelectorAll("th[data-asort]").forEach(h => h.onclick = () => {
+      const k = h.dataset.asort;
+      PJ.allSort = PJ.allSort.key === k ? { key: k, dir: -PJ.allSort.dir } : { key: k, dir: (k === "modified" || k === "opened" || k === "docs") ? -1 : 1 };
+      try { localStorage.setItem("pj-allsort", JSON.stringify(PJ.allSort)); } catch (e) { /* order kept for this session */ }
+      renderAll();
+    });
+    box.querySelectorAll("button[data-aop]").forEach(b => b.onclick = async () => {
+      const x = list[+b.closest("tr").dataset.k];
+      try {
+        if (b.dataset.aop === "open") {
+          await postJSON("/api/projects/open", { path: x.path });
+          state.files = []; renderFiles();
+          await refreshProjects();
+          status("Project " + x.name + " opened (" + x.folder + ")");
+        } else {
+          await postJSON("/api/projects/forget", { path: x.path });
+          await refreshProjects();
+        }
+      } catch (e) { showErr(e); }
+    });
+  }
+  async function scanProjects() {
+    const folder = $("#pj-scanpath").value.trim();
+    if (!folder) { showErr(new Error("Enter or choose the folder to search")); return; }
+    try {
+      busy(true);
+      const r = await (await postJSON("/api/projects/scan", { folder })).json();
+      PJ.info = r;
+      await refreshProjects();
+      status(`${r.found.length} project(s) found in ${folder}`);
+    } catch (e) { showErr(e); } finally { busy(false); }
   }
 
   async function refreshDocs() {
@@ -46,11 +103,28 @@
     const links = $("#pj-showlinks").checked;
     const rows = d.docs.filter(x => !filt || x.name.toLowerCase().includes(filt) || x.type.includes(filt));
     if (!rows.length) { box.innerHTML = '<p class="hint">No documents. Save a part, sketch, assembly or analysis in its tab.</p>'; return; }
-    box.innerHTML = `<table class="pj-table"><tr><th>Name</th><th>Type</th><th>Version</th><th>Note</th><th>Modified</th><th>Size</th>${links ? "<th>Uses</th><th>Used by</th><th>Exports</th>" : ""}<th></th></tr>` +
+    // sort by the clicked column (a second click reverses); ties by name
+    const S = PJ.sort;
+    const val = x => S.key === "type" ? TYPE_LABEL[x.type] : x[S.key];
+    rows.sort((a, b) => {
+      const va = val(a), vb = val(b);
+      const c = typeof va === "number" && typeof vb === "number" ? va - vb : String(va || "").localeCompare(String(vb || ""), undefined, { numeric: true, sensitivity: "base" });
+      return (c || a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" })) * S.dir;
+    });
+    const th = (key, label) => `<th class="pj-sort${S.key === key ? " on" : ""}" data-sort="${key}" title="Sort by ${label.toLowerCase()} (click again to reverse)">${label}${S.key === key ? (S.dir > 0 ? " ▲" : " ▼") : ""}</th>`;
+    box.innerHTML = `<table class="pj-table"><tr>${th("name", "Name")}${th("type", "Type")}${th("version", "Version")}${th("note", "Note")}${th("modified", "Modified")}${th("size", "Size")}<th title="Document file in the project folder; ↔ a linked file outside the project (written at each save)">File</th>${links ? "<th>Uses</th><th>Used by</th><th>Exports</th>" : ""}<th></th></tr>` +
       rows.map(x => `<tr data-type="${x.type}" data-name="${esc(x.name)}"><td><b>${esc(x.name)}</b></td><td>${TYPE_LABEL[x.type]}</td><td>${x.version ? "v" + x.version : "–"}</td><td>${esc(x.note)}</td><td>${esc(x.modified)}</td><td>${kb(x.size)}</td>` +
+        `<td><span title="${esc(x.package_path || "")}">${esc(x.package || "")}</span>${x.linked ? `<br><span class="pj-linked" title="${esc(x.linked)}">↔ ${esc(x.linked)}</span> <button type="button" class="small" data-op="unlink" title="End the link (the file is not changed)">×</button>` : ""}</td>` +
         (links ? `<td>${usesHtml(x.links)}</td>` +
           `<td>${x.used_by.map(l => `<span class="pj-link" data-goto="${l.type}:${esc(l.name)}">${esc(l.name)}</span>`).join(", ")}</td><td>${x.exports.map(esc).join(", ")}</td>` : "") +
-        `<td class="pj-actions"><button type="button" data-op="open" title="Open in its tab">Open</button><button type="button" data-op="rename">Rename</button><button type="button" data-op="copy">Copy</button><button type="button" data-op="snapshot" title="Store a numbered version with a note">Version</button><button type="button" data-op="versions" title="List, restore">Versions…</button><button type="button" data-op="move" title="Move or copy to another project">Move…</button><button type="button" data-op="delete" title="Move to the project trash folder">×</button></td></tr>`).join("") + `</table>`;
+        `<td class="pj-actions"><button type="button" data-op="open" title="Open in its tab">Open</button><button type="button" data-op="rename">Rename</button><button type="button" data-op="copy">Copy</button><button type="button" data-op="snapshot" title="Store a numbered version with a note">Version</button><button type="button" data-op="versions" title="List, restore">Versions…</button><button type="button" data-op="move" title="Move or copy to another project">Move…</button><button type="button" data-op="savefile" title="Save as a document file in any folder">File…</button><button type="button" data-op="delete" title="Move to the project trash folder">×</button></td></tr>`).join("") + `</table>`;
+    box.querySelectorAll("th[data-sort]").forEach(h => h.onclick = () => {
+      const k = h.dataset.sort;
+      // a new column: names A to Z, dates and sizes newest / largest first
+      PJ.sort = PJ.sort.key === k ? { key: k, dir: -PJ.sort.dir } : { key: k, dir: (k === "modified" || k === "size" || k === "version") ? -1 : 1 };
+      try { localStorage.setItem("pj-sort", JSON.stringify(PJ.sort)); } catch (e) { /* the order is kept for this session only */ }
+      renderDocs();
+    });
     box.querySelectorAll("button[data-op]").forEach(b => b.onclick = () => docOp(b.dataset.op, b.closest("tr").dataset.type, b.closest("tr").dataset.name));
     box.querySelectorAll(".pj-link").forEach(s => s.onclick = () => { const [t, n] = s.dataset.goto.split(":"); openDoc(t, n); });
   }
@@ -80,11 +154,11 @@
     box.innerHTML = list("drawings/", e.drawings) + list("step/", e.step) + list("step_import/", e.step_import);
   }
 
-  async function openDoc(type, name) {
+  async function openDoc(type, name, noConfirm) {
     const loaders = { part: window.__partLoadNamed, assembly: window.__asmLoadNamed, sketch: window.__sketchLoadNamed, analysis: window.__feaLoadNamed, explicit: window.__xpLoadNamed };
     const cur = { part: window.__partCurrent, assembly: window.__asmCurrent, analysis: window.__feaCurrent, explicit: window.__xpCurrent }[type];
     const c = cur && cur();
-    if (c && c.dirty && !confirm(`Discard the changes to the current ${type}?`)) return;
+    if (c && c.dirty && !noConfirm && !confirm(`Discard the changes to the current ${type}?`)) return;
     showTab(TAB_OF[type]);
     try { await loaders[type](name); status(`Loaded ${type} ${name}`); } catch (e) { showErr(e); }
   }
@@ -111,6 +185,10 @@
         return showVersions(type, name);
       } else if (op === "move") {
         return showMove(type, name);
+      } else if (op === "savefile") {
+        return window.saveDocFile(type, name);
+      } else if (op === "unlink") {
+        await postJSON("/api/file/unlink", { type, name });
       } else if (op === "delete") {
         if (!confirm(`Move ${type} ${name} to the project trash folder?`)) return;
         await postJSON("/api/project/doc", { op: "delete", type, name });
@@ -248,6 +326,18 @@
     if (!path) return;
     try { await api("/api/projects/root", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path }) }); await refreshProjects(); } catch (e) { showErr(e); }
   }
+  /** A recently used projects folder: set as the projects folder, then the project last opened there is opened. */
+  async function openRecentRoot() {
+    const sel = $("#pj-recent"), r = ((PJ.info && PJ.info.recent_roots) || [])[+sel.value];
+    sel.value = "";
+    if (!r) return;
+    try {
+      await api("/api/projects/root", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: r.path }) });
+      if (r.project) { await postJSON("/api/projects/open", { name: r.project }); state.files = []; renderFiles(); }
+      await refreshProjects();
+      status("Projects folder " + r.path + (r.project ? ", project " + r.project + " opened" : ""));
+    } catch (e) { showErr(e); }
+  }
   async function newProject() {
     const name = prompt("Name of the new project");
     if (!name) return;
@@ -283,9 +373,15 @@
   window.projectShown = function () { refreshProjects(); };
   window.projectInfo = () => PJ.info;
   window.projectRefreshDocs = refreshDocs;
+  window.projectRefresh = refreshProjects;
+  window.projectOpenDoc = openDoc;
 
   document.addEventListener("DOMContentLoaded", () => {
     $("#pj-setroot").onclick = setRoot;
+    $("#pj-recent").onchange = openRecentRoot;
+    $("#pj-scan").onclick = scanProjects;
+    $("#pj-allfilter").oninput = renderAll;
+    $("#pj-allshow").onchange = renderAll;
     $("#pj-new").onclick = newProject;
     $("#pj-open").onclick = openProject;
     $("#pj-adopt").onclick = adopt;
@@ -297,6 +393,10 @@
     $("#pj-filter").oninput = renderDocs;
     $("#pj-showlinks").onchange = renderDocs;
     $("#pj-savestate").onclick = saveState;
-    refreshProjects();
+    $("#pj-openfile").onclick = () => window.openDocFile();
+    // run.py --open <file> (double-click in Explorer): /?open=<path>
+    const toOpen = new URLSearchParams(location.search).get("open");
+    if (toOpen) history.replaceState(null, "", location.pathname);
+    refreshProjects().then(() => { if (toOpen) window.openDocFile(toOpen); });
   });
 })();

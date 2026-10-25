@@ -4,6 +4,7 @@ the page fails the test. Skipped when Playwright or its browser is not installed
 (py -m pip install playwright, then py -m playwright install chromium)."""
 import logging
 import math
+import json
 import os
 import time
 
@@ -561,10 +562,18 @@ def test_point_from_vertex_click(page, client):
           if (h && h.vertex && Math.abs(h.point[0] - q[0]) + Math.abs(h.point[1] - q[1]) + Math.abs(h.point[2] - q[2]) < 1e-6) { best = [x, y, q]; break; }
         }
         return best; }"""
-    x, y, q = page.evaluate(js)
-    page.mouse.move(x, y)
-    page.mouse.click(x, y)
-    page.wait_for_function("([q]) => { const P = window.__part, f = P.feat(P.PT.cmd.id); return f.point && Math.abs(f.point[0] - q[0]) + Math.abs(f.point[1] - q[1]) + Math.abs(f.point[2] - q[2]) < 1e-6; }", arg=[q])
+    # the view can still change after the part is shown (fit): the position is taken again when a click misses
+    done = "([q]) => { const P = window.__part, f = P.feat(P.PT.cmd.id); return f.point && Math.abs(f.point[0] - q[0]) + Math.abs(f.point[1] - q[1]) + Math.abs(f.point[2] - q[2]) < 1e-6; }"
+    for k in range(4):
+        x, y, q = page.evaluate(js)
+        page.mouse.move(x, y)
+        page.mouse.click(x, y)
+        try:
+            page.wait_for_function(done, arg=[q], timeout=3000 if k < 3 else 30000)
+            break
+        except Exception:
+            if k == 3:
+                raise
     assert page.evaluate("window.__part.hoverText({kind: 'point', vertex: true, point: [1, 2, 3]})") == "Vertex (1, 2, 3) mm"
 
 
@@ -2908,3 +2917,115 @@ def test_sketch_check_failed_fix_marked(page):
     page.click("#sk-props button[data-fix=tiny]")
     wait_text(page, "#sk-props", "fix not possible")
     assert page.locator("#sk-props button[data-fix=tiny]").count() == 0
+
+
+def test_project_sort_columns_and_recent_folder(page, client, web, tmp_path):
+    """Project tab: a click on Size sorts largest first, a second click reverses; choosing a recent projects folder
+    sets it and opens the project last opened there."""
+    root0, cur0 = web.PROJECTS.root(), web.PROJECTS.current_name()
+    client.put("/api/part/file/ui_sort_small", json=plate("ui_sort_small"))
+    big = plate("ui_sort_big")
+    big["note_pad"] = "x" * 20000
+    client.put("/api/part/file/ui_sort_big", json=big)
+    other = str(tmp_path / "recent_root")
+    try:
+        client.put("/api/projects/root", json={"path": other})
+        client.post("/api/projects", json={"name": "rec_pj", "description": "", "open": True})
+        client.put("/api/projects/root", json={"path": root0})
+        client.post("/api/projects/open", json={"name": cur0})
+        tab(page, "project")
+        page.wait_for_selector("#pj-docs th[data-sort=size]")
+        page.click("#pj-docs th[data-sort=size]")
+        names = page.evaluate("() => [...document.querySelectorAll('#pj-docs tr[data-name]')].map(r => r.dataset.name)")
+        assert names.index("ui_sort_big") < names.index("ui_sort_small")
+        page.click("#pj-docs th[data-sort=size]")
+        names = page.evaluate("() => [...document.querySelectorAll('#pj-docs tr[data-name]')].map(r => r.dataset.name)")
+        assert names.index("ui_sort_big") > names.index("ui_sort_small")
+        assert "▲" in page.inner_text("#pj-docs th[data-sort=size]")
+        # recent folder
+        idx = page.evaluate("(p) => window.projectInfo().recent_roots.findIndex(r => r.path === p)", other)
+        assert idx >= 0
+        page.select_option("#pj-recent", str(idx))
+        wait_text(page, "#pj-title", "rec_pj")
+        assert web.PROJECTS.current_name() == "rec_pj"
+    finally:
+        web.PROJECTS.set_root(root0)
+        web.PROJECTS.open(cur0)
+        page.evaluate("() => window.projectShown && window.projectShown()")
+
+
+def test_project_all_projects_find_and_open(page, client, web, tmp_path):
+    """Project tab, All projects: Find projects lists the projects in the subfolders of a folder; Open opens one in
+    another folder; × removes it from the list."""
+    root0, cur0 = web.PROJECTS.root(), web.PROJECTS.current_name()
+    base = tmp_path / "find_base"
+    d = base / "x" / "found_pj"
+    (d / "work").mkdir(parents=True)
+    (d / "project.json").write_text(json.dumps({"name": "found_pj", "description": "old one"}), encoding="utf-8")
+    try:
+        tab(page, "project")
+        page.fill("#pj-scanpath", str(base))
+        page.click("#pj-scan")
+        page.wait_for_selector("#pj-all tr:has-text('found_pj') button[data-aop=open]")
+        page.click("#pj-all tr:has-text('found_pj') button[data-aop=open]")
+        wait_text(page, "#pj-title", "found_pj")
+        assert web.PROJECTS.current_name() == "found_pj"
+        assert os.path.normcase(web.PROJECTS.root()) == os.path.normcase(str(base / "x"))
+        page.fill("#pj-allfilter", "old one")
+        assert page.locator("#pj-all tr.pj-cur").count() == 1
+        web.PROJECTS.set_root(root0)
+        web.PROJECTS.open(cur0)
+        page.evaluate("() => window.projectShown && window.projectShown()")
+        page.wait_for_selector("#pj-all tr:has-text('found_pj') button[data-aop=forget]")
+        page.click("#pj-all tr:has-text('found_pj') button[data-aop=forget]")
+        page.wait_for_function("() => !document.querySelector('#pj-all').textContent.includes('found_pj')")
+    finally:
+        page.fill("#pj-allfilter", "")
+        web.PROJECTS.set_root(root0)
+        web.PROJECTS.open(cur0)
+        web.PROJECTS.forget(str(d))
+        page.evaluate("() => window.projectShown && window.projectShown()")
+
+
+def test_document_file_opened_from_url_and_file_column(page, client, web, server_url, tmp_path):
+    """/?open=<file> (run.py --open, a double-click in Explorer) opens the document in its tab; the File menu has
+    Open file… and Save as file…; the Documents list shows the linked file."""
+    client.put("/api/part/file/ui_pkg", json=plate("ui_pkg"))
+    f = str(tmp_path / "ui_loose.scpart")
+    try:
+        r = client.post("/api/file/saveas", json={"type": "part", "name": "ui_pkg", "path": f})
+        assert r.status_code == 200, r.get_data(as_text=True)
+        from urllib.parse import quote
+        page.goto(server_url + "/?open=" + quote(f))
+        page.wait_for_function("window.__partCurrent && (window.__partCurrent() || {}).name === 'ui_pkg'", timeout=30000)
+        wait_text(page, "#status", "Opened")
+        assert not page.is_hidden("#tab-part") and "open=" not in page.url
+        file_menu(page, "#tab-part")
+        assert page.is_visible("#pt-openfile") and page.is_visible("#pt-savefile")
+        tab(page, "project")
+        page.wait_for_selector("#pj-docs tr[data-name=ui_pkg] .pj-linked", state="attached")
+        assert "ui_loose.scpart" in page.inner_text("#pj-docs tr[data-name=ui_pkg] .pj-linked")
+    finally:
+        client.post("/api/file/unlink", json={"type": "part", "name": "ui_pkg"})
+        client.post("/api/project/doc", json={"op": "delete", "type": "part", "name": "ui_pkg"})
+
+
+def test_command_search_finds_stl_import(page):
+    """Ctrl+K opens the command search; "stl" lists Import STEP of the Part tab first; Enter starts it in the Part
+    tab; Esc closes the window."""
+    tab(page, "project")
+    page.keyboard.press("Control+k")
+    page.wait_for_selector("#cmd-search:not([hidden]) #cs-input")
+    page.fill("#cs-input", "stl")
+    first = page.locator("#cs-list .cs-item").first
+    assert first.locator("b").inner_text() == "Import STEP" and "Part" in first.inner_text()
+    page.keyboard.press("Enter")
+    assert page.is_hidden("#cmd-search")
+    assert not page.is_hidden("#tab-part")
+    page.wait_for_function("(() => { const P = window.__part; return P.PT.cmd && P.feat(P.PT.cmd.id).type === 'import'; })()")
+    page.evaluate("window.__part.cancelCommand()")
+    page.click("#cs-open")
+    page.fill("#cs-input", "fillet")
+    assert page.locator("#cs-list .cs-item").count() >= 1
+    page.keyboard.press("Escape")
+    assert page.is_hidden("#cmd-search")
