@@ -13,6 +13,7 @@ largest angle between neighbouring triangles, default 30).
 """
 import math
 import os
+import time
 import re
 import struct
 from collections import defaultdict, deque
@@ -20,7 +21,8 @@ from collections import defaultdict, deque
 import numpy as np
 
 _CACHE = {}
-MAX_FACES = 20000                    # faces of one converted solid
+MAX_FACES = 150000                   # faces of one converted solid
+FIT_BUDGET_S = 60.0                  # time for fitted surfaces; after it the solid is made of flat facets
 
 
 # --------------------------------------------------------------------------- reading and welding
@@ -114,7 +116,7 @@ def _dir(tri, u, v):
 
 def fit_plane(P):
     c = P.mean(0)
-    _, s, vt = np.linalg.svd(P - c)
+    _, s, vt = np.linalg.svd(P - c, full_matrices=False)
     n = vt[-1]
     return {"kind": "plane", "p": c, "n": n}, float(np.abs((P - c) @ n).max())
 
@@ -158,6 +160,53 @@ def fit_cyl_cone(P, C, N, W):
     return {"kind": "cone", "apex": apex, "a": a, "half": half}, dist
 
 
+def fit_torus(P, C, N, W):
+    """Torus (a fillet along a circular edge) from the triangle centroids C and normals N: the points C - r N lie on
+    the spine circle (centre o, axis a, radius R) for the minor radius r (signed: the normals point away from the
+    spine or towards it). r is found by a search for the most circular and planar point set."""
+    size = float(np.ptp(C, axis=0).max())
+    if size <= 0 or len(C) < 6:
+        raise ValueError("too few points")
+
+    def spine(r):
+        Q = C - r * N
+        c = Q.mean(0)
+        _, _, vt = np.linalg.svd(Q - c, full_matrices=False)
+        a = vt[-1]
+        e1 = np.cross(a, [1.0, 0, 0] if abs(a[0]) < 0.9 else [0, 1.0, 0])
+        e1 /= np.linalg.norm(e1)
+        e2 = np.cross(a, e1)
+        c2, R = _circle2(np.c_[(Q - c) @ e1, (Q - c) @ e2])
+        o = c + c2[0] * e1 + c2[1] * e2
+        h = (Q - o) @ a
+        rho = np.linalg.norm(Q - o - np.outer(h, a), axis=1) - R
+        return float(np.sqrt(((h ** 2 + rho ** 2) * W).sum() / W.sum())), o, a, R
+
+    rs = np.r_[-np.geomspace(size, size * 1e-3, 40), np.geomspace(size * 1e-3, size, 40)]
+    errs = [spine(r)[0] for r in rs]
+    k = int(np.argmin(errs))
+    lo, hi = rs[max(k - 1, 0)], rs[min(k + 1, len(rs) - 1)]
+    g = (math.sqrt(5) - 1) / 2
+    for _ in range(40):                       # golden section between the neighbours of the best sample
+        x1, x2 = hi - g * (hi - lo), lo + g * (hi - lo)
+        if spine(x1)[0] < spine(x2)[0]:
+            hi = x2
+        else:
+            lo = x1
+    r = (lo + hi) / 2
+    _, o, a, R = spine(r)
+    r = abs(r)
+    if R <= r:
+        raise ValueError("not a ring torus")
+
+    def dist(X):
+        v = X - o
+        h = v @ a
+        rho = np.linalg.norm(v - np.outer(h, a), axis=1)
+        return np.sqrt((rho - R) ** 2 + h ** 2) - r
+    return {"kind": "torus", "o": o, "a": a, "R": R, "r": r}, dist
+
+
 def fit_sphere(P):
     A = np.c_[2 * P, np.ones(len(P))]
     b = (P ** 2).sum(1)
@@ -172,6 +221,12 @@ def surface_normal(sf, X):
     k = sf["kind"]
     if k == "sphere":
         d = X - sf["c"]
+    elif k == "torus":
+        o, a = sf["o"], sf["a"]
+        v = X - o
+        rad = v - np.outer(v @ a, a)
+        rad /= np.linalg.norm(rad, axis=1)[:, None]
+        d = X - (o + sf["R"] * rad)
     elif k == "cylinder":
         a = sf["a"]
         d = X - sf["o"] - np.outer((X - sf["o"]) @ a, a)
@@ -184,11 +239,11 @@ def surface_normal(sf, X):
     return d / np.linalg.norm(d, axis=1)[:, None]
 
 
-def best_fit(P, C, N, W, tol, max_angle):
+def best_fit(P, C, N, W, tol, max_angle, torus=True):
     """The simplest of cylinder, cone and sphere that fits: vertices within tol, triangle centroids within 4 tol
     and triangle normals within max_angle (deg) of the surface normals (either side). (surface, deviation) or None."""
     cands = []
-    for fn in (lambda: fit_cyl_cone(P, C, N, W), lambda: fit_sphere(P)):
+    for fn in (lambda: fit_cyl_cone(P, C, N, W), lambda: fit_sphere(P)) + ((lambda: fit_torus(P, C, N, W),) if torus else ()):
         try:
             cands.append(fn())
         except Exception:
@@ -200,8 +255,9 @@ def best_fit(P, C, N, W, tol, max_angle):
         float(np.degrees(np.arccos(np.clip((N @ N[np.random.default_rng(0).choice(len(N), 400)].T).min(), -1, 1))))
     if spread < 3.0:
         return None
+    ok = []
     for sf, dist in cands:
-        if sf.get("r", 0) > 50 * max(size, 1e-9) or not np.isfinite(dist(P)).all():
+        if max(sf.get("r", 0), sf.get("R", 0)) > 50 * max(size, 1e-9) or not np.isfinite(dist(P)).all():
             continue
         if sf["kind"] == "cone" and sf["half"] > math.radians(80):
             continue
@@ -210,11 +266,19 @@ def best_fit(P, C, N, W, tol, max_angle):
             continue
         if (np.abs(np.einsum("ij,ij->i", surface_normal(sf, C), N)) < cmin).any():
             continue
-        return sf, dv
-    return None
+        ok.append((sf, dv))
+    if not ok:
+        return None
+    # the simplest surface (cylinder or cone, sphere, torus) unless a later one is much closer (a narrow band of a
+    # torus also lies within the tolerance of a sphere)
+    best = min(dv for _, dv in ok)
+    return next((sf, dv) for sf, dv in ok if dv <= 3 * best + 1e-12)
 
 
 # --------------------------------------------------------------------------- regions
+
+CURVED_COS = math.cos(math.radians(0.1))   # normals of one region turning by more: a curved surface
+
 
 def regions(V, T, tol, ang_flat, ang_smooth, fit):
     """Region index of each triangle and the surface of each region."""
@@ -263,7 +327,12 @@ def regions(V, T, tol, ang_flat, ang_smooth, fit):
         tr = s["tris"]
         small = len(tr) <= 8 and area[tr].sum() <= 0.02 * total
         if not small and s["dev"] <= 0.02 * tol:
-            continue
+            # a fine mesh of a curved surface: flat within the tolerance, but the triangle normals turn (a planar
+            # face has one normal; the larger triangles are used, small slivers have imprecise normals)
+            at = area[tr]
+            big = np.asarray(tr)[at >= 0.1 * at.max()]
+            if len(big) < 2 or float((N[big] @ N[big[0]]).min()) >= CURVED_COS:
+                continue
         nsm = set()
         for t in tr:
             for o in nb[t]:
@@ -293,7 +362,14 @@ def regions(V, T, tol, ang_flat, ang_smooth, fit):
             continue
         P = V[np.unique(T[g])]
         Cg = (V[T[g, 0]] + V[T[g, 1]] + V[T[g, 2]]) / 3.0
-        best = best_fit(P, Cg, N[g], area[g], tol, ang_smooth)
+        # normals of the fitted surface within a few mesh steps of the triangle normals (the median angle between
+        # neighbouring triangles of the group): a surface that only passes within the tolerance of a group made of
+        # two tangent surfaces (a cylinder running into a fillet) is refused and the group is split
+        gs = set(g)
+        steps = [float(N[t] @ N[o]) for t in g[:2000] for o in nb[t] if o in gs]
+        step = math.degrees(math.acos(min(1.0, float(np.median(steps))))) if steps else ang_smooth
+        ang_fit = min(ang_smooth, max(3.0, 2.5 * step))
+        best = best_fit(P, Cg, N[g], area[g], tol, ang_fit)
         found = [(best[0], g)] if best is not None else _split_group(g, V, T, N, area, reg, nb, tol, ang_smooth)
         for sf, gg in found:
             gg = list(gg)
@@ -368,7 +444,7 @@ def _split_group(g, V, T, N, area, reg, nb, tol, ang_smooth, min_tris=16):
             if turn >= 3.0:
                 P = V[np.unique(T[cand])]
                 C = (V[T[cand, 0]] + V[T[cand, 1]] + V[T[cand, 2]]) / 3.0
-                f2 = best_fit(P, C, N[cand], area[cand], tol, ang_smooth)
+                f2 = best_fit(P, C, N[cand], area[cand], tol, ang_smooth, torus=False)
                 if f2 is None:
                     continue
                 fit = f2
@@ -390,7 +466,7 @@ def _split_group(g, V, T, N, area, reg, nb, tol, ang_smooth, min_tris=16):
                 # facets rejected by the fit of a smaller region: tried again with a fit of the whole region
                 P = V[np.unique(T[cur_t])]
                 C = (V[T[cur_t, 0]] + V[T[cur_t, 1]] + V[T[cur_t, 2]]) / 3.0
-                refit = best_fit(P, C, N[cur_t], area[cur_t], tol, ang_smooth)
+                refit = best_fit(P, C, N[cur_t], area[cur_t], tol, ang_smooth, torus=False)
                 if refit is None or len(cur_t) == last:
                     break
                 sf, dist, last = refit[0], _dist_fn(refit[0]), len(cur_t)
@@ -410,7 +486,7 @@ def _split_group(g, V, T, N, area, reg, nb, tol, ang_smooth, min_tris=16):
             if len(cur_t) > 1.25 * last:
                 P = V[np.unique(T[cur_t])]
                 C = (V[T[cur_t, 0]] + V[T[cur_t, 1]] + V[T[cur_t, 2]]) / 3.0
-                refit = best_fit(P, C, N[cur_t], area[cur_t], tol, ang_smooth)
+                refit = best_fit(P, C, N[cur_t], area[cur_t], tol, ang_smooth, torus=False)
                 if refit is None:
                     for x in units[u]:
                         cur_t.remove(x)
@@ -429,6 +505,14 @@ def _dist_fn(sf):
     k = sf["kind"]
     if k == "sphere":
         return lambda X: np.linalg.norm(X - sf["c"], axis=1) - sf["r"]
+    if k == "torus":
+        o, a, R, r = sf["o"], sf["a"], sf["R"], sf["r"]
+
+        def dt(X):
+            v = X - o
+            h = v @ a
+            return np.sqrt((np.linalg.norm(v - np.outer(h, a), axis=1) - R) ** 2 + h ** 2) - r
+        return dt
     if k == "cylinder":
         o, a, r = sf["o"], sf["a"], sf["r"]
         return lambda X: np.linalg.norm(X - o - np.outer((X - o) @ a, a), axis=1) - r
@@ -444,13 +528,13 @@ def _halves(sf, g, Cg, reg):
     """The triangles g of a cylinder or cone that goes all the way round its axis, in two halves (a face closed
     round the axis would need a seam edge): whole flat facets (regions reg) go to the half of their mean angle, so
     the boundary between the halves runs along facet edges (generator lines)."""
-    if sf["kind"] not in ("cylinder", "cone"):
+    if sf["kind"] not in ("cylinder", "cone", "torus"):
         return [g]
     a = sf["a"]
     e1 = np.cross(a, [1.0, 0, 0] if abs(a[0]) < 0.9 else [0, 1.0, 0])
     e1 /= np.linalg.norm(e1)
     e2 = np.cross(a, e1)
-    base = sf["o"] if sf["kind"] == "cylinder" else sf["apex"]
+    base = sf["apex"] if sf["kind"] == "cone" else sf["o"]
     th = np.arctan2((Cg - base) @ e2, (Cg - base) @ e1)
     srt = np.sort(th)
     gaps = np.diff(np.r_[srt, srt[0] + 2 * math.pi])
@@ -469,7 +553,7 @@ def _halves(sf, g, Cg, reg):
 # --------------------------------------------------------------------------- B-rep
 
 def _geom_surface(s):
-    from OCP.Geom import Geom_Plane, Geom_CylindricalSurface, Geom_ConicalSurface, Geom_SphericalSurface
+    from OCP.Geom import Geom_Plane, Geom_CylindricalSurface, Geom_ConicalSurface, Geom_SphericalSurface, Geom_ToroidalSurface
     from OCP.gp import gp_Pnt, gp_Dir, gp_Ax3
     P = lambda v: gp_Pnt(*[float(x) for x in v])
     D = lambda v: gp_Dir(*[float(x) for x in v])
@@ -480,6 +564,8 @@ def _geom_surface(s):
         return Geom_CylindricalSurface(gp_Ax3(P(s["o"]), D(s["a"])), float(s["r"]))
     if k == "cone":
         return Geom_ConicalSurface(gp_Ax3(P(s["apex"]), D(s["a"])), float(s["half"]), 0.0)
+    if k == "torus":
+        return Geom_ToroidalSurface(gp_Ax3(P(s["o"]), D(s["a"])), float(s["R"]), float(s["r"]))
     return Geom_SphericalSurface(gp_Ax3(P(s["c"]), D([0, 0, 1])), float(s["r"]))
 
 
@@ -530,6 +616,11 @@ def build(V, T, reg, surf, tol):
     from build123d import Shape
     loops = _loops(T, reg)
     geo = [_geom_surface(s) for s in surf]
+    for i, s in enumerate(surf):
+        if s["kind"] == "torus":
+            # a torus is periodic around the tube too, with its seam on the outer equator, where a fillet usually
+            # starts: the face is made on the torus trimmed to the tube angles of its triangles (no seam)
+            geo[i] = _torus_trimmed(geo[i], s, V[np.unique(T[s["tris"]])])
     B = BRep_Builder()
     # corners: vertices with three or more regions, or more than two region boundary edges
     vreg = defaultdict(set)
@@ -671,14 +762,20 @@ def build(V, T, reg, surf, tol):
         g = geo[r]
         face = _make_face(g, wires, True)
         if surf[r]["kind"] != "plane":
-            # a face on a closed surface bounded by its loops can be either side: it must hold the triangles
+            # a face on a closed surface bounded by its loops can be either side: it must hold the triangles and
+            # have their area (on a torus both sides can hold a point when the parameters wrap)
             tr = surf[r]["tris"]
-            t0 = tr[int(np.argmax(area_of(V, T, tr)))]
-            if not _face_holds(face, g, V[T[t0]].mean(0)):
-                face = _make_face(g, [TopoDS.Wire(w.Reversed()) for w in wires], False)
-                if not _face_holds(face, g, V[T[t0]].mean(0)):
-                    demote.add(r)
-                    continue
+            ta = area_of(V, T, tr)
+            t0 = tr[int(np.argmax(ta))]
+            tarea = float(ta.sum())
+            cands = [f for f in (face, _make_face(g, [TopoDS.Wire(w.Reversed()) for w in wires], False))
+                     if _face_holds(f, g, V[T[t0]].mean(0))]
+            cands = [(abs(_face_area(f) - tarea), f) for f in cands]
+            cands = [c for c in cands if c[0] <= 0.25 * tarea]
+            if not cands:
+                demote.add(r)
+                continue
+            face = min(cands, key=lambda c: c[0])[1]
         B.Add(shell, face)
     if demote:
         raise _Demote(demote)
@@ -688,6 +785,9 @@ def build(V, T, reg, surf, tol):
     fs = ShapeFix_Shell(shell)
     fs.Perform()
     sh = fs.Shell()
+    if fs.NbShells() != 1 and any(x["kind"] != "plane" for x in surf):
+        # fitted faces that do not form one shell: made of flat facets instead (sewing curved faces can take long)
+        raise ValueError("the fitted faces do not close one shell (%d shells)" % fs.NbShells())
     if fs.NbShells() != 1:
         # faces whose shared edges were copied by the face fixes: sewn again (the edges coincide)
         sew = BRepBuilderAPI_Sewing(max(tol, 1e-6))
@@ -724,6 +824,26 @@ class _Demote(Exception):
     def __init__(self, regs):
         super().__init__("demote")
         self.regs = regs
+
+
+def _torus_trimmed(g, s, X):
+    from OCP.Geom import Geom_RectangularTrimmedSurface
+    o, a, R = s["o"], s["a"], s["R"]
+    w = X - o
+    h = w @ a
+    rho = np.linalg.norm(w - np.outer(h, a), axis=1)
+    v = np.sort(np.mod(np.arctan2(h, rho - R), 2 * math.pi))
+    gaps = np.diff(np.r_[v, v[0] + 2 * math.pi])
+    k = int(np.argmax(gaps))
+    v0 = v[(k + 1) % len(v)]
+    v1 = v[k] if k + 1 < len(v) else v[k]
+    if v1 <= v0:
+        v1 += 2 * math.pi
+    span = v1 - v0
+    m = min(0.2, max(0.0, (2 * math.pi - span) / 3))
+    if span + 2 * m >= 2 * math.pi - 1e-6:
+        return g                                  # all round the tube
+    return Geom_RectangularTrimmedSurface(g, float(v0 - m), float(v1 + m), False)
 
 
 def _surf_dev(g, pts):
@@ -794,6 +914,17 @@ def _make_face(g, wires, fix_orientation):
     sf.FixMissingSeamMode = 1
     sf.Perform()
     return sf.Face()
+
+
+def _face_area(face):
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+    gp = GProp_GProps()
+    try:
+        BRepGProp.SurfaceProperties_s(face, gp)
+        return abs(gp.Mass())
+    except Exception:  # noqa: BLE001
+        return float("inf")
 
 
 def _face_holds(face, g, p):
@@ -898,7 +1029,11 @@ def stl_solid(path, opts=None):
     smooth = float(opts.get("smooth") or 30)
     fit = bool(opts.get("fit", True))
     rep = {"triangles": int(len(T)), "mesh_volume": round(vol, 6), "tolerance": tol, "fit": fit}
-    reg, surf, area, N = regions(V, T, tol, ang, smooth, fit)
+    # flat faces made without fitted surfaces: coplanar triangles merged within a tight tolerance, so that the
+    # faces stay planar and the solid valid
+    ftol = min(tol, max(1e-5 * size, 1e-7))
+    t_fit = time.time()
+    reg, surf, area, N = regions(V, T, tol if fit else ftol, ang, smooth, fit)
     if len(surf) > MAX_FACES:
         raise ValueError("the mesh gives %d faces (limit %d): curved areas stay as flat facets; reduce the number of "
                          "triangles of the STL, or raise the tolerance or the flat face angle" % (len(surf), MAX_FACES))
@@ -912,15 +1047,27 @@ def stl_solid(path, opts=None):
             raise ValueError("the faces from the STL give no closed solid of the mesh volume")
         except _Demote as d:
             # fitted regions whose edges cannot be made: back to their flat facets
-            reg, surf = _demote(V, T, reg, surf, d.regs, tol, ang)
+            regs = d.regs
+            if time.time() - t_fit > FIT_BUDGET_S:
+                rep["fallback"] = True
+                reg, surf, area, N = regions(V, T, ftol, ang, smooth, False)
+            else:
+                reg, surf = _demote(V, T, reg, surf, regs, tol, ang)
         except ValueError as e:
-            # the fitted faces do not join: spheres first, then every fitted surface back to flat facets
+            # the fitted faces do not join: spheres and tori first, then every fitted surface back to flat facets
+            # (at once after the time for fitting)
             err, shape = e, None
-            sph = {i for i, sf in enumerate(surf) if sf["kind"] == "sphere"}
-            fitted = sph or {i for i, sf in enumerate(surf) if sf["kind"] != "plane"}
+            sph = {i for i, sf in enumerate(surf) if sf["kind"] in ("sphere", "torus")}
+            allfit = {i for i, sf in enumerate(surf) if sf["kind"] != "plane"}
+            fitted = allfit if time.time() - t_fit > FIT_BUDGET_S else (sph or allfit)
             if not fitted:
                 break
-            reg, surf = _demote(V, T, reg, surf, fitted, tol, ang)
+            if fitted == allfit:
+                # every fitted surface back to flat: the flat faces of the mesh (coplanar triangles merged)
+                rep["fallback"] = True
+                reg, surf, area, N = regions(V, T, ftol, ang, smooth, False)
+            else:
+                reg, surf = _demote(V, T, reg, surf, fitted, tol, ang)
             if len(surf) > MAX_FACES:
                 raise ValueError("the fitted faces do not join, and without fitting the mesh gives %d faces "
                                  "(limit %d)" % (len(surf), MAX_FACES))
@@ -964,7 +1111,116 @@ def _demote(V, T, reg, surf, regs, tol, ang):
 
 def report_note(rep):
     k = rep.get("kinds", {})
-    names = [("plane", "planar"), ("cylinder", "cylindrical"), ("cone", "conical"), ("sphere", "spherical")]
+    names = [("plane", "planar"), ("cylinder", "cylindrical"), ("cone", "conical"), ("sphere", "spherical"), ("torus", "toroidal")]
     parts = ", ".join("%d %s" % (k[a], b) for a, b in names if k.get(a))
     return ("STL: %d triangles -> %d faces (%s); volume %.6g mm^3 (mesh %.6g mm^3); tolerance %.4g mm"
-            % (rep["triangles"], rep["faces"], parts, rep["volume"], rep["mesh_volume"], rep["tolerance"]))
+            % (rep["triangles"], rep["faces"], parts, rep["volume"], rep["mesh_volume"], rep["tolerance"])
+            + ("; the fitted faces did not join: flat facets" if rep.get("fallback") else ""))
+
+
+# --------------------------------------------------------------------------- rough mesh (surface body)
+
+_ROUGH = {}
+
+
+def cluster(V, T, max_tris):
+    """Vertex clustering: the vertices in each cell of a grid are merged into their mean, triangles that collapse
+    are dropped; the cell size is the smallest of a series that gives at most max_tris triangles."""
+    size = float(np.ptp(V, axis=0).max())
+    lo = V.min(0)
+    best = (V, T)
+    for k in range(40):
+        h = size / 400.0 / (0.8 ** k)          # cells from 1/400 of the size, 25 % larger each step
+        cell = np.floor((V - lo) / h).astype(np.int64)
+        keys, inv = np.unique(cell, axis=0, return_inverse=True)
+        inv = inv.reshape(-1)
+        cnt = np.bincount(inv, minlength=len(keys)).astype(float)
+        NV = np.stack([np.bincount(inv, weights=V[:, d], minlength=len(keys)) for d in range(3)], axis=1) / cnt[:, None]
+        NT = inv[T]
+        ok = (NT[:, 0] != NT[:, 1]) & (NT[:, 1] != NT[:, 2]) & (NT[:, 0] != NT[:, 2])
+        NT = NT[ok]
+        srt = np.sort(NT, axis=1)
+        _, first = np.unique(srt, axis=0, return_index=True)
+        NT = NT[np.sort(first)]
+        best = (NV, NT)
+        if len(NT) <= max_tris:
+            break
+    NV, NT = best
+    used = np.unique(NT)
+    remap = -np.ones(len(NV), np.int64)
+    remap[used] = np.arange(len(used))
+    return NV[used], remap[NT]
+
+
+def mesh_shape(V, T):
+    """Faces of the triangles with shared vertices and edges (a shell when the mesh is connected), as a build123d
+    Shape. Triangles of zero area are left out."""
+    from OCP.BRep import BRep_Builder
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+    from OCP.Geom import Geom_Plane
+    from OCP.TopoDS import TopoDS_Vertex, TopoDS_Wire, TopoDS_Face, TopoDS_Compound, TopoDS
+    from OCP.gp import gp_Pnt, gp_Dir
+    from build123d import Shape
+    B = BRep_Builder()
+    tolv = max(1e-7, 1e-6 * float(np.ptp(V, axis=0).max()))
+    verts = []
+    for p in V:
+        vx = TopoDS_Vertex()
+        B.MakeVertex(vx, gp_Pnt(float(p[0]), float(p[1]), float(p[2])), tolv)
+        verts.append(vx)
+    edges = {}
+
+    def edge(a, b):
+        k = (a, b) if a < b else (b, a)
+        e = edges.get(k)
+        if e is None:
+            e = BRepBuilderAPI_MakeEdge(verts[k[0]], verts[k[1]]).Edge()
+            edges[k] = e
+        return e if a < b else TopoDS.Edge(e.Reversed())
+
+    comp = TopoDS_Compound()
+    B.MakeCompound(comp)
+    P0, P1, P2 = V[T[:, 0]], V[T[:, 1]], V[T[:, 2]]
+    cr = np.cross(P1 - P0, P2 - P0)
+    nrm = np.linalg.norm(cr, axis=1)
+    n = 0
+    for t in range(len(T)):
+        if nrm[t] <= 1e-12:
+            continue
+        a, b, c = (int(x) for x in T[t])
+        w = TopoDS_Wire()
+        B.MakeWire(w)
+        for u, v in ((a, b), (b, c), (c, a)):
+            B.Add(w, edge(u, v))
+        nd = cr[t] / nrm[t]
+        pl = Geom_Plane(gp_Pnt(*[float(x) for x in V[a]]), gp_Dir(*[float(x) for x in nd]))
+        fc = TopoDS_Face()
+        B.MakeFace(fc, pl, tolv)
+        B.Add(fc, w)
+        B.Add(comp, fc)
+        n += 1
+    return Shape.cast(comp), n
+
+
+def rough_mesh(path, max_tris=20000):
+    """(shape, report) of an STL file as a rough mesh body: the triangles (reduced by vertex clustering to at most
+    max_tris) as planar faces, without fitted surfaces. Cached per path, modification time, size and max_tris."""
+    st = os.stat(path)
+    key = (os.path.abspath(path), st.st_mtime, st.st_size, int(max_tris))
+    if key in _ROUGH:
+        return _ROUGH[key]
+    t0 = time.time()
+    tris = read_stl(path)
+    size = float(np.ptp(tris.reshape(-1, 3), axis=0).max())
+    V, T = weld(tris, max(size * 1e-7, 1e-9))
+    n0 = len(T)
+    if max_tris and len(T) > max_tris:
+        V, T = cluster(V, T, int(max_tris))
+    shape, n = mesh_shape(V, T)
+    shape._mesh = True
+    bb = np.ptp(V, axis=0)
+    rep = {"triangles": int(n0), "faces": int(n), "size": [round(float(x), 3) for x in bb], "seconds": round(time.time() - t0, 1)}
+    _ROUGH[key] = (shape, rep)
+    while len(_ROUGH) > 4:
+        _ROUGH.pop(next(iter(_ROUGH)))
+    return shape, rep

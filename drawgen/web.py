@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Local web server of SHINYCAD."""
+import hashlib
 import io
 import json
 import sys
@@ -19,7 +20,7 @@ import numpy as np
 
 from flask import Flask, jsonify, request, send_file, send_from_directory
 
-from . import analysis, assembly, dialogs, drawing, fcstd, fea, fits, measure, model, part, render, sketch, sketchimage, units
+from . import analysis, assembly, cam, dialogs, drawing, fcstd, fea, fits, measure, model, part, render, sketch, sketchimage, units
 from . import titleblock as tbk
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -60,7 +61,8 @@ LOCK = threading.Lock()
 # settings of this PC: config.local.json next to config.json (not in the repository); the other settings (sheet, views,
 # title block, options) stay in config.json
 LOCAL_PATH = os.path.splitext(CONFIG_PATH)[0] + ".local.json"
-LOCAL_KEYS = ("projects_root", "current_project", "explicit", "browser", "ccx_path", "recent_roots", "known_projects")
+LOCAL_KEYS = ("projects_root", "current_project", "explicit", "browser", "ccx_path", "recent_roots", "known_projects",
+              "part_last")
 
 
 def load_config():
@@ -453,7 +455,7 @@ def _pj_error(fn):
 def projects_list():
     d = PROJECTS.dirs()
     return jsonify({"root": PROJECTS.root(), "current": PROJECTS.current_name(), "projects": PROJECTS.list_projects(),
-                    "recent_roots": PROJECTS.recent_roots(), "known": PROJECTS.known(), "dirs": {"work": str(d.parts), "step": d.step, "drawings": d.drawings}})
+                    "recent_roots": PROJECTS.recent_roots(), "known": PROJECTS.known(), "dirs": {"work": str(d.parts), "step": d.step, "drawings": d.drawings, "cam": d.cam}})
 
 
 @app.route("/api/projects/root", methods=["PUT"])
@@ -775,10 +777,11 @@ def dialog():
             "dxf": [("DXF files", "*.dxf"), ("All files", "*.*")],
             "inp": [("Abaqus input", "*.inp"), ("All files", "*.*")],
             "image": [("Images", "*.png *.jpg *.jpeg *.gif *.webp *.bmp *.tif *.tiff"), ("All files", "*.*")],
-            "shinycad": [("ShinyCAD documents", "*.scpart *.scasm *.scsketch *.scfea *.scexp"), ("All files", "*.*")],
+            "shinycad": [("ShinyCAD documents", "*.scpart *.scasm *.scsketch *.scfea *.scexp *.sccam"), ("All files", "*.*")],
             "scpart": [("ShinyCAD part", "*.scpart")], "scasm": [("ShinyCAD assembly", "*.scasm")],
             "scsketch": [("ShinyCAD sketch", "*.scsketch")], "scfea": [("ShinyCAD analysis", "*.scfea")],
-            "scexp": [("ShinyCAD explicit analysis", "*.scexp")]}.get(filt, [("All files", "*.*")])
+            "scexp": [("ShinyCAD explicit analysis", "*.scexp")], "sccam": [("ShinyCAD CAM", "*.sccam")],
+            "nc": [("G-code", "*.nc *.ngc *.gcode *.tap"), ("All files", "*.*")]}.get(filt, [("All files", "*.*")])
     try:
         path = dialogs.ask(req.get("kind") or "open", req.get("title") or "", req.get("initial") or "", pats, req.get("save_name") or "")
     except Exception as e:
@@ -1500,6 +1503,32 @@ def _part_path(name):
     return os.path.join(PART_DIR, safe_name(name) + ".part.json")
 
 
+@app.route("/api/part/last", methods=["GET"])
+def get_part_last():
+    """Last used settings of the Part tab commands (config.local.json "part_last": {type: {key: value}})."""
+    return jsonify(load_config().get("part_last") or {})
+
+
+@app.route("/api/part/last", methods=["PUT"])
+def put_part_last():
+    """{"type": command type, "values": {key: value}} merged into the last used settings of that command;
+    {"clear": true} removes all of them."""
+    req = request.get_json(force=True) or {}
+    cfg = load_config()
+    last = cfg.get("part_last") or {}
+    if req.get("clear"):
+        last = {}
+    else:
+        t = str(req.get("type") or "")
+        vals = req.get("values")
+        if not t or not isinstance(vals, dict):
+            return error("type and values required")
+        last[t] = dict(last.get(t) or {}, **vals)
+    cfg["part_last"] = last
+    save_config(cfg)
+    return jsonify(last)
+
+
 @app.route("/api/part/build", methods=["POST"])
 def part_build():
     req = request.get_json(force=True)
@@ -1514,15 +1543,15 @@ def part_build():
         for k, b in bodies.items():
             try:
                 mm = part.mesh(b)
-                smesh[k] = {"vertices": mm["vertices"], "triangles": mm["triangles"], "edges": mm["edges"], "edge_keys": mm["edge_keys"],
-                            "face_keys": mm["face_keys"], "face_of_tri": mm["face_of_tri"]}
+                rough = getattr(b, "_mesh", False)        # a rough STL mesh: its triangle edges are not drawn
+                smesh[k] = {"vertices": mm["vertices"], "triangles": mm["triangles"], "edges": [] if rough else mm["edges"],
+                            "edge_keys": [] if rough else mm["edge_keys"], "face_keys": mm["face_keys"], "face_of_tri": mm["face_of_tri"]}
             except Exception:
                 pass
         solids = []
         if shape is not None:
-            for i, so in enumerate(shape.solids()):
-                bb = so.bounding_box()
-                solids.append({"index": i, "volume_mm3": round(so.volume, 3), "bbox": [bb.min.X, bb.min.Y, bb.min.Z, bb.max.X, bb.max.Y, bb.max.Z]})
+            for i, so in enumerate(part._topo(shape).solids):
+                solids.append({"index": i, "volume_mm3": round(so.volume, 3), "bbox": part.exact_bbox(so)})
     except Exception as e:
         traceback.print_exc()
         return error("build failed: %s" % e, 500)
@@ -1684,6 +1713,23 @@ def part_expand():
     except Exception as e:
         traceback.print_exc()
         return error("edge selection failed: %s" % e, 500)
+
+
+@app.route("/api/part/expand_faces", methods=["POST"])
+def part_expand_faces():
+    """Face references grown from a picked face: {"part", "index", "mode": tangent | connected, "ref": face key,
+    "surface": surface body id (none: the solid)} -> [face keys]."""
+    req = request.get_json(force=True)
+    try:
+        bodies = {}
+        shape, _ = part.build(req.get("part") or {}, upto=int(req.get("index", 0)), surfaces=bodies)
+        body = bodies.get(req.get("surface")) if req.get("surface") else shape
+        if body is None:
+            return jsonify([req.get("ref")])
+        return jsonify(part.expand_faces(body, req.get("ref") or {}, req.get("mode") or "tangent"))
+    except Exception as e:
+        traceback.print_exc()
+        return error("face selection failed: %s" % e, 500)
 
 
 @app.route("/api/part/list", methods=["GET"])
@@ -1895,6 +1941,13 @@ def part_measure():
                 if not 0 <= fi < len(fs):
                     return error("face not found", 400)
                 items.append(measure.item_from_face(fs[fi], "face %d" % fi))
+            elif it.get("point") is not None:
+                # a point clicked on a surface body (a rough STL mesh)
+                from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
+                from OCP.gp import gp_Pnt
+                q = [float(v) for v in it["point"]][:3]
+                items.append({"kind": "point", "name": "Point on " + names.get(it.get("surface"), "surface"), "c": q,
+                              "shape": BRepBuilderAPI_MakeVertex(gp_Pnt(*q)).Vertex()})
             elif it.get("base") in base:
                 items.append({"kind": "plane", "name": "Plane " + it["base"], "c": [0, 0, 0], "n": base[it["base"]], "shape": None})
             else:
@@ -2324,7 +2377,569 @@ def fea_open_folder():
     return jsonify({"ok": True, "path": path})
 
 
-# --------------------------------------------------------------------------- explicit analysis (OpenCourant)
+
+# --------------------------------------------------------------------------- CAM
+
+CAM_DIR = _Dir("cam")        # G-code files of the open project
+
+
+def _cam_doc_path(name):
+    return os.path.join(ASM_DIR, safe_name(name) + ".cam.json")
+
+
+def _cam_tools():
+    """Tool bit library (config.json "cam_tools"; the default tools when none is saved)."""
+    t = load_config().get("cam_tools")
+    bits = t if isinstance(t, list) and t else [dict(x) for x in cam.DEFAULT_TOOLS]
+    return [cam.normalize_tool(b) for b in bits]
+
+
+def _cam_shape(doc, placed=True):
+    """(solid of the source part of a CAM document moved by the model placement (placed False: as in the part),
+    cache key of the part file and the placement)."""
+    src = doc.get("source") or {}
+    if not src.get("name"):
+        raise ValueError("no part is chosen")
+    path = _part_path(src["name"])
+    with open(path, "r", encoding="utf-8") as f:
+        raw = f.read()
+    p = part.migrate(json.loads(raw))
+    shape, st = part.build(p)
+    if shape is None:
+        raise ValueError("the part %s has no solid" % src["name"])
+    key = "%s:%s" % (src["name"], hashlib.sha1(raw.encode("utf-8")).hexdigest())
+    st = doc.get("stock") or {}
+    if st.get("kind") == "step":
+        try:
+            sp = cam.job.step_path(st)
+            fs = os.stat(sp)
+            key += ":stock:%s:%s:%s" % (sp, fs.st_mtime, fs.st_size)
+        except (OSError, ValueError):
+            pass
+    if placed:
+        pk = cam.placement.key(doc.get("placement"))
+        if pk:
+            shape = cam.placement.apply(shape, doc.get("placement"))
+            key += ":" + pk
+    return shape, key
+
+
+def _cam_step_path(p):
+    """A stock STEP path: absolute as it is, relative in the STEP folder of the open project."""
+    if os.path.isabs(p):
+        return p
+    try:
+        return os.path.join(PROJECTS.dirs().step, p)
+    except Exception:
+        return p
+
+
+cam.job.RESOLVE_PATH = _cam_step_path
+
+
+def _cam_part_sketch(name, fid):
+    """A sketch of a part (its sketch feature fid) as a sketch record with "plane": {"o", "u", "v"} (the sketch plane
+    in part coordinates; principal planes with their offset, plane features, faces and normal planes resolved by a
+    build of the part)."""
+    with open(_part_path(name), "r", encoding="utf-8") as f:
+        p = part.migrate(json.loads(f.read()))
+    feats = part.normalize(p)
+    f = next((x for x in feats if x.get("id") == fid), None)
+    if f is None or not f.get("sketch"):
+        raise ValueError("the sketch %s of the part %s is not found" % (fid, name))
+    if f.get("plane") in ("normal", "datum", "face"):
+        dts, bodies = {}, {}
+        shape, _ = part.build(p, datums=dts, surfaces=bodies)
+        part.resolve_plane(f, shape, bodies, dts)
+    pl = part.plane_of(f)
+    rec = dict(f["sketch"])
+    rec["name"] = "%s: %s" % (name, f.get("name") or fid)
+    rec["plane"] = {"o": [pl.origin.X, pl.origin.Y, pl.origin.Z], "u": [pl.x_dir.X, pl.x_dir.Y, pl.x_dir.Z],
+                    "v": [pl.y_dir.X, pl.y_dir.Y, pl.y_dir.Z]}
+    return rec
+
+
+def _cam_prepare(doc):
+    """The document in the current form with the sketch records of the Engrave and Vcarve operations loaded
+    from the project ({"sketch": {"name"}} -> the saved sketch; {"sketch": {"part", "feature"}} -> the sketch of a
+    part feature with its plane)."""
+    d = cam.migrate(doc)
+    for op in d.get("operations") or []:
+        sk = op.get("sketch")
+        if isinstance(sk, dict) and sk.get("part") and sk.get("feature") and "entities" not in sk:
+            try:
+                op["sketch"] = _cam_part_sketch(sk["part"], sk["feature"])
+            except (OSError, ValueError) as e:
+                op["sketch"] = {"name": sk.get("feature"), "error": "the part sketch cannot be read: %s" % e}
+            continue
+        if isinstance(sk, dict) and sk.get("name") and "entities" not in sk:
+            try:
+                with open(_sketch_path(sk["name"]), "r", encoding="utf-8") as f:
+                    rec = json.load(f)
+                rec["name"] = sk["name"]
+                op["sketch"] = rec
+            except (OSError, ValueError) as e:
+                op["sketch"] = {"name": sk["name"], "error": "the sketch %s cannot be read: %s" % (sk["name"], e)}
+    return d
+
+
+def _view_mesh(shape, keys=False):
+    if shape is None:
+        return None
+    m = part.mesh(shape)
+    out = {"vertices": m["vertices"], "triangles": m["triangles"], "edges": m["edges"], "bbox": m["bbox"]}
+    if keys:
+        out["face_keys"] = m["face_keys"]
+        out["face_of_tri"] = m["face_of_tri"]
+        out["edge_keys"] = m["edge_keys"]
+    return out
+
+
+@app.route("/api/cam/list", methods=["GET"])
+def cam_list():
+    names = []
+    if os.path.isdir(ASM_DIR):
+        names = sorted(n[:-len(".cam.json")] for n in os.listdir(ASM_DIR) if n.endswith(".cam.json"))
+    return jsonify(names)
+
+
+@app.route("/api/cam/file/<name>", methods=["GET"])
+def cam_get(name):
+    """The saved document in the current form (cam.migrate)."""
+    try:
+        with open(_cam_doc_path(name), "r", encoding="utf-8") as f:
+            return jsonify(cam.migrate(json.load(f)))
+    except (OSError, ValueError) as e:
+        return error("cannot read CAM document %s: %s" % (name, e), 404)
+
+
+@app.route("/api/cam/file/<name>", methods=["PUT"])
+def cam_put(name):
+    a = request.get_json(force=True)
+    if not isinstance(a, dict) or "operations" not in a:
+        return error("CAM document expected")
+    os.makedirs(ASM_DIR, exist_ok=True)
+    tmp = _cam_doc_path(name) + _tmp_ext()
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(a, f)
+    _replace(tmp, _cam_doc_path(name))
+    return jsonify({"ok": True, "path": _cam_doc_path(name)})
+
+
+@app.route("/api/cam/meta", methods=["GET"])
+def cam_meta():
+    """Names of the operation types, the tool shapes, the setup sheet defaults, the workpiece and tool materials
+    and the post-processors."""
+    return jsonify({"op_names": cam.OP_NAMES, "shapes": cam.SHAPE_NAMES, "setup": cam.DEFAULT_SETUP,
+                    "materials": cam.feeds.materials(), "tool_materials": cam.feeds.TOOL_MATERIALS,
+                    "posts": [{"id": k, "name": v} for k, v in cam.POSTS.items()], "supplemental": list(cam.SUPPLEMENTAL),
+                    "derived": list(cam.DERIVED)})
+
+
+@app.route("/api/cam/tools", methods=["GET"])
+def cam_tools_get():
+    return jsonify(_cam_tools())
+
+
+@app.route("/api/cam/tool_profile", methods=["POST"])
+def cam_tool_profile():
+    """Half profile of a tool bit for the bit editor: {"bit": tool bit} -> {"cut": [[r, z]...], "body": [[r, z]...],
+    "d", "height" (cutting), "length" (mm)} or {"error": text}."""
+    b = (request.get_json(force=True) or {}).get("bit") or {}
+    try:
+        t = cam.tools.normalize(b)
+        cut, body = cam.tools.tool_profile(t)
+        return jsonify({"cut": [[round(r, 4), round(z, 4)] for r, z in cut], "body": [[round(r, 4), round(z, 4)] for r, z in body],
+                        "d": round(2 * max(r for r, z in cut), 4), "height": round(cut[-1][1], 4), "length": round(body[-1][1], 4)})
+    except (ValueError, TypeError) as e:
+        return jsonify({"error": str(e)})
+
+
+@app.route("/api/cam/library", methods=["GET"])
+def cam_library():
+    """The standard tool library (tools.library): [tool bit with "group"]."""
+    return jsonify(cam.tools.library())
+
+
+CAM_MACHINE = {"travel_x": 600.0, "travel_y": 400.0, "travel_z": 100.0, "table_x": 700.0, "table_y": 500.0, "table_t": 20.0,
+               "home_x": 50.0, "home_y": 50.0, "tip_top": 110.0, "gantry_clear": 130.0, "spindle_d": 80.0, "spindle_len": 200.0}
+
+
+@app.route("/api/cam/machine", methods=["GET"])
+def cam_machine_get():
+    """The machine model of the CAM tab (config.json "cam_machine"): travels, table, the table position of X 0 Y 0
+    of the travel, the tool tip height at the top of the Z travel, gantry clearance, spindle size (mm)."""
+    m = dict(CAM_MACHINE)
+    m.update({k: v for k, v in (load_config().get("cam_machine") or {}).items() if k in CAM_MACHINE})
+    return jsonify(m)
+
+
+@app.route("/api/cam/machine", methods=["PUT"])
+def cam_machine_put():
+    m = request.get_json(force=True)
+    if not isinstance(m, dict):
+        return error("machine record expected")
+    out = {}
+    for k, d in CAM_MACHINE.items():
+        try:
+            out[k] = float(m.get(k, d))
+        except (TypeError, ValueError):
+            return error("%s is not a number" % k)
+    if min(out["travel_x"], out["travel_y"], out["travel_z"], out["table_x"], out["table_y"]) <= 0:
+        return error("travels and table size must be above 0")
+    cfg = load_config()
+    cfg["cam_machine"] = out
+    save_config(cfg)
+    return jsonify(out)
+
+
+@app.route("/api/cam/posts", methods=["GET"])
+def cam_posts():
+    """G-code post-processors: [{"id", "name"}]."""
+    return jsonify([{"id": k, "name": v} for k, v in cam.POSTS.items()])
+
+
+@app.route("/api/cam/tools", methods=["PUT"])
+def cam_tools_put():
+    """[tool bit, ...] saved to config.json "cam_tools"; each bit is checked (tool_profile)."""
+    tools = request.get_json(force=True)
+    if not isinstance(tools, list):
+        return error("tool list expected")
+    ids = set()
+    out = []
+    for t in tools:
+        if not isinstance(t, dict) or not str(t.get("id") or "").strip():
+            return error("every tool needs an id")
+        t["id"] = str(t["id"]).strip()
+        if t["id"] in ids:
+            return error("tool id %s is used twice" % t["id"])
+        ids.add(t["id"])
+        try:
+            t = cam.normalize_tool(t)
+            cam.check_tool(t)
+        except ValueError as e:
+            return error(str(e))
+        out.append(t)
+    cfg = load_config()
+    cfg["cam_tools"] = out
+    save_config(cfg)
+    return jsonify(out)
+
+
+@app.route("/api/cam/geometry", methods=["POST"])
+def cam_geometry():
+    """View mesh of the source part of a CAM document with the face and edge keys, the kind of every face and the
+    undercut faces: {"cam": doc}."""
+    doc = (request.get_json(force=True) or {}).get("cam") or {}
+    try:
+        shape, skey = _cam_shape(doc)
+        m = _view_mesh(shape, keys=True)
+        try:
+            with open(_part_path((doc.get("source") or {}).get("name", "")), "rb") as f:
+                m["part_key"] = hashlib.sha1(f.read()).hexdigest()
+        except OSError:
+            m["part_key"] = ""
+        under = []
+        keys = [part.face_key(fc) for fc, _ in cam.undercut_faces(shape)]
+        for i, k in enumerate(m["face_keys"]):
+            if k and any(math.dist(k["c"], u["c"]) < 1e-3 for u in keys):
+                under.append(i)
+        m["undercuts"] = under
+        m["face_kind"] = cam.face_kinds(shape, under)
+        m["volume_mm3"] = round(shape.volume, 3)
+        try:
+            with open(_part_path((doc.get("source") or {}).get("name", "")), "r", encoding="utf-8") as f:
+                prec = part.migrate(json.loads(f.read()))
+            m["part_sketches"] = [{"id": x.get("id"), "name": x.get("name") or x.get("id"), "plane": x.get("plane", "XY"),
+                                   "offset": x.get("offset", 0)} for x in prec.get("features") or [] if x.get("type") == "sketch"]
+        except (OSError, ValueError):
+            m["part_sketches"] = []
+        m["bbox"] = cam._bbox(shape)
+        return jsonify(m)
+    except Exception as e:
+        traceback.print_exc()
+        return error("geometry failed: %s" % e, 400)
+
+
+@app.route("/api/cam/setup", methods=["POST"])
+def cam_setup():
+    """Stock and machine zero of a CAM document: {"cam": doc} -> {"stock_bbox", "part_bbox", "origin", "clearance_z",
+    "stock_mesh" (STEP stock: the view mesh of the stock before the first operation)}."""
+    doc = (request.get_json(force=True) or {}).get("cam") or {}
+    try:
+        doc = cam.migrate(doc)
+        shape, _ = _cam_shape(doc)
+        stock0 = cam.stock_solid(doc, shape)
+        bb = cam._bbox(stock0)
+        out = {"stock_bbox": bb, "part_bbox": cam._bbox(shape), "origin": cam.origin_of(doc, bb),
+               "clearance_z": bb[5] + cam._f((doc.get("setup") or {}).get("clearance_offset"), 5.0)}
+        if (doc.get("stock") or {}).get("kind") == "step":
+            out["stock_mesh"] = _view_mesh(stock0)
+        return jsonify(out)
+    except Exception as e:
+        traceback.print_exc()
+        return error("setup failed: %s" % e, 400)
+
+
+_CAM_PREVIEW = {}                  # client id -> number of its latest preview run
+_CAM_PREVIEW_LOCK = threading.Lock()
+
+
+def _cam_run(doc, upto=None, cancel=None):
+    """(document, shape, bits, result) of a run; the operations before upto come from the cache of the job module."""
+    d = _cam_prepare(doc)
+    shape, key = _cam_shape(d)
+    bits = _cam_tools()
+    res = cam.run(d, shape, bits, upto=upto, shape_key=key, cancel=cancel)
+    return d, shape, bits, res
+
+
+@app.route("/api/cam/part_state", methods=["POST"])
+def cam_part_state():
+    """State of the source part file of a CAM document without a build: {"cam": doc} -> {"key": sha1 of the part
+    file, "mtime"}; the client compares the key with the key of the loaded geometry."""
+    doc = (request.get_json(force=True) or {}).get("cam") or {}
+    src = doc.get("source") or {}
+    if not src.get("name"):
+        return jsonify({"key": "", "mtime": 0})
+    try:
+        path = _part_path(src["name"])
+        with open(path, "rb") as f:
+            raw = f.read()
+        return jsonify({"key": hashlib.sha1(raw).hexdigest(), "mtime": os.path.getmtime(path)})
+    except OSError as e:
+        return error("cannot read the part %s: %s" % (src["name"], e), 404)
+
+
+@app.route("/api/cam/placement", methods=["POST"])
+def cam_placement():
+    """Model placement: {"cam": doc, "drag": {"delta"} (optional)} -> the solve of the placement constraints {"pos",
+    "rot", "constraints", "messages", "unsatisfied", "flipped"}; {"cam": doc, "suggest": {"face": index | "edge":
+    point | "vertex": point (job coordinates), "type"}} -> {"datum", "flip", "value", "kind", ...} of a new
+    constraint."""
+    req = request.get_json(force=True) or {}
+    doc = cam.migrate(req.get("cam") or {})
+    try:
+        shape, _ = _cam_shape(doc, placed=False)
+        if req.get("suggest") is not None:
+            sg = req["suggest"] or {}
+            return jsonify(cam.placement.suggest(doc.get("placement"), shape, sg.get("face"), sg.get("type") or "coincident",
+                                                 edge=sg.get("edge"), vertex=sg.get("vertex")))
+        return jsonify(cam.placement.solve(doc.get("placement"), shape, drag=req.get("drag")))
+    except Exception as e:
+        traceback.print_exc()
+        return error("placement failed: %s" % e, 400)
+
+
+@app.route("/api/cam/measure", methods=["POST"])
+def cam_measure():
+    """Measurement in a CAM job (the placed part, job coordinates): {"cam": doc, "items": [{"face": index} | {"edge":
+    index} (shape.faces() / shape.edges() order of the placed part) | {"vertex": [x, y, z]} | {"ref": "zero" |
+    "stock_top" | "stock_bottom"}]} -> measure.measure (rows, closest points) with "items" (labels) and "origin" (the
+    machine zero); one item: its point or centre in machine coordinates as well."""
+    req = request.get_json(force=True) or {}
+    doc = cam.migrate(req.get("cam") or {})
+    try:
+        shape, _ = _cam_shape(doc)
+        stock0 = cam.stock_solid(doc, shape)
+        sb = cam._bbox(stock0)
+        origin = cam.origin_of(doc, sb)
+        items = []
+        for it in (req.get("items") or [])[:2]:
+            if it.get("face") is not None:
+                fs = shape.faces()
+                fi = int(it["face"])
+                if not 0 <= fi < len(fs):
+                    return error("face not found", 400)
+                items.append(measure.item_from_face(fs[fi], "face %d" % (fi + 1)))
+            elif it.get("edge") is not None:
+                es = shape.edges()
+                ei = int(it["edge"])
+                if not 0 <= ei < len(es):
+                    return error("edge not found", 400)
+                items.append(measure.item_from_edge(es[ei], "edge %d" % (ei + 1)))
+            elif it.get("vertex") is not None:
+                items.append(measure.item_from_point(it["vertex"], "vertex"))
+            elif it.get("ref") == "zero":
+                x = measure.item_from_point(origin, "machine zero")
+                items.append(x)
+            elif it.get("ref") in ("stock_top", "stock_bottom"):
+                top = it["ref"] == "stock_top"
+                c = [(sb[0] + sb[3]) / 2, (sb[1] + sb[4]) / 2, sb[5] if top else sb[2]]
+                items.append({"kind": "plane", "name": "Stock top" if top else "Stock bottom", "c": c, "n": [0, 0, 1 if top else -1], "shape": None})
+            else:
+                return error("unknown measure item", 400)
+        if not items:
+            return error("nothing picked", 400)
+        res = measure.measure(items[0], items[1] if len(items) > 1 else None)
+        if len(items) == 1 and items[0].get("shape") is not None:
+            c = items[0]["c"]
+            what = "Point" if items[0]["kind"] == "point" else "Midpoint" if items[0]["kind"] in ("line", "other") and items[0].get("edge") else "Centre"
+            res["rows"].append([what + ", machine coordinates", measure.vec([c[i] - origin[i] for i in range(3)])])
+        res["items"] = [measure.label(x) for x in items]
+        res["origin"] = origin
+        return jsonify(res)
+    except Exception as e:
+        traceback.print_exc()
+        return error("measure failed: %s" % e, 400)
+
+
+@app.route("/api/cam/feeds", methods=["POST"])
+def cam_feeds():
+    """Feeds and speeds: {"cam": doc, "tc": tool controller id | "bit": tool bit id, "ae", "ap" (mm), "material"
+    (default: the stock material of the job)} -> feeds.calc."""
+    req = request.get_json(force=True) or {}
+    doc = cam.migrate(req.get("cam") or {})
+    try:
+        bid = req.get("bit")
+        if req.get("tc"):
+            tc = next((t for t in doc.get("tools") or [] if t.get("id") == req["tc"]), None)
+            if tc is None:
+                return error("no tool controller %s" % req["tc"])
+            bid = tc.get("bit")
+        bit = next((b for b in _cam_tools() if b.get("id") == bid), None)
+        if bit is None:
+            return error("the tool %s is not in the tool table" % bid)
+        mat = req.get("material") or (doc.get("stock") or {}).get("material")
+        if not mat:
+            return error("no workpiece material: set the material of the stock")
+        return jsonify(cam.feeds.calc(bit, mat, doc.get("setup"), req.get("ae"), req.get("ap")))
+    except ValueError as e:
+        return error(str(e))
+
+
+@app.route("/api/cam/run", methods=["POST"])
+def cam_run():
+    """Toolpaths and the stock after the operations: {"cam": doc, "upto": index or null, "meshes": true} ->
+    {"operations", "stock_mesh", "stock0_bbox", "clearance_z", "origin", "left_mm3", "gone_mm3", "left_mesh",
+    "sanity"}. "preview": client id: a later preview of the same client stops this run before its next operation
+    ({"cancelled": true})."""
+    req = request.get_json(force=True) or {}
+    doc = req.get("cam") or {}
+    upto = req.get("upto")
+    cancel = None
+    cid = req.get("preview")
+    if cid:
+        with _CAM_PREVIEW_LOCK:
+            gen = _CAM_PREVIEW[cid] = _CAM_PREVIEW.get(cid, 0) + 1
+        cancel = lambda: _CAM_PREVIEW.get(cid) != gen
+    try:
+        d, shape, bits, res = _cam_run(doc, int(upto) if upto is not None else None, cancel=cancel)
+        out = {"operations": res["operations"], "stock0_bbox": cam._bbox(res["stock0"]), "clearance_z": res["clearance_z"],
+               "origin": res["origin"], "sanity": cam.sanity(d, shape, bits, res)}
+        if req.get("meshes", True):
+            left_v, gone_v, left = cam.remaining(res["stock"], shape)
+            out.update({"stock_mesh": _view_mesh(res["stock"]), "left_mm3": round(left_v, 3), "gone_mm3": round(gone_v, 3),
+                        "left_mesh": _view_mesh(left) if left is not None else None})
+        return jsonify(out)
+    except cam.job.Cancelled:
+        return jsonify({"cancelled": True})
+    except Exception as e:
+        traceback.print_exc()
+        return error("CAM run failed: %s" % e, 400)
+
+
+@app.route("/api/cam/cancel", methods=["POST"])
+def cam_cancel():
+    """Stop the running preview of a client before its next operation: {"preview": client id}."""
+    cid = (request.get_json(force=True) or {}).get("preview")
+    if cid:
+        with _CAM_PREVIEW_LOCK:
+            _CAM_PREVIEW[cid] = _CAM_PREVIEW.get(cid, 0) + 1
+    return jsonify({"ok": True})
+
+
+@app.route("/api/cam/sanity", methods=["POST"])
+def cam_sanity():
+    """Sanity check of the job without a run: {"cam": doc} -> [{"level", "text"}]."""
+    doc = (request.get_json(force=True) or {}).get("cam") or {}
+    try:
+        d = _cam_prepare(doc)
+        shape = None
+        try:
+            shape, _ = _cam_shape(d)
+        except Exception:
+            shape = None
+        return jsonify(cam.sanity(d, shape, _cam_tools(), None))
+    except Exception as e:
+        traceback.print_exc()
+        return error("sanity check failed: %s" % e, 400)
+
+
+@app.route("/api/cam/template", methods=["POST"])
+def cam_template():
+    """Job template of the document: {"cam": doc} -> the template; {"cam": doc, "apply": template} -> the document
+    with the template applied."""
+    req = request.get_json(force=True) or {}
+    doc = req.get("cam") or {}
+    try:
+        if req.get("apply") is not None:
+            tpl = req["apply"]
+            if not isinstance(tpl, dict) or tpl.get("format") != "shinycad-cam-template":
+                return error("not a ShinyCAD CAM template")
+            return jsonify(cam.apply_template(doc, tpl))
+        return jsonify(cam.template(doc))
+    except Exception as e:
+        traceback.print_exc()
+        return error("template failed: %s" % e, 400)
+
+
+@app.route("/api/cam/gcode", methods=["POST"])
+def cam_gcode():
+    """G-code of the operations: {"cam": doc, "folder": output folder (empty: the project cam folder; "-": download),
+    "overwrite", "inspect": index (the text of one operation returned as {"text"}), "post"} -> {"written": [path]}
+    or the file."""
+    req = request.get_json(force=True) or {}
+    doc = req.get("cam") or {}
+    inspect = req.get("inspect")
+    try:
+        d, shape, bits, res = _cam_run(doc, int(inspect) if inspect is not None else None)
+        bad = [o for o in res["operations"] if not o.get("ok")]
+        if bad and inspect is None:
+            return error("operation %s: %s" % (bad[0].get("name") or bad[0].get("id"), "; ".join(bad[0].get("errors") or ["failed"])))
+        text = cam.gcode(d, res, bits, post=req.get("post") or None, only=int(inspect) if inspect is not None else None)
+    except Exception as e:
+        traceback.print_exc()
+        return error("G-code failed: %s" % e, 400)
+    if inspect is not None:
+        return jsonify({"text": text, "lines": len(text.splitlines())})
+    out = d.get("output") or {}
+    name = safe_name(out.get("name") or d.get("name") or "cam")
+    if not name.lower().endswith((".nc", ".gcode", ".tap", ".ngc")):
+        name += ".nc"
+    folder = (req.get("folder") or out.get("folder") or "").strip().strip('"')
+    if folder == "-":
+        return send_file(io.BytesIO(text.encode("utf-8")), as_attachment=True, download_name=name)
+    folder = folder or (str(CAM_DIR) if PROJECTS.current_name() else "")
+    if not folder:
+        return send_file(io.BytesIO(text.encode("utf-8")), as_attachment=True, download_name=name)
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, name)
+    if os.path.exists(path) and not req.get("overwrite"):
+        return jsonify({"exists": path}), 409
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    return jsonify({"written": [path], "lines": len(text.splitlines())})
+
+
+@app.route("/api/cam/open_folder", methods=["POST"])
+def cam_open_folder():
+    """Opens the G-code folder of the open project in Explorer."""
+    folder = str(CAM_DIR) if PROJECTS.current_name() else ""
+    if not folder:
+        return error("no project is open")
+    os.makedirs(folder, exist_ok=True)
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(folder)  # noqa
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", folder])
+        else:
+            subprocess.Popen(["xdg-open", folder])
+    except Exception as e:
+        return error("cannot open %s: %s" % (folder, e))
+    return jsonify({"ok": True, "path": folder})
+
 
 from .explicit import routes as _explicit_routes      # noqa: E402
 EXPLICIT = _explicit_routes.register(sys.modules[__name__])

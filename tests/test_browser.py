@@ -36,6 +36,7 @@ def page(ui_browser, server_url, client):
     pg.on("console", lambda m: errors.append("console: %s (%s)" % (m.text, m.location.get("url", "")))
           if m.type == "error" and "favicon" not in m.location.get("url", "") else None)
     pg.on("dialog", lambda d: d.accept(pg.__dict__.get("_answer", "")) if d.type == "prompt" else d.accept())
+    client.put("/api/part/last", json={"clear": True})     # Part command settings of earlier tests not kept
     pg.goto(server_url + "/")
     pg.wait_for_load_state("networkidle")
     pg.wait_for_function("window.__part && window.__asm && window.projectInfo && window.projectInfo()")
@@ -129,7 +130,7 @@ def test_part_sketch_extrude_save(page, client):
     page.wait_for_selector("#pf-depth")
     page.fill("#pf-depth", "20")
     page.dispatch_event("#pf-depth", "change")
-    page.click("#pt-cmdfinish")
+    page.click("#cmd-finish")
     wait_text(page, "#pt-info", "Volume 100 cm^3")
     page.__dict__["_answer"] = "ui_box"
     page.keyboard.press("Control+s")                                # not saved yet: asks for the name
@@ -241,7 +242,7 @@ def test_part_hole_mesh_command(page, client):
     page.click("#tab-part [data-add=hole_mesh]")
     page.wait_for_selector("#pf-hmcirc")
     page.evaluate("(keys) => { const P = window.__part, f = P.feat(P.PT.cmd.id); f.faces = keys; P.changedPart(); }", keys)
-    page.click("#pt-cmdfinish")
+    page.click("#cmd-finish")
     wait_text(page, "#pt-props", "20 blocks")
 
 
@@ -1357,7 +1358,7 @@ def test_part_place_command(page, client):
     time.sleep(0.5)
     click_face(0, -1)
     page.wait_for_function("window.__part.feat(window.__part.PT.cmd.id).face2")
-    page.click("#pt-cmdfinish")
+    page.click("#cmd-finish")
     page.wait_for_function("window.__part.PT.mesh && !window.__part.PT.cmd")
     page.wait_for_function("(() => { const b = window.__part.PT.mesh.bbox; return Math.abs(b[2]) < 1e-6 && Math.abs(b[1]) < 1e-6; })()", timeout=60000)
 
@@ -1378,9 +1379,9 @@ def test_part_plane_normal_to_sketch_curve(page, client):
     page.wait_for_function("window.__part.PT.cmd")
     page.evaluate("window.__part.gotoStep(0)")                     # the command opens at Offset (Method has a default)
     page.select_option("#pf-method", "edge")
-    page.wait_for_selector("#cmd-next")
-    page.click("#cmd-next")
-    page.wait_for_function("document.querySelector('#pt-props .cmd-step.active .lbl').textContent === 'Edge or curve'")
+    page.wait_for_selector("#pt-cmdbody .cw-sec[data-step='1'] .cw-sec-head")
+    page.click("#pt-cmdbody .cw-sec[data-step='1'] .cw-sec-head")
+    page.wait_for_function("document.querySelector('#pt-cmdbody .cw-sec.active .lbl').textContent.startsWith('Edge or curve')")
     time.sleep(0.4)
     xy = page.evaluate("""() => { const P = window.__part, PT = P.PT, t = PT.three, T = window.__part.THREE || Object.getPrototypeOf(t.camera.position).constructor;
         const r = t.renderer.domElement.getBoundingClientRect();
@@ -2271,7 +2272,7 @@ def test_part_pick_face_of_second_solid(page):
 
 
 def test_part_import_step_clean_up(page, tmp_path):
-    """Import STEP: clean-up options (rebuild and fix on for a new import); a minimum volume removes the small solid
+    """Import geometry: clean-up options (rebuild and fix on for a new import); a minimum volume removes the small solid
     and the result line reports it."""
     from build123d import Box, Compound, Location, export_step
     path = str(tmp_path / "two.step")
@@ -2285,7 +2286,7 @@ def test_part_import_step_clean_up(page, tmp_path):
     wait_text(page, "#pt-info", "2 cells")
     page.fill("#pf-cminvol", "10")
     page.dispatch_event("#pf-cminvol", "change")
-    wait_text(page, "#pt-props", "1 solid(s) below the minimum volume removed")
+    wait_text(page, "#pt-cmdbody", "1 solid(s) below the minimum volume removed")
     wait_text(page, "#pt-info", "Volume 1 cm^3")
     assert page.evaluate("window.__part.PT.part.features[0].clean.min_volume") == 10
 
@@ -2333,7 +2334,7 @@ def test_part_import_stl(page, tmp_path):
     page.dispatch_event("#pf-path", "change")
     page.wait_for_selector("#pf-sfit")
     assert page.is_checked("#pf-sfit")
-    wait_text(page, "#pt-props", "7 planar, 2 cylindrical, 2 conical")
+    wait_text(page, "#pt-cmdbody", "7 planar, 2 cylindrical, 2 conical")
     wait_text(page, "#pt-info", "Volume 22.99")
     page.uncheck("#pf-sfit")
     page.wait_for_function("window.__part.PT.status && Object.values(window.__part.PT.status).some(s => s.stl && s.stl.fit === false)", timeout=60000)
@@ -2519,6 +2520,69 @@ def test_sketch_fillet_automatic_radius_drag_and_dimension(page):
     # the dimension leader scaled with the radius (first value)
     off1 = page.evaluate("window.__sk.SK.doc.dims[0].off")
     assert off1 == pytest.approx([v * 5 / r0 for v in off0], abs=1e-6)
+
+
+def test_sketch_dimension_circle_outline_gives_centre(page):
+    """Dimension tool: a circle clicked on its outline, then a line: the distance from the circle centre to the line;
+    a line, then a circle: the same; two circles: centre to centre; a circle, then empty space: its diameter."""
+    tab(page, "sketch")
+    page.click("#sk-new")
+    page.keyboard.press("w")
+    page.keyboard.type("0,0")
+    page.keyboard.press("Enter")
+    page.keyboard.type("100,60")
+    page.keyboard.press("Enter")
+    page.keyboard.press("Escape")
+    page.keyboard.press("e")
+    page.keyboard.type("30,30")
+    page.keyboard.press("Enter")
+    page.keyboard.type("12")
+    page.keyboard.press("Enter")
+    page.keyboard.type("70,30")
+    page.keyboard.press("Enter")
+    page.keyboard.type("10")
+    page.keyboard.press("Enter")
+    page.keyboard.press("Escape")
+    page.wait_for_function("window.__sk.SK.doc.entities.filter(e => e.t === 'circle').length === 2")
+    page.uncheck("#sk-driving")
+
+    def click(xy):
+        s = page.evaluate("(p) => window.__sk.S(p)", list(xy))
+        box = page.locator("#sk-canvas svg").bounding_box()
+        page.mouse.click(box["x"] + s[0], box["y"] + s[1])
+    dims = lambda: page.evaluate("window.__sk.SK.doc.dims")
+    c1, c2 = page.evaluate("window.__sk.SK.doc.entities.filter(e => e.t === 'circle').map(e => e.id)")
+    bottom = page.evaluate("window.__sk.SK.doc.entities.find(e => e.t === 'line' && Math.abs(e.y1) < 1e-9 && Math.abs(e.y2) < 1e-9).id")
+    page.click("#tab-sketch [data-tool=dim]")
+    # circle 1 (R12) on its outline (away from the grips at 0, 90, 180, 270 deg and, at the small zoom of the test
+    # window, from the centre grip), then the bottom line, then the position
+    click((30 + 12 * math.cos(math.radians(-50)), 30 + 12 * math.sin(math.radians(-50))))
+    wait_text(page, "#sk-hint", "distance from the centre")
+    click((50, 0))
+    click((45, -10))
+    page.wait_for_function("window.__sk.SK.doc.dims.length === 1")
+    d = dims()[0]
+    assert d["type"] == "linear" and d["r1"] == {"e": c1, "k": "c"} and d["l2"] == bottom, d
+    # the bottom line, then circle 2 on its outline
+    click((80, 0))
+    click((70 + 10 * math.cos(math.radians(40)), 30 + 10 * math.sin(math.radians(40))))
+    click((85, -10))
+    page.wait_for_function("window.__sk.SK.doc.dims.length === 2")
+    d = dims()[1]
+    assert d["type"] == "linear" and d["r1"] == {"e": c2, "k": "c"} and d["l2"] == bottom, d
+    # circle 1, then circle 2: centre to centre
+    click((30 + 12 * math.cos(math.radians(130)), 30 + 12 * math.sin(math.radians(130))))
+    click((70 + 10 * math.cos(math.radians(50)), 30 + 10 * math.sin(math.radians(50))))
+    click((50, 50))
+    page.wait_for_function("window.__sk.SK.doc.dims.length === 3")
+    d = dims()[2]
+    assert d["type"] == "linear" and d["r1"] == {"e": c1, "k": "c"} and d["r2"] == {"e": c2, "k": "c"}, d
+    # circle 2, then empty space: diameter
+    click((70 + 10 * math.cos(math.radians(-40)), 30 + 10 * math.sin(math.radians(-40))))
+    click((92, 12))
+    page.wait_for_function("window.__sk.SK.doc.dims.length === 4")
+    d = dims()[3]
+    assert d["type"] == "diameter" and d["ent"] == c2, d
 
 
 def test_sketch_trim_by_sweep(page):
@@ -2832,7 +2896,7 @@ def test_part_pattern_bodies_pick(page, client):
     assert xy
     page.mouse.click(*xy)
     page.wait_for_function("(() => { const P = window.__part; return JSON.stringify(P.feat(P.PT.cmd.id).bodies) === '[{\"solid\":0}]'; })()")
-    page.click("#pt-cmdfinish")
+    page.click("#cmd-finish")
     page.wait_for_function("window.__part.PT.solids.length === 3", timeout=60000)
 
 
@@ -2857,7 +2921,7 @@ def test_part_cut_bodies_step(page, client):
     page.wait_for_selector("#tab-part input[data-pbs]")
     assert page.locator("#tab-part input[data-pbs]").count() == 2
     page.check("#tab-part input[data-pbs='1']")
-    page.click("#pt-cmdfinish")
+    page.click("#cmd-finish")
     page.wait_for_function("window.__part.PT.mesh && !window.__part.PT.cmd && window.__part.PT.solids.length === 2 && window.__part.PT.solids.some(s => Math.round(s.volume_mm3) === 1000)", timeout=60000)
 
 
@@ -2942,6 +3006,22 @@ def test_project_sort_columns_and_recent_folder(page, client, web, tmp_path):
         names = page.evaluate("() => [...document.querySelectorAll('#pj-docs tr[data-name]')].map(r => r.dataset.name)")
         assert names.index("ui_sort_big") > names.index("ui_sort_small")
         assert "▲" in page.inner_text("#pj-docs th[data-sort=size]")
+        # column width: the grip of the Name header dragged 60 px to the right widens the column; the width is kept
+        # over a redraw (localStorage); a double-click on the grip restores the automatic widths
+        w0 = page.evaluate("document.querySelector('#pj-docs th[data-sort=name]').offsetWidth")
+        g = page.locator("#pj-docs th[data-sort=name] .pj-grip").bounding_box()
+        page.mouse.move(g["x"] + g["width"] / 2, g["y"] + g["height"] / 2)
+        page.mouse.down()
+        page.mouse.move(g["x"] + g["width"] / 2 + 60, g["y"] + g["height"] / 2, steps=4)
+        page.mouse.up()
+        w1 = page.evaluate("document.querySelector('#pj-docs th[data-sort=name]').offsetWidth")
+        assert abs(w1 - (w0 + 60)) <= 2, (w0, w1)
+        assert names == page.evaluate("() => [...document.querySelectorAll('#pj-docs tr[data-name]')].map(r => r.dataset.name)")   # no sort by the drag
+        page.click("#pj-refresh")
+        page.wait_for_function("document.querySelector('#pj-docs th[data-sort=name]').offsetWidth === %d" % w1)
+        page.dblclick("#pj-docs th[data-sort=name] .pj-grip")
+        page.wait_for_function("document.querySelector('#pj-docs table').style.tableLayout === ''")
+        assert page.evaluate("localStorage.getItem('pj-colw-docs-links')") is None
         # recent folder
         idx = page.evaluate("(p) => window.projectInfo().recent_roots.findIndex(r => r.path === p)", other)
         assert idx >= 0
@@ -3011,21 +3091,1098 @@ def test_document_file_opened_from_url_and_file_column(page, client, web, server
 
 
 def test_command_search_finds_stl_import(page):
-    """Ctrl+K opens the command search; "stl" lists Import STEP of the Part tab first; Enter starts it in the Part
+    """Ctrl+K opens the command search; "stl" lists Import geometry of the Part tab first; Enter starts it in the Part
     tab; Esc closes the window."""
     tab(page, "project")
     page.keyboard.press("Control+k")
-    page.wait_for_selector("#cmd-search:not([hidden]) #cs-input")
-    page.fill("#cs-input", "stl")
+    page.wait_for_selector("#cmd-search:not([hidden])")
+    assert page.evaluate("document.activeElement.id") == "cs-input"
+    page.keyboard.type("stl")
     first = page.locator("#cs-list .cs-item").first
-    assert first.locator("b").inner_text() == "Import STEP" and "Part" in first.inner_text()
+    assert first.locator("b").inner_text() == "Import geometry" and "Part" in first.inner_text()
     page.keyboard.press("Enter")
     assert page.is_hidden("#cmd-search")
     assert not page.is_hidden("#tab-part")
     page.wait_for_function("(() => { const P = window.__part; return P.PT.cmd && P.feat(P.PT.cmd.id).type === 'import'; })()")
     page.evaluate("window.__part.cancelCommand()")
-    page.click("#cs-open")
-    page.fill("#cs-input", "fillet")
+    page.click("#cs-input")
+    page.keyboard.type("fillet")
     assert page.locator("#cs-list .cs-item").count() >= 1
     page.keyboard.press("Escape")
     assert page.is_hidden("#cmd-search")
+
+
+def test_part_sketch_on_sketch_curve_end_and_tool_sweep(page, client):
+    """A click on a sketch curve in the Plane section of Sketch sets the plane normal to the curve at the end
+    nearer the click; Sweep with Moving tool shows the tool axis and removes the V groove."""
+    from test_models import _sweep_part
+    pp = _sweep_part()
+    pp["name"] = "ui_sw"
+    client.put("/api/part/file/ui_sw", json=pp)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_sw')")
+    page.wait_for_function("window.__part.PT.mesh && window.__part.PT.mesh.vertices.length > 0 && window.__part.PT.status.sw", timeout=60000)
+    assert page.evaluate("window.__part.PT.status.sw.error") is None
+    page.evaluate("window.__part.selectItem('sw')")
+    page.evaluate("window.__part.startCommand('sweep', null, 'sw')")
+    page.wait_for_selector("#pf-saxis")
+    assert page.input_value("#pf-skind") == "tool" and page.input_value("#pf-saxis") == "auto"
+    assert page.input_value("#pf-stoolat") == "path"
+    # a click on the line x = 3 of the profile (the right side of the V, on XZ) makes it the tool axis
+    i = page.evaluate("window.__part.commandSteps(window.__part.feat('sw')).findIndex(s => s.key === 'tool_axis')")
+    page.evaluate("window.__part.gotoStep(%d)" % i)
+    page.evaluate("window.__part.addHits([{kind: 'sketch', id: 'sq', point: [1.5, 0, 2]}])")
+    assert page.evaluate("window.__part.feat('sw').axis") == 12
+    page.wait_for_selector("#pf-stoolat")
+    assert page.input_value("#pf-stoolat") == "drawn"
+    # a construction line of the profile sketch (x = 0, z from -1 to 6, drawn dashed) clicked in the view at
+    # (0, 0, 5): it becomes the tool axis; the hover text names the line under the cursor
+    page.evaluate("""(() => { const P = window.__part, sq = P.feat('sq');
+        sq.sketch.entities.push({ id: 14, t: 'line', x1: 0, y1: -1, x2: 0, y2: 6, constr: true, layer: '0' }); P.changedPart(); })()""")
+    page.wait_for_function("window.__part.PT.sketchObjs.some(o => o.userData.id === 'sq' && o.userData.constr)")
+    i = page.evaluate("window.__part.commandSteps(window.__part.feat('sw')).findIndex(s => s.key === 'tool_axis')")
+    page.evaluate("window.__part.gotoStep(%d)" % i)
+    page.wait_for_selector("#pf-saxis")
+    xy = page.evaluate("""() => { const P = window.__part, t = P.PT.three, r = t.renderer.domElement.getBoundingClientRect();
+        const v = new P.THREE.Vector3(0, 0, 5).project(t.camera);
+        return [r.left + (v.x + 1) / 2 * r.width, r.top + (1 - v.y) / 2 * r.height]; }""")
+    page.mouse.move(*xy)
+    h = page.evaluate("window.__part.PT.hover")
+    assert h and h["kind"] == "sketch" and h["id"] == "sq", h
+    assert page.evaluate("window.__part.hoverText(window.__part.PT.hover)").startswith("Construction line 14 (0, -1) - (0, 6) of Profile")
+    page.mouse.click(*xy)
+    page.wait_for_function("window.__part.feat('sw').axis === 14")
+    assert page.input_value("#pf-saxis") == "14"
+    page.select_option("#pf-skind", "profile")
+    page.wait_for_selector("#pf-saxis", state="detached")
+    page.evaluate("window.__part.cancelCommand()")
+    page.click("#tab-part [data-add=sketch]")
+    page.wait_for_selector("#pf-plane")
+    page.evaluate("window.__part.addHits([{kind: 'sketch', id: 'sp', point: [11, 9.8, 2]}])")
+    f = page.evaluate("window.__part.feat(window.__part.PT.cmd.id)")
+    assert f["plane"] == "normal" and f["plane_sketch_curve"]["sketch"] == "sp" and f["plane_t"] is None
+    assert "Normal to Path at the nearer end" in page.inner_text("#pt-cmdbody")
+    page.evaluate("window.__part.cancelCommand()")
+    # Origin step of a new sketch on XY: a click on the path curve near its end (11, 10, 2) puts the origin there
+    page.click("#tab-part [data-add=sketch]")
+    page.wait_for_selector("#pf-plane")
+    i = page.evaluate("window.__part.commandSteps(window.__part.feat(window.__part.PT.cmd.id)).findIndex(s => s.key === 'origin')")
+    page.evaluate("window.__part.gotoStep(%d)" % i)
+    page.evaluate("window.__part.addHits([{kind: 'sketch', id: 'sp', point: [11, 8, 2]}])")
+    f = page.evaluate("window.__part.feat(window.__part.PT.cmd.id)")
+    assert f["plane_origin"] == pytest.approx([11, 10, 2], abs=1e-6), f
+    page.evaluate("window.__part.cancelCommand()")
+
+
+def test_part_command_window(page, client):
+    """Command window over the view: all sections of Fillet at once (Edges and Radius); a field of Radius makes it
+    the active section; Select shown with Radius active adds the edges to Edges; the edges are listed as chips and
+    × removes one; the title bar moves the window and the place is kept for the next command; Esc closes it. The
+    body list shows colour marks and no volumes; Configurations is folded by default."""
+    pp = plate("ui_cw")
+    pp["body_colors"] = {"solid:0": "#ff0000"}
+    client.put("/api/part/file/ui_cw", json=pp)
+    tab(page, "part")
+    page.evaluate("try { localStorage.removeItem('pt-cmdwin-pos'); localStorage.removeItem('pt-cfg-open'); } catch (e) {}")
+    page.evaluate("window.__partLoadNamed('ui_cw')")
+    page.wait_for_function("window.__part.PT.mesh && window.__part.PT.mesh.vertices.length > 0", timeout=60000)
+    tree = page.inner_text("#pt-features")
+    assert "cm^3" not in tree
+    assert page.evaluate("getComputedStyle(document.querySelector(\"#pt-features .pt-feat[data-id='solid:0'] .swatch\")).backgroundColor") == "rgb(255, 0, 0)"
+    assert page.is_hidden("#pt-configs")
+    page.click("#pt-cfg-toggle")
+    assert page.is_visible("#pt-configs")
+    page.click("#pt-cfg-toggle")
+    page.click("#tab-part [data-add=fillet]")
+    page.wait_for_selector("#pt-cmdwin:not([hidden])")
+    assert page.inner_text("#pt-cmdwin-title") == "Fillet"
+    assert page.locator("#pt-cmdbody .cw-sec").count() == 2
+    assert page.is_visible("#pf-value")
+    assert "Fillet 1 is open in the command window" in page.inner_text("#pt-props")
+    page.focus("#pf-value")
+    page.wait_for_function("window.__part.PT.cmd.step === 1")
+    assert page.locator("#pt-cmdbody .cw-sec.active[data-step='1']").count() == 1
+    page.evaluate("document.activeElement.blur()")                  # a click in the view takes the focus
+    n = page.evaluate("window.__part.selectShown()")
+    assert n > 0
+    page.wait_for_function("window.__part.PT.cmd.step === 0")
+    ne = page.evaluate("window.__part.feat(window.__part.PT.cmd.id).edges.length")
+    assert ne == n and page.locator("#pt-cmdbody .cw-chip").count() == min(ne, 40)
+    page.click("#pt-cmdbody .cw-chip [data-cwdel='0']")
+    page.wait_for_function("window.__part.feat(window.__part.PT.cmd.id).edges.length === %d" % (ne - 1))
+    box = page.locator("#pt-cmdwin-head").bounding_box()
+    x0 = page.evaluate("document.querySelector('#pt-cmdwin').offsetLeft")
+    page.mouse.move(box["x"] + 40, box["y"] + 10)
+    page.mouse.down()
+    page.mouse.move(box["x"] + 240, box["y"] + 90, steps=5)
+    page.mouse.up()
+    x1 = page.evaluate("document.querySelector('#pt-cmdwin').offsetLeft")
+    assert x1 - x0 > 150
+    page.keyboard.press("Escape")
+    page.wait_for_selector("#pt-cmdwin", state="hidden")
+    page.click("#tab-part [data-add=chamfer]")
+    page.wait_for_selector("#pt-cmdwin:not([hidden])")
+    assert abs(page.evaluate("document.querySelector('#pt-cmdwin').offsetLeft") - x1) < 2
+    page.evaluate("window.__part.cancelCommand()")
+
+
+def test_part_settings_kept_for_next_use(page, client):
+    """A finished Fillet keeps its radius and a finished Boolean its sliver thickness for the next new feature of the
+    same type, also after a reload (config.local.json "part_last"); picks are not kept; a cancelled command keeps
+    nothing."""
+    client.put("/api/part/file/ui_last", json=plate("ui_last"))
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_last')")
+    page.wait_for_function("window.__part.PT.solids.length === 1", timeout=60000)
+    page.evaluate("() => { const P = window.__part; P.startCommand('fillet'); const f = P.PT.part.features.slice(-1)[0]; f.value = 0.75; f.edges = [{mid: [0, 0, 0], len: 1}]; P.finishCommand(); }")
+    assert page.evaluate("window.__part.PT.lastSave") is True
+    assert client.get("/api/part/last").get_json()["fillet"] == {"value": 0.75}
+    page.evaluate("() => { const P = window.__part; P.startCommand('boolean'); const f = P.PT.part.features.slice(-1)[0]; f.min_thickness = 0.05; P.cancelCommand(); }")
+    assert "boolean" not in client.get("/api/part/last").get_json()
+    page.reload()
+    page.wait_for_function("window.__part && window.__part.PT.last && window.__part.PT.last.fillet")
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_last')")
+    page.wait_for_function("window.__part.PT.solids.length >= 0 && window.__part.PT.part && window.__part.PT.part.name === 'ui_last'", timeout=60000)
+    page.wait_for_function("window.__part.PT.mesh && window.__part.PT.mesh.vertices.length > 0", timeout=60000)
+    f = page.evaluate("() => { const P = window.__part; P.startCommand('fillet'); return P.PT.part.features.slice(-1)[0]; }")
+    assert f["value"] == 0.75 and f["edges"] == []
+    page.evaluate("window.__part.cancelCommand()")
+    page.evaluate("() => { const P = window.__part; P.startCommand('boolean'); const f = P.PT.part.features.slice(-1)[0]; f.min_thickness = 0.05; f.targets = [0]; f.tools = [0]; P.finishCommand(); }")
+    assert page.evaluate("window.__part.PT.lastSave") is True
+    assert client.get("/api/part/last").get_json()["boolean"]["min_thickness"] == 0.05
+    f = page.evaluate("() => { const P = window.__part; P.startCommand('boolean'); return P.PT.part.features.slice(-1)[0]; }")
+    assert f["min_thickness"] == 0.05 and f["targets"] == []
+    page.evaluate("window.__part.cancelCommand()")
+
+
+def test_part_body_show_only(page, client):
+    """Show only of a body in the tree hides the other solids and surface bodies; Show all in the Bodies header and
+    in Properties shows them again."""
+    pp = plate("ui_only")
+    pp["features"].append({"id": "c1", "name": "Copy body 1", "type": "body_copy", "bodies": [0], "surfaces": [], "move": [0, 0, 40]})
+    client.put("/api/part/file/ui_only", json=pp)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_only')")
+    page.wait_for_function("window.__part.PT.solids.length === 2", timeout=60000)
+    page.click("#pt-features .pt-feat[data-id='solid:1'] button[data-k=only]")
+    assert page.evaluate("[!!window.__part.PT.hidden['solid:0'], !!window.__part.PT.hidden['solid:1']]") == [True, False]
+    assert page.evaluate("window.__part.PT.faceObjs.filter(o => o.userData.solid === 0).every(o => !o.visible)")
+    page.click("#pt-showall")
+    assert page.evaluate("Object.values(window.__part.PT.hidden).filter(Boolean).length") == 0
+    page.click("#pt-features .pt-feat[data-id='solid:0'] .nm")
+    page.click("#pp-only")
+    assert page.evaluate("[!!window.__part.PT.hidden['solid:0'], !!window.__part.PT.hidden['solid:1']]") == [False, True]
+    page.click("#pp-showall")
+    assert page.evaluate("Object.values(window.__part.PT.hidden).filter(Boolean).length") == 0
+
+
+def test_part_body_scale(page, client):
+    """Scale body from the tree: the command opens at the factor; a factor of 2 about the bounding box centre gives
+    8 times the volume; non-uniform factors show X, Y, Z fields; the Point reference adds the Point step."""
+    client.put("/api/part/file/ui_scale", json=plate("ui_scale"))
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_scale')")
+    page.wait_for_function("window.__part.PT.solids.length === 1", timeout=60000)
+    v0 = page.evaluate("window.__part.PT.solids[0].volume_mm3")
+    page.click("#pt-features .pt-feat[data-id='solid:0'] button[data-k=bscale]")
+    page.wait_for_selector("#pf-sfac")
+    page.select_option("#pf-sabout", "bbox")
+    page.wait_for_selector("#pf-sfac")
+    page.fill("#pf-sfac", "2")
+    page.dispatch_event("#pf-sfac", "change")
+    page.click("#cmd-finish")
+    page.wait_for_function("window.__part.PT.solids.length === 1 && Math.abs(window.__part.PT.solids[0].volume_mm3 - 8 * %r) < 1e-3 * 8 * %r" % (v0, v0), timeout=60000)
+    f = page.evaluate("window.__part.PT.part.features.slice(-1)[0]")
+    assert f["type"] == "body_scale" and f["bodies"] == [0] and f["about"] == "bbox" and f["factor"] == 2
+    assert page.evaluate("window.__part.PT.status[window.__part.PT.part.features.slice(-1)[0].id].error") is None
+    page.evaluate("window.__part.startCommand('body_scale', {bodies: [0], surfaces: []})")
+    page.wait_for_selector("#pf-suni")
+    page.uncheck("#pf-suni")
+    page.wait_for_selector("#pf-sfacsx")
+    page.select_option("#pf-sabout", "point")
+    page.wait_for_selector("#pf-sptx")
+    labels = page.evaluate("window.__part.commandSteps(window.__part.PT.part.features.slice(-1)[0]).map(s => s.label)")
+    assert labels == ["Bodies to scale", "Scale", "Point"], labels
+
+
+def test_part_body_delete_copy_colour_and_rough_mesh(page, client, tmp_path):
+    """Bodies in the tree: copy (Copy body opens at the move vector), delete (Delete body feature added), colour in
+    Properties; a rough STL import is an opaque mesh body, and Measure picks points on it."""
+    from build123d import Box, export_stl
+    stl = str(tmp_path / "rough.stl")
+    export_stl(Box(10, 10, 10), stl)
+    pp = plate("ui_bodies")
+    pp["features"].append({"id": "r1", "name": "Import geometry 2", "type": "import", "path": stl, "part": None,
+                           "stl": {"mode": "rough"}, "clean": {}})
+    client.put("/api/part/file/ui_bodies", json=pp)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_bodies')")
+    page.wait_for_function("window.__part.PT.surfaces && window.__part.PT.surfaces.r1 && window.__part.PT.solids.length === 1", timeout=60000)
+    assert page.evaluate("window.__part.PT.status.r1.mesh") is True
+    # copy the solid: the command opens at the move vector
+    page.click("#pt-features .pt-feat[data-id='solid:0'] button[data-k=bcopy]")
+    page.wait_for_selector("#pf-bmovez")
+    page.fill("#pf-bmovez", "40")
+    page.dispatch_event("#pf-bmovez", "change")
+    page.click("#cmd-finish")
+    page.wait_for_function("window.__part.PT.solids.length === 2", timeout=60000)
+    # delete the mesh body: a Delete body feature, applied at once
+    page.click("#pt-features .pt-feat[data-id='r1'] button[data-k=bdel]")
+    page.wait_for_function("!window.__part.PT.surfaces.r1", timeout=60000)
+    types = page.evaluate("window.__part.PT.part.features.map(f => f.type)")
+    assert types[-2:] == ["body_copy", "body_delete"]
+    assert page.evaluate("window.__part.PT.part.features.slice(-1)[0].surfaces") == ["r1"]
+    # colour of solid 2
+    page.click("#pt-features .pt-feat[data-id='solid:1'] .nm")
+    page.wait_for_selector("#pp-color")
+    page.evaluate("() => { const c = document.querySelector('#pp-color'); c.value = '#ff0000'; c.dispatchEvent(new Event('input')); }")
+    assert page.evaluate("window.__part.PT.part.body_colors['solid:1']") == "#ff0000"
+    assert page.evaluate("window.__part.PT.faceObjs.find(o => o.userData.solid === 1).material.color.getHexString()") == "ff0000"
+    page.click("#pp-colordef")
+    assert page.evaluate("Object.keys(window.__part.PT.part.body_colors || {}).length") == 0
+    # measure: points on a mesh body (undo the delete first)
+    page.evaluate("() => { const P = window.__part.PT; P.part.features.pop(); }")
+    page.evaluate("window.__part.changedPart()")
+    page.wait_for_function("window.__part.PT.surfaces.r1", timeout=60000)
+    page.evaluate("window.__part.setMeasure(true)")
+    page.evaluate("window.__part.measureClick({kind: 'face', surface: 'r1', fi: 0, point: [0, 0, 5]})")
+    page.evaluate("window.__part.measureClick({kind: 'face', surface: 'r1', fi: 1, point: [3, 4, 5]})")
+    page.wait_for_function("window.__part.PT.measure && window.__part.PT.measure.res", timeout=30000)
+    rows = page.evaluate("window.__part.PT.measure.res.rows")
+    assert any(r[0] == "Minimum distance" and r[1].startswith("5.0000") for r in rows), rows
+    page.evaluate("window.__part.setMeasure(false)")
+
+
+def test_sketch_earlier_sketches_toggle(page, client):
+    """Sketch bar: Earlier sketches hides and shows the curves of the earlier sketches; Model edges stays separate."""
+    from conftest import rect
+    pp = {"name": "ui_esr", "version": 2, "features": [
+        {"id": "s1", "name": "Sketch 1", "type": "sketch", "plane": "XY", "offset": 0, "sketch": {"entities": rect(40, 20), "layers": [{"name": "0", "on": True}]}},
+        {"id": "s2", "name": "Sketch 2", "type": "sketch", "plane": "XY", "offset": 0, "sketch": {"entities": [], "layers": [{"name": "0", "on": True}]}}]}
+    client.put("/api/part/file/ui_esr", json=pp)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_esr')")
+    page.wait_for_selector("#pt-features .pt-feat[data-id=s2]")
+    page.dblclick("#pt-features .pt-feat[data-id=s2] .nm")
+    page.wait_for_function("window.__sk.SK.refs && window.__sk.SK.refs.some(e => e.src === 'sketch')", timeout=30000)
+    assert page.is_visible("#sk-sketchrefs")
+    count = lambda: page.evaluate("document.querySelectorAll('#sk-canvas [stroke=\"#9aa3b0\"]').length")
+    n0 = count()
+    assert n0 >= 1
+    page.uncheck("#sk-sketchrefs")
+    assert count() < n0
+    page.check("#sk-sketchrefs")
+    assert count() == n0
+
+
+def test_part_surface_fillet_faces_of_one_body_by_click(page, client):
+    """Surface fillet with Pick single faces: a click on a face of a surface body sets the side (A, then B, both faces
+    of one sewn body); Finish gives the fillet."""
+    from conftest import part_rec, rect
+    p = part_rec("ui_sf1", [
+        {"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(40, 20, -20, 1)}},
+        {"id": "b", "name": "B", "type": "surf_sketch", "kind": "planar", "plane": "XZ", "offset": 0, "sketch": {"entities": rect(40, 20, -20, 1)}},
+        {"id": "s", "name": "Sew 1", "type": "surf_sew", "sources": ["a", "b"], "tolerance": 0.001}])
+    p["hidden"] = ["a", "b"]
+    client.put("/api/part/file/ui_sf1", json=p)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_sf1')")
+    page.wait_for_function("window.__part.PT.surfaces && window.__part.PT.surfaces.s")
+    page.evaluate("() => { window.__part.PT.hidden.a = true; window.__part.PT.hidden.b = true; window.__part.setMesh(window.__part.PT.mesh); }")
+    page.evaluate("window.__part.startCommand('surf_fillet')")
+    page.wait_for_selector("#pf-sfacea")
+    page.check("#pf-sfacea")
+    find = """([cx, cy, cz]) => { const P = window.__part, t = P.PT.three, r = t.renderer.domElement.getBoundingClientRect();
+        for (let i = 2; i < 60; i++) for (let j = 2; j < 60; j++) {
+          const x = r.left + r.width * i / 61, y = r.top + r.height * j / 61;
+          const h = P.pickAt({ clientX: x, clientY: y }, ['sface', 'face']);
+          if (h && h.kind === 'face' && h.surface === 's' && Math.abs(h.key.c[0] - cx) + Math.abs(h.key.c[1] - cy) + Math.abs(h.key.c[2] - cz) < 0.5) return [x, y];
+        }
+        return null; }"""
+    xy = page.evaluate(find, [0, 11, 0])
+    assert xy, "face A not found on screen"
+    page.mouse.click(*xy)
+    page.wait_for_function("(() => { const f = window.__part.feat(window.__part.PT.cmd.id); return f.source_a === 's' && (f.faces_a || []).length === 1; })()")
+    page.evaluate("window.__part.gotoStep(1)")
+    page.wait_for_selector("#pf-sfaceb")
+    xy = page.evaluate(find, [0, 0, 11])
+    assert xy, "face B not found on screen"
+    page.mouse.click(*xy)
+    page.wait_for_function("(() => { const f = window.__part.feat(window.__part.PT.cmd.id); return f.source_b === 's' && (f.faces_b || []).length === 1; })()")
+    page.evaluate("window.__part.gotoStep(2)")
+    page.wait_for_selector("#pf-sfr")
+    page.fill("#pf-sfr", "3")
+    page.dispatch_event("#pf-sfr", "change")
+    page.evaluate("window.__part.finishCommand()")
+    page.wait_for_function("""(() => { const PT = window.__part.PT; const f = PT.part.features.find(x => x.type === 'surf_fillet');
+        const st = f && PT.status[f.id]; return st && !st.pending && st.error === null && st.faces === 3; })()""", timeout=60000)
+
+
+def test_part_inspect_join_cells(page, client):
+    """Inspect of a part of cells: Edges where cells meet, Join cells adds Boolean union and Merge faces, one solid."""
+    pp = plate("ui_cells", 100.0, 50.0, 20.0, 0)
+    pp["features"] += [{"id": "s1", "name": "Partition 1", "type": "split", "method": "principal", "plane": "YZ", "offset": 50}]
+    client.put("/api/part/file/ui_cells", json=pp)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_cells')")
+    page.wait_for_function("window.__part.PT.solids && window.__part.PT.solids.length === 2", timeout=60000)
+    page.click("#pt-features .pt-feat[data-id='solid:0'] .nm")
+    page.click("#pp-inspect")
+    wait_text(page, "#pt-props", "Edges where cells meet")
+    page.click("#pi-join")
+    page.wait_for_function("window.__part.PT.solids.length === 1 && !Object.values(window.__part.PT.status).some(s => s.pending)", timeout=60000)
+    assert page.evaluate("window.__part.PT.part.features.slice(-2).map(f => f.type)") == ["boolean", "unify"]
+
+
+def test_part_extend_surface_face_of_body_edge_click(page, client):
+    """Extend surface with Pick single faces: a face of a sewn surface body, then a click on its outer edge; the
+    face is extended by 5 mm across that edge."""
+    from conftest import part_rec, rect
+    p = part_rec("ui_ext1", [
+        {"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(40, 20, -20, 1)}},
+        {"id": "b", "name": "B", "type": "surf_sketch", "kind": "planar", "plane": "XZ", "offset": 0, "sketch": {"entities": rect(40, 20, -20, 1)}},
+        {"id": "s", "name": "Sew 1", "type": "surf_sew", "sources": ["a", "b"], "tolerance": 0.001}])
+    client.put("/api/part/file/ui_ext1", json=p)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_ext1')")
+    page.wait_for_function("window.__part.PT.surfaces && window.__part.PT.surfaces.s")
+    page.evaluate("() => { window.__part.PT.hidden.a = true; window.__part.PT.hidden.b = true; window.__part.setMesh(window.__part.PT.mesh); }")
+    page.evaluate("window.__part.startCommand('surf_extend')")
+    page.wait_for_selector("#pf-sface")
+    page.check("#pf-sface")
+    find = """([kinds, test]) => { const P = window.__part, t = P.PT.three, r = t.renderer.domElement.getBoundingClientRect();
+        const ok = new Function('h', 'return ' + test);
+        for (let i = 2; i < 120; i++) for (let j = 2; j < 120; j++) {
+          const x = r.left + r.width * i / 121, y = r.top + r.height * j / 121;
+          const h = P.pickAt({ clientX: x, clientY: y }, kinds);
+          if (h && ok(h)) return [x, y];
+        }
+        return null; }"""
+    xy = page.evaluate(find, [["sface", "face"], "h.kind === 'face' && h.surface === 's' && Math.abs(h.key.c[1] - 11) < 0.5 && Math.abs(h.key.c[2]) < 0.5"])
+    assert xy, "face A not found"
+    page.mouse.click(*xy)
+    page.wait_for_function("(window.__part.feat(window.__part.PT.cmd.id).faces || []).length === 1")
+    page.evaluate("window.__part.gotoStep(1)")
+    xy = page.evaluate(find, [["sedge", "edge"], "h.kind === 'edge' && h.surface === 's' && Math.abs(h.key.mid[1] - 21) < 0.5 && Math.abs(h.key.mid[2]) < 0.5"])
+    assert xy, "outer edge of A not found"
+    page.mouse.click(*xy)
+    page.wait_for_function("(window.__part.feat(window.__part.PT.cmd.id).edges || []).length === 1")
+    page.evaluate("window.__part.finishCommand()")
+    page.wait_for_function("""(() => { const PT = window.__part.PT; const f = PT.part.features.find(x => x.type === 'surf_extend');
+        const st = f && PT.status[f.id]; return st && !st.pending && st.error === null && Math.abs(st.area - (800 + 200)) < 0.01; })()""", timeout=60000)
+
+
+def test_part_face_click_tangent_and_connected(page, client):
+    """Face click mode of a multi-face step (Extract surface): Tangent faces adds the top of a filleted plate with
+    its fillets and the sides joined through them (9 faces); Connected faces adds the rest (10); a Connected click on
+    a selected face removes them all."""
+    import copy
+    from drawgen import part as dpart
+    p = plate("ui_fmode", 40.0, 20.0, 10.0, 0)
+    sh, st = dpart.build(copy.deepcopy(p))
+    top = [f for f in sh.faces() if abs(f.center().Z - 10) < 1e-6][0]
+    p["features"].append({"id": "f9", "name": "Fillet 1", "type": "fillet", "edges": [dpart.edge_key(e) for e in top.edges()], "value": 2})
+    client.put("/api/part/file/ui_fmode", json=p)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_fmode')")
+    page.wait_for_function("window.__part.PT.mesh && window.__part.PT.mesh.face_keys && window.__part.PT.mesh.face_keys.length === 10", timeout=60000)
+    page.evaluate("window.__part.startCommand('surf_extract')")
+    page.wait_for_selector("input[name=pf-fmode][value=tangent]")
+    page.check("input[name=pf-fmode][value=tangent]")
+    find = """(z) => { const P = window.__part, t = P.PT.three, r = t.renderer.domElement.getBoundingClientRect();
+        for (let i = 2; i < 100; i++) for (let j = 2; j < 100; j++) {
+          const x = r.left + r.width * i / 101, y = r.top + r.height * j / 101;
+          const h = P.pickAt({ clientX: x, clientY: y }, ['face', 'sface']);
+          if (h && h.kind === 'face' && !h.surface && Math.abs(h.key.c[2] - z) < 0.01 && h.key.area > 300) return [x, y];
+        }
+        return null; }"""
+    nfaces = "(window.__part.feat(window.__part.PT.cmd.id).faces || []).length"
+    xy = page.evaluate(find, 10)
+    assert xy, "top face not found"
+    page.mouse.click(*xy)
+    page.wait_for_function(nfaces + " === 9", timeout=30000)
+    page.check("input[name=pf-fmode][value=connected]")
+    page.mouse.click(*xy)          # the top face is selected: Connected removes every face joined to it
+    page.wait_for_function(nfaces + " === 0", timeout=30000)
+    page.mouse.click(*xy)
+    page.wait_for_function(nfaces + " === 10", timeout=30000)
+    page.evaluate("window.__part.cancelCommand()")
+
+
+def test_sketch_command_closed_before_slow_refs(page, client):
+    """Draw while the reference geometry is still read (a part with many bodies): the command bar is closed at once
+    and a late Next does nothing (was: Cannot read properties of null)."""
+    client.put("/api/part/file/ui_rp", json=plate("ui_rp"))
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_rp')")
+    page.wait_for_function("window.__part.PT.mesh && window.__part.PT.mesh.vertices.length")
+    page.route("**/api/part/refs", lambda r: (time.sleep(2), r.continue_()))
+    page.click("#tab-part [data-add=sketch]")
+    page.wait_for_selector("#pf-plane")
+    assert page.locator("#pt-cmdwin:not([hidden]) #cmd-finish").count() == 1
+    page.get_by_role("button", name="Draw", exact=True).click()
+    page.wait_for_timeout(200)
+    assert page.locator("#pt-cmdwin:not([hidden])").count() == 0
+    page.evaluate("window.__part.nextStep()")
+    page.wait_for_selector("#tab-sketch:not([hidden])")
+
+
+def _bx_load(page, client):
+    client.put("/api/part/file/ui_bx", json=plate("ui_bx"))
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_bx')")
+    page.wait_for_function("window.__part.PT.mesh && window.__part.PT.mesh.vertices.length")
+
+def _view_rect(page):
+    return page.evaluate("(() => { const r = window.__part.PT.three.renderer.domElement.getBoundingClientRect(); return [r.left, r.top, r.width, r.height]; })()")
+
+def test_part_box_selection_and_select_shown(page, client):
+    _bx_load(page, client)
+    page.evaluate("window.__part.startCommand('fillet')")
+    page.wait_for_selector("#pf-shown")
+    ne = page.evaluate("window.__part.PT.mesh.edges.length")
+    page.click("#pf-shown")
+    page.wait_for_function("(window.__part.feat(window.__part.PT.cmd.id).edges || []).length > 0")
+    shown = page.evaluate("window.__part.feat(window.__part.PT.cmd.id).edges.length")
+    assert 0 < shown < ne, (shown, ne)
+    # Ctrl + drag right to left over the whole view: every edge (the box adds to the selection)
+    x, y, w, h = _view_rect(page)
+    page.keyboard.down("Control")
+    page.mouse.move(x + w - 5, y + h - 5)
+    page.mouse.down()
+    page.mouse.move(x + w / 2, y + h / 2, steps=4)
+    page.mouse.move(x + 5, y + 5, steps=4)
+    page.mouse.up()
+    page.keyboard.up("Control")
+    page.wait_for_function("window.__part.feat(window.__part.PT.cmd.id).edges.length === %d" % ne)
+    # the view did not rotate: Select shown again adds nothing and removes nothing
+    page.click("#pf-shown")
+    assert page.evaluate("window.__part.feat(window.__part.PT.cmd.id).edges.length") == ne
+
+def test_part_box_window_faces_shown_only(page, client):
+    _bx_load(page, client)
+    page.click("#tab-part .dd-btn:has-text('Faces')")
+    page.click("#tab-part [data-add=defeature]")
+    page.wait_for_function("window.__part.PT.cmd && window.__part.PT.cmd.legacyDefs")
+    page.wait_for_selector("#pf-boxshown")
+    nf = page.evaluate("window.__part.PT.mesh.face_keys.length")
+    x, y, w, h = _view_rect(page)
+    hits = page.evaluate("window.__part.boxHits(%f, %f, %f, %f, false, false).length" % (x, y, x + w, y + h))
+    shown = page.evaluate("window.__part.boxHits(%f, %f, %f, %f, false, true).length" % (x, y, x + w, y + h))
+    assert hits == nf and 0 < shown < nf, (hits, shown, nf)
+    page.check("#pf-boxshown")
+    page.keyboard.down("Control")
+    page.mouse.move(x + 3, y + 3); page.mouse.down(); page.mouse.move(x + w - 3, y + h - 3, steps=6); page.mouse.up()
+    page.keyboard.up("Control")
+    page.wait_for_function("(window.__part.feat(window.__part.PT.cmd.id).faces || []).length === %d" % shown)
+
+
+def test_part_edge_pick_records_shown_cell(page, client):
+    """Two solids side by side, solid 1 hidden: a click on the edge where both solids have an edge stores the shown
+    solid as the cell of the edge reference (the fillet acts on that solid only)."""
+    from conftest import part_rec, rect
+    ext = lambda i, x, nb: {"id": "e%d" % i, "name": "Extrude %d" % i, "type": "extrude", "plane": "XY", "offset": 0,
+                            "depth": 10, "direction": "normal", "new_body": nb, "sketch": {"entities": rect(10, 10, x, 0)}}
+    client.put("/api/part/file/ui_cells", json=part_rec("ui_cells", [ext(1, 0, False), ext(2, 10, True)]))
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_cells')")
+    page.wait_for_function("window.__part.PT.mesh && window.__part.PT.cells === 2")
+    page.evaluate("(() => { const P = window.__part; P.PT.hidden['solid:0'] = true; P.setMesh(P.PT.mesh); P.startCommand('fillet'); })()")
+    page.wait_for_selector("#pf-shown")
+    xy = page.evaluate("""() => { const P = window.__part, t = P.PT.three, r = t.renderer.domElement.getBoundingClientRect();
+        const v = new P.THREE.Vector3(10, 0, 5).project(t.camera);
+        return [r.left + (v.x + 1) / 2 * r.width, r.top + (1 - v.y) / 2 * r.height]; }""")
+    page.mouse.click(*xy)
+    page.wait_for_function("(window.__part.feat(window.__part.PT.cmd.id).edges || []).length === 1")
+    e = page.evaluate("window.__part.feat(window.__part.PT.cmd.id).edges[0]")
+    assert e.get("cell") == 1 and abs(e["mid"][0] - 10) < 1e-6 and abs(e["mid"][1]) < 1e-6, e
+
+
+def cam_add(page, kind):
+    """Adds an operation (its dropdown opened first); the command window opens for it."""
+    btn = page.locator("#tab-cam [data-addop=%s]" % kind)
+    if not btn.is_visible():
+        btn.evaluate("b => b.closest('.dd').querySelector('.dd-btn').click()")
+    btn.click()
+    page.wait_for_function("window.__cam.CM.cmd && window.__cam.CM.doc.operations[window.__cam.CM.doc.operations.length - 1].type === '%s'" % kind)
+
+
+def cam_click_at(page, x, y, z):
+    xy = page.evaluate("""([x, y, z]) => { const CM = window.__cam.CM, t = CM.three; const T = t.controls.target, V = Object.getPrototypeOf(T).constructor;
+        t.camera.updateMatrixWorld(true); const p = new V(x, y, z).project(t.camera); const r = t.renderer.domElement.getBoundingClientRect();
+        return [r.left + (p.x + 1) / 2 * r.width, r.top + (1 - p.y) / 2 * r.height]; }""", [x, y, z])
+    page.mouse.click(*xy)
+
+
+def cam_click_undercut(page):
+    """The undercut face is seen from the +Y side: the view turned there, then the face centre clicked."""
+    xy = page.evaluate("""() => { const CM = window.__cam.CM, t = CM.three;
+        const fi = CM.geo.undercuts[0], m = CM.geo, c = [0, 0, 0]; let n = 0;
+        m.triangles.forEach((tr, k) => { if (m.face_of_tri[k] === fi) for (const v of tr) { c[0] += m.vertices[v][0]; c[1] += m.vertices[v][1]; c[2] += m.vertices[v][2]; n++; } });
+        const T = t.controls.target, V = Object.getPrototypeOf(T).constructor;
+        const dist = t.camera.position.distanceTo(T);
+        t.camera.position.copy(T.clone().add(new V(-0.3, 1, 0.1).normalize().multiplyScalar(dist)));
+        t.camera.up.set(0, 0, 1); t.controls.update(); t.camera.updateMatrixWorld(true);
+        const p = new V(c[0] / n, c[1] / n, c[2] / n).project(t.camera);
+        const r = t.renderer.domElement.getBoundingClientRect();
+        return [r.left + (p.x + 1) / 2 * r.width, r.top + (1 - p.y) / 2 * r.height]; }""")
+    page.mouse.click(*xy)
+
+
+def test_cam_tab_tree_and_placement(page, client):
+    """CAM tab: the operation buttons with icons in the toolbar (no dropdown), the tree in the FreeCAD order (Job,
+    Operations with the operations and dressups, Model with the part, Stock, SetupSheet, Tools folded), folding and
+    the eyes; Placement: a Coincident constraint of the plate top added by a click (the part stays where it is),
+    Flip turns the part over (the picked pocket face follows), the constraint row in the tree, Position fields and
+    Z +90, Cancel restores the placement and the picks; Zero: the machine zero at a clicked vertex, moved with the part."""
+    from test_cam import job_part, BITS
+    client.put("/api/part/file/ui_place", json=job_part("ui_place"))
+    client.put("/api/cam/tools", json=BITS)
+    tab(page, "cam")
+    page.wait_for_function("window.__cam && window.__cam.CM.doc && window.__cam.CM.bits.length")
+    page.select_option("#cm-source", "ui_place")
+    page.wait_for_function("window.__cam.CM.geo && window.__cam.CM.setup")
+    for k in ("face", "profile", "pocket", "drilling", "undercut", "pocket3d"):
+        assert page.is_visible("#tab-cam [data-addop=%s]" % k) and page.locator("#tab-cam [data-addop=%s] svg.tb-ico" % k).count() == 1
+    assert page.locator("#tab-cam [data-addop=pocket]").evaluate("b => !b.closest('.dd-menu')")
+    page.click("#tab-cam [data-addop=face]")
+    page.click("#cm-cmd-ok")
+    page.click("#tab-cam [data-addop=pocket]")
+    cam_click_at(page, 50, 40, 10)
+    page.wait_for_function("window.__cam.CM.doc.operations[1].faces.length === 1")
+    page.click("#cm-cmd-ok")
+    ids = page.evaluate("[...document.querySelectorAll('#cm-tree .pt-feat')].map(e => e.dataset.id)")
+    o1, o2 = page.evaluate("window.__cam.CM.doc.operations.map(o => o.id)")
+    assert ids[:4] == ["job", "ops", o1, o2] and ids[4:] == ["model", "part", "stock", "setup", "machine", "tools"], ids
+    page.click("#cm-tree .pt-feat[data-id=tools] [data-k=fold]")
+    page.wait_for_function("document.querySelector('#cm-tree .pt-feat[data-id^=\"tc:\"]')")
+    page.click("#cm-tree .pt-feat[data-id=ops] [data-k=fold]")
+    page.wait_for_function("!document.querySelector('#cm-tree .pt-feat[data-id=%s]')" % o1)
+    page.click("#cm-tree .pt-feat[data-id=ops] [data-k=fold]")
+    page.click("#cm-tree .pt-feat[data-id=ops] [data-k=eye]")
+    page.wait_for_function("window.__cam.CM.hidden.ops && document.querySelector('#cm-tree .pt-feat[data-id=%s]').classList.contains('hid')" % o1)
+    page.click("#cm-tree .pt-feat[data-id=ops] [data-k=eye]")
+    page.click("#cm-tree .pt-feat[data-id=job]")
+    page.wait_for_selector("#cm-props select[data-k=post]")
+    # placement: the plate top in the XY plane, Flip kept from the current direction: the part does not move
+    face0 = page.evaluate("JSON.stringify(window.__cam.CM.doc.operations[1].faces[0])")
+    runs = []
+    page.on("request", lambda rq: runs.append(rq.url) if rq.url.endswith("/api/cam/run") else None)
+    page.click("#cm-place")
+    page.wait_for_function("window.__cam.CM.cmd && window.__cam.CM.cmd.place")
+    assert "Model placement" in page.text_content("#cm-cmdwin-title")
+    page.click("#cm-cmdbody [data-pctype=coincident]")
+    cam_click_at(page, 50, 40, 10)
+    page.wait_for_function("window.__cam.CM.doc.placement.constraints.length === 1 && window.__cam.CM.placeRes")
+    pl = page.evaluate("window.__cam.CM.doc.placement")
+    assert pl["constraints"][0]["datum"] == "XY" and pl["constraints"][0]["flip"] is True
+    assert pl["pos"] == [0, 0, -10] and pl["rot"] == [0, 0, 0], pl
+    page.wait_for_function("window.__cam.CM.geo && Math.abs(window.__cam.CM.geo.bbox[5] - 6) < 1e-3")
+    assert page.locator("#cm-tree .pt-feat[data-id^='pc:']").count() == 1
+    assert abs(page.evaluate("window.__cam.CM.doc.operations[1].faces[0].c[2]")) < 1e-6
+    # Flip off: the plate top faces down, the part above the table
+    page.uncheck("#cm-cmdbody [data-pcf]")
+    page.wait_for_function("window.__cam.CM.geo && Math.abs(window.__cam.CM.geo.bbox[2] + 6) < 1e-3 && Math.abs(window.__cam.CM.geo.bbox[5] - 10) < 1e-3", timeout=60000)
+    assert page.evaluate("window.__cam.CM.doc.operations[1].faces[0].n[2]") < -0.99
+    # Z +90 with the constraint kept: a turn about Z, the top still on the table
+    page.click("#cm-cmdbody [data-pturn='2']")
+    page.wait_for_function("window.__cam.CM.geo && Math.abs((window.__cam.CM.geo.bbox[4] - window.__cam.CM.geo.bbox[1]) - 100) < 1e-3", timeout=60000)
+    # no toolpath run while the Placement window is open; the toolpaths of the old placement are dropped
+    page.wait_for_timeout(800)
+    assert runs == [] and page.evaluate("window.__cam.CM.res") is None
+    # Cancel: placement and picks as before
+    page.click("#cm-cmd-cancel")
+    page.wait_for_function("!window.__cam.CM.cmd && window.__cam.CM.doc.placement.constraints.length === 0")
+    page.wait_for_function("window.__cam.CM.geo && Math.abs(window.__cam.CM.geo.bbox[5] - 16) < 1e-3")
+    assert page.evaluate("JSON.stringify(window.__cam.CM.doc.operations[1].faces[0])") == face0
+    page.wait_for_function("window.__cam.CM.res && window.__cam.CM.res.operations.length === 2", timeout=60000)
+    # the position typed without constraints moves the part
+    page.dblclick("#cm-tree .pt-feat[data-id=model]")
+    page.wait_for_function("window.__cam.CM.cmd && window.__cam.CM.cmd.place")
+    page.fill("#cm-cmdbody input[data-ppos='0']", "10")
+    page.dispatch_event("#cm-cmdbody input[data-ppos='0']", "change")
+    page.wait_for_function("window.__cam.CM.geo && Math.abs(window.__cam.CM.geo.bbox[0] - 10) < 1e-3")
+    page.click("#cm-cmd-ok")
+    page.wait_for_function("!window.__cam.CM.cmd")
+    assert page.evaluate("window.__cam.CM.doc.placement.pos") == [10, 0, 0]
+    wait_text(page, "#cm-tree", "at 10, 0, 0 mm")
+    # the machine zero at a vertex clicked in the view (Zero in the toolbar)
+    page.click("#cm-zero")
+    page.wait_for_function("window.__cam.CM.zeroPick")
+    cam_click_at(page, 110, 60, 10)
+    page.wait_for_function("!window.__cam.CM.zeroPick && window.__cam.CM.doc.origin.xy === 'point' && window.__cam.CM.doc.origin.z === 'point'")
+    assert page.evaluate("window.__cam.CM.doc.origin.point") == [110, 60, 10]
+    page.wait_for_function("window.__cam.CM.setup && window.__cam.CM.setup.origin[0] === 110 && window.__cam.CM.setup.origin[1] === 60 && window.__cam.CM.setup.origin[2] === 10")
+    wait_text(page, "#cm-props", "Picked vertex X 110 Y 60 Z 10 mm")
+    # the vertex follows the part when the placement changes
+    page.click("#cm-place")
+    page.wait_for_function("window.__cam.CM.cmd && window.__cam.CM.cmd.place")
+    page.fill("#cm-cmdbody input[data-ppos='0']", "0")
+    page.dispatch_event("#cm-cmdbody input[data-ppos='0']", "change")
+    page.wait_for_function("window.__cam.CM.doc.origin.point[0] === 100")
+    page.click("#cm-cmd-ok")
+
+
+def test_cam_tab_feeds_and_speeds(page, client):
+    """CAM tab feeds and speeds: the machine fields of the SetupSheet, the material of the Stock, the calculation in
+    the properties of a tool controller (no material: a message; ae typed; Apply sets rpm, feed and plunge), the
+    Calculate button of an Adaptive operation (ae from the step over), Feeds and speeds for all, the tool material
+    column of the bit library."""
+    from test_cam import job_part, BITS
+    client.put("/api/part/file/ui_fs", json=job_part("ui_fs"))
+    client.put("/api/cam/tools", json=BITS)
+    tab(page, "cam")
+    page.wait_for_function("window.__cam && window.__cam.CM.doc && window.__cam.CM.bits.length")
+    page.select_option("#cm-source", "ui_fs")
+    page.wait_for_function("window.__cam.CM.geo && window.__cam.CM.setup")
+    page.click("#cm-tree .pt-feat[data-id=setup]")
+    page.fill("#cm-props input[data-k=rpm_max]", "18000")
+    page.dispatch_event("#cm-props input[data-k=rpm_max]", "change")
+    page.wait_for_function("window.__cam.CM.doc.setup.rpm_max === 18000")
+    page.click("#tab-cam [data-addop=adaptive]")
+    page.wait_for_function("window.__cam.CM.cmd")
+    page.click("#cm-cmd-ok")
+    tc = page.evaluate("window.__cam.CM.doc.operations[0].tc")
+    page.click("#cm-tree .pt-feat[data-id=tools] [data-k=fold]")
+    page.click("#cm-tree .pt-feat[data-id='tc:%s']" % tc)
+    wait_text(page, "#cm-props", "No workpiece material")
+    page.click("#cm-tree .pt-feat[data-id=stock]")
+    page.select_option("#cm-props select[data-k=material]", "al_wrought")
+    page.wait_for_function("window.__cam.CM.doc.stock.material === 'al_wrought'")
+    wait_text(page, "#cm-tree", "Aluminium wrought")
+    page.click("#cm-tree .pt-feat[data-id='tc:%s']" % tc)
+    wait_text(page, "#cm-fs-res", "Chip load")
+    page.fill("#cm-props input[data-fs=ae]", "3")
+    page.dispatch_event("#cm-props input[data-fs=ae]", "change")
+    page.wait_for_function("window.__cam.CM.doc.tools[0].fs && window.__cam.CM.doc.tools[0].fs.ae === 3")
+    page.click("#cm-fs-apply")
+    page.wait_for_function("window.__cam.CM.doc.tools[0].rpm === 15915")             # 300 m/min at D 6 mm
+    assert page.evaluate("window.__cam.CM.doc.tools[0].hfeed") > 800
+    # Calculate in the Feeds section of the Adaptive operation: ae from the step over 20 %
+    page.dblclick("#cm-tree .pt-feat[data-id=%s]" % page.evaluate("window.__cam.CM.doc.operations[0].id"))
+    page.wait_for_function("window.__cam.CM.cmd")
+    page.click("#cm-cmdbody .cw-sec[data-step='3'] .cw-sec-head")
+    page.click("#cm-fs-op")
+    page.wait_for_function("window.__cam.CM.doc.operations[0].feed > 0 && window.__cam.CM.doc.operations[0].rpm === 15915")
+    assert page.evaluate("window.__cam.CM.fsOp.r.ae") == pytest.approx(1.2)
+    wait_text(page, "#cm-cmdbody", "ae 1.2 mm")
+    page.click("#cm-cmd-ok")
+    # Feeds and speeds for all; the spindle maximum caps the V bit
+    page.evaluate("window.__cam.CM.doc.tools.push({id: 'TC9', name: 'V', bit: 'T5', number: 9, hfeed: 1, vfeed: 1, rpm: 1, dir: 'CW'})")
+    page.click("#cm-tree .pt-feat[data-id=tools]")
+    page.click("#cm-fs-all")
+    page.wait_for_function("window.__cam.CM.doc.tools[1].rpm === 18000 && window.__cam.CM.doc.tools[1].hfeed > 1")
+    # the tool material column of the bit library
+    if not page.is_visible("#cm-tools"):
+        page.click("#cm-tools-toggle")
+    page.select_option("#cm-bited select[data-k=tool_material]", "hss")
+    assert page.evaluate("window.__cam.CM.bits[0].tool_material") == "hss"
+
+
+def test_cam_tab_library_machine_refresh_placement(page, client, tmp_path):
+    """CAM tab: the standard tool library (Library…, a group, Select all, Add selected), Thread / Hop / Probe / Axis
+    map buttons and the STEP stock (shown before a run, turned and moved by the stock offsets), the playback bar and the machine (Show ▾ Machine, the Machine tree item
+    with the travel check), the part change marked on Refresh and the reload, placement by an edge (Edges, Parallel,
+    an edge click) and a drag of the part in Drag mode."""
+    from test_cam import job_part, BITS
+    client.put("/api/part/file/ui_lib", json=job_part("ui_lib"))
+    client.put("/api/cam/tools", json=BITS)
+    tab(page, "cam")
+    page.wait_for_function("window.__cam && window.__cam.CM.doc && window.__cam.CM.bits.length")
+    page.select_option("#cm-source", "ui_lib")
+    page.wait_for_function("window.__cam.CM.geo && window.__cam.CM.setup")
+    for sel in ("#tab-cam [data-addop=thread]",):
+        assert page.is_visible(sel)
+    assert page.locator("#tab-cam [data-addop=hop]").count() == 1 and page.locator("#tab-cam [data-addop=probe]").count() == 1 and page.locator("#tab-cam [data-adddr=axismap]").count() == 1
+    # the library
+    if not page.is_visible("#cm-tools"):
+        page.click("#cm-tools-toggle")
+    n0 = page.evaluate("window.__cam.CM.bits.length")
+    page.click("#cm-lib-toggle")
+    page.wait_for_selector("#cm-lib-group")
+    page.select_option("#cm-lib-group", "Tapered ball nose")
+    page.click("#cm-lib-all")
+    page.click("#cm-lib-add")
+    page.wait_for_function("n => window.__cam.CM.bits.length === n + 12", arg=n0)
+    assert page.evaluate("window.__cam.CM.bits.some(b => b.id === 'TB-R0.5-3' && b.shape === 'tapered')")
+    # the STEP stock option
+    page.click("#cm-tree .pt-feat[data-id=stock]")
+    assert page.locator("#cm-props select[data-k=kind] option[value=step]").count() == 1
+    from build123d import Box, Location, Vector, export_step
+    stp = str(tmp_path / "ui_blank.step")
+    export_step(Box(110, 70, 20).moved(Location(Vector(50, 30, 10))), stp)
+    page.select_option("#cm-props select[data-k=kind]", "step")
+    page.fill("#cm-props input[data-k=path]", stp)
+    page.press("#cm-props input[data-k=path]", "Tab")
+    page.wait_for_function("window.__cam.CM.setup && window.__cam.CM.setup.stock_mesh && Math.abs(window.__cam.CM.setup.stock_bbox[0] + 5) < 1e-3", timeout=60000)
+    page.fill("#cm-props input[data-k=rz]", "90")
+    page.press("#cm-props input[data-k=rz]", "Tab")
+    page.fill("#cm-props input[data-k=dx]", "70")
+    page.press("#cm-props input[data-k=dx]", "Tab")
+    page.wait_for_function("Math.abs(window.__cam.CM.setup.stock_bbox[0] - 5) < 1e-3 && Math.abs(window.__cam.CM.setup.stock_bbox[4] - 105) < 1e-3", timeout=60000)
+    page.select_option("#cm-props select[data-k=kind]", "offsets")
+    page.wait_for_function("!window.__cam.CM.setup.stock_mesh", timeout=60000)
+    # a run, the playback and the machine
+    page.click("#tab-cam [data-addop=face]")
+    page.wait_for_function("window.__cam.CM.cmd")
+    page.click("#cm-cmd-ok")
+    page.click("#cm-run")
+    page.wait_for_function("window.__cam.CM.res && window.__cam.CM.res.operations[0].ok && window.__cam.CM.play", timeout=120000)
+    assert page.is_visible("#cm-play")
+    page.click("#tab-cam .dd-btn:has-text('Show')")
+    page.check("#cm-showmachine")
+    page.click("#tab-cam .dd-btn:has-text('Show')")
+    page.wait_for_function("window.__cam.CM.mach && window.__cam.CM.mach.gantry")
+    page.evaluate("window.__cam.playAt(0.5)")
+    wait_text(page, "#cm-play-info", "Face")
+    y = page.evaluate("window.__cam.CM.mach.gantry.position.y")
+    d = page.evaluate("window.__cam.machineOffset()")
+    assert abs(y - (page.evaluate("window.__cam.CM.play.pos[1]") + d[1])) < 1e-6
+    page.click("#cm-tree .pt-feat[data-id=machine]")
+    wait_text(page, "#cm-props", "All moves inside the travel")
+    # a change of the part marks Refresh; Refresh loads it again
+    rec = job_part("ui_lib")
+    rec["features"][0]["depth"] = 12
+    client.put("/api/part/file/ui_lib", json=rec)
+    page.evaluate("window.__cam.checkPart()")
+    page.wait_for_function("document.querySelector('#cm-refresh').classList.contains('cm-stale')")
+    page.click("#cm-refresh")
+    page.wait_for_function("!window.__cam.CM.partStale && window.__cam.CM.geo && Math.abs(window.__cam.CM.geo.bbox[2] - 0) < 1e-3 && !document.querySelector('#cm-refresh').classList.contains('cm-stale')")
+    # placement by an edge: the front bottom edge parallel to the X axis
+    page.click("#cm-place")
+    page.wait_for_function("window.__cam.CM.cmd && window.__cam.CM.cmd.place")
+    page.check("#cm-cmdbody input[name=cm-pkind][value=edges]")
+    page.click("#cm-cmdbody [data-pctype=parallel]")
+    cam_click_at(page, 50, 0, 0)
+    page.wait_for_function("window.__cam.CM.doc.placement.constraints.length === 1 && window.__cam.CM.doc.placement.constraints[0].edge != null")
+    c = page.evaluate("window.__cam.CM.doc.placement.constraints[0]")
+    assert c["datum"] == "X" and abs(c["ec"][1]) < 1e-6 and abs(c["ec"][2]) < 1e-6
+    # drag: the part moved in X and Y with the constraint kept
+    page.click("#cm-pdrag")
+    page.wait_for_function("window.__cam.CM.cmd.drag")
+    a = page.evaluate("""() => { const CM = window.__cam.CM, t = CM.three; const T = t.controls.target, V = Object.getPrototypeOf(T).constructor;
+        t.camera.updateMatrixWorld(true); const r = t.renderer.domElement.getBoundingClientRect();
+        const pr = p => { const q = new V(...p).project(t.camera); return [r.left + (q.x + 1) / 2 * r.width, r.top + (1 - q.y) / 2 * r.height]; };
+        return [pr([50, 30, 10]), pr([70, 30, 10])]; }""")
+    page.mouse.move(*a[0])
+    page.mouse.down()
+    page.mouse.move((a[0][0] + a[1][0]) / 2, (a[0][1] + a[1][1]) / 2)
+    page.mouse.move(*a[1])
+    page.mouse.up()
+    page.wait_for_function("Math.abs(window.__cam.CM.doc.placement.pos[0] - 20) < 0.5", timeout=60000)
+    page.click("#cm-cmd-ok")
+
+
+def test_cam_tab_finish_section(page, client):
+    """CAM tab: the Finish section of a Pocket (After the roughing, a second tool controller, finish feed and step
+    down, spring pass), the run gives the roughing and the finish records, the tree names the finish controller, the
+    properties show both results; Off leaves one record."""
+    from test_cam import job_part, BITS
+    client.put("/api/part/file/ui_fin", json=job_part("ui_fin"))
+    client.put("/api/cam/tools", json=BITS)
+    tab(page, "cam")
+    page.wait_for_function("window.__cam && window.__cam.CM.doc && window.__cam.CM.bits.length")
+    page.select_option("#cm-source", "ui_fin")
+    page.wait_for_function("window.__cam.CM.geo && window.__cam.CM.setup")
+    page.evaluate("() => { const CM = window.__cam.CM; CM.doc.tools = [{id: 'TC1', name: 'E6', bit: 'T1', number: 1, hfeed: 800, vfeed: 200, rpm: 12000, dir: 'CW'}, {id: 'TC6', name: 'E3', bit: 'T6', number: 6, hfeed: 600, vfeed: 150, rpm: 15000, dir: 'CW'}]; }")
+    page.click("#tab-cam [data-addop=face]")
+    page.wait_for_function("window.__cam.CM.cmd")
+    page.click("#cm-cmd-ok")
+    page.click("#tab-cam [data-addop=pocket]")
+    cam_click_at(page, 65, 38, 6)
+    page.wait_for_function("window.__cam.CM.doc.operations[1].faces.length === 1")
+    assert page.evaluate("window.__cam.CM.doc.operations[1].finish_mode") == "level"
+    page.click("#cm-cmdbody .cw-sec[data-step='3'] .cw-sec-head")
+    page.fill("#cm-cmdbody input[data-k=extra_offset]", "0.3")
+    page.dispatch_event("#cm-cmdbody input[data-k=extra_offset]", "change")
+    page.click("#cm-cmdbody .cw-sec[data-step='4'] .cw-sec-head")
+    page.select_option("#cm-cmdbody select[data-k=finish_mode]", "separate")
+    page.wait_for_selector("#cm-cmdbody select[data-k=finish_tc]")
+    page.select_option("#cm-cmdbody select[data-k=finish_tc]", "TC6")
+    for k, v in (("finish_feed", "450"), ("finish_step", "4")):
+        page.fill("#cm-cmdbody input[data-k=%s]" % k, v)
+        page.dispatch_event("#cm-cmdbody input[data-k=%s]" % k, "change")
+    page.check("#cm-cmdbody input[data-k=finish_spring]")
+    page.wait_for_function("() => { const o = window.__cam.CM.doc.operations[1]; return o.finish_tc === 'TC6' && o.finish_feed === 450 && o.finish_step === 4 && o.finish_spring; }")
+    page.click("#cm-cmd-ok")
+    page.click("#cm-run")
+    page.wait_for_function("window.__cam.CM.res && window.__cam.CM.res.operations.length === 3 && window.__cam.CM.resUpto === null", timeout=120000)
+    recs = page.evaluate("window.__cam.CM.res.operations.map(o => [o.id, o.ok, o.tool])")
+    oid = page.evaluate("window.__cam.CM.doc.operations[1].id")
+    assert recs[1] == [oid, True, "TC1"] and recs[2] == [oid + ":finish", True, "TC6"], recs
+    wait_text(page, "#cm-tree", "finish TC6")
+    page.click("#cm-tree .pt-feat[data-id=%s]" % oid)
+    wait_text(page, "#cm-props", "Roughing")
+    wait_text(page, "#cm-props", "Finish (TC6)")
+    page.evaluate("id => { const o = window.__cam.CM.doc.operations[1]; o.finish_mode = 'off'; }", oid)
+    page.click("#cm-run")
+    page.wait_for_function("window.__cam.CM.res && window.__cam.CM.res.operations.length === 2", timeout=120000)
+
+
+def test_cam_tab_undercut_pick_run_gcode(page, client):
+    """CAM tab: the part chosen, the stock set in the properties of the Stock tree item, Undercut added (the
+    command window opens, the tool controller made from the library), the undercut face picked by a click in the
+    view (a chip appears), the preview runs, OK closes the window, Simulate cuts the stock (nothing left, no gouge),
+    the G-code file written to the cam folder of the project, Inspect shows the G-code of the operation."""
+    from test_cam import rail_part, BITS
+    client.put("/api/part/file/ui_rail", json=rail_part("ui_rail"))
+    client.put("/api/cam/tools", json=BITS)
+    tab(page, "cam")
+    page.wait_for_function("window.__cam && window.__cam.CM.doc && window.__cam.CM.bits.length")
+    page.select_option("#cm-source", "ui_rail")
+    page.wait_for_function("window.__cam.CM.geo && window.__cam.CM.geo.undercuts.length === 1")
+    page.click("#cm-tree .pt-feat[data-id=stock]")
+    page.select_option("#cm-props select[data-k=kind]", "part_filled")
+    page.wait_for_function("window.__cam.CM.doc.stock.kind === 'part_filled' && window.__cam.CM.setup && Math.abs(window.__cam.CM.setup.stock_bbox[5] - 16) < 1e-3")
+    cam_add(page, "undercut")
+    assert page.evaluate("window.__cam.CM.doc.tools.length") == 1 and page.evaluate("window.__cam.CM.doc.tools[0].bit") == "T2"
+    assert page.is_visible("#cm-cmdwin") and "Undercut" in page.text_content("#cm-cmdwin-title")
+    assert page.evaluate("window.__cam.CM.cmd.step") == 0                     # the Base geometry section is active
+    cam_click_undercut(page)
+    page.wait_for_function("window.__cam.CM.doc.operations[0].faces.length === 1")
+    assert page.locator("#cm-cmdbody .cw-chip").count() == 1
+    page.wait_for_function("window.__cam.CM.res && window.__cam.CM.res.operations.length === 1 && window.__cam.CM.res.operations[0].ok", timeout=120000)
+    wait_text(page, "#cm-cmdbody", "undercut depth")
+    page.click("#cm-cmd-ok")
+    page.wait_for_function("!window.__cam.CM.cmd")
+    assert not page.is_visible("#cm-cmdwin")
+    page.click("#cm-run")
+    page.wait_for_function("window.__cam.CM.res && window.__cam.CM.res.operations.length === 1", timeout=120000)
+    assert page.evaluate("window.__cam.CM.res.operations[0].ok") is True
+    assert page.evaluate("window.__cam.CM.res.left_mm3") < 1e-3
+    assert page.locator("#cm-tree .cm-ok").count() == 1
+    # the properties of the operation show its results
+    page.click("#cm-tree .pt-feat[data-id=%s]" % page.evaluate("window.__cam.CM.doc.operations[0].id"))
+    wait_text(page, "#cm-props", "removed")
+    file_menu(page, "#tab-cam")
+    page.click("#cm-inspect")
+    wait_text(page, "#cm-gcodebody", "M06 T1")
+    page.click("#cm-gcodewin-x")
+    file_menu(page, "#tab-cam")
+    page.click("#cm-gcode")
+    page.wait_for_function("document.querySelector('#status-text').textContent.includes('Written')", timeout=120000)
+    path = page.text_content("#status-text").split("Written ")[1].split(" (")[0].strip()
+    assert os.path.isfile(path) and path.endswith(".nc")
+
+
+def test_cam_tab_job(page, client):
+    """CAM tab: a whole job on the pocketed rail plate: stock offsets typed, Face, Pocket Shape (plate top picked by a
+    click), Pocket Shape (the pocket floor), Drilling, Undercut, Profile with a Tag dressup from the Dressup menu;
+    Cancel restores an operation; the tree shows the dressup; Simulate; results; the document saved and loaded
+    again; the sanity check."""
+    from test_cam import job_part, BITS
+    client.put("/api/part/file/ui_job", json=job_part("ui_job"))
+    client.put("/api/cam/tools", json=BITS)
+    tab(page, "cam")
+    page.wait_for_function("window.__cam && window.__cam.CM.doc && window.__cam.CM.bits.length")
+    file_menu(page, "#tab-cam")
+    page.click("#cm-new")
+    page.wait_for_function("window.__cam.CM.doc.operations.length === 0")
+    page.select_option("#cm-source", "ui_job")
+    page.wait_for_function("window.__cam.CM.geo && window.__cam.CM.setup")
+    assert page.evaluate("window.__cam.CM.geo.face_kind.filter(k => k === 'floor').length") == 4
+    page.click("#cm-tree .pt-feat[data-id=stock]")
+    for k in ("xneg", "xpos", "yneg", "ypos", "zpos"):
+        page.fill("#cm-props input[data-k=%s]" % k, "2")
+        page.dispatch_event("#cm-props input[data-k=%s]" % k, "change")
+        page.wait_for_function("k => window.__cam.CM.doc.stock[k] === 2", arg=k)
+    page.wait_for_function("window.__cam.CM.setup && Math.abs(window.__cam.CM.setup.stock_bbox[3] - 102) < 1e-3")
+    wait_text(page, "#cm-setup-hint", "Stock 104 x 64 x 18 mm; machine zero at part X -2 Y -2 Z 18")
+    cam_add(page, "face")
+    page.click("#cm-cmd-ok")
+    cam_add(page, "pocket")
+    cam_click_at(page, 50, 40, 10)                                    # the plate top
+    page.wait_for_function("window.__cam.CM.doc.operations[1].faces.length === 1")
+    page.click("#cm-cmd-ok")
+    cam_add(page, "pocket")
+    cam_click_at(page, 65, 38, 6)                                     # the pocket floor beside the island
+    page.wait_for_function("window.__cam.CM.doc.operations[2].faces.length === 1")
+    # Cancel on a new operation removes it; on an opened one restores it
+    page.click("#cm-cmd-cancel")
+    page.wait_for_function("!window.__cam.CM.cmd && window.__cam.CM.doc.operations.length === 2")
+    cam_add(page, "pocket")
+    cam_click_at(page, 65, 38, 6)
+    page.wait_for_function("window.__cam.CM.doc.operations[2].faces.length === 1")
+    page.click("#cm-cmd-ok")
+    page.wait_for_function("!window.__cam.CM.cmd")
+    page.dblclick("#cm-tree .pt-feat[data-id=%s]" % page.evaluate("window.__cam.CM.doc.operations[2].id"))
+    page.wait_for_function("window.__cam.CM.cmd && window.__cam.CM.cmd.id === window.__cam.CM.doc.operations[2].id")
+    page.click("#cm-cmdbody .cw-sec[data-step='3'] .cw-sec-head")
+    page.select_option("#cm-cmdbody select[data-k=pattern]", "zigzag")
+    page.wait_for_function("window.__cam.CM.doc.operations[2].pattern === 'zigzag'")
+    page.click("#cm-cmd-cancel")
+    page.wait_for_function("!window.__cam.CM.cmd && window.__cam.CM.doc.operations[2].pattern === 'offset'")
+    assert page.evaluate("window.__cam.CM.doc.operations[2].faces.length") == 1
+    cam_add(page, "drilling")
+    page.evaluate("""() => { const CM = window.__cam.CM; const i = CM.geo.face_kind.indexOf("hole"); const k = CM.geo.face_keys[i];
+        CM.doc.operations[3].faces = [{c: k.c, n: k.n, area: k.area}]; }""")
+    page.click("#cm-cmd-ok")
+    cam_add(page, "undercut")
+    cam_click_undercut(page)
+    page.wait_for_function("window.__cam.CM.doc.operations[4].faces.length === 1")
+    page.click("#cm-cmd-ok")
+    cam_add(page, "profile")
+    page.click("#cm-cmd-ok")
+    page.wait_for_function("!window.__cam.CM.cmd")
+    # the Tag dressup of the selected profile from the Dressup menu
+    page.click("#tab-cam .dd-btn:has-text('Dressup')")
+    page.click("#tab-cam [data-adddr=tag]")
+    page.wait_for_function("window.__cam.CM.cmd && window.__cam.CM.cmd.dr === 0 && window.__cam.CM.doc.operations[5].dressups.length === 1")
+    page.fill("#cm-cmdbody input[data-k=count]", "3")
+    page.dispatch_event("#cm-cmdbody input[data-k=count]", "change")
+    page.fill("#cm-cmdbody input[data-k=height]", "1")
+    page.dispatch_event("#cm-cmdbody input[data-k=height]", "change")
+    page.wait_for_function("window.__cam.CM.doc.operations[5].dressups[0].count === 3 && window.__cam.CM.doc.operations[5].dressups[0].height === 1")
+    page.click("#cm-cmd-ok")
+    assert page.locator("#cm-tree .pt-feat.cm-child").count() >= 1 + len(page.evaluate("window.__cam.CM.doc.tools"))
+    page.click("#cm-run")
+    page.wait_for_function("window.__cam.CM.res && window.__cam.CM.res.operations.length === 6 && window.__cam.CM.resUpto === null", timeout=300000)
+    assert page.evaluate("window.__cam.CM.res.operations.every(o => o.ok)"), page.evaluate("window.__cam.CM.res.operations.map(o => o.errors)")
+    assert page.evaluate("window.__cam.CM.res.gone_mm3") < 0.05 and page.evaluate("window.__cam.CM.res.left_mm3") < 400
+    assert page.locator("#cm-tree .cm-ok").count() == 6
+    page.click("#cm-tree .pt-feat[data-id=%s]" % page.evaluate("window.__cam.CM.doc.operations[5].id"))
+    wait_text(page, "#cm-props", "3 tag(s)")
+    # the sanity check in the properties panel
+    page.click("#cm-sanity")
+    wait_text(page, "#cm-props", "Sanity check")
+    # saved and loaded again with the operations and their faces
+    page.__dict__["_answer"] = "ui_jobcam"
+    file_menu(page, "#tab-cam")
+    page.click("#cm-saveas")
+    page.wait_for_function("!window.__cam.CM.dirty")
+    assert "ui_jobcam" in client.get("/api/cam/list").get_json()
+    page.evaluate("window.__camLoadNamed('ui_jobcam')")
+    page.wait_for_function("window.__cam.CM.doc.name === 'ui_jobcam' && window.__cam.CM.geo")
+    assert page.evaluate("window.__cam.CM.doc.operations.map(o => (o.faces || []).length)") == [0, 1, 1, 1, 1, 0]
+    assert page.evaluate("window.__cam.CM.doc.operations[5].dressups[0].type") == "tag"
+
+
+def test_cam_tab_measure(page, client):
+    """CAM tab: Measure (toolbar button, window): a click on the plate top face, a second click on the pocket floor
+    (distance between the planes, the minimum distance line), Machine zero and Stock top from the window buttons, a
+    vertex click with machine coordinates, Esc ends it."""
+    from test_cam import job_part, BITS
+    client.put("/api/part/file/ui_meas", json=job_part("ui_meas"))
+    client.put("/api/cam/tools", json=BITS)
+    tab(page, "cam")
+    page.wait_for_function("window.__cam && window.__cam.CM.doc && window.__cam.CM.bits.length")
+    page.select_option("#cm-source", "ui_meas")
+    page.wait_for_function("window.__cam.CM.geo && window.__cam.CM.setup")
+    page.click("#cm-measure-btn")
+    assert page.is_visible("#cm-measure") and page.evaluate("!!window.__cam.CM.measure")
+    cam_click_at(page, 20, 30, 10)
+    page.wait_for_function("window.__cam.CM.measure.res && window.__cam.CM.measure.items.length === 1")
+    assert page.evaluate("window.__cam.CM.measure.items[0].face !== undefined")
+    cam_click_at(page, 65, 44, 6)
+    page.wait_for_function("window.__cam.CM.measure.res && window.__cam.CM.measure.items.length === 2")
+    wait_text(page, "#cm-measure-body", "Distance between the planes")
+    assert "4.0000 mm" in page.text_content("#cm-measure-body")
+    page.click("#cm-measure [data-mref=zero]")
+    page.wait_for_function("window.__cam.CM.measure.items.length === 1 && window.__cam.CM.measure.res")
+    page.click("#cm-measure [data-mref=stock_top]")
+    page.wait_for_function("window.__cam.CM.measure.items.length === 2 && window.__cam.CM.measure.res")
+    wait_text(page, "#cm-measure-body", "Stock top")
+    page.click("#cm-measure [data-mref=zero]")
+    cam_click_at(page, 100, 60, 10)
+    page.wait_for_function("window.__cam.CM.measure.items.length === 2 && window.__cam.CM.measure.res")
+    assert page.evaluate("JSON.stringify(window.__cam.CM.measure.items[1].vertex)") == "[100,60,10]"
+    page.click("#cm-measure [data-mref=zero]")
+    page.wait_for_function("window.__cam.CM.measure.items.length === 1 && window.__cam.CM.measure.res")
+    page.keyboard.press("Escape")
+    page.wait_for_function("!window.__cam.CM.measure")
+    assert not page.is_visible("#cm-measure")
+
+
+def test_cam_tab_new_controller_from_op(page, client):
+    """CAM tab: the Tool controller select of an operation lists the bits of the library as new controllers; picking
+    one adds a controller to the job and sets it on the operation (and on Finish tool controller)."""
+    from test_cam import job_part, BITS
+    client.put("/api/part/file/ui_tc", json=job_part("ui_tc"))
+    client.put("/api/cam/tools", json=BITS)
+    tab(page, "cam")
+    page.wait_for_function("window.__cam && window.__cam.CM.doc && window.__cam.CM.bits.length")
+    page.select_option("#cm-source", "ui_tc")
+    page.wait_for_function("window.__cam.CM.geo && window.__cam.CM.setup")
+    page.click("#tab-cam [data-addop=pocket]")
+    page.wait_for_selector("#cm-cmdbody select[data-k=tc]")
+    n0 = page.evaluate("window.__cam.CM.doc.tools.length")
+    assert page.locator("#cm-cmdbody select[data-k=tc] option[value='bit:T4']").count() == 1
+    page.select_option("#cm-cmdbody select[data-k=tc]", "bit:T4")
+    page.wait_for_function("n => window.__cam.CM.doc.tools.length === n + 1", arg=n0)
+    tc = page.evaluate("window.__cam.CM.doc.operations[0].tc")
+    assert page.evaluate("t => window.__cam.CM.doc.tools.find(x => x.id === t).bit", tc) == "T4"
+    page.wait_for_function("t => document.querySelector('#cm-cmdbody select[data-k=tc]').value === t", arg=tc)
+    page.select_option("#cm-cmdbody select[data-k=finish_mode]", "separate")
+    page.wait_for_selector("#cm-cmdbody select[data-k=finish_tc]")
+    page.select_option("#cm-cmdbody select[data-k=finish_tc]", "bit:T6")
+    page.wait_for_function("n => window.__cam.CM.doc.tools.length === n + 2", arg=n0)
+    assert page.evaluate("window.__cam.CM.doc.tools.find(x => x.id === window.__cam.CM.doc.operations[0].finish_tc).bit") == "T6"
+
+
+def test_cam_tab_gouge_places(page, client):
+    """CAM tab: a Face operation cut into the part top: the Gouges table in the operation properties (volume, centre,
+    move), the Gouge column of the levels, the gouge drawn in the view, a click on a row centres the view."""
+    from test_cam import job_part, BITS
+    client.put("/api/part/file/ui_gouge", json=job_part("ui_gouge"))
+    client.put("/api/cam/tools", json=BITS)
+    tab(page, "cam")
+    page.wait_for_function("window.__cam && window.__cam.CM.doc && window.__cam.CM.bits.length")
+    page.select_option("#cm-source", "ui_gouge")
+    page.wait_for_function("window.__cam.CM.geo && window.__cam.CM.setup")
+    page.click("#tab-cam [data-addop=face]")
+    page.wait_for_selector("#cm-cmdbody input[data-k=final_depth]")
+    page.fill("#cm-cmdbody input[data-k=final_depth]", "15.5")
+    page.press("#cm-cmdbody input[data-k=final_depth]", "Tab")
+    page.click("#cm-cmd-ok")
+    page.wait_for_function("window.__cam.CM.res && window.__cam.CM.res.operations[0].gouges && window.__cam.CM.res.operations[0].gouges.length", timeout=60000)
+    page.click("#cm-tree .pt-feat[data-id=%s]" % page.evaluate("window.__cam.CM.doc.operations[0].id"))
+    page.wait_for_selector("#cm-props .cm-gouges tr[data-gouge]")
+    assert "Gouge (mm^3)" in page.text_content("#cm-props")
+    assert page.evaluate("window.__cam.CM.three.group.children.some(o => o.material && o.material.color && o.material.color.getHex() === 0xe64980)")
+    c = page.evaluate("window.__cam.CM.res.operations[0].gouges[0].c")
+    page.click("#cm-props .cm-gouges tr[data-gouge]")
+    t = page.evaluate("window.__cam.CM.three.controls.target.toArray()")
+    assert all(abs(t[i] - c[i]) < 1e-3 for i in range(3)), (t, c)
+
+
+def test_cam_tab_bit_editor(page, client):
+    """CAM tab: the bit list and the bit editor: New bit, Shape T-slot cutter with its fields (Disc diameter, Disc
+    thickness, Neck diameter), the profile drawing and its line, a neck as large as the disc refused in the drawing
+    line, Copy, a Custom profile with a point added (D from the points), Save bits (the server sets D)."""
+    from test_cam import BITS
+    client.put("/api/cam/tools", json=BITS)
+    tab(page, "cam")
+    page.wait_for_function("window.__cam && window.__cam.CM.doc && window.__cam.CM.bits.length")
+    if not page.is_visible("#cm-tools"):
+        page.click("#cm-tools-toggle")
+    n0 = page.evaluate("window.__cam.CM.bits.length")
+    page.click("#cm-tool-add")
+    page.wait_for_function("n => window.__cam.CM.bits.length === n + 1", arg=n0)
+    page.select_option("#cm-bited select[data-k=shape]", "tslot")
+    page.wait_for_selector("#cm-bited input[data-k=height]")
+    assert "Disc diameter D (mm)" in page.text_content("#cm-bited") and "Disc thickness (mm)" in page.text_content("#cm-bited")
+    for k, v in (("d", "16"), ("height", "6"), ("neck", "7"), ("neck_length", "10")):
+        page.fill("#cm-bited input[data-k=%s]" % k, v)
+        page.press("#cm-bited input[data-k=%s]" % k, "Tab")
+    wait_text(page, "#cm-bit-info", "D 16 mm, cutting height 6 mm")
+    assert page.locator("#cm-bit-svg polygon").count() == 2
+    page.fill("#cm-bited input[data-k=neck]", "16")
+    page.press("#cm-bited input[data-k=neck]", "Tab")
+    wait_text(page, "#cm-bit-info", "must be smaller than the disc diameter")
+    page.fill("#cm-bited input[data-k=neck]", "7")
+    page.press("#cm-bited input[data-k=neck]", "Tab")
+    wait_text(page, "#cm-bit-info", "cutting height 6 mm")
+    page.click("#cm-tools tr[data-bi='%d'] [data-tdup]" % n0)
+    page.wait_for_function("n => window.__cam.CM.bits.length === n + 2 && window.__cam.CM.bits[n + 1].shape === 'tslot'", arg=n0)
+    page.select_option("#cm-bited select[data-k=shape]", "custom")
+    page.wait_for_selector("#cm-bited #cm-padd")
+    page.click("#cm-bited #cm-padd")
+    page.wait_for_function("n => window.__cam.CM.bits[n + 1].profile.length === 4", arg=n0)
+    page.fill("#cm-bited input[data-pr='1'][data-pc='0']", "5")
+    page.press("#cm-bited input[data-pr='1'][data-pc='0']", "Tab")
+    page.wait_for_function("n => window.__cam.CM.bits[n + 1].d === 10", arg=n0)
+    page.click("#cm-tool-save")
+    page.wait_for_function("n => window.__cam.CM.bits.length === n + 2 && window.__cam.CM.bits[n + 1].height === 12", arg=n0)
+    saved = client.get("/api/cam/tools").get_json()
+    assert saved[n0]["shape"] == "tslot" and saved[n0 + 1]["shape"] == "custom" and saved[n0 + 1]["d"] == 10

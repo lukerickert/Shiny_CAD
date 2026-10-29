@@ -623,6 +623,7 @@ function showTab(name) {
   $("#tab-asm").hidden = name !== "asm";
   $("#tab-fea").hidden = name !== "fea";
   $("#tab-xp").hidden = name !== "xp";
+  $("#tab-cam").hidden = name !== "cam";
   // the drawing settings panel (models, sheet, views, title block) is for the Drawings tab
   const aside = document.querySelector("#layout > aside");
   if (aside) aside.hidden = name !== "annotate";
@@ -632,12 +633,13 @@ function showTab(name) {
   if (name === "asm" && window.asmShown) asmShown();
   if (name === "fea" && window.feaShown) feaShown();
   if (name === "xp" && window.xpShown) xpShown();
+  if (name === "cam" && window.camShown) camShown();
   if (name === "annotate" && window.annotatorShown) annotatorShown();
   if (name === "sketch" && window.sketchShown) sketchShown();
 }
 
 /** Build stamp in the title (tooltip): the newest static file on the server and the version of this script. */
-const APP_BUILD = "fix179";
+const APP_BUILD = "fix182";
 async function showBuild() {
   try {
     const r = await fetch("/api/build"); const j = await r.json();
@@ -801,7 +803,7 @@ document.addEventListener("DOMContentLoaded", () => {
 });
 
 // ------------------------------------------------------------------ document files (.scpart, .scasm, ...)
-const DOC_EXT = { part: ".scpart", sketch: ".scsketch", assembly: ".scasm", analysis: ".scfea", explicit: ".scexp" };
+const DOC_EXT = { part: ".scpart", sketch: ".scsketch", assembly: ".scasm", analysis: ".scfea", explicit: ".scexp", cam: ".sccam" };
 /** Opens a document file from any folder (path empty: file dialog). In a project folder that project is opened;
  *  elsewhere the document is added to the open project and stays linked to the file. */
 window.openDocFile = async function (path) {
@@ -830,7 +832,7 @@ window.saveDocFile = async function (type, name, path) {
 // ------------------------------------------------------------------ document file menu (Part, Assembly)
 /** File menu of a document tab, linked to the open project of the Project tab.
  *  o: { pre ("pt"), type ("part"), label ("part"), pane ("#tab-part"), listUrl, cur() -> {name, dirty},
- *       load(name), save(name, asNew), blank(), setName(name) }.
+ *       load(name), save(name, asNew), blank(), setName(name), folderHint(dirs) -> placeholder of the folder field (optional) }.
  *  The list holds the saved documents of the open project; the current document is selected in it
  *  ("(not saved)" when it has no file in the open project). Output folder empty: the project STEP folder. */
 function docFileMenu(o) {
@@ -858,7 +860,7 @@ function docFileMenu(o) {
     el("rename").disabled = !ok || !info.current;
     el("openwork").disabled = !info.current;
     el("openstep").disabled = !info.current;
-    el("folder").placeholder = d.step ? "empty: " + d.step : "empty: download";
+    el("folder").placeholder = o.folderHint ? o.folderHint(d) : d.step ? "empty: " + d.step : "empty: download";
   }
   function markSaved(name) { saved = { name, project: project().current || "" }; refresh(); }
   function markUnsaved() { saved = null; render(); }

@@ -78,3 +78,49 @@ def test_import_feature_with_stl(tmp_path):
     shape, st = part.build(p)
     assert st[0]["error"] is None and "2 cylindrical, 2 conical" in st[0]["note"]
     assert shape.volume == pytest.approx(_plate().volume, rel=2e-3)
+
+
+def test_fine_mesh_cylinders_fitted(tmp_path):
+    """A finely meshed part (about 19000 triangles, 0.46 deg between neighbouring triangles of the cylinders): the
+    cylinders are fitted (a fine mesh of a curved surface is flat within the tolerance over several triangles)."""
+    from build123d import Box, Cylinder, Pos, Rot, export_stl
+    from drawgen import stlimport
+    cap = Cylinder(30, 4) + Pos(0, 0, 4) * (Cylinder(28, 8) - Cylinder(26, 8))
+    for a in (0, 90, 180, 270):
+        cap += Rot(0, 0, a) * Pos(26, 0, 10) * Box(2, 10, 12)
+    path = str(tmp_path / "cap.stl")
+    export_stl(cap, path, tolerance=0.0008, angular_tolerance=0.008)
+    so, rep = stlimport.stl_solid(path, {"fit": True})
+    assert rep["triangles"] > 15000
+    assert rep["kinds"].get("cylinder", 0) >= 6 and rep["faces"] < 60
+    assert abs(rep["volume"] - rep["mesh_volume"]) < 0.001 * rep["mesh_volume"]
+
+
+def test_flat_faces_without_fitting_valid(tmp_path):
+    """Fitting off on a finely meshed curved part: coplanar triangles are merged only within 1e-5 x the size, so the
+    faces stay planar and the solid is valid with the mesh volume."""
+    from build123d import Cylinder, export_stl
+    from drawgen import stlimport
+    path = str(tmp_path / "cyl.stl")
+    export_stl(Cylinder(20, 10), path, tolerance=0.001, angular_tolerance=0.02)
+    so, rep = stlimport.stl_solid(path, {"fit": False})
+    assert rep["kinds"] == {"plane": rep["faces"]} and rep["faces"] > 100
+    assert so.is_valid and abs(rep["volume"] - rep["mesh_volume"]) < 1e-3 * rep["mesh_volume"]
+
+
+def test_rough_mesh_reduced_and_exact(tmp_path):
+    """Rough import: a mesh above the maximum is reduced by vertex clustering (size kept within a cell); a mesh below
+    it keeps every triangle; the faces are planar triangles of one compound marked as a mesh body."""
+    from build123d import Cylinder, Box, export_stl
+    from drawgen import stlimport
+    path = str(tmp_path / "cyl.stl")
+    export_stl(Cylinder(20, 10), path, tolerance=0.001, angular_tolerance=0.02)
+    sh, rep = stlimport.rough_mesh(path, 2000)
+    assert rep["triangles"] > 2000 and rep["faces"] <= 2000
+    assert abs(rep["size"][0] - 40) < 0.5 and abs(rep["size"][2] - 10) < 0.5
+    assert getattr(sh, "_mesh", False) and len(sh.faces()) == rep["faces"]
+    path2 = str(tmp_path / "box.stl")
+    export_stl(Box(10, 20, 30), path2)
+    sh2, rep2 = stlimport.rough_mesh(path2, 2000)
+    assert rep2["faces"] == rep2["triangles"] == 12
+    assert abs(sh2.area - 2 * (200 + 300 + 600)) < 1e-6

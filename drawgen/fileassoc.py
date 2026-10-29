@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Windows file types of the document files (.scpart, .scasm, .scsketch, .scfea, .scexp) for the current user
+"""Windows file types of the document files (.scpart, .scasm, .scsketch, .scfea, .scexp, .sccam) for the current user
 (HKEY_CURRENT_USER\\Software\\Classes, no administrator rights): a double-click in Explorer runs
 run.py --open <file> with the Python of the running program."""
 import os
@@ -8,7 +8,7 @@ import sys
 from .packages import PKG_EXT
 
 LABEL = {"part": "ShinyCAD part", "sketch": "ShinyCAD sketch", "assembly": "ShinyCAD assembly",
-         "analysis": "ShinyCAD analysis", "explicit": "ShinyCAD explicit analysis"}
+         "analysis": "ShinyCAD analysis", "explicit": "ShinyCAD explicit analysis", "cam": "ShinyCAD CAM"}
 
 
 def _icon(app_dir):

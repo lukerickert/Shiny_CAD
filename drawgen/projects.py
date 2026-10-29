@@ -4,13 +4,14 @@ document versions (snapshots) and saved project states.
 
 <projects root>/<project>/
     project.json          name, description, created, document metadata (version, note), links
-    work/                 *.part.json, *.sketch.json, *.asm.json, *.fea.json, *.exp.json
+    work/                 *.part.json, *.sketch.json, *.asm.json, *.fea.json, *.exp.json, *.cam.json
     work/annotations/     drawing annotations and view layouts (by part uid or file name)
     drawings/             exported PDF, DXF, SVG, FCStd
     step/                 exported STEP and mesh files
     step_import/          local copies of imported STEP files
     analysis/<name>/      analysis runs: CalculiX input and result files, report, results for the view
     explicit/<name>/      explicit analyses (OpenCourant): model .inp, run folders with decks and results
+    cam/                  G-code files of the CAM documents
     versions/             <name>.<type>.v<N>.json snapshots with <name>.<type>.v<N>.meta.json
     states/               saved project states (*.state.json)
     trash/                deleted documents
@@ -23,9 +24,9 @@ import threading
 import time
 
 TYPES = {"part": ".part.json", "sketch": ".sketch.json", "assembly": ".asm.json", "analysis": ".fea.json",
-         "explicit": ".exp.json"}
+         "explicit": ".exp.json", "cam": ".cam.json"}
 SUBDIRS = ("work", os.path.join("work", "annotations"), "drawings", "step", "step_import", "versions", "states", "trash",
-           "analysis", "explicit")
+           "analysis", "explicit", "cam")
 
 
 def safe_name(s):
@@ -35,10 +36,11 @@ def safe_name(s):
 class Dirs(object):
     """Directories of the documents of the open project (or of the program folder when no project is open)."""
     def __init__(self, parts, sketches, assemblies, stacks, annotations, drawings=None, step=None, step_import=None,
-                 analysis=None):
+                 analysis=None, cam=None):
         self.parts, self.sketches, self.assemblies, self.stacks = parts, sketches, assemblies, stacks
         self.annotations, self.drawings, self.step, self.step_import = annotations, drawings, step, step_import
         self.analysis = analysis
+        self.cam = cam
 
 
 _CFG_LOCK = threading.RLock()
@@ -100,11 +102,12 @@ class Projects(object):
         if not name:
             a = self.app_dir
             return Dirs(os.path.join(a, "parts"), os.path.join(a, "sketches"), os.path.join(a, "assemblies"),
-                        os.path.join(a, "stacks"), os.path.join(a, "annotations"), analysis=os.path.join(a, "analysis"))
+                        os.path.join(a, "stacks"), os.path.join(a, "annotations"), analysis=os.path.join(a, "analysis"),
+                        cam=os.path.join(a, "cam"))
         p = self.project_dir(name)
         w = os.path.join(p, "work")
         return Dirs(w, w, w, w, os.path.join(w, "annotations"), os.path.join(p, "drawings"), os.path.join(p, "step"),
-                    os.path.join(p, "step_import"), os.path.join(p, "analysis"))
+                    os.path.join(p, "step_import"), os.path.join(p, "analysis"), os.path.join(p, "cam"))
 
     def ensure_dirs(self, name):
         for s in SUBDIRS:
@@ -176,7 +179,7 @@ class Projects(object):
             return packages.sync(self, force, pack, only)
 
     # ------------------------------------------------------------------ all known projects (any folder)
-    SKIP_DIRS = {"work", "versions", "trash", "drawings", "step", "step_import", "analysis", "explicit", "states",
+    SKIP_DIRS = {"work", "versions", "trash", "drawings", "step", "step_import", "analysis", "explicit", "cam", "states",
                  "node_modules", "__pycache__", ".git", "$recycle.bin", "appdata"}
 
     @_cfg_locked
@@ -433,6 +436,10 @@ class Projects(object):
                         s = data.get("source") or {}
                         if s.get("name"):
                             doc["links"].append({"type": s.get("type") or "assembly", "name": s["name"]})
+                    if dtype == "cam":
+                        s = data.get("source") or {}
+                        if s.get("name"):
+                            doc["links"].append({"type": "part", "name": s["name"]})
                     if dtype == "explicit":
                         s = data.get("source") or {}
                         if s.get("kind") == "shinycad" and s.get("name"):
@@ -445,7 +452,7 @@ class Projects(object):
                 if l["type"] == "part" and l["name"] in parts:
                     parts[l["name"]]["used_by"].append({"type": "assembly", "name": a["name"]})
         for d in docs:
-            if d["type"] in ("analysis", "explicit"):
+            if d["type"] in ("analysis", "explicit", "cam"):
                 for l in d["links"]:
                     if l["type"] not in ("assembly", "part"):
                         continue
@@ -510,7 +517,7 @@ class Projects(object):
         # analyses and explicit analyses referencing the part or assembly
         if dtype in ("part", "assembly"):
             for fn in os.listdir(w):
-                if fn.endswith(TYPES["analysis"]) or fn.endswith(TYPES["explicit"]):
+                if fn.endswith(TYPES["analysis"]) or fn.endswith(TYPES["explicit"]) or fn.endswith(TYPES["cam"]):
                     p = os.path.join(w, fn)
                     with open(p, "r", encoding="utf-8") as f:
                         a = json.load(f)
@@ -585,7 +592,7 @@ class Projects(object):
 
     def _uses(self, w, dtype, dname):
         """Documents a document uses: the parts of an assembly; the part or assembly of an analysis or explicit
-        analysis (with the parts of that assembly). [(type, name)]"""
+        analysis (with the parts of that assembly); the part of a CAM document. [(type, name)]"""
         data = self._doc_data(w, dtype, dname)
         out = []
         if dtype == "assembly":
@@ -593,9 +600,11 @@ class Projects(object):
                 src = c.get("source") or {}
                 if src.get("type") == "part" and src.get("name") and ("part", src["name"]) not in out:
                     out.append(("part", src["name"]))
-        elif dtype in ("analysis", "explicit"):
+        elif dtype in ("analysis", "explicit", "cam"):
             src = data.get("source") or {}
-            if (dtype == "analysis" or src.get("kind") == "shinycad") and src.get("name"):
+            if dtype == "cam":
+                src = dict(src, type="part")
+            if (dtype != "explicit" or src.get("kind") == "shinycad") and src.get("name"):
                 t = src.get("type") or "assembly"
                 if t in TYPES:
                     out.append((t, src["name"]))

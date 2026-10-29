@@ -98,6 +98,7 @@
       <button type="button" class="tab" data-tab="asm">Assembly</button>
       <button type="button" class="tab" data-tab="fea">Analysis</button>
       <button type="button" class="tab" data-tab="xp">Explicit</button>
+      <button type="button" class="tab" data-tab="cam">CAM</button>
     </nav>
 
     <div id="tab-project" class="tabpane project-pane">
@@ -137,7 +138,7 @@
             <input type="text" id="pj-filter" placeholder="filter" class="sk-short">
             <label class="check inline"><input type="checkbox" id="pj-showlinks" checked> Links</label>
             <button type="button" id="pj-refresh" class="small">Refresh</button>
-            <button type="button" id="pj-openfile" class="small" title="Open a ShinyCAD document file (.scpart .scasm .scsketch .scfea .scexp) from any folder: in a project folder that project is opened; elsewhere the document is added to the open project and stays linked to the file">Open file…</button>
+            <button type="button" id="pj-openfile" class="small" title="Open a ShinyCAD document file (.scpart .scasm .scsketch .scfea .scexp .sccam) from any folder: in a project folder that project is opened; elsewhere the document is added to the open project and stays linked to the file">Open file…</button>
           </div>
           <div id="pj-docs"></div>
         </section>
@@ -243,6 +244,7 @@
       <div id="sk-partbar" class="ann-top sk-partbar" hidden>
         <strong id="sk-parttitle" title="Dashed: section of the part with the sketch plane. Grey: the part seen along the plane normal (dotted: hidden edges). Reference geometry snaps only."></strong>
         <label class="check inline"><input type="checkbox" id="sk-partproj" checked> Model edges</label>
+        <label class="check inline" title="Curves of the earlier sketches that no feature uses (grey), projected onto the sketch plane"><input type="checkbox" id="sk-sketchrefs" checked> Earlier sketches</label>
         <button type="button" id="sk-include" title="Click reference geometry to copy it into the sketch as fixed entities">Include</button>
         <button type="button" id="sk-includesec" title="Copy the whole section into the sketch">Include section</button>
         <button type="button" id="sk-includeproj" title="Copy all visible model edges into the sketch">Include edges</button>
@@ -386,7 +388,7 @@
           </div>
         </div>
         <div class="toolbar">
-          <button type="button" data-add="import" title="Base geometry from a STEP or STL file">Import STEP</button>
+          <button type="button" data-add="import" title="Base geometry from a STEP or STL file">Import geometry</button>
           <button type="button" data-add="place" title="Move the part so that its faces lie on the principal planes XY, XZ, YZ (and bounding box centre or minimum to the planes)">Place</button>
           <button type="button" data-add="sketch" title="Sketch on a reference plane, a plane feature, a planar face or normal to an edge">Sketch</button>
           <button type="button" data-add="plane" title="Datum plane for sketches and partitions">Plane</button>
@@ -403,10 +405,10 @@
           <button type="button" data-add="pattern">Pattern</button>
           <button type="button" data-add="mirror">Mirror</button>
           <button type="button" data-add="boolean" title="Boolean between solids of the part: union, subtract, intersect">Boolean</button>
-          <button type="button" data-add="sweep">Sweep</button>
+          <button type="button" data-add="sweep" title="Profile swept along a path, or a tool of revolution (the profile revolved about its axis) moved along a path">Sweep</button>
         </div>
         <div class="dd">
-          <button type="button" class="dd-btn" title="Face operations for mesh preparation">Faces ▾</button>
+          <button type="button" class="dd-btn" title="Face operations for mesh preparation; Delete body, Copy body, Scale body">Faces ▾</button>
           <div class="toolbar dd-menu">
           <button type="button" data-add="split" title="Cut the cells with a plane (CAE: Partition Cell)">Partition</button>
           <button type="button" data-add="unify" title="Merge coplanar faces and collinear edges (CAE: virtual topology)">Merge faces</button>
@@ -418,6 +420,9 @@
           <button type="button" data-add="replace" title="Rebuild faces on a clean, offset surface: cut outside, fill inside (CAE: replace faces)">Replace faces</button>
           <button type="button" data-add="combine" title="Mesh several faces as one surface; geometry unchanged (CAE: virtual topology)">Combine faces</button>
           <button type="button" data-add="hole_mesh" title="O-grid partition around holes and element counts for the structured hexahedral mesh">Hole mesh</button>
+          <button type="button" data-add="body_delete" title="Remove solids and surface bodies, and solids below a volume or a mean thickness, from the part (a feature in the tree)">Delete body</button>
+          <button type="button" data-add="body_copy" title="Copies of solids and surface bodies, moved by a vector">Copy body</button>
+          <button type="button" data-add="body_scale" title="Scale solids and surface bodies by a factor (or factors along X, Y, Z) about a reference point">Scale body</button>
           </div>
         </div>
         <div class="dd">
@@ -467,13 +472,12 @@
         <span id="pt-info" class="hint"></span>
         <button type="button" class="panel-toggle" data-panel="#tab-part .ann-props" title="Hide or show the side panel (Ctrl+B)" style="margin-left:auto">Panel</button>
       </div>
-      <div id="pt-cmdbar" class="ann-top sk-partbar" hidden>
-        <span id="pt-cmdtitle"></span>
-        <button type="button" id="pt-cmdfinish" class="primary">Finish</button>
-        <button type="button" id="pt-cmdcancel">Cancel</button>
-      </div>
       <div class="ann-body">
         <div id="pt-view"><div id="pt-meshinfo" class="meshinfo" hidden></div><div id="pt-section" class="meshinfo section-box" hidden></div>
+          <div id="pt-cmdwin" class="cmdwin" hidden>
+            <div class="cmdwin-head" id="pt-cmdwin-head" title="Drag to move"><span id="pt-cmdwin-title"></span><button type="button" id="pt-cmdwin-x" class="small" title="Cancel (Esc)">×</button></div>
+            <div id="pt-cmdbody" class="cmdwin-body"></div>
+          </div>
           <div id="pt-measure" class="meas-win meas-right" hidden>
             <div class="as-matewin-head"><strong>Measure</strong><button type="button" id="pt-measure-close" class="small" title="End measuring (Esc)">×</button></div>
             <div id="pt-measure-body"></div>
@@ -482,10 +486,10 @@
         <div class="ann-props">
           <h2>Tree</h2>
           <div id="pt-features"><p class="hint">Sketch on a reference plane, then Extrude.</p></div>
-          <h2 class="sk-h">Command</h2>
+          <h2 class="sk-h">Properties</h2>
           <div id="pt-props"></div>
-          <h2 class="sk-h">Configurations</h2>
-          <div id="pt-configs"></div>
+          <h2 class="sk-h pt-fold" id="pt-cfg-toggle" title="Show or hide the configurations"><span class="fold">▸</span> Configurations</h2>
+          <div id="pt-configs" hidden></div>
         </div>
       </div>
     </div>
@@ -709,6 +713,129 @@
         </div>
       </div>
     </div>
+
+    <div id="tab-cam" class="tabpane annotate-pane" hidden>
+      <div class="ann-top sk-tools">
+        <div class="dd">
+          <button type="button" class="dd-btn" title="New, load, save, name, post process, template">File ▾</button>
+          <div class="dd-menu file-menu sk-file">
+            <div class="row fm-head"><span id="cm-project" class="fm-project"></span><button type="button" id="cm-openwork" class="small" title="Open the work folder of the project on this PC">Open folder</button></div>
+            <div class="row"><label class="inline">Job<select id="cm-list" title="Saved CAM jobs of the open project; choosing one opens it"></select></label></div>
+            <div class="row"><button type="button" id="cm-new">New</button><button type="button" id="cm-save" title="Save under the current name (Ctrl+S)">Save</button><button type="button" id="cm-saveas" title="Save under a new name">Save as…</button><button type="button" id="cm-rename" title="Rename the saved document in the project">Rename…</button></div>
+            <div class="row"><label class="inline">G-code folder<input type="text" id="cm-folder" class="sk-path"></label><button type="button" class="browse" data-browse="folder" data-target="#cm-folder" title="Choose the G-code folder">…</button><button type="button" id="cm-openstep" class="small" title="Open the cam folder of the project on this PC">Open</button></div>
+            <div class="row"><label class="inline" title="G-code dialect of the controller">Post-processor<select id="cm-post"></select></label><label class="inline" title="File name of the G-code (empty: the job name)">File name<input type="text" id="cm-outname" class="sk-path" placeholder="&lt;job&gt;.nc"></label></div>
+            <div class="row"><button type="button" id="cm-gcode" class="primary" title="Run the operations and write the G-code file to the G-code folder (empty: the cam folder of the project; no project: download)">Post process</button><button type="button" id="cm-gcode-dl" title="Run the operations and download the G-code file">Download G-code</button><button type="button" id="cm-inspect" title="G-code of the selected operation in a window">Inspect G-code</button></div>
+            <div class="row"><button type="button" id="cm-tpl-export" title="Download the job as a template: setup sheet, tool controllers, post-processor, stock, operations without their geometry">Export template</button><button type="button" id="cm-tpl-import" title="Apply a job template file to this job">Import template…</button><input type="file" id="cm-tpl-file" accept=".json" hidden></div>
+          </div>
+        </div>
+        <label class="inline" title="The part the operations machine: a saved part of the project">Part<select id="cm-source"></select></label>
+        <div class="toolbar"><button type="button" id="cm-refresh" data-icon="cam_refresh" title="Load the part again (after a change in the Part tab)">Refresh</button></div>
+        <div class="toolbar" id="cm-tb-job">
+          <button type="button" id="cm-zero" data-icon="cam_zero" title="Machine zero: click a vertex of the part in the view; X, Y and Z of the machine zero at that vertex (Esc: cancel)">Zero</button>
+          <button type="button" id="cm-place" data-icon="cam_place" title="Model placement: the part moved and turned in the job coordinate system, by constraints of its faces to the datum planes XY, XZ, YZ and the axes X, Y, Z, or by position and rotation">Placement</button>
+          <button type="button" id="cm-measure-btn" data-icon="measure" title="Measure: click a face, an edge or a vertex of the part (or add the machine zero or a stock plane), then a second one: distances, angles, diameters, minimum distance, machine coordinates. Esc ends">Measure</button>
+        </div>
+        <div class="toolbar" id="cm-tb-ops">
+          <button type="button" data-addop="face" data-icon="cam_face" title="Face: the stock top cleared down to the part top">Face</button>
+          <button type="button" data-addop="profile" data-icon="cam_profile" title="Profile: the contour of the part, of picked faces or edges, outside or inside, in levels">Profile</button>
+          <button type="button" data-addop="pocket" data-icon="cam_pocket" title="Pocket Shape: the material above picked floor faces cleared in levels, islands kept, open sides extended">Pocket</button>
+          <button type="button" data-addop="adaptive" data-icon="cam_adaptive" title="Adaptive: clearing or profiling with spiral paths of constant engagement">Adaptive</button>
+          <button type="button" data-addop="drilling" data-icon="cam_drilling" title="Drilling: picked holes drilled with pecks and dwell">Drilling</button>
+          <button type="button" data-addop="helix" data-icon="cam_helix" title="Helix: picked holes milled with a helix">Helix</button>
+          <button type="button" data-addop="slot" data-icon="cam_slot" title="Slot: a straight or circular slot along its centre line">Slot</button>
+          <button type="button" data-addop="undercut" data-icon="cam_undercut" title="Undercut: inclined faces with the material above them cut with a dovetail cutter">Undercut</button>
+          <button type="button" data-addop="engrave" data-icon="cam_engrave" title="Engrave: picked edges, a saved sketch or a text followed at a depth">Engrave</button>
+          <button type="button" data-addop="vcarve" data-icon="cam_vcarve" title="Vcarve: closed regions of a text, a sketch or faces carved with a V bit along the centre lines">Vcarve</button>
+          <button type="button" data-addop="deburr" data-icon="cam_deburr" title="Deburr: a chamfer along picked edges with a V bit or a chamfer bit">Deburr</button>
+          <button type="button" data-addop="thread" data-icon="cam_thread" title="Thread milling: picked holes (internal) or bosses (external) cut along a helix of the pitch with a thread mill">Thread</button>
+        </div>
+        <div class="toolbar" id="cm-tb-3d">
+          <button type="button" data-addop="pocket3d" data-icon="cam_pocket3d" title="3D Pocket: the volume above picked faces cleared in levels, the region of every level bounded by the surface">3D Pocket</button>
+          <button type="button" data-addop="surface" data-icon="cam_surface" title="3D Surface: the tool follows the surface along a pattern">3D Surface</button>
+          <button type="button" data-addop="waterline" data-icon="cam_waterline" title="Waterline: contours of the surface at Z levels">Waterline</button>
+        </div>
+        <div class="dd">
+          <button type="button" class="dd-btn" title="Dressup of the selected operation: a change of its path">Dressup ▾</button>
+          <div class="toolbar dd-menu">
+            <button type="button" data-adddr="tag" data-icon="cam_dr_tag" title="Tag: holding tabs on the lowest level of a closed path">Tag</button>
+            <button type="button" data-adddr="ramp" data-icon="cam_dr_ramp" title="Ramp entry: plunges replaced by ramps along the path">Ramp entry</button>
+            <button type="button" data-adddr="leadinout" data-icon="cam_dr_leadinout" title="Lead in / lead out: an arc or a line into and out of the path">Lead in/out</button>
+            <button type="button" data-adddr="dogbone" data-icon="cam_dr_dogbone" title="Dogbone: inside corners of a path cut out for a part to fit">Dogbone</button>
+            <button type="button" data-adddr="boundary" data-icon="cam_dr_boundary" title="Boundary: the path cut at a rectangle">Boundary</button>
+            <button type="button" data-adddr="axismap" data-icon="cam_dr_axismap" title="Axis map: X or Y written as the rotary axis A (part on a rotary axis)">Axis map</button>
+          </div>
+        </div>
+        <div class="dd">
+          <button type="button" class="dd-btn" title="Operations without a cut, and copies of operations">More ▾</button>
+          <div class="toolbar dd-menu">
+            <button type="button" data-addop="fixture" data-icon="cam_fixture" title="Fixture: a work coordinate system (G54..G59); with the Estlcam post a shift of the coordinates">Fixture</button>
+            <button type="button" data-addop="comment" data-icon="cam_comment" title="Comment in the G-code">Comment</button>
+            <button type="button" data-addop="stop" data-icon="cam_stop" title="Stop: M00 (or the optional stop M01)">Stop</button>
+            <button type="button" data-addop="custom" data-icon="cam_custom" title="Custom: G-code lines written as they are">Custom</button>
+            <button type="button" data-addop="hop" data-icon="cam_hop" title="Hop: a rapid lift to a height between operations">Hop</button>
+            <button type="button" data-addop="probe" data-icon="cam_probe" title="Probe: a grid of G38.2 probe moves (LinuxCNC writes the results to a file)">Probe</button>
+            <button type="button" data-addop="copy" data-icon="copy" title="Copy: the moves of another operation again">Copy</button>
+            <button type="button" data-addop="array" data-icon="pattern" title="Array: the moves of another operation repeated in a line or around a point">Array</button>
+          </div>
+        </div>
+        <div class="toolbar">
+          <button type="button" id="cm-run" class="primary" data-icon="cam_simulate" title="Compute all toolpaths and cut the stock with the tool (simulation)">Simulate</button>
+          <button type="button" id="cm-sanity" data-icon="as_check" title="Checks of the job: tools, geometry, depths, stock">Sanity check</button>
+          <button type="button" id="cm-inspect-tb" data-icon="cam_gcode" title="G-code of the selected operation (or the whole job) in a window">G-code</button>
+        </div>
+        <div class="toolbar">
+          <button type="button" data-cmview="iso">Iso</button>
+          <button type="button" data-cmview="front">Front</button>
+          <button type="button" data-cmview="top">Top</button>
+          <button type="button" data-cmview="right">Right</button>
+          <button type="button" data-cmview="fit">Fit</button>
+        </div>
+        <div class="dd">
+          <button type="button" class="dd-btn" title="What the view shows">Show ▾</button>
+          <div class="dd-menu show-menu">
+            <label class="check inline"><input type="checkbox" id="cm-edges" checked> Edges</label>
+            <label class="check inline"><input type="checkbox" id="cm-axes" checked> Axes</label>
+            <label class="check inline"><input type="checkbox" id="cm-showpart" checked> Part</label>
+            <label class="check inline" title="The stock after the operations, translucent"><input type="checkbox" id="cm-showstock"> Stock after the operations</label>
+            <label class="check inline" title="Material of the stock outside the part after the operations"><input type="checkbox" id="cm-showleft" checked> Remaining material</label>
+            <label class="check inline"><input type="checkbox" id="cm-showpath" checked> Toolpaths</label>
+            <label class="check inline"><input type="checkbox" id="cm-showrapid" checked> Rapid moves</label>
+            <label class="check inline" title="Undercut faces of the part tinted"><input type="checkbox" id="cm-showunder" checked> Undercut faces</label>
+            <label class="check inline" title="The cut surface of a 3D Surface operation from its height map"><input type="checkbox" id="cm-showhm" checked> 3D surfaces</label>
+            <label class="check inline" title="The router: table, gantry, carriage, spindle and the travel of the tool tip (green box)"><input type="checkbox" id="cm-showmachine"> Machine</label>
+          </div>
+        </div>
+        <span id="cm-info" class="hint"></span>
+        <button type="button" class="panel-toggle" data-panel="#cm-panel" title="Hide or show the side panel (Ctrl+B)" style="margin-left:auto">Panel</button>
+      </div>
+      <div class="ann-body">
+        <div id="cm-view">
+          <div id="cm-cmdwin" class="cmdwin" hidden>
+            <div class="cmdwin-head" id="cm-cmdwin-head" title="Drag to move"><span id="cm-cmdwin-title"></span><button type="button" id="cm-cmdwin-x" class="small" title="Close (Esc)">×</button></div>
+            <div id="cm-cmdbody" class="cmdwin-body"></div>
+          </div>
+          <div id="cm-measure" class="meas-win meas-right cm-measure" hidden>
+            <div class="as-matewin-head"><strong>Measure</strong><button type="button" id="cm-measure-close" class="small" title="End measuring (Esc)">×</button></div>
+            <div class="row cm-meas-refs"><span class="hint">Add</span><button type="button" class="small" data-mref="zero" title="The machine zero as a point">Machine zero</button><button type="button" class="small" data-mref="stock_top" title="The plane of the stock top">Stock top</button><button type="button" class="small" data-mref="stock_bottom" title="The plane of the stock bottom (the table)">Stock bottom</button></div>
+            <div id="cm-measure-body"></div>
+          </div>
+          <div id="cm-play" class="cm-play" hidden><button type="button" id="cm-play-btn" class="small" title="Play the toolpaths with the tool (and the machine when shown)">▶</button><input type="range" id="cm-play-slider" min="0" max="1000" value="0" title="Position along the toolpaths"><select id="cm-play-speed" title="Playback speed"><option value="1">×1</option><option value="5">×5</option><option value="20" selected>×20</option><option value="100">×100</option></select><span id="cm-play-info" class="hint"></span></div>
+          <div id="cm-gcodewin" class="cmdwin cm-gcodewin" hidden>
+            <div class="cmdwin-head" id="cm-gcodewin-head" title="Drag to move"><span id="cm-gcodewin-title">G-code</span><button type="button" id="cm-gcodewin-x" class="small" title="Close">×</button></div>
+            <pre id="cm-gcodebody" class="cmdwin-body cm-gcode"></pre>
+          </div>
+        </div>
+        <div id="cm-split" class="fa-split" title="Drag to change the width of the panel"></div>
+        <div class="ann-props" id="cm-panel">
+          <h2>Tree</h2>
+          <div id="cm-tree"></div>
+          <h2 class="sk-h">Properties</h2>
+          <div id="cm-props"></div>
+          <h2 class="sk-h pt-fold" id="cm-tools-toggle" title="Show or hide the tool bit library"><span class="fold">▸</span> Tool bits</h2>
+          <div id="cm-tools" hidden></div>
+        </div>
+      </div>
+    </div>
   </main>
 </div>
 <div id="text-dialog" class="modal" hidden>
@@ -887,5 +1014,6 @@
 <script type="module" src="/static/assembly.js"></script>
 <script type="module" src="/static/analysis.js"></script>
 <script type="module" src="/static/explicit.js"></script>
+<script type="module" src="/static/cam.js"></script>
 </body>
 </html>

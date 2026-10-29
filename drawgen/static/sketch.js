@@ -1708,7 +1708,7 @@ function redraw() {
   }
   // reference geometry (section of the part with the sketch plane)
   for (const e of SK.refs || []) {
-    if (!SK.showProj && (e.kind === "proj" || e.kind === "hidden")) continue;
+    if (!refShown(e)) continue;
     if (e.kind === "proj") out.push(entSvg(e, "#9aa3b0", 1.0, ""));
     else if (e.kind === "hidden") out.push(entSvg(e, "#b8bfc9", 0.9, "1 2.5"));
     else if (e.kind === "axis") out.push(entSvg(e, "#6a3fa0", 1.0, "10 3 2 3"));
@@ -1914,7 +1914,7 @@ function snapAt(p, opts) {
   const tol = SNAP_PX / SK.view.s;
   const near = [];
   for (const e of visibleEnts().concat(SK.refs || [])) {
-    if (e.t === "text" || (opts.exclude && opts.exclude.has(e.id))) continue;
+    if (e.t === "text" || (opts.exclude && opts.exclude.has(e.id)) || (e.src === "sketch" && SK.showSketchRefs === false)) continue;
     const d = entDist(e, p);
     if (d < tol * 1.5) near.push([d, e]);
   }
@@ -5050,8 +5050,10 @@ function dimTool(orient) {
     hint: n => {
       if (!n) return "Line, circle, arc, or first point" + (orient ? "" : " (two lines: angle)");
       const f = SK.pick[0];
-      if (n === 1 && f.kind === "pt") return "Second point or a line";
-      if (n === 1 && f.kind === "line" && !orient) return "Dimension position, or a second line (angle)";
+      if (n === 1 && f.kind === "pt") return "Second point, line or circle (its centre)";
+      if (n === 1 && f.kind === "radial") return "Dimension position (" + (entById(f.id).t === "circle" ? "diameter" : "radius") + "), or a point, line or circle: distance from the centre";
+      if (n === 1 && f.kind === "line" && !orient) return "Dimension position, a second line (angle) or a circle (distance from its centre)";
+      if (n === 1 && f.kind === "line") return "Dimension position, or a circle (distance from its centre)";
       return "Dimension position";
     },
     pickWhat(sn, hit) {
@@ -5061,6 +5063,8 @@ function dimTool(orient) {
       if (hit && (hit.t === "circle" || hit.t === "arc")) return { kind: "radial", id: hit.id };
       return null;
     },
+    /** A circle or arc picked for a distance: its centre as a point pick. */
+    centreOf(w) { const e = entById(w.id); return { kind: "pt", ref: { e: w.id, k: "c" }, p: [e.cx, e.cy] }; },
     click(sn, ev, hit) {
       const w = this.pickWhat(sn, hit);
       const P = SK.pick;
@@ -5069,7 +5073,13 @@ function dimTool(orient) {
         P.push(w); return;
       }
       const f = P[0];
-      // second pick
+      // second pick: a point, a line, or a circle or arc clicked on its outline (its centre; the diameter or radius
+      // when the first pick is the circle and the click is on empty space)
+      if (P.length === 1 && w && w.kind === "radial" && w.id !== f.id) {
+        if (f.kind === "radial") P[0] = this.centreOf(f);
+        P.push(this.centreOf(w)); return;
+      }
+      if (P.length === 1 && f.kind === "radial" && w && (w.kind === "pt" || w.kind === "line")) { P[0] = this.centreOf(f); P.push(w); return; }
       if (P.length === 1 && f.kind === "pt" && w && (w.kind === "pt" || w.kind === "line")) { P.push(w); return; }
       if (P.length === 1 && f.kind === "line" && !orient && w && w.kind === "line" && w.id !== f.id) { P.push(w); return; }
       if (P.length === 1 && f.kind === "pt") return;
@@ -5098,6 +5108,8 @@ function dimTool(orient) {
         Object.assign(d, { type: "linear", r1: f.ref, r2: s.ref, orient: orient || "a" });
       } else if (f.kind === "pt" && s && s.kind === "line") {
         Object.assign(d, { type: "linear", r1: f.ref, l2: s.id, orient: "a" });
+      } else if (f.kind === "line" && s && s.kind === "pt") {
+        Object.assign(d, { type: "linear", r1: s.ref, l2: f.id, orient: "a" });
       } else return null;
       if (d.type === "linear") {
         const a = resolveDim(Object.assign({}, d, { off: [0, 0] }));
@@ -6574,8 +6586,7 @@ window.sketchEditForPart = function (sketch, refs, title, onFinish) {
   doc.sheet = { page: "extents", title_block: false, origin: [0, 0] };
   SK.frameRef = (refs || []).find(e => e.t === "frame") || null;
   SK.refs = (refs || []).filter(e => e.t !== "frame").map((e, i) => Object.assign({ id: "ref" + i, isRef: true, layer: "" }, e));
-  if (SK.showProj === undefined) SK.showProj = true;
-  if ($("#sk-partproj")) { $("#sk-partproj").checked = SK.showProj; $("#sk-partproj").onchange = () => { SK.showProj = $("#sk-partproj").checked; redraw(); }; }
+  bindRefToggles();
   showTab("sketch");
   loadDoc(doc);
   ensureAxes();
@@ -7519,11 +7530,29 @@ function includeRef(r) {
   SK.dirty = true;
 }
 
+/** Reference geometry shown: Model edges (projection and hidden edges of the part) and Earlier sketches (curves of
+ *  the earlier sketches, src "sketch") check boxes of the sketch bar; the section and datums are always shown. */
+function refShown(e) {
+  if (e.src === "sketch") return SK.showSketchRefs !== false;
+  return SK.showProj !== false || (e.kind !== "proj" && e.kind !== "hidden");
+}
+function bindRefToggles() {
+  if (SK.showProj === undefined) SK.showProj = true;
+  if (SK.showSketchRefs === undefined) SK.showSketchRefs = true;
+  if ($("#sk-partproj")) { $("#sk-partproj").checked = SK.showProj; $("#sk-partproj").onchange = () => { SK.showProj = $("#sk-partproj").checked; redraw(); }; }
+  const sr = $("#sk-sketchrefs");
+  if (sr) {
+    sr.checked = SK.showSketchRefs;
+    sr.onchange = () => { SK.showSketchRefs = sr.checked; redraw(); };
+    sr.closest("label").hidden = !(SK.refs || []).some(e => e.src === "sketch");
+  }
+}
+
 function includeAt(p) {
   const tol = HIT_PX / SK.view.s;
   let best = null, bd = tol;
   for (const r of SK.refs || []) {
-    if (!SK.showProj && (r.kind === "proj" || r.kind === "hidden")) continue;
+    if (!refShown(r)) continue;
     const d = entDist(r, p);
     if (d <= bd) { bd = d; best = r; }
   }
@@ -7535,7 +7564,7 @@ function includeAt(p) {
 }
 
 function includeAll(kinds) {
-  const list = (SK.refs || []).filter(r => kinds.includes(r.kind));
+  const list = (SK.refs || []).filter(r => kinds.includes(r.kind) && refShown(r));
   if (!list.length) return msg("Nothing to include", true);
   checkpoint();
   for (const r of list) includeRef(r);
@@ -7598,8 +7627,7 @@ window.sketchEditForDrawing = async function (d, target, label, onFinish) {
                    inner: j.svg.replace(/^[\s\S]*?<svg[^>]*>/, "").replace(/<\/svg>\s*$/, "") };
   SK.frameRef = null;
   SK.refs = (j.refs || []).map((e, i) => Object.assign({ id: "ref" + i, isRef: true, layer: "" }, e));
-  if (SK.showProj === undefined) SK.showProj = true;
-  if ($("#sk-partproj")) { $("#sk-partproj").checked = SK.showProj; $("#sk-partproj").onchange = () => { SK.showProj = $("#sk-partproj").checked; redraw(); }; }
+  bindRefToggles();
   showTab("sketch");
   SK.sheetData = null;
   loadDoc(doc);

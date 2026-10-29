@@ -16,7 +16,7 @@ const PT = {
 };
 const TYPE_NAMES = { sketch: "Sketch", plane: "Plane", point: "Point", axis: "Axis", extrude: "Extrude", cut: "Cut", revolve: "Revolve", fillet: "Fillet", chamfer: "Chamfer",
                      shell: "Shell", pattern: "Pattern", mirror: "Mirror", boolean: "Boolean", hole: "Hole", thread: "Thread", sweep: "Sweep",
-                     import: "Import STEP", place: "Place", split: "Partition", unify: "Merge faces", heal: "Heal", defeature: "Remove faces", offset_faces: "Offset faces", move_faces: "Move faces", combine: "Combine faces", hole_mesh: "Hole mesh", smooth: "Smooth surfaces", replace: "Replace faces",
+                     import: "Import geometry", body_delete: "Delete body", body_copy: "Copy body", body_scale: "Scale body", place: "Place", split: "Partition", unify: "Merge faces", heal: "Heal", defeature: "Remove faces", offset_faces: "Offset faces", move_faces: "Move faces", combine: "Combine faces", hole_mesh: "Hole mesh", smooth: "Smooth surfaces", replace: "Replace faces",
                      surf_extract: "Extract surface", surf_fit: "Fit surface", surf_sketch: "Extruded surface", surf_loft: "Loft surface",
                      surf_fill: "Fill surface", surf_offset: "Offset surface", surf_sew: "Sew surfaces", surf_import: "Import surface", thicken: "Thicken", surf_cut: "Cut with surface",
                      curve_extract: "Extract curve", curve_section: "Intersection curve", surf_from_curve: "Surface from curve", surf_trim: "Trim surface", surf_extend: "Extend surface", surf_bridge: "Bridge surface", surf_fillet: "Surface fillet" };
@@ -33,7 +33,7 @@ const PLANE_METHODS = { principal: "Principal plane + offset", datum: "Parallel 
 const SKETCH_TYPES = new Set(["extrude", "cut", "revolve", "hole", "sweep"]);
 const BASE_PLANES = { XY: "Top (XY)", XZ: "Front (XZ)", YZ: "Right (YZ)" };
 const PLANE_TXT = { XY: "Top (XY), normal +Z", XZ: "Front (XZ), normal -Y", YZ: "Right (YZ), normal +X", normal: "Normal to an edge or curve" };
-const COL = { hover: 0x7ad17a, sel: 0x2bb24c, surf: 0x5b7fb5, curve: 0x6a1b9a, solid: 0xb8c2cf, edge: 0x1d2125, sketch: 0x7a4a9a, plane: 0x6c7a89, region: 0x3aa6d8, datum: 0x6a3fa0 };
+const COL = { mesh: 0xc9b48a, hover: 0x7ad17a, sel: 0x2bb24c, surf: 0x5b7fb5, curve: 0x6a1b9a, solid: 0xb8c2cf, edge: 0x1d2125, sketch: 0x7a4a9a, plane: 0x6c7a89, region: 0x3aa6d8, datum: 0x6a3fa0 };
 
 function msgPart(text, isError) { status(text, isError); }
 const pesc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -103,6 +103,8 @@ function initThree() {
   camera.userData.target = controls.target;
   PT.three.cube = createNavCube(box, camera, viewDir);
   let down = null;
+  // Ctrl + left drag: box selection (the view does not rotate)
+  box.addEventListener("pointerdown", e => { if (e.target === renderer.domElement && e.button === 0 && (e.ctrlKey || e.metaKey)) boxStart(e); }, true);
   renderer.domElement.addEventListener("pointerdown", e => { down = [e.clientX, e.clientY]; });
   renderer.domElement.addEventListener("pointerup", e => {
     if (!down || Math.abs(e.clientX - down[0]) + Math.abs(e.clientY - down[1]) > 4 || (e.button !== 0 && e.button !== 1)) { down = null; return; }
@@ -163,17 +165,63 @@ function viewDir(dir, up) {
   render3();
 }
 
-/** A mesh of the given face indices of a mesh record. userData.tri: mesh triangle index of each triangle of the
- * geometry (a raycast faceIndex counts the triangles of the geometry). */
+/** Buffers shared by every geometry made from a mesh record, built once per record: the vertex positions, the
+ *  vertex normals (each vertex belongs to one face, so the normals are those of its own face) and the triangle
+ *  indices of each face. */
+function meshBuffers(m) {
+  if (m._buf) return m._buf;
+  const V = m.vertices, T = m.triangles, nv = V.length;
+  const pos = new Float32Array(nv * 3), nrm = new Float32Array(nv * 3);
+  for (let i = 0, k = 0; i < nv; i++) { const v = V[i]; pos[k++] = v[0]; pos[k++] = v[1]; pos[k++] = v[2]; }
+  const nf = m.face_solid ? m.face_solid.length : 0;
+  const faceTris = Array.from({ length: nf }, () => []);
+  for (let i = 0; i < T.length; i++) {
+    const tr = T[i], a = tr[0] * 3, b = tr[1] * 3, c = tr[2] * 3;
+    const fi = m.face_of_tri[i];
+    if (fi >= 0 && fi < nf) faceTris[fi].push(i);
+    const ux = pos[b] - pos[a], uy = pos[b + 1] - pos[a + 1], uz = pos[b + 2] - pos[a + 2];
+    const vx = pos[c] - pos[a], vy = pos[c + 1] - pos[a + 1], vz = pos[c + 2] - pos[a + 2];
+    const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    nrm[a] += nx; nrm[a + 1] += ny; nrm[a + 2] += nz; nrm[b] += nx; nrm[b + 1] += ny; nrm[b + 2] += nz; nrm[c] += nx; nrm[c + 1] += ny; nrm[c + 2] += nz;
+  }
+  for (let k = 0; k < nrm.length; k += 3) { const l = Math.hypot(nrm[k], nrm[k + 1], nrm[k + 2]) || 1; nrm[k] /= l; nrm[k + 1] /= l; nrm[k + 2] /= l; }
+  m._buf = { pos: new THREE.BufferAttribute(pos, 3), nrm: new THREE.BufferAttribute(nrm, 3), faceTris };
+  return m._buf;
+}
+
+/** Geometry of the triangles of the given faces (a Set of face indices) of a mesh record: the shared buffers with
+ *  an index of its own. userData.tri[k] is the triangle index of the k-th triangle of the geometry. */
 function facesGeometry(m, faceSet) {
-  const tri = [], gi = [];
-  m.triangles.forEach((tr, i) => { if (faceSet.has(m.face_of_tri[i])) { tri.push(...tr); gi.push(i); } });
+  const b = meshBuffers(m), T = m.triangles, tri = [], gi = [];
+  for (const fi of faceSet) {
+    const ts = b.faceTris[fi];
+    if (!ts) continue;
+    for (const i of ts) { const tr = T[i]; tri.push(tr[0], tr[1], tr[2]); gi.push(i); }
+  }
   const g = new THREE.BufferGeometry();
-  g.setAttribute("position", new THREE.Float32BufferAttribute(m.vertices.flat(), 3));
+  g.setAttribute("position", b.pos);
+  g.setAttribute("normal", b.nrm);
   g.setIndex(tri);
-  g.computeVertexNormals();
   g.userData.tri = gi;
   return g;
+}
+
+/** Colour of a body ("solid:<i>" or a surface body id) set in Properties (part "body_colors"), else dflt. */
+function bodyColor(id, dflt) {
+  const c = (PT.part && PT.part.body_colors || {})[id];
+  return c ? new THREE.Color(c) : dflt;
+}
+function colorRow(id, dflt) {
+  const c = (PT.part.body_colors || {})[id] || "#" + new THREE.Color(dflt).getHexString();
+  return `<div class="row pt-color"><label class="inline">Colour <input type="color" id="pp-color" value="${c}"></label>` +
+    `<button type="button" id="pp-colordef" class="small"${(PT.part.body_colors || {})[id] ? "" : " disabled"}>Default</button></div>`;
+}
+function bindColor(id) {
+  const inp = $("#pp-color"), def = $("#pp-colordef");
+  if (!inp) return;
+  inp.oninput = () => { PT.part.body_colors = Object.assign({}, PT.part.body_colors || {}, { [id]: inp.value }); PT.dirty = true; def.disabled = false; setMesh(PT.mesh); renderTree(); };
+  inp.onchange = () => renderProps();
+  def.onclick = () => { const bc = Object.assign({}, PT.part.body_colors || {}); delete bc[id]; PT.part.body_colors = bc; PT.dirty = true; setMesh(PT.mesh); renderTree(); renderProps(); };
 }
 
 /** Rebuilds the scene from the current mesh, surfaces, sketches and planes. */
@@ -186,14 +234,16 @@ function setMesh(m) {
   if (PT.meshPreview) { t.scene.remove(PT.meshPreview); PT.meshPreview = null; if ($("#pt-meshinfo")) $("#pt-meshinfo").hidden = true; }
   if (m && m.vertices.length) {
     // one mesh per solid cell (hidden cells are skipped)
-    const nSolids = Math.max(0, ...m.face_solid) + 1;
+    let nSolids = 0;
+    for (const s of m.face_solid) if (s + 1 > nSolids) nSolids = s + 1;
+    const solidFaces = Array.from({ length: nSolids }, () => new Set());
+    m.face_solid.forEach((s, fi) => { if (s >= 0) solidFaces[s].add(fi); });
     for (let si = 0; si < nSolids; si++) {
       if (PT.hidden["solid:" + si]) continue;
-      const faces = new Set();
-      m.face_solid.forEach((s, fi) => { if (s === si) faces.add(fi); });
+      const faces = solidFaces[si];
       const g = facesGeometry(m, faces);
       const seeThrough = !!(PT.cmd && PT.cmd.regions);
-      const mat = new THREE.MeshStandardMaterial({ color: COL.solid, metalness: 0.15, roughness: 0.6, side: THREE.DoubleSide, transparent: seeThrough, opacity: seeThrough ? 0.3 : 1, depthWrite: !seeThrough,
+      const mat = new THREE.MeshStandardMaterial({ color: bodyColor("solid:" + si, COL.solid), metalness: 0.15, roughness: 0.6, side: THREE.DoubleSide, transparent: seeThrough, opacity: seeThrough ? 0.3 : 1, depthWrite: !seeThrough,
                                                    polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });
       const mesh = new THREE.Mesh(g, mat);
       mesh.userData = { kind: "solid", solid: si, faces };
@@ -201,13 +251,14 @@ function setMesh(m) {
       PT.faceObjs.push(mesh);
     }
     if ($("#pt-edges").checked) {
+      const edgeMat = new THREE.LineBasicMaterial({ color: COL.edge });     // one material for all the edges
       m.edges.forEach((pl, i) => {
         // edges of hidden solids are hidden (an edge shared with a visible solid stays)
         const owners = (m.edge_solids || [])[i] || [];
         if (owners.length && owners.every(si => PT.hidden["solid:" + si])) return;
         const eg = new THREE.BufferGeometry();
         eg.setAttribute("position", new THREE.Float32BufferAttribute(pl.flat(), 3));
-        const line = new THREE.Line(eg, new THREE.LineBasicMaterial({ color: COL.edge }));
+        const line = new THREE.Line(eg, edgeMat);
         line.userData = { kind: "edge", index: i, key: m.edge_keys[i] };
         t.group.add(line);
         PT.edgeLines.push(line);
@@ -235,12 +286,15 @@ function drawSurfaces() {
     if (!f || f.suppressed) continue;
     if (trimming && trimming.source === id) continue;
     const isCurve = !sm.triangles.length;
+    const isMesh = !!(PT.status[id] && PT.status[id].mesh);
     if (!isCurve) {
       const g = new THREE.BufferGeometry();
       g.setAttribute("position", new THREE.Float32BufferAttribute(sm.vertices.flat(), 3));
       g.setIndex(sm.triangles.flat());
       g.computeVertexNormals();
-      const mesh = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: COL.surf, transparent: true, opacity: 0.45, side: THREE.DoubleSide, depthWrite: false,
+      // a rough mesh body (STL) is drawn opaque like a solid, the other surface bodies translucent
+      const mesh = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: bodyColor(id, isMesh ? COL.mesh : COL.surf), transparent: !isMesh, opacity: isMesh ? 1 : 0.45,
+                                                                     side: THREE.DoubleSide, depthWrite: isMesh, flatShading: isMesh, metalness: isMesh ? 0.1 : 0, roughness: isMesh ? 0.7 : 1,
                                                                      polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }));
       mesh.renderOrder = 2;
       mesh.userData = { kind: "surface", id };
@@ -257,6 +311,8 @@ function drawSurfaces() {
         line.renderOrder = 6; line.userData = { kind: "curve", id }; PT.surfObjs.push(line);
         t.group.add(line);
       }
+    } else if (isMesh) {
+      // a mesh body: no triangle edges (they would hide the shading)
     } else {
       // one pickable line per edge of the surface body
       sm.edges.forEach((pl, i) => {
@@ -339,7 +395,8 @@ function drawSketches() {
     };
     const a = add(pos, COL.sketch, false);
     if (a) PT.sketchObjs.push(a);
-    add(cpos, 0x2f74d0, true);
+    const c = add(cpos, 0x2f74d0, true);                 // construction lines: picked like the other lines
+    if (c) { c.userData.constr = true; PT.sketchObjs.push(c); }
     for (const m of sk.images || []) if (m.show3d && m.show !== false) drawSketchImage(item, m);
   }
 }
@@ -487,6 +544,7 @@ function drawRegions() {
 
 /** Highlights: the selected tree item (green) and the references of the active command step (orange). */
 function drawSelection() {
+  if (PT.quiet) return;
   const t = PT.three;
   t.overlay.clear();
   const m = PT.mesh;
@@ -532,7 +590,7 @@ function drawSelection() {
     const refs = commandRefs(c);
     const faces = new Set();
     for (const r of refs.faces) {
-      const fi = m ? m.face_keys.findIndex(k => k && keyOfFace(k) === keyOfFace(r)) : -1;
+      const fi = m && m.face_keys ? m.face_keys.findIndex(k => k && keyOfFace(k) === keyOfFace(r)) : -1;      // no solid: no face keys
       if (fi >= 0) { faces.add(fi); continue; }
       // a face of a surface body
       for (const [sid, sm] of Object.entries(PT.surfaces || {})) { const si = (sm.face_keys || []).findIndex(k => k && keyOfFace(k) === keyOfFace(r)); if (si >= 0) { paintSurface(sid, 0xe8590c, 0.5, si); break; } }
@@ -545,7 +603,15 @@ function drawSelection() {
     for (const pid of refs.planes) paintPlane(pid, 0xe8590c);
     for (const sid of refs.sketches) paintSketch(sid, 0xe8590c);
     for (const did of refs.datums || []) paintDatum(did, 0xe8590c);
+    if (c.type === "sweep" || c.type === "revolve") { const ln = axisLine3(c); if (ln) paintLine3(ln[0], ln[1], 0xe8590c); }
+    // the solids the command acts on (Bodies section): tinted in the view
+    const bsel = new Set((c.bodies || []).map(b => (typeof b === "object" ? b.solid : b)));
+    if (bsel.size && m && m.face_solid) { const bf = new Set(); m.face_solid.forEach((s, fi) => { if (bsel.has(s)) bf.add(fi); }); paint(bf, 0xe8590c, 0.3, 4); }
     for (const q of refs.points || []) { const sg = new THREE.SphereGeometry(planeSize() * 0.02, 12, 12); const sp = new THREE.Mesh(sg, new THREE.MeshBasicMaterial({ color: 0xe8590c, depthTest: false })); sp.position.set(...q); sp.renderOrder = 11; t.overlay.add(sp); }
+    // the face or edge under the mouse in the selection chips of the command window
+    const hv = PT.chipHover;
+    if (hv && hv.mid) paintEdges(new Set([keyOfEdge(hv)]), 0x0a84ff);
+    else if (hv && hv.c && m && m.face_keys) { const fi = m.face_keys.findIndex(k => k && keyOfFace(k) === keyOfFace(hv)); if (fi >= 0) paint(new Set([fi]), 0x0a84ff, 0.7, 5); }
   }
   // inspection results: the active issue red, the others orange
   if (PT.inspect && PT.inspect.issues) {
@@ -582,7 +648,11 @@ function drawSelection() {
     else if (h.kind === "edge") paintEdges(new Set([keyOfEdge(h.key)]), COL.hover);
     else if (h.kind === "surface" || h.kind === "curve") paintSurface(h.id, COL.hover, 0.6);
     else if (h.kind === "plane") paintPlane(h.id, COL.hover);
-    else if (h.kind === "sketch") paintSketch(h.id, COL.hover);
+    else if (h.kind === "sketch") {
+      const ax = activeAxisStep();
+      const near = ax && h.id === ax.f.sketch_ref && h.point ? nearestSketchLine(feat(h.id), axisLines(ax.f, ax.constrOnly), h.point) : null;
+      if (near && near.dist <= planeSize() * 0.02) paintLine3(near.a, near.b, COL.hover); else paintSketch(h.id, COL.hover);
+    }
     else if (h.kind === "point" && h.vertex) { const sg = new THREE.SphereGeometry(planeSize() * 0.015, 10, 10); const sp = new THREE.Mesh(sg, new THREE.MeshBasicMaterial({ color: COL.hover, depthTest: false })); sp.position.set(...h.point); sp.renderOrder = 12; t.overlay.add(sp); }
     else if (h.kind === "point" || h.kind === "axis") paintDatum(h.id, COL.hover);
     else if (h.kind === "region") { const o = PT.regionObjs[h.index]; if (o) { const mm = o.clone(); mm.material = new THREE.MeshBasicMaterial({ color: COL.hover, transparent: true, opacity: 0.7, side: THREE.DoubleSide, depthWrite: false }); mm.renderOrder = 6; t.overlay.add(mm); } }
@@ -634,11 +704,85 @@ function paintDatum(id, color) {
 }
 function paintSketch(id, color) {
   const t = PT.three;
-  const o = PT.sketchObjs.find(p => p.userData.id === id);
-  if (!o) return;
-  const l = new THREE.LineSegments(o.geometry, new THREE.LineBasicMaterial({ color, depthTest: false, linewidth: 2 }));
-  l.renderOrder = 10;
+  for (const o of PT.sketchObjs.filter(p => p.userData.id === id)) {
+    const l = new THREE.LineSegments(o.geometry, new THREE.LineBasicMaterial({ color, depthTest: false, linewidth: 2 }));
+    l.renderOrder = 10;
+    t.overlay.add(l);
+  }
+}
+
+/** A line between two 3D points in the overlay (an axis chosen or under the cursor). */
+function paintLine3(a, b, color) {
+  const t = PT.three;
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute([...a, ...b], 3));
+  const l = new THREE.Line(g, new THREE.LineBasicMaterial({ color, depthTest: false }));
+  l.renderOrder = 12;
   t.overlay.add(l);
+  for (const q of [a, b]) { const sg = new THREE.SphereGeometry(planeSize() * 0.01, 8, 8); const sp = new THREE.Mesh(sg, new THREE.MeshBasicMaterial({ color, depthTest: false })); sp.position.set(...q); sp.renderOrder = 12; t.overlay.add(sp); }
+}
+
+/** Lines of the profile sketch of f that can be its axis (constrOnly: construction lines only, as Revolve lists). */
+function axisLines(f, constrOnly) {
+  const sk = f.sketch_ref && feat(f.sketch_ref);
+  return (((sk || {}).sketch || {}).entities || []).filter(e => e.t === "line" && !e.axis && (!constrOnly || e.constr));
+}
+
+/** The line of lines (entities of the sketch item sk) nearest to the 3D point q: {e, a, b, dist} or null. */
+function nearestSketchLine(sk, lines, q) {
+  let best = null;
+  for (const e of lines) {
+    const a = to3(sk, e.x1, e.y1), b = to3(sk, e.x2, e.y2);
+    const d = [0, 1, 2].map(k => b[k] - a[k]), L2 = d.reduce((t, v) => t + v * v, 0) || 1;
+    const t = Math.max(0, Math.min(1, [0, 1, 2].reduce((s2, k) => s2 + (q[k] - a[k]) * d[k], 0) / L2));
+    const dist = Math.hypot(...[0, 1, 2].map(k => q[k] - (a[k] + t * d[k])));
+    if (!best || dist < best.dist) best = { e, a, b, dist };
+  }
+  return best;
+}
+
+/** The step of the active command that takes a line of the profile sketch as the axis (Sweep tool axis, Revolve
+ *  axis), when it is the active step: {f, constrOnly} or null. */
+function activeAxisStep() {
+  const c = PT.cmd, f = c && feat(c.id);
+  if (!f || c.pick) return null;
+  const st = commandSteps(f)[c.step];
+  if (!st || !st.axisPick) return null;
+  return { f, constrOnly: st.axisPick === "constr" };
+}
+
+/** Name of a sketch line for the hover text and the command window. */
+function lineLabel(e) { return (e.constr ? "Construction line " : "Line ") + e.id + " (" + pfmt(e.x1, 2) + ", " + pfmt(e.y1, 2) + ") - (" + pfmt(e.x2, 2) + ", " + pfmt(e.y2, 2) + ")"; }
+
+/** A click on a line of the profile sketch or on an axis feature as the axis of f (f.axis: line id, or f.axis_ref:
+ *  the axis feature). constrOnly: construction lines only. */
+function acceptAxisPick(f, h, constrOnly) {
+  if (h.kind === "axis") { f.axis_ref = h.id; PT.dirty = true; return; }
+  if (h.id !== f.sketch_ref) { msgPart("Click a line of the profile sketch (" + itemName(f.sketch_ref) + ")", true); return; }
+  const sk = feat(f.sketch_ref);
+  if (!h.point) return;
+  const best = nearestSketchLine(sk, axisLines(f, constrOnly), h.point);
+  if (!best) { msgPart(constrOnly ? "The profile sketch has no construction line" : "The profile sketch has no line", true); return; }
+  if (best.dist > planeSize() * 0.02) { msgPart("Click a " + (constrOnly ? "construction line" : "line") + " of the profile sketch (the line under the cursor is highlighted)", true); return; }
+  f.axis = best.e.id; f.axis_ref = null; PT.dirty = true;
+  msgPart(lineLabel(best.e) + " is the axis");
+}
+
+/** The axis line of a Sweep or Revolve feature in the view: [a, b] (3D ends of the sketch line) or null. */
+function axisLine3(f) {
+  if (!f || f.axis_ref || !f.sketch_ref) return null;
+  const sk = feat(f.sketch_ref);
+  if (!sk) return null;
+  const e = axisLines(f, false).find(x => String(x.id) === String(f.axis));
+  if (e) return [to3(sk, e.x1, e.y1), to3(sk, e.x2, e.y2)];
+  if (f.axis === "u" || f.axis === "v") {
+    // the sketch axis across the extent of the sketch
+    let lo = -10, hi = 10;
+    for (const x of (sk.sketch || {}).entities || []) for (const [u, v] of sketchPolylines({ entities: [x] }).flat()) { const w = f.axis === "u" ? u : v; lo = Math.min(lo, w); hi = Math.max(hi, w); }
+    lo -= 2; hi += 2;
+    return f.axis === "u" ? [to3(sk, lo, 0), to3(sk, hi, 0)] : [to3(sk, 0, lo), to3(sk, 0, hi)];
+  }
+  return null;
 }
 
 // ------------------------------------------------------------------ hover and click in the view
@@ -766,14 +910,17 @@ function legacyPick(c) {
 
 /** Kinds accepted by the active command step (null: any element, for tree selection). */
 function activeKinds() {
-  if (PT.measure && !PT.cmd) return ["face", "plane", "axis"];
+  if (PT.measure && !PT.cmd) return ["face", "sface", "plane", "axis"];
   const c = PT.cmd;
   if (!c) return null;
   if (c.pick) return c.pick.kinds;
   const lp = legacyPick(c);
   if (lp) return lp.kinds;
-  const st = commandSteps(feat(c.id))[c.step];
-  return st && st.kinds ? st.kinds : null;
+  const steps = commandSteps(feat(c.id)), st = steps[c.step];
+  if (st && st.kinds) return st.kinds;
+  // a value section is active: the clicks go to the element sections (feedCommand picks the section)
+  const all = [...new Set(steps.filter(isPickStep).flatMap(x => x.kinds))];
+  return all.length ? all : null;
 }
 
 function hoverView(e) {
@@ -812,7 +959,11 @@ function hoverText(h) {
   }
   if (h.kind === "surface") return "Surface" + owner(h.id);
   if (h.kind === "curve") return "Curve" + owner(h.id);
-  if (h.kind === "sketch") return itemName(h.id);
+  if (h.kind === "sketch") {
+    const ax = activeAxisStep();
+    const near = ax && h.id === ax.f.sketch_ref && h.point ? nearestSketchLine(feat(h.id), axisLines(ax.f, ax.constrOnly), h.point) : null;
+    return near && near.dist <= planeSize() * 0.02 ? lineLabel(near.e) + " of " + itemName(h.id) : itemName(h.id);
+  }
   if (h.kind === "point") { const q = h.point || []; return (h.vertex ? "Vertex" : itemName(h.id)) + " (" + q.map(v => pfmt(v, 2)).join(", ") + ") mm"; }
   if (h.kind === "axis") return itemName(h.id);
   if (h.kind === "plane") return BASE_PLANES[h.id] ? "Reference plane " + BASE_PLANES[h.id] : itemName(h.id);
@@ -842,9 +993,25 @@ function clickView(e) {
 function feedCommand(h) {
   const c = PT.cmd;
   if (!c) return false;
+  // a click in the view ends the typing in a field of the command window (the window is then redrawn)
+  const ae = document.activeElement, cw = $("#pt-cmdbody");
+  if (ae && cw && cw.contains(ae) && ae.matches("input, select, textarea")) ae.blur();
   const kinds = activeKinds();
   if (!kinds || !kinds.includes(h.kind)) return false;
   const f = feat(c.id);
+  if (!c.pick && !legacyPick(c)) {
+    // the active section does not take this element: the element section that does (the nearest one above the
+    // active section, else the first one) becomes active
+    const steps = commandSteps(f), cur = steps[c.step];
+    if (!(cur && cur.kinds && cur.kinds.includes(h.kind))) {
+      const idx = steps.map((x, i) => i).filter(i => steps[i].kinds && steps[i].kinds.includes(h.kind));
+      const before = idx.filter(i => i < c.step);
+      const j = before.length ? before[before.length - 1] : idx[0];
+      if (j === undefined) return false;
+      c.step = j;
+      if (steps[j].enter) steps[j].enter(f);
+    }
+  }
   if (!c.pick && legacyPick(c)) { c.pick = legacyPick(c); applyPick(f, c.pick, h); renderCommand(); return true; }
   if (c.pick) { applyPick(f, c.pick, h); return true; }
   const st = commandSteps(f)[c.step];
@@ -944,7 +1111,7 @@ function setPivot(e) {
 
 function dblclickView(e) {
   if (PT.cmd && !isPlaneStep()) return;
-  const h = pickAt(e, ["plane", "face", "edge", "curve"]);
+  const h = pickAt(e, ["plane", "face", "edge", "curve", "sketch"]);
   if (h) sketchOnPlane(h);
 }
 
@@ -959,10 +1126,21 @@ function fillThreePoints(f, h) {
   msgPart("Point " + (i + 1) + " set to (" + f.points[i].map(v => pfmt(v, 2)).join(", ") + ") mm");
 }
 
+/** Cell of a picked edge of the solid when the part has several cells: the first shown solid that holds the edge
+ *  (an edge where cells touch, or edges of two solids at one place, are one edge in the view). */
+function edgeCell(h) {
+  const m = PT.mesh;
+  if (h.surface || h.index === undefined || !m || !m.face_solid || !(Math.max(0, ...m.face_solid) >= 1)) return undefined;
+  const owners = (m.edge_solids || [])[h.index] || [];
+  if (!owners.length) return undefined;
+  const shown = owners.find(si => !PT.hidden["solid:" + si]);
+  return shown !== undefined ? shown : owners[0];
+}
+
 function refOf(h) {
   // cell: the solid the face was picked on (a face between two cells belongs to both)
   if (h.kind === "face") return PT.cells > 1 && h.solid !== undefined ? { c: h.key.c, n: h.key.n, area: h.key.area, cell: h.solid } : { c: h.key.c, n: h.key.n, area: h.key.area };
-  if (h.kind === "edge") return { mid: h.key.mid, len: h.key.len };
+  if (h.kind === "edge") { const c = edgeCell(h); return c !== undefined ? { mid: h.key.mid, len: h.key.len, cell: c } : { mid: h.key.mid, len: h.key.len }; }
   if (h.kind === "body") return { solid: h.solid };
   return h.id !== undefined ? h.id : h.point;
 }
@@ -974,6 +1152,7 @@ function applyPick(f, pick, h) {
   const ref = refOf(h);
   if (pick.expand && h.kind === "face" && pick.kinds.includes("edge")) { expandEdges(f, pick.prop, "faces", [ref]); return; }
   if (pick.expand === "tangent" && h.kind === "edge") { expandEdges(f, pick.prop, "tangent", [ref]); return; }
+  if (h.kind === "face" && h.key && !pick.single && !(pick.kinds || []).includes("edge") && faceMode() !== "face") { pickFaces(f, pick.prop, h, faceMode()); return; }
   if (pick.single) { f[pick.prop] = ref; if (pick.after) pick.after(f, h); }
   else {
     f[pick.prop] = f[pick.prop] || [];
@@ -991,14 +1170,263 @@ async function expandEdges(f, prop, mode, refs) {
   try {
     const r = await postJSON("/api/part/expand", { part: PT.part, index: featIndex(f.id), mode, refs });
     const keys = await r.json();
+    // the edges grown from a face or an edge picked on a cell belong to that cell
+    const cell = refs.length && refs[0] && Number.isInteger(refs[0].cell) ? refs[0].cell : undefined;
+    if (cell !== undefined) for (const k of keys) k.cell = cell;
     f[prop] = f[prop] || [];
     const have = new Set(f[prop].map(keyOfEdge));
     let n = 0;
-    for (const k of keys) if (!have.has(keyOfEdge(k))) { f[prop].push({ mid: k.mid, len: k.len }); have.add(keyOfEdge(k)); n++; }
+    for (const k of keys) if (!have.has(keyOfEdge(k))) { f[prop].push(k.cell !== undefined ? { mid: k.mid, len: k.len, cell: k.cell } : { mid: k.mid, len: k.len }); have.add(keyOfEdge(k)); n++; }
     PT.dirty = true;
     renderCommand(); drawSelection(); scheduleBuild();
     msgPart(n + " edge(s) added, " + f[prop].length + " selected");
   } catch (e) { showErr(e); }
+}
+
+/** Face click mode of the steps that take several faces: Face, Tangent faces (joined through tangent edges) or
+ *  Connected faces (all faces joined through edges, within the solid or surface body of the clicked face). */
+const faceModeHtml = () => `<div class="cw-modes" title="What a click on a face adds">` +
+  [["face", "Face"], ["tangent", "Tangent faces"], ["connected", "Connected faces"]].map(([v, l]) =>
+    `<label class="check inline"><input type="radio" name="pf-fmode" value="${v}"${((PT.cmd && PT.cmd.fmode) || "face") === v ? " checked" : ""}> ${l}</label>`).join("") + `</div>`;
+const bindFaceMode = box => { box.querySelectorAll("input[name=pf-fmode]").forEach(r => r.onchange = () => { if (PT.cmd) PT.cmd.fmode = r.value; }); bindBoxTools(box); };
+const faceMode = () => (PT.cmd && PT.cmd.fmode) || "face";
+/** Multi-face step of the command bar (takes faces into an array): the face click mode is shown. */
+const isMultiFaceStep = st => !!st && (st.multiFace || (!!st.prop && !st.single && !st.accept && Array.isArray(st.kinds) && (st.kinds.includes("face") || st.kinds.includes("sface"))));
+
+/** Adds the faces grown from the clicked face (mode tangent or connected) to f[prop]; when the clicked face is
+ *  already selected, removes them. */
+async function pickFaces(f, prop, h, mode) {
+  try {
+    const r = await postJSON("/api/part/expand_faces", { part: PT.part, index: featIndex(f.id), mode, ref: Object.assign({ c: h.key.c, n: h.key.n, area: h.key.area }, PT.cells > 1 && h.solid !== undefined && !h.surface ? { cell: h.solid } : {}), surface: h.surface || null });
+    const keys = await r.json();
+    f[prop] = f[prop] || [];
+    const at = k => f[prop].findIndex(x => x && x.c && keyOfFace(x) === keyOfFace(k));
+    const had = at(h.key) >= 0;
+    let n = 0;
+    for (const k of keys) {
+      const i = at(k);
+      if (had && i >= 0) { f[prop].splice(i, 1); n++; }
+      else if (!had && i < 0) { f[prop].push(PT.cells > 1 && h.solid !== undefined && !h.surface ? { c: k.c, n: k.n, area: k.area, cell: h.solid } : { c: k.c, n: k.n, area: k.area }); n++; }
+    }
+    PT.dirty = true;
+    renderCommand(); drawSelection(); scheduleBuild();
+    msgPart(n + " face(s) " + (had ? "removed" : "added") + ", " + f[prop].length + " selected");
+  } catch (e) { showErr(e); }
+}
+
+// ------------------------------------------------------------------ box selection and Select shown
+/** The active pick of the command: { kinds, multi } (multi: the step takes several elements). */
+function activePick() {
+  const c = PT.cmd;
+  if (!c) return null;
+  const p = c.pick || legacyPick(c);
+  if (p) return { kinds: p.kinds || [], multi: !p.single };
+  const f = feat(c.id), steps = f ? commandSteps(f) : [], st = steps[c.step];
+  const multi = x => !!(x.multi || x.multiFace || (x.prop && !x.single));
+  if (st && st.kinds) return { kinds: st.kinds, multi: multi(st) };
+  // a value section is active: the element sections (feedCommand gives each element to the section that takes it)
+  const picks = steps.filter(isPickStep);
+  if (!picks.length) return null;
+  return { kinds: [...new Set(picks.flatMap(x => x.kinds))], multi: picks.some(multi) };
+}
+/** Kinds taken by a box or Select shown: the edges when the step takes edges (a face would add all its edges),
+ *  otherwise the kinds of the step without reference planes and axes. */
+function boxKinds(kinds) {
+  if (kinds.includes("edge") || kinds.includes("sedge")) return kinds.filter(k => k === "edge" || k === "sedge");
+  return kinds.filter(k => k !== "plane" && k !== "axis");
+}
+const boxToolsHtml = (extra) => `<div class="buttons"><button type="button" id="pf-shown" title="Adds every element of this step that is visible in the view (in the view area and not hidden behind a solid)">Select shown</button>${extra || ""}` +
+  `<label class="check inline" title="Box selection: Ctrl + left drag. Left to right: the elements entirely inside the box; right to left: the elements the box touches"><input type="checkbox" id="pf-boxshown"${PT.boxShown ? " checked" : ""}> Box: shown only</label></div>`;
+function bindBoxTools(box) {
+  const b = box.querySelector("#pf-shown");
+  if (b) b.onclick = () => selectShown();
+  const k = box.querySelector("#pf-boxshown");
+  if (k) k.onchange = () => { PT.boxShown = k.checked; };
+}
+
+/** Elements of the given kinds in the view: [{ h, pts (world points of the element), probes (points on it for
+ *  the visibility test) }]. h is the hit a click on the element gives. */
+function boxCandidates(kinds) {
+  const allow = k => kinds.includes(k);
+  const out = [], m = PT.mesh;
+  const posOf = o => { const a = o.geometry.attributes.position, p = []; for (let i = 0; i < a.count; i++) p.push([a.getX(i), a.getY(i), a.getZ(i)]); return p; };
+  const mid = pl => pl[Math.floor(pl.length / 2)] || pl[0];
+  // faces of a triangle mesh: their vertices and the centres of up to 5 of their largest triangles
+  const faceSets = (verts, tris, faceOfTri, skip) => {
+    const by = new Map();
+    tris.forEach((tr, i) => {
+      const fi = faceOfTri[i];
+      if (fi === undefined || fi < 0 || (skip && skip(fi))) return;
+      let e = by.get(fi);
+      if (!e) by.set(fi, e = { vi: new Set(), tris: [] });
+      tr.forEach(v => e.vi.add(v));
+      const [a, b, c] = tr.map(v => verts[v]);
+      const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2], vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
+      const ar = Math.hypot(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx);
+      e.tris.push([ar, [(a[0] + b[0] + c[0]) / 3, (a[1] + b[1] + c[1]) / 3, (a[2] + b[2] + c[2]) / 3]]);
+    });
+    for (const e of by.values()) { e.pts = [...e.vi].map(v => verts[v]); e.probes = e.tris.sort((x, y) => y[0] - x[0]).slice(0, 5).map(x => x[1]); }
+    return by;
+  };
+  if (m && m.vertices.length && (allow("face") || allow("body"))) {
+    const shownSolid = si => !PT.hidden["solid:" + si];
+    const by = faceSets(m.vertices, m.triangles, m.face_of_tri, fi => !shownSolid(m.face_solid[fi]));
+    if (allow("face")) {
+      for (const [fi, e] of by) out.push({ h: { kind: "face", fi, key: m.face_keys[fi], solid: m.face_solid[fi], owner: (m.face_owner || [])[fi], point: e.probes[0] }, pts: e.pts, probes: e.probes, fi });
+    } else {
+      for (const o of PT.faceObjs) {
+        const pts = [], probes = [];
+        for (const fi of o.userData.faces) { const e = by.get(fi); if (e) { pts.push(...e.pts); probes.push(...e.probes.slice(0, 1)); } }
+        if (pts.length) out.push({ h: { kind: "body", solid: o.userData.solid, faces: o.userData.faces, point: probes[0] }, pts, probes, solid: o.userData.solid });
+      }
+    }
+  }
+  if (allow("surface") || allow("sface")) {
+    for (const o of PT.surfObjs.filter(o => o.userData.kind === "surface")) {
+      const id = o.userData.id, sm = PT.surfaces[id];
+      if (!sm) continue;
+      if (allow("sface") && !allow("surface") && sm.face_of_tri) {
+        for (const [fi, e] of faceSets(sm.vertices, sm.triangles, sm.face_of_tri)) {
+          const key = (sm.face_keys || [])[fi];
+          if (key) out.push({ h: { kind: "face", fi, key, surface: id, point: e.probes[0] }, pts: e.pts, probes: e.probes, surface: id, fi });
+        }
+      } else out.push({ h: { kind: "surface", id, fi: -1, key: null }, pts: sm.vertices, probes: sm.vertices.filter((v, i) => i % Math.max(1, Math.floor(sm.vertices.length / 8)) === 0), surface: id });
+    }
+  }
+  for (const l of PT.edgeLines) {
+    const u = l.userData;
+    if (u.surface ? !allow("sedge") : !allow("edge")) continue;
+    const pl = u.polyline || (m && m.edges[u.index]) || posOf(l);
+    out.push({ h: { kind: "edge", key: u.key, index: u.index, surface: u.surface, polyline: pl, point: mid(pl), line: true }, pts: pl, probes: [mid(pl), pl[0], pl[pl.length - 1]], line: true });
+  }
+  if (allow("region")) for (const o of PT.regionObjs) { const u = o.userData, p = posOf(o); out.push({ h: { kind: "region", index: u.index, point: u.point, uv: u.uv, area: u.area }, pts: p, probes: [u.point], region: true }); }
+  if (allow("point")) {
+    for (const o of PT.pointObjs) { const u = o.userData; out.push({ h: { kind: "point", id: u.id, point: u.point }, pts: [u.point], probes: [u.point], line: true }); }
+    for (const q of meshVertices()) out.push({ h: { kind: "point", vertex: true, point: q.slice() }, pts: [q], probes: [q], line: true });
+  }
+  if (allow("sketch")) for (const o of PT.sketchObjs) { const p = posOf(o); out.push({ h: { kind: "sketch", id: o.userData.id }, pts: p, probes: [p[0]], line: true, always: true }); }
+  if (allow("curve")) for (const o of PT.surfObjs.filter(o => o.userData.kind === "curve")) { const p = posOf(o); out.push({ h: { kind: "curve", id: o.userData.id }, pts: p, probes: [p[0]], line: true, always: true }); }
+  return out;
+}
+
+/** True when a point of the candidate is in the view area and not behind a solid face (or an opaque mesh body). */
+function shownCandidate(cd) {
+  const t = PT.three, r = t.renderer.domElement.getBoundingClientRect();
+  const px = (t.camera.right - t.camera.left) / t.camera.zoom / r.width;
+  const see = !!(PT.cmd && PT.cmd.regions);                      // the solid is drawn see-through while regions are shown
+  const occl = see ? [] : PT.faceObjs.concat(PT.surfObjs.filter(o => o.userData.kind === "surface" && PT.status[o.userData.id] && PT.status[o.userData.id].mesh));
+  const rc = new THREE.Raycaster(), v = new THREE.Vector3();
+  for (const q of cd.probes) {
+    v.set(q[0], q[1], q[2]).project(t.camera);
+    if (Math.abs(v.x) > 1 || Math.abs(v.y) > 1) continue;
+    if (cd.always || cd.region || !occl.length) return true;
+    rc.setFromCamera(new THREE.Vector2(v.x, v.y), t.camera);
+    const along = new THREE.Vector3(...q).sub(rc.ray.origin).dot(rc.ray.direction);
+    const hits = rc.intersectObjects(occl, false);
+    if (!hits.length || hits[0].distance >= along - px * 3) return true;
+    // the first face hit is the face itself (a face of the solid)
+    const hh = hits[0];
+    if (cd.fi !== undefined && !cd.surface && hh.object.userData.kind === "solid") {
+      const ti = hh.object.geometry.userData.tri;
+      if (PT.mesh.face_of_tri[ti ? ti[hh.faceIndex] : hh.faceIndex] === cd.fi) return true;
+    }
+    if (cd.solid !== undefined && hh.object.userData.solid === cd.solid) return true;
+  }
+  return false;
+}
+
+/** Adds the hits to the active step (a hit that is already selected stays selected). */
+function addHits(hits) {
+  const c = PT.cmd;
+  if (!c || !hits.length) return 0;
+  const f = feat(c.id);
+  const fm = c.fmode, em = c.emode;
+  c.fmode = "face"; c.emode = "edge";
+  PT.quiet = true;
+  let n = 0;
+  try {
+    for (const h of hits) {
+      const before = {};
+      for (const [k, v] of Object.entries(f)) if (Array.isArray(v)) before[k] = v.slice();
+      if (!feedCommand(h)) continue;
+      // a click on a selected element deselects it: the arrays that got shorter are put back
+      let off = false;
+      for (const [k, v] of Object.entries(before)) if (Array.isArray(f[k]) && f[k].length < v.length) { f[k] = v; off = true; }
+      if (!off) n++;
+      if (PT.cmd !== c) break;
+    }
+  } finally {
+    PT.quiet = false;
+    c.fmode = fm; c.emode = em;
+  }
+  PT.dirty = true;
+  renderCommand(); drawSelection(); scheduleBuild();
+  return n;
+}
+
+function selectShown() {
+  const ap = activePick();
+  if (!ap || !ap.multi) { msgPart("Select shown: in a command step that takes several elements", true); return; }
+  const kinds = boxKinds(ap.kinds);
+  const hits = boxCandidates(kinds).filter(shownCandidate).map(cd => cd.h);
+  const n = addHits(hits);
+  msgPart("Select shown: " + hits.length + " element(s) shown, " + n + " added");
+  return n;
+}
+
+/** Elements in a screen rectangle (client px): all points inside (window) or any inside (crossing). */
+function boxHits(xa, ya, xb, yb, crossing, shownOnly) {
+  const ap = activePick();
+  const t = PT.three, r = t.renderer.domElement.getBoundingClientRect(), v = new THREE.Vector3();
+  const out = [];
+  for (const cd of boxCandidates(boxKinds(ap.kinds))) {
+    const step = Math.max(1, Math.ceil(cd.pts.length / 2000));
+    let all = true, any = false;
+    for (let i = 0; i < cd.pts.length; i += step) {
+      const q = cd.pts[i];
+      v.set(q[0], q[1], q[2]).project(t.camera);
+      const x = r.left + (v.x + 1) / 2 * r.width, y = r.top + (1 - v.y) / 2 * r.height;
+      const inside = x >= xa && x <= xb && y >= ya && y <= yb;
+      if (inside) any = true; else all = false;
+      if (crossing ? any : !all) break;
+    }
+    if ((crossing ? any : all) && (!shownOnly || shownCandidate(cd))) out.push(cd.h);
+  }
+  return out;
+}
+
+/** Ctrl + left drag in the view: box selection for the active step. Left to right: the elements entirely
+ *  inside the box; right to left: the elements the box touches. A Ctrl click without a drag is a click. */
+function boxStart(e) {
+  const t = PT.three;
+  e.stopPropagation();
+  e.preventDefault();
+  const r = t.box.getBoundingClientRect();
+  const x0 = e.clientX, y0 = e.clientY;
+  const el = document.createElement("div");
+  el.className = "sel-box";
+  el.hidden = true;
+  t.box.appendChild(el);
+  const move = ev => {
+    const x1 = ev.clientX, y1 = ev.clientY;
+    el.hidden = Math.abs(x1 - x0) + Math.abs(y1 - y0) < 4;
+    el.classList.toggle("cross", x1 < x0);
+    Object.assign(el.style, { left: Math.min(x0, x1) - r.left + "px", top: Math.min(y0, y1) - r.top + "px", width: Math.abs(x1 - x0) + "px", height: Math.abs(y1 - y0) + "px" });
+  };
+  const up = ev => {
+    window.removeEventListener("pointermove", move);
+    window.removeEventListener("pointerup", up);
+    el.remove();
+    const x1 = ev.clientX, y1 = ev.clientY;
+    if (Math.abs(x1 - x0) + Math.abs(y1 - y0) < 4) { clickView(ev); return; }
+    const ap = activePick();
+    if (!ap || !ap.multi) { msgPart("Box selection: in a command step that takes several elements", true); return; }
+    const hits = boxHits(Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1), x1 < x0, !!PT.boxShown);
+    const n = addHits(hits);
+    msgPart("Box selection: " + hits.length + " element(s) " + (x1 < x0 ? "touched by the box" : "inside the box") + (PT.boxShown ? " (shown only)" : "") + ", " + n + " added");
+  };
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", up);
 }
 
 function togglePanel(sel) {
@@ -1125,6 +1553,7 @@ function applyHolePreset(f, id) {
 // ------------------------------------------------------------------ build
 
 function scheduleBuild() {
+  if (PT.quiet) return;
   clearTimeout(PT.buildTimer);
   PT.buildTimer = setTimeout(build, 150);
 }
@@ -1141,7 +1570,17 @@ function buildUpto() {
   return null;
 }
 
+/** One build request at a time: a build asked for while one runs is made when it returns (with the part as it
+ *  is then), so that the server does not run a build for every click. */
 async function build() {
+  if (PT.building) { PT.buildAgain = true; return; }
+  PT.building = true;
+  try { await buildNow(); } finally {
+    PT.building = false;
+    if (PT.buildAgain) { PT.buildAgain = false; build(); }
+  }
+}
+async function buildNow() {
   const seq = ++PT.buildSeq;
   $("#pt-info").textContent = "Building...";
   try {
@@ -1150,6 +1589,7 @@ async function build() {
     const r = await postJSON("/api/part/build", { part: PT.part, upto });
     const j = await r.json();
     if (seq !== PT.buildSeq) return;
+    if (PT.buildAgain) return;                  // the part changed while this build ran: the next build follows
     PT.status = {};
     for (const s of j.status) PT.status[s.id] = s;
     // a cut that removed nothing in its direction was made in the opposite direction: the feature records it
@@ -1171,6 +1611,8 @@ async function build() {
 
 function changedPart(rebuild) {
   PT.dirty = true;
+  // the result of the edited feature is out of date until the next build returns
+  if (rebuild !== false && PT.cmd && PT.status[PT.cmd.id]) PT.status[PT.cmd.id] = Object.assign({}, PT.status[PT.cmd.id], { pending: true });
   if (PT.rendering) { if (rebuild !== false) scheduleBuild(); return; }
   PT.rendering = true;
   try {
@@ -1187,6 +1629,32 @@ function changedPart(rebuild) {
 const EYE = '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M1 8s2.5-4.5 7-4.5S15 8 15 8s-2.5 4.5-7 4.5S1 8 1 8z" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="8" cy="8" r="2" fill="currentColor"/></svg>';
 const ICON = { sketch: "✎", plane: "▱", point: "⊕", axis: "⟋", solid: "◆", surface: "◈", curve: "∿", feature: "●" };
 
+/** Volume texts of the solids of a list in one unit: cm^3 when the largest is 1 cm^3 or more, else mm^3. */
+function volTexts(vols) {
+  const big = vols.some(v => Math.abs(v) >= 1000);
+  return vols.map(v => big ? pfmt(v / 1000, Math.abs(v) >= 1000 ? 2 : 3) + " cm^3" : pfmt(v, Math.abs(v) >= 1 ? 3 : 6) + " mm^3");
+}
+/** Label of a solid in the body lists of the commands: colour mark, number and volume (one unit for the list). */
+function solidLabel(i, vt) { return swatch("solid:" + i, COL.solid) + " Solid " + (i + 1) + " (" + vt[i] + ")"; }
+/** Colour mark of a body in the tree: its colour (Properties) or the default colour of its kind. */
+function swatch(id, dflt, curve) {
+  const c = (PT.part.body_colors || {})[id] || "#" + new THREE.Color(dflt).getHexString();
+  return curve ? `<span class="swatch" style="background:${c};height:3px;border:none;vertical-align:3px" title="Curve"></span>` : `<span class="swatch" style="background:${c}"></span>`;
+}
+/** Tree keys of the bodies: "solid:<i>" and the surface body feature ids. */
+function bodyIds() {
+  return [...PT.solids.map((_, i) => "solid:" + i), ...PT.part.features.filter(f => !f.suppressed && PT.surfaces[f.id]).map(f => f.id)];
+}
+/** Show only: every other solid and surface body hidden, this one shown. */
+function showOnlyBody(id) {
+  for (const k of bodyIds()) { if (k === id) delete PT.hidden[k]; else PT.hidden[k] = true; }
+  renderTree(); renderProps(); setMesh(PT.mesh);
+}
+function showAllBodies() {
+  for (const k of bodyIds()) delete PT.hidden[k];
+  renderTree(); renderProps(); setMesh(PT.mesh);
+}
+
 function renderTree() {
   const box = $("#pt-features");
   const fs = PT.part.features;
@@ -1196,24 +1664,26 @@ function renderTree() {
     return `<div class="pt-feat${id === PT.sel ? " sel" : ""}${o.suppressed ? " supp" : ""}${o.cmd ? " editing" : ""}" data-id="${pesc(id)}">` +
       (o.toggle ? `<input type="checkbox" data-k="on" title="Active"${o.suppressed ? "" : " checked"}>` : `<span class="ico">${icon}</span>`) +
       `<span class="nm">${o.toggle ? `<span class="ico">${icon}</span> ` : ""}${pesc(name)}</span>` +
-      `<span class="ops">` + (o.eye ? `<button type="button" data-k="eye" class="${PT.hidden[id] ? "off" : ""}" title="Show / hide">${EYE}</button>` : "") +
+      `<span class="ops">` + (o.body ? `<button type="button" data-k="bcopy" title="Copy body">&#10697;</button><button type="button" data-k="bscale" title="Scale body">&#10530;</button><button type="button" data-k="bdel" title="Delete body (adds a Delete body feature)">&#10006;</button><button type="button" data-k="only" title="Show only this body">&#9673;</button>` : "") +
+      (o.eye ? `<button type="button" data-k="eye" class="${PT.hidden[id] ? "off" : ""}" title="Show / hide">${EYE}</button>` : "") +
       (o.ops ? `<button type="button" data-k="up" title="Move up">&#9650;</button><button type="button" data-k="down" title="Move down">&#9660;</button><button type="button" data-k="del" title="Delete">&#10005;</button>` : "") + `</span>` +
-      (st.error && o.ops ? `<span class="err">${pesc(st.error)}</span>` : "") + "</div>";
+      (st.error && !st.pending && o.ops ? `<span class="err">${pesc(st.error)}</span>` : "") + "</div>";
   };
   let h = `<div class="pt-sec">Reference planes</div>` + Object.entries(BASE_PLANES).map(([k, n]) => row(k, ICON.plane, n, { eye: true })).join("");
-  h += `<div class="pt-sec">Bodies</div>`;
+  h += `<div class="pt-sec">Bodies${bodyIds().some(k => PT.hidden[k]) ? ` <button type="button" id="pt-showall" class="small" title="Show all bodies">Show all</button>` : ""}</div>`;
   const nSolids = PT.solids.length;
   if (nSolids > 6 && !PT.showCells) h += `<div class="pt-feat" data-id="cells"><span class="ico">${ICON.solid}</span><span class="nm">${nSolids} solid cells</span><span class="ops"><button type="button" data-k="cells" title="List the cells">…</button></span></div>`;
-  else for (let i = 0; i < nSolids; i++) h += row("solid:" + i, ICON.solid, "Solid " + (i + 1) + (nSolids > 1 ? ` (${pfmt(PT.solids[i].volume_mm3 / 1000, 2)} cm^3)` : ""), { eye: true });
-  for (const f of fs) if (SURFACE_TYPES.has(f.type) && !f.suppressed && PT.surfaces[f.id]) h += row(f.id, CURVE_TYPES.has(f.type) ? ICON.curve : ICON.surface, f.name, { eye: true });
-  if (!nSolids && !fs.some(f => SURFACE_TYPES.has(f.type) && PT.surfaces[f.id])) h += `<p class="hint">No body yet.</p>`;
+  else for (let i = 0; i < nSolids; i++) h += row("solid:" + i, swatch("solid:" + i, COL.solid), "Solid " + (i + 1), { eye: true, body: true });
+  for (const f of fs) if (!f.suppressed && PT.surfaces[f.id]) h += row(f.id, CURVE_TYPES.has(f.type) ? swatch(f.id, COL.curve, true) : swatch(f.id, (PT.status[f.id] || {}).mesh ? COL.mesh : COL.surf), f.name, { eye: true, body: true });
+  if (!nSolids && !fs.some(f => PT.surfaces[f.id])) h += `<p class="hint">No body yet.</p>`;
   h += `<div class="pt-sec">Features</div>`;
   if (!fs.length) h += '<p class="hint">Sketch on a reference plane, then Extrude.</p>';
   for (const f of fs) {
     const icon = f.type === "sketch" ? ICON.sketch : f.type === "plane" ? ICON.plane : f.type === "point" ? ICON.point : f.type === "axis" ? ICON.axis : SURFACE_TYPES.has(f.type) ? (CURVE_TYPES.has(f.type) ? ICON.curve : ICON.surface) : ICON.feature;
-    h += row(f.id, icon, f.name, { toggle: true, ops: true, suppressed: f.suppressed, eye: ["sketch", "plane", "point", "axis"].includes(f.type) || (SURFACE_TYPES.has(f.type) && !!PT.surfaces[f.id]), cmd: PT.cmd && PT.cmd.id === f.id });
+    h += row(f.id, icon, f.name, { toggle: true, ops: true, suppressed: f.suppressed, eye: ["sketch", "plane", "point", "axis"].includes(f.type) || !!PT.surfaces[f.id], cmd: PT.cmd && PT.cmd.id === f.id });
   }
   box.innerHTML = h;
+  if ($("#pt-showall")) $("#pt-showall").onclick = showAllBodies;
   box.querySelectorAll(".pt-feat").forEach(el => {
     const id = el.dataset.id;
     el.onclick = e => {
@@ -1221,6 +1691,8 @@ function renderTree() {
       const f = feat(id);
       const i = featIndex(id);
       if (k === "eye") { PT.hidden[id] = !PT.hidden[id]; renderTree(); setMesh(PT.mesh); return; }
+      if (k === "only") { showOnlyBody(id); return; }
+      if (k === "bcopy" || k === "bdel" || k === "bscale") { bodyCommand(k === "bcopy" ? "body_copy" : k === "bscale" ? "body_scale" : "body_delete", id); return; }
       if (id === "cells") { PT.showCells = !PT.showCells; renderTree(); return; }
       if (!k && PT.cmd) { const th = treeHit(id); if (th && feedCommand(th)) return; }
       if (!f) { selectItem(id); return; }
@@ -1289,7 +1761,7 @@ function redoPart() {
 function deleteFeature(id) {
   const f = feat(id);
   if (!f) return;
-  const users = PT.part.features.filter(x => x.sketch_ref === id || x.path_ref === id || x.plane_ref === id || x.source === id || x.tool === id || (x.sources || []).includes(id) || (x.curves || []).includes(id) || (x.features || []).includes(id) || x.point_ref === id || x.axis_ref === id || x.plane_axis === id || x.plane_point === id || x.plane_origin_ref === id || x.plane_xdir_ref === id || (x.points_ref || []).includes(id) || (x.planes_ref || []).includes(id) || (x.sketch_refs || []).includes(id));
+  const users = PT.part.features.filter(x => x.sketch_ref === id || x.path_ref === id || x.plane_ref === id || x.source === id || x.tool === id || (x.sources || []).includes(id) || (x.curves || []).includes(id) || (x.features || []).includes(id) || x.point_ref === id || x.axis_ref === id || x.plane_axis === id || x.plane_point === id || x.plane_origin_ref === id || x.plane_xdir_ref === id || (x.plane_sketch_curve && x.plane_sketch_curve.sketch === id) || (x.points_ref || []).includes(id) || (x.planes_ref || []).includes(id) || (x.sketch_refs || []).includes(id));
   checkpointPart();
   if (PT.cmd && PT.cmd.id === id) PT.cmd = null;
   PT.part.features.splice(featIndex(id), 1);
@@ -1394,18 +1866,19 @@ async function inspectBody(id) {
 function renderInspect() {
   const box = $("#pt-props"), I = PT.inspect;
   if (!I) return;
-  $("#pt-cmdbar").hidden = true;
   const S = I.summary || {};
-  const kinds = { gap: "Gaps", pointgap: "Vertex gaps", nonmanifold: "Non-manifold edges", free: "Free edges", smallface: "Small faces", smalledge: "Short edges" };
+  const kinds = { gap: "Gaps", pointgap: "Vertex gaps", nonmanifold: "Non-manifold edges", free: "Free edges", smallface: "Small faces", smalledge: "Short edges", celledge: "Edges where cells meet" };
   const counts = {};
   for (const x of I.issues) counts[x.kind] = (counts[x.kind] || 0) + 1;
   let h = `<p><strong>Inspection: ${pesc(I.name)}</strong></p>` +
     `<p class="hint">${S.faces} faces, ${S.edges} edges, ${S.vertices} vertices, area ${pfmt(S.area, 1)} mm^2. ${S.free_edges} free edge(s), free length ${pfmt(S.free_length, 2)} mm. ` +
     `${S.shells} shell(s), ${S.closed_shells} closed. ${S.valid === null ? "" : S.valid ? "Topology valid." : "Topology invalid (BRepCheck)."}</p>` +
     `<p class="hint">${Object.entries(kinds).filter(([k]) => counts[k]).map(([k, n]) => n + " " + counts[k]).join(", ") || "No free edges, gaps, non-manifold edges, small faces or short edges."}</p>` +
+    (counts.celledge ? `<p class="hint">The part is ${S.cells} cells (solids sharing faces). An edge where cells meet has two faces in each cell. Boolean, Union of the cells, makes one solid; Partition and the hexahedral mesh use the cells.</p>` : "") +
     `<div class="grid2"><label>Gap tolerance (mm)<input type="text" inputmode="decimal" class="numf" id="pi-gap" value="${INSPECT.gap_tol}"></label><label>Small face below (mm^2)<input type="text" inputmode="decimal" class="numf" id="pi-area" value="${INSPECT.min_area}"></label>` +
     `<label>Short edge below (mm)<input type="text" inputmode="decimal" class="numf" id="pi-edge" value="${INSPECT.min_edge}"></label><label class="check"><input type="checkbox" id="pi-all"${I.showAll ? " checked" : ""}> Show all in the view</label></div>` +
-    `<div class="buttons"><button type="button" id="pi-run">Run again</button><button type="button" id="pi-close">Close</button></div>` +
+    `<div class="buttons"><button type="button" id="pi-run">Run again</button><button type="button" id="pi-close">Close</button>` +
+    (counts.celledge && !I.body ? `<button type="button" id="pi-join" title="Adds Boolean (Union of all solids) and Merge faces at the end of the feature list">Join cells</button>` : "") + `</div>` +
     (I.issues.length ? `<ul class="check-list">${I.issues.map((x, i) => `<li><a href="#" data-ii="${i}"${i === I.active ? ' class="active"' : ""}>${pesc(x.text)}</a></li>`).join("")}</ul>` : "");
   box.innerHTML = h;
   const num = (id, k) => { const el = $(id); el.onchange = () => { const v = window.numv ? numv(el.value) : parseFloat(el.value); if (v > 0) INSPECT[k] = v; }; };
@@ -1413,6 +1886,16 @@ function renderInspect() {
   $("#pi-all").onchange = () => { INSPECT.showAll = I.showAll = $("#pi-all").checked; drawSelection(); };
   $("#pi-run").onclick = () => inspectBody(I.body);
   $("#pi-close").onclick = () => { PT.inspect = null; renderProps(); drawSelection(); };
+  if ($("#pi-join")) $("#pi-join").onclick = () => {
+    // one solid from the cells: Boolean union of all solids, then the faces and edges left between them merged
+    checkpointPart();
+    const n = PT.solids.length;
+    PT.part.features.push({ id: newId(), name: nextName("boolean"), type: "boolean", suppressed: false, op: "union", targets: [...Array(n).keys()], tools: [], keep_tools: false });
+    PT.part.features.push({ id: newId(), name: nextName("unify"), type: "unify", suppressed: false, faces: true, edges: true, angle: 0 });
+    PT.inspect = null;
+    changedPart();
+    status(`Boolean union of ${n} solids and Merge faces added; Inspect again after the rebuild`);
+  };
   box.querySelectorAll("a[data-ii]").forEach(a => a.onclick = ev => {
     ev.preventDefault();
     I.active = +a.dataset.ii;
@@ -1533,12 +2016,23 @@ function renderSectionPanel() {
 
 function renderProps() {
   const box = $("#pt-props");
+  if (!PT.cmd && $("#pt-cmdwin")) $("#pt-cmdwin").hidden = true;
   if (PT.inspect && !PT.cmd) { renderInspect(); return; }
-  $("#pt-cmdbar").hidden = true;
+  if (PT.cmd && feat(PT.cmd.id)) { box.innerHTML = `<p class="hint">${pesc(feat(PT.cmd.id).name)} is open in the command window.</p>`; return; }
   const id = PT.sel;
   if (!id) { box.innerHTML = '<p class="hint">Click an element in the view or an item in the tree. Double-click a feature to edit its definition.</p>' + nextHtml(); bindNext(box); return; }
   if (BASE_PLANES[id]) { box.innerHTML = `<p><strong>${BASE_PLANES[id]}</strong></p><p class="hint">Reference plane through the origin. Sketches and planes can be placed on it.</p>` + nextHtml(); bindNext(box); return; }
-  if (id.startsWith("solid:")) { const s = PT.solids[+id.slice(6)]; box.innerHTML = `<p><strong>Solid ${+id.slice(6) + 1}</strong></p>` + (s ? `<p class="hint">Volume ${pfmt(s.volume_mm3 / 1000, 3)} cm^3, size ${pfmt(s.bbox[3] - s.bbox[0], 2)} x ${pfmt(s.bbox[4] - s.bbox[1], 2)} x ${pfmt(s.bbox[5] - s.bbox[2], 2)} mm</p>` : "") + `<div class="buttons"><button type="button" id="pp-inspect">Inspect</button></div>` + nextHtml(); $("#pp-inspect").onclick = () => inspectBody(null); bindNext(box); return; }
+  if (id.startsWith("solid:")) {
+    const s = PT.solids[+id.slice(6)];
+    box.innerHTML = `<p><strong>Solid ${+id.slice(6) + 1}</strong></p>` + (s ? `<p class="hint">Volume ${pfmt(s.volume_mm3 / 1000, 3)} cm^3, size ${pfmt(s.bbox[3] - s.bbox[0], 2)} x ${pfmt(s.bbox[4] - s.bbox[1], 2)} x ${pfmt(s.bbox[5] - s.bbox[2], 2)} mm</p>` : "") +
+      colorRow(id, COL.solid) + `<div class="buttons"><button type="button" id="pp-inspect">Inspect</button><button type="button" id="pp-bcopy" title="Copy body feature with this solid">Copy body…</button><button type="button" id="pp-bscale" title="Scale body feature with this solid">Scale body…</button><button type="button" id="pp-only" title="Hide the other solids and surface bodies">Show only</button><button type="button" id="pp-showall">Show all</button><button type="button" id="pp-bdel" title="Delete body feature with this solid">Delete body</button></div>` + nextHtml();
+    $("#pp-inspect").onclick = () => inspectBody(null);
+    $("#pp-bcopy").onclick = () => bodyCommand("body_copy", id);
+    $("#pp-bscale").onclick = () => bodyCommand("body_scale", id);
+    $("#pp-only").onclick = () => showOnlyBody(id); $("#pp-showall").onclick = showAllBodies;
+    $("#pp-bdel").onclick = () => bodyCommand("body_delete", id);
+    bindColor(id); bindNext(box); return;
+  }
   const f = feat(id);
   if (!f) { box.innerHTML = ""; return; }
   const st = PT.status[id] || {};
@@ -1552,8 +2046,12 @@ function renderProps() {
   else if (st.surface) h += `<p class="hint">${st.curve ? "Curve, length " + pfmt(st.length, 2) + " mm" : "Surface, " + st.faces + " face(s), " + pfmt(st.area, 1) + " mm^2"}${st.note ? ". " + pesc(st.note) : ""}</p>`;
   h += `<div class="buttons"><button type="button" id="pp-edit" class="primary">Edit definition</button>` +
     (f.type === "sketch" ? `<button type="button" id="pp-sketch">Edit sketch</button>` : "") +
-    (PT.surfaces[id] && !(st.curve) ? `<button type="button" id="pp-inspect" title="Free edges, gaps, non-manifold edges, small faces and short edges of the surface body">Inspect</button>` : "") + `</div>`;
+    (PT.surfaces[id] && !(st.curve) ? `<button type="button" id="pp-inspect" title="Free edges, gaps, non-manifold edges, small faces and short edges of the surface body">Inspect</button>` : "") +
+    (PT.surfaces[id] ? `<button type="button" id="pp-bcopy" title="Copy body feature with this body">Copy body…</button><button type="button" id="pp-bscale" title="Scale body feature with this body">Scale body…</button><button type="button" id="pp-only" title="Hide the other solids and surface bodies">Show only</button><button type="button" id="pp-showall">Show all</button><button type="button" id="pp-bdel" title="Delete body feature with this body">Delete body</button>` : "") + `</div>`;
+  if (PT.surfaces[id] && !st.curve) h += colorRow(id, st.mesh ? COL.mesh : COL.surf);
   box.innerHTML = h + nextHtml();
+  if ($("#pp-bcopy")) { $("#pp-bcopy").onclick = () => bodyCommand("body_copy", id); $("#pp-bscale").onclick = () => bodyCommand("body_scale", id); $("#pp-only").onclick = () => showOnlyBody(id); $("#pp-showall").onclick = showAllBodies; $("#pp-bdel").onclick = () => bodyCommand("body_delete", id); }
+  bindColor(id);
   $("#pp-edit").onclick = () => editDefinition(id);
   if ($("#pp-inspect")) $("#pp-inspect").onclick = () => inspectBody(id);
   if ($("#pp-sketch")) $("#pp-sketch").onclick = () => editSketch(id);
@@ -1602,15 +2100,18 @@ function planeSelectField(item) {
   if (item.plane === "face") opts.push(["face", "A planar face"]);
   const cur = item.plane === "datum" ? "datum:" + item.plane_ref : item.plane;
   let h = `<div class="grid2">` + select("pf-plane", "Plane", opts, cur) + num("pf-offset", "Offset (mm)", item.offset || 0) + `</div>`;
-  if (item.plane === "normal") h += `<div class="grid2">` + num("pf-pt", "Position along the edge (0 to 1)", item.plane_t === undefined ? 0.5 : item.plane_t) + `<label class="check bottom"><input type="checkbox" id="pf-pflip"${item.plane_flip ? " checked" : ""}> Flip the normal</label></div>` +
-    `<p class="hint">${item.plane_edge ? "Edge of the solid picked." : item.plane_curve ? "Curve body " + itemName(item.plane_curve) + "." : "Click an edge or a curve in the view."}</p>`;
+  if (item.plane === "normal") {
+    const sc = item.plane_sketch_curve, tEmpty = item.plane_t === null || item.plane_t === undefined;
+    h += `<div class="grid2">` + num("pf-pt", sc ? "Position along the curve (0 to 1; empty: the nearer end)" : "Position along the edge (0 to 1)", sc ? (tEmpty ? "" : item.plane_t) : (tEmpty ? 0.5 : item.plane_t)) + `<label class="check bottom"><input type="checkbox" id="pf-pflip"${item.plane_flip ? " checked" : ""}> Flip the normal</label></div>` +
+      `<p class="hint">${sc ? "Curve of " + pesc(itemName(sc.sketch)) + (tEmpty ? ", at the end nearer the click." : ".") : item.plane_edge ? "Edge of the solid picked." : item.plane_curve ? "Curve body " + itemName(item.plane_curve) + "." : "Click an edge, a curve body or a sketch curve in the view."}</p>`;
+  }
   return h;
 }
 function bindPlaneSelect(box, item) {
   bindAll(box, {
     "#pf-plane": el => { const v = el.value; if (v.startsWith("datum:")) { item.plane = "datum"; item.plane_ref = v.slice(6); } else { item.plane = v; if (v === "normal" && item.plane_t === undefined) item.plane_t = 0.5; } },
     "#pf-offset": el => { item.offset = numv(el.value) || 0; },
-    "#pf-pt": el => { const t = numv(el.value); item.plane_t = t >= 0 && t <= 1 ? t : 0.5; },
+    "#pf-pt": el => { const t = el.value.trim() === "" ? NaN : numv(el.value); item.plane_t = t >= 0 && t <= 1 ? t : (item.plane_sketch_curve ? null : 0.5); },
     "#pf-pflip": el => { item.plane_flip = el.checked; },
   });
 }
@@ -1645,21 +2146,27 @@ function acceptPlanePick(item, h) {
     const k = PT.mesh && PT.mesh.face_keys && PT.mesh.face_keys[h.fi];
     if (!item.plane_xdir_ref && k && k.n) { const xd = viewXdir(k.n); if (xd) item.plane_xdir = xd; }
   }
-  else if (h.kind === "edge") { item.plane = "normal"; item.plane_edge = refOf(h); item.plane_curve = null; item.plane_axis = null; if (item.plane_t === undefined) item.plane_t = 0.5; }
-  else if (h.kind === "curve") { item.plane = "normal"; item.plane_curve = h.id; item.plane_edge = null; item.plane_axis = null; if (item.plane_t === undefined) item.plane_t = 0.5; }
-  else if (h.kind === "axis") { item.plane = "normal"; item.plane_axis = h.id; item.plane_edge = null; item.plane_curve = null; }
+  else if (h.kind === "edge") { item.plane = "normal"; item.plane_edge = refOf(h); item.plane_curve = null; item.plane_axis = null; item.plane_sketch_curve = null; if (item.plane_t === undefined || item.plane_t === null) item.plane_t = 0.5; }
+  else if (h.kind === "curve") { item.plane = "normal"; item.plane_curve = h.id; item.plane_edge = null; item.plane_axis = null; item.plane_sketch_curve = null; if (item.plane_t === undefined || item.plane_t === null) item.plane_t = 0.5; }
+  else if (h.kind === "axis") { item.plane = "normal"; item.plane_axis = h.id; item.plane_edge = null; item.plane_curve = null; item.plane_sketch_curve = null; }
+  else if (h.kind === "sketch" && h.id !== item.id) {
+    // normal to the clicked curve chain of a sketch, at the end of the chain nearer the click
+    item.plane = "normal"; item.plane_sketch_curve = { sketch: h.id, pick: (h.point || [0, 0, 0]).map(v => +(+v).toFixed(6)) };
+    item.plane_edge = null; item.plane_curve = null; item.plane_axis = null; item.plane_t = null; item.offset = 0;
+  }
   PT.dirty = true;
 }
 function planeSummary(item) {
   if (item.plane === "normal" && item.plane_axis) return "Normal to " + itemName(item.plane_axis) + (item.plane_point ? " at " + itemName(item.plane_point) : "");
+  if (item.plane === "normal" && item.plane_sketch_curve) return "Normal to " + itemName(item.plane_sketch_curve.sketch) + (item.plane_t === null || item.plane_t === undefined ? " at the nearer end" : " at " + pfmt(item.plane_t, 2));
   if (item.plane === "normal") return "Normal to " + (item.plane_curve ? itemName(item.plane_curve) : "an edge") + " at " + pfmt(item.plane_t === undefined ? 0.5 : item.plane_t, 2);
   if (item.plane === "face") return "A planar face" + (item.offset ? ", offset " + pfmt(item.offset) + " mm" : "");
   return planeName(item.plane === "datum" ? item.plane_ref : item.plane) + (item.offset ? ", offset " + pfmt(item.offset) + " mm" : "");
 }
 
-const edgeModeHtml = f => `<p class="hint" style="margin-bottom:2px">Click mode</p><label class="check inline"><input type="radio" name="pf-emode" value="edge"${(PT.cmd.emode || "edge") === "edge" ? " checked" : ""}> Edge</label>` +
+const edgeModeHtml = f => `<div class="cw-modes" title="What a click in the view adds"><label class="check inline"><input type="radio" name="pf-emode" value="edge"${(PT.cmd.emode || "edge") === "edge" ? " checked" : ""}> Edge</label>` +
   `<label class="check inline"><input type="radio" name="pf-emode" value="tangent"${PT.cmd.emode === "tangent" ? " checked" : ""}> Tangent chain</label>` +
-  `<label class="check inline"><input type="radio" name="pf-emode" value="face"${PT.cmd.emode === "face" ? " checked" : ""}> All edges of a face</label>`;
+  `<label class="check inline"><input type="radio" name="pf-emode" value="face"${PT.cmd.emode === "face" ? " checked" : ""}> All edges of a face</label></div>`;
 const bindEdgeMode = box => box.querySelectorAll("input[name=pf-emode]").forEach(r => r.onchange = () => { PT.cmd.emode = r.value; });
 /** Edge selection step: single edges, tangent chains or all edges of a clicked face, toggled. */
 function edgesStep(label, prop, hint) {
@@ -1672,14 +2179,13 @@ function edgesStep(label, prop, hint) {
       if (mode === "tangent") { expandEdges(f, prop, "tangent", [refOf(h)]); return; }
       applyPick(f, { prop, kinds: ["edge"], single: false }, h);
     },
-    html: f => edgeModeHtml(f) + `<p class="hint">${(f[prop] || []).length} edge(s) selected.</p><div class="buttons"><button type="button" data-clear="${prop}">Clear</button></div>`,
-    bind: (f, box) => { bindEdgeMode(box); box.querySelectorAll("button[data-clear]").forEach(b => b.onclick = () => { f[b.dataset.clear] = []; changedPart(); }); },
+    html: f => edgeModeHtml(f),
+    bind: (f, box) => bindEdgeMode(box),
     summary: f => (f[prop] || []).length + " edge(s)" };
 }
 function facesStep(label, prop, hint, single, sfaces) {
   return { key: prop, label, kinds: sfaces ? ["face", "sface"] : ["face"], prop, single: !!single, hint: hint || (single ? "Click the face." : "Click the faces (click again to deselect)."),
-    html: f => `<p class="hint">${single ? (f[prop] ? "1 face" : "no face") : (f[prop] || []).length + " face(s)"} selected.</p>` + (single ? "" : `<div class="buttons"><button type="button" data-clear="${prop}">Clear</button></div>`),
-    bind: (f, box) => box.querySelectorAll("button[data-clear]").forEach(b => b.onclick = () => { f[b.dataset.clear] = []; changedPart(); }),
+    html: f => single ? `<p class="hint">${f[prop] ? "1 face" : "No face"} selected.</p>` : "",
     summary: f => single ? (f[prop] ? "1 face" : "none") : (f[prop] || []).length + " face(s)" };
 }
 function sourceStep(label, prop, curves, hint) {
@@ -1689,12 +2195,42 @@ function sourceStep(label, prop, curves, hint) {
     bind: (f, box) => bindAll(box, { ["#pf-" + prop]: el => { f[prop] = el.value || null; } }),
     summary: f => f[prop] ? itemName(f[prop]) : "none" };
 }
+/** Side A or B of Surface fillet: a surface body, or with Pick single faces some faces of one surface body (both
+ *  sides can be faces of the same body, for example two separate sections of one Extract surface or Offset surface). */
+function filletSideStep(k) {
+  const K = k.toUpperCase(), prop = "source_" + k, fprop = "faces_" + k;
+  // single faces: the pick of a surface body face comes as kind "face" with .surface (faces of the solid are refused)
+  return { key: prop, label: "Surface " + K, multiFace: true, get kinds() { return PT.cmd && PT.cmd.sface ? ["sface", "face"] : ["surface"]; }, before: false,
+    hint: `Click surface body ${K}, or choose it. To use separate sections of one body for A and B, tick Pick single faces and click the faces of side ${K} (click again to deselect).`,
+    accept: (f, h) => {
+      if (h.kind === "surface") { f[prop] = h.id; f[fprop] = []; }
+      else if (h.kind === "face" && !h.surface) { msgPart("Click a face of a surface body", true); return; }
+      else if (h.surface) {
+        if (f[prop] !== h.surface) f[fprop] = [];
+        f[prop] = h.surface; f[fprop] = f[fprop] || [];
+        if (faceMode() !== "face" && h.key) { pickFaces(f, fprop, h, faceMode()); return; }
+        const ref = refOf(h), i = f[fprop].findIndex(x => sameRef(x, ref));
+        if (i >= 0) f[fprop].splice(i, 1); else f[fprop].push(ref);
+      }
+      PT.dirty = true;
+    },
+    html: f => sourceSelect("pf-" + prop, f, prop, false, false) + check("pf-sface" + k, "Pick single faces of surface bodies (sections of one body for A and B)", PT.cmd && PT.cmd.sface) +
+      ((f[fprop] || []).length ? `<p class="hint">${f[fprop].length} face(s) of ${pesc(itemName(f[prop]))}.</p><div class="buttons"><button type="button" data-clear="${fprop}">Whole body</button></div>` : ""),
+    bind: (f, box) => {
+      bindAll(box, { ["#pf-" + prop]: el => { f[prop] = el.value || null; f[fprop] = []; } });
+      const sf = box.querySelector("#pf-sface" + k); if (sf) sf.onchange = () => { PT.cmd.sface = sf.checked; renderCommand(); };
+      box.querySelectorAll("button[data-clear]").forEach(b => b.onclick = () => { f[fprop] = []; changedPart(); });
+    },
+    done: f => !!f[prop],
+    summary: f => f[prop] ? itemName(f[prop]) + ((f[fprop] || []).length ? `, ${f[fprop].length} face(s)` : "") : "none" };
+}
 /** Source step taking a surface body or faces of the solid (sewn into one surface). */
 function surfaceOrFacesStep(label, hint, before) {
-  return { key: "source", label: label || "Surface", get kinds() { return PT.cmd && PT.cmd.sface ? ["sface", "face"] : ["surface", "face"]; }, before: before === undefined ? false : before,
+  return { key: "source", label: label || "Surface", multiFace: true, get kinds() { return PT.cmd && PT.cmd.sface ? ["sface", "face"] : ["surface", "face"]; }, before: before === undefined ? false : before,
     hint: hint || "Click a surface body, or faces of the solid (click again to deselect a face); or choose a surface body. Single faces of surface bodies: tick the option.",
     accept: (f, h) => {
       if (h.kind === "surface") { f.source = h.id; f.faces = []; }
+      else if (faceMode() !== "face" && h.key) { f.source = null; pickFaces(f, "faces", h, faceMode()); return; }
       else { f.source = null; f.faces = f.faces || []; const ref = refOf(h); const i = f.faces.findIndex(x => sameRef(x, ref)); if (i >= 0) f.faces.splice(i, 1); else f.faces.push(ref); }
       PT.dirty = true;
     },
@@ -1706,12 +2242,62 @@ function surfaceOrFacesStep(label, hint, before) {
     summary: f => (f.faces || []).length ? (f.faces || []).length + " face(s)" : f.source ? itemName(f.source) : "none" };
 }
 
+/** Surface bodies (feature ids) present before the feature f. */
+function surfaceBodiesBefore(f) {
+  const i = featIndex(f.id);
+  return PT.part.features.filter((g, k) => (i < 0 || k < i) && !g.suppressed && PT.surfaces[g.id] && !(PT.status[g.id] && PT.status[g.id].curve)).map(g => g.id);
+}
+/** Step of Delete body and Copy body: solids ("bodies": indices before the feature) and surface bodies ("surfaces"). */
+function bodyPickStep(label) {
+  const tog = (arr, v) => { const i = arr.indexOf(v); if (i >= 0) arr.splice(i, 1); else arr.push(v); };
+  return { key: "bodies", label, multi: true, kinds: ["body", "surface"], before: true,
+    hint: "Click the solids and surface bodies (click again to deselect), or check them.",
+    accept: (f, h) => { f.bodies = f.bodies || []; f.surfaces = f.surfaces || []; if (h.kind === "surface") tog(f.surfaces, h.id); else if (h.solid !== undefined) tog(f.bodies, h.solid); PT.dirty = true; },
+    html: f => {
+      const sel = new Set(f.bodies || []), ss = new Set(f.surfaces || []), sb = surfaceBodiesBefore(f);
+      return (PT.solids.length ? PT.solids.map((s, i, a) => `<label class="check"><input type="checkbox" data-pbd="${i}"${sel.has(i) ? " checked" : ""}> ${solidLabel(i, volTexts(a.map(x => x.volume_mm3)))}</label>`).join("") : "") +
+        sb.map(sid => `<label class="check"><input type="checkbox" data-pbsf="${pesc(sid)}"${ss.has(sid) ? " checked" : ""}> ${pesc(itemName(sid))}</label>`).join("") +
+        (!PT.solids.length && !sb.length ? '<p class="hint">No bodies.</p>' : "") + `<p class="hint">Solids are numbered as in the tree before this feature.</p>`;
+    },
+    bind: (f, box) => box.querySelectorAll("input[data-pbd], input[data-pbsf]").forEach(cb => cb.onchange = () => {
+      f.bodies = [...box.querySelectorAll("input[data-pbd]:checked")].map(x => +x.dataset.pbd);
+      f.surfaces = [...box.querySelectorAll("input[data-pbsf]:checked")].map(x => x.dataset.pbsf); changedPart(); }),
+    done: f => (f.bodies || []).length + (f.surfaces || []).length > 0,
+    summary: f => [...(f.bodies || []).map(i => "Solid " + (i + 1)), ...(f.surfaces || []).map(itemName)].join(", ") || "none" };
+}
+/** Delete body (applied at once), Copy body (opens at the move vector) or Scale body (opens at the factor) for a body of the tree ("solid:<i>" or a
+ *  surface body id), added at the end of the feature list. */
+function bodyCommand(type, id) {
+  const init = id.startsWith("solid:") ? { bodies: [+id.slice(6)], surfaces: [] } : { bodies: [], surfaces: [id] };
+  if (PT.cmd) { if (canFinish(feat(PT.cmd.id))) finishCommand(true); else cancelCommand(); }
+  checkpointPart();
+  startCommand(type, init);
+  if (type === "body_delete") finishCommand();
+}
+
+/** Tool axis of a moving-tool Sweep: a line of the profile sketch (clicked in the view or chosen), an axis feature,
+ *  or the line through the centre of the profile normal to the path plane; and where the tool starts. */
+function toolAxisStep() {
+  const lines = f => { const sk = f.sketch_ref && feat(f.sketch_ref); return (((sk || {}).sketch || {}).entities || []).filter(e => e.t === "line" && !e.axis); };
+  const atPath = f => (f.tool_at || ((f.axis || "auto") === "auto" && !f.axis_ref ? "path" : "drawn")) === "path";
+  return { key: "tool_axis", label: "Tool axis", kinds: ["sketch", "axis"], single: true, before: false, axisPick: "all",
+    hint: "Click a line of the profile sketch (the line under the cursor is highlighted) or an axis feature in the view, or choose the axis.",
+    accept: (f, h) => acceptAxisPick(f, h, false),
+    html: f => select("pf-saxis", "Tool axis", [["auto", "Through the centre of the profile, normal to the path plane"], ["u", "Sketch x axis (u)"], ["v", "Sketch y axis (v)"]]
+        .concat(lines(f).map(e => [e.id, lineLabel(e)]))
+        .concat(axisItems(featIndex(f.id)).map(a => ["ref:" + a.id, "Axis feature " + a.name])), f.axis_ref ? "ref:" + f.axis_ref : (f.axis || "auto")) +
+      select("pf-stoolat", "Tool position", [["drawn", "As drawn: moved with the path from its start"], ["path", "Axis through the start of the path"]], atPath(f) ? "path" : "drawn"),
+    bind: (f, box) => bindAll(box, { "#pf-saxis": el => { if (el.value.startsWith("ref:")) f.axis_ref = el.value.slice(4); else { f.axis = el.value; f.axis_ref = null; } },
+      "#pf-stoolat": el => { f.tool_at = el.value; } }),
+    done: () => true,
+    summary: f => (f.axis_ref ? itemName(f.axis_ref) : (f.axis || "auto") === "auto" ? "profile centre" : f.axis === "u" ? "sketch x axis" : f.axis === "v" ? "sketch y axis" : "line " + f.axis) + (atPath(f) ? ", on the path" : ", as drawn") };
+}
 /** Optional step of Extrude, Cut, Revolve and Sweep: the solids the feature acts on (none: all solids). */
 function bodiesStep() {
-  return { key: "bodies", label: "Bodies", kinds: ["body"], before: true, optional: true,
+  return { key: "bodies", label: "Bodies", multi: true, kinds: ["body"], before: true, optional: true,
     hint: "Click the solids the feature acts on (click again to deselect), or check them; none: all solids.",
     accept: (f, h) => { f.bodies = f.bodies || []; const i = f.bodies.indexOf(h.solid); if (i >= 0) f.bodies.splice(i, 1); else f.bodies.push(h.solid); PT.dirty = true; },
-    html: f => { const sel = new Set(f.bodies || []); return (PT.solids.length ? PT.solids.map((s, i) => `<label class="check"><input type="checkbox" data-pbs="${i}"${sel.has(i) ? " checked" : ""}> Solid ${i + 1} (${pfmt(s.volume_mm3 / 1000, 2)} cm^3)</label>`).join("") : '<p class="hint">No solids.</p>') + `<p class="hint">Solids are numbered as in the tree before this feature. Add material: fused with the checked solids only. Remove material: cut from the checked solids only. The other solids are not changed.</p>`; },
+    html: f => { const sel = new Set(f.bodies || []); return (PT.solids.length ? PT.solids.map((s, i, a) => `<label class="check"><input type="checkbox" data-pbs="${i}"${sel.has(i) ? " checked" : ""}> ${solidLabel(i, volTexts(a.map(x => x.volume_mm3)))}</label>`).join("") : '<p class="hint">No solids.</p>') + `<p class="hint">Solids are numbered as in the tree before this feature. Add material: fused with the checked solids only. Remove material: cut from the checked solids only. The other solids are not changed.</p>`; },
     bind: (f, box) => box.querySelectorAll("input[data-pbs]").forEach(cb => cb.onchange = () => { f.bodies = [...box.querySelectorAll("input[data-pbs]:checked")].map(x => +x.dataset.pbs); changedPart(); }),
     done: f => (f.bodies || []).length > 0, summary: f => (f.bodies || []).length ? f.bodies.map(i => "Solid " + (i + 1)).join(", ") : "all solids" };
 }
@@ -1723,15 +2309,47 @@ function profileStep(prop, label) {
     summary: f => f[prop || "sketch_ref"] ? itemName(f[prop || "sketch_ref"]) : "none" };
 }
 const nameField = f => `<label>Name<input type="text" id="pf-name" value="${pesc(f.name)}"></label>`;
-const resultLine = f => { const st = PT.status[f.id] || {}; if (st.error) return `<p class="hint err">${pesc(st.error)}</p>`; if (st.faces !== undefined && st.faces_before !== undefined) return `<p class="hint">Result: ${st.faces_before} → ${st.faces} faces, ${st.edges_before} → ${st.edges} edges${st.note ? ". " + pesc(st.note) : ""}</p>`; if (st.note) return `<p class="hint">${pesc(st.note)}</p>`; return ""; };
+const resultLine = f => { const st = PT.status[f.id] || {}; if (st.pending) return pendingText(st); if (st.error) return `<p class="hint err">${pesc(st.error)}</p>`; if (st.faces !== undefined && st.faces_before !== undefined) return `<p class="hint">Result: ${st.faces_before} → ${st.faces} faces, ${st.edges_before} → ${st.edges} edges${st.note ? ". " + pesc(st.note) : ""}</p>`; if (st.note) return `<p class="hint">${pesc(st.note)}</p>`; return ""; };
 
 const COMMANDS = {
+  body_delete: { title: "Delete body",
+    defaults: init => ({ bodies: (init && init.bodies) || [], surfaces: (init && init.surfaces) || [] }),
+    steps: f => { const b = bodyPickStep("Bodies to delete"); b.done = f => (f.bodies || []).length + (f.surfaces || []).length > 0 || f.min_volume > 0 || f.min_thickness > 0;
+      return [b, { key: "small", label: "Small solids", optional: true, hint: "Solids below a volume or a mean thickness are deleted too.",
+        html: f => `<div class="grid2">` + num("pf-dminv", "Volume below (mm^3)", f.min_volume || 0) + num("pf-dmint", "Mean thickness below (mm)", f.min_thickness || 0) + `</div>` +
+          `<p class="hint">Mean thickness: 2 x volume / area. 0: not used.</p>` + resultLine(f),
+        bind: (f, box) => bindAll(box, { "#pf-dminv": el => { f.min_volume = Math.max(0, numv(el.value) || 0); }, "#pf-dmint": el => { f.min_thickness = Math.max(0, numv(el.value) || 0); } }),
+        summary: f => (f.min_volume > 0 || f.min_thickness > 0) ? [f.min_volume > 0 ? "< " + pfmt(f.min_volume) + " mm^3" : "", f.min_thickness > 0 ? "thinner than " + pfmt(f.min_thickness) + " mm" : ""].filter(Boolean).join(", ") : "none" }]; } },
+  body_copy: { title: "Copy body",
+    defaults: init => ({ bodies: (init && init.bodies) || [], surfaces: (init && init.surfaces) || [], move: [0, 0, 0] }),
+    steps: f => [bodyPickStep("Bodies to copy"),
+      { key: "move", label: "Move", hint: "Move vector of the copies (mm).", html: f => v3("pf-bmove", "Move vector (mm)", f.move || [0, 0, 0]) + `<p class="hint">The copied solids are new solids; the copied surface bodies are one surface body of this feature.</p>`,
+        bind: (f, box) => bind3(box, "pf-bmove", v => { f.move = v; }), summary: f => "(" + (f.move || [0, 0, 0]).map(v => pfmt(v, 2)).join(", ") + ") mm" }] },
+  body_scale: { title: "Scale body",
+    defaults: init => ({ bodies: (init && init.bodies) || [], surfaces: (init && init.surfaces) || [], uniform: true, factor: 1, factors: [1, 1, 1], about: "origin", point: [0, 0, 0], point_ref: null, copy: false }),
+    steps: f => {
+      const steps = [bodyPickStep("Bodies to scale"),
+        { key: "factor", label: "Scale", hint: "Scale factor, or factors along X, Y and Z, and the reference point.",
+          html: f => check("pf-suni", "Uniform", f.uniform !== false) +
+            (f.uniform !== false ? num("pf-sfac", "Factor", f.factor != null ? f.factor : 1) : v3("pf-sfacs", "Factors along X, Y, Z", f.factors || [1, 1, 1]) + `<p class="hint">Different factors convert the faces to B-spline surfaces.</p>`) +
+            select("pf-sabout", "Reference point", [["origin", "Origin"], ["centroid", "Centre of mass of the selection"], ["bbox", "Bounding box centre of the selection"], ["point", "Point"]], f.about || "origin") +
+            (f.about === "point" && !f.point_ref ? v3("pf-spt", "Point (mm, when no point feature or vertex is picked)", f.point || [0, 0, 0]) : "") +
+            check("pf-scopy", "Copy (keep the original bodies)", !!f.copy) +
+            `<p class="hint">${f.copy ? "The scaled solids are new solids; the scaled surface bodies are one surface body of this feature." : "The scaled bodies take the place of the originals."}</p>` + resultLine(f),
+          bind: (f, box) => { bindAll(box, { "#pf-suni": el => { f.uniform = el.checked; }, "#pf-sfac": el => { f.factor = numv(el.value); }, "#pf-sabout": el => { f.about = el.value; }, "#pf-scopy": el => { f.copy = el.checked; } });
+            bind3(box, "pf-sfacs", v => { f.factors = v; }); bind3(box, "pf-spt", v => { f.point = v; }); },
+          done: f => f.uniform !== false ? f.factor > 0 : (f.factors || []).every(v => v > 0),
+          summary: f => (f.uniform !== false ? pfmt(f.factor != null ? f.factor : 1, 4) : "(" + (f.factors || [1, 1, 1]).map(v => pfmt(v, 4)).join(", ") + ")") + " about " +
+            ({ origin: "origin", centroid: "centre of mass", bbox: "bounding box centre", point: f.point_ref ? itemName(f.point_ref) : "(" + (f.point || [0, 0, 0]).map(v => pfmt(v, 2)).join(", ") + ") mm" })[f.about || "origin"] + (f.copy ? ", copy" : "") }];
+      if (f.about === "point") { const d = datumStep("point", "Point", "point_ref", "Click a point feature or a vertex of the part (none: the coordinates in Scale).", true); steps.push(d); }
+      return steps;
+    } },
   sketch: {
     title: "Sketch", startStep: 0,
     defaults: init => ({ plane: (init && init.plane) || "XY", offset: 0, sketch: emptySketch() }),
-    steps: f => [{ key: "plane", label: "Plane", kinds: ["plane", "face", "edge", "curve", "axis"], before: false, hint: "Click a reference plane, a plane feature, a planar face, an edge or an axis feature (plane normal to it). Double-click opens the sketch editor on it.",
+    steps: f => [{ key: "plane", label: "Plane", kinds: ["plane", "face", "edge", "curve", "axis", "sketch"], before: false, hint: "Click a reference plane, a plane feature, a planar face, an edge, a curve or an axis feature (plane normal to it), or a curve of a sketch (plane normal to it at the end nearer the click). Double-click opens the sketch editor on it.",
       accept: acceptPlanePick, html: planeSelectField, bind: (f, box) => bindPlaneSelect(box, f), done: f => !!f.plane && (f.plane !== "normal" || f.plane_edge || f.plane_curve || f.plane_axis), summary: planeSummary },
-      { key: "origin", label: "Origin and x axis", kinds: ["edge", "face", "point", "axis"], optional: true, before: false, hint: "Click an edge: the sketch origin goes to its nearer end and the sketch x axis along it. Click a face: the origin goes to its centre. Click a point feature: the origin. Click an axis feature: the sketch x axis. Nothing clicked: the plane origin.",
+      { key: "origin", label: "Origin and x axis", kinds: ["edge", "face", "point", "axis", "sketch"], optional: true, before: false, hint: "Click an edge: the sketch origin goes to its nearer end and the sketch x axis along it. Click a curve of an earlier sketch: the origin goes to its nearer end. Click a face: the origin goes to its centre. Click a point feature: the origin. Click an axis feature: the sketch x axis. Nothing clicked: the plane origin.",
         accept: (f, h) => {
           if (h.kind === "point" && h.vertex) { f.plane_origin = h.point.slice(); delete f.plane_origin_ref; }
           else if (h.kind === "point") { f.plane_origin_ref = h.id; delete f.plane_origin; }
@@ -1742,6 +2360,19 @@ const COMMANDS = {
             const [o, e] = d(a) <= d(b) ? [a, b] : [b, a];
             f.plane_origin = o.slice(); f.plane_xdir = [e[0] - o[0], e[1] - o[1], e[2] - o[2]]; delete f.plane_origin_ref; delete f.plane_xdir_ref;
           } else if (h.kind === "face") { f.plane_origin = h.key.c.slice(); delete f.plane_origin_ref; }
+          else if (h.kind === "sketch") {
+            // the end of the clicked curve of an earlier sketch nearer the click (ends of its polylines in 3D)
+            const item = feat(h.id);
+            if (!item || item.type !== "sketch" || !h.point) return;
+            const d = q => Math.hypot(q[0] - h.point[0], q[1] - h.point[1], q[2] - h.point[2]);
+            let best = null;
+            for (const e of (item.sketch || {}).entities || []) {
+              if (e.axis || e.t === "point") continue;
+              for (const pl of sketchPolylines({ entities: [e] })) for (const q of [pl[0], pl[pl.length - 1]]) { const p = to3(item, q[0], q[1]); if (!best || d(p) < d(best)) best = p; }
+            }
+            if (!best) { msgPart("The sketch has no curve", true); return; }
+            f.plane_origin = best; delete f.plane_origin_ref;
+          }
           PT.dirty = true;
         },
         html: f => (f.plane_origin_ref ? `<p class="hint">Origin at ${pesc(itemName(f.plane_origin_ref))}.</p>` : v3("pf-po", "Origin (mm, projected onto the plane)", f.plane_origin || (PT.status[f.id] && PT.status[f.id].frame ? PT.status[f.id].frame.o : [0, 0, 0]))) +
@@ -1827,7 +2458,7 @@ const COMMANDS = {
       const cands = PT.part.features.filter((x, i) => i < i0 && SKETCH_TYPES.has(x.type));
       const m = f.method || "principal";
       return [
-        { key: "features", label: "Features", kinds: ["face"], before: false, hint: "Click a face of each feature to mirror (click again to deselect), or check the features. Sketch features and holes only.",
+        { key: "features", label: "Features", multi: true, kinds: ["face"], before: false, hint: "Click a face of each feature to mirror (click again to deselect), or check the features. Sketch features and holes only.",
           accept: (f, h) => { const id = h.owner; if (!id || !cands.some(x => x.id === id)) { msgPart("Only sketch features and holes above this feature can be mirrored", true); return; }
             f.features = f.features || []; const i = f.features.indexOf(id); if (i >= 0) f.features.splice(i, 1); else f.features.push(id); PT.dirty = true; },
           html: f => { const sel = new Set(f.features || []); return (cands.length ? cands.map(x => `<label class="check"><input type="checkbox" data-pf="${pesc(x.id)}"${sel.has(x.id) ? " checked" : ""}> ${pesc(x.name)}</label>`).join("") : '<p class="hint">No sketch features above this one.</p>') + check("pf-mbody", "Mirror the whole body (fused)", f.body); },
@@ -1897,9 +2528,9 @@ const COMMANDS = {
     steps: f => {
       const sk = f.sketch_ref && feat(f.sketch_ref);
       const axes = (((sk || {}).sketch || {}).entities || []).filter(e => e.t === "line" && e.constr && !e.axis);
-      return [profileStep(), regionsStep(), { key: "axis", label: "Axis and extent", kinds: ["axis"], before: false, hint: "Choose the axis, or click an axis feature in the view or the tree.",
-        accept: (f, h) => { f.axis_ref = h.id; PT.dirty = true; },
-        html: f => select("pf-axis", "Axis", [["u", "Sketch x axis (u)"], ["v", "Sketch y axis (v)"]].concat(axes.map(e => [e.id, `Construction line ${e.id} (${pfmt(e.x1, 2)}, ${pfmt(e.y1, 2)}) - (${pfmt(e.x2, 2)}, ${pfmt(e.y2, 2)})`])).concat(axisItems(featIndex(f.id)).map(a => ["ref:" + a.id, "Axis feature " + a.name])), f.axis_ref ? "ref:" + f.axis_ref : (f.axis || "v")) +
+      return [profileStep(), regionsStep(), { key: "axis", label: "Axis and extent", kinds: ["sketch", "axis"], before: false, axisPick: "constr", hint: "Click a construction line of the profile sketch (the line under the cursor is highlighted) or an axis feature in the view, or choose the axis.",
+        accept: (f, h) => acceptAxisPick(f, h, true),
+        html: f => select("pf-axis", "Axis", [["u", "Sketch x axis (u)"], ["v", "Sketch y axis (v)"]].concat(axes.map(e => [e.id, lineLabel(e)])).concat(axisItems(featIndex(f.id)).map(a => ["ref:" + a.id, "Axis feature " + a.name])), f.axis_ref ? "ref:" + f.axis_ref : (f.axis || "v")) +
           `<div class="grid2">` + num("pf-angle", "Angle (deg)", f.angle) + select("pf-mode", "Mode", [["add", "Add material"], ["cut", "Remove material"]], f.mode || "add") + `</div>` + check("pf-newbody", "New body (not fused with the part; combine later with Boolean)", f.new_body) + `<p class="hint">A construction line drawn in the sketch can be the axis.</p>`,
         bind: (f, box) => bindAll(box, { "#pf-axis": el => { if (el.value.startsWith("ref:")) f.axis_ref = el.value.slice(4); else { f.axis = el.value; f.axis_ref = null; } }, "#pf-angle": el => { const v = numv(el.value); if (v > 0 && v <= 360) f.angle = v; }, "#pf-mode": el => { f.mode = el.value; }, "#pf-newbody": el => { f.new_body = el.checked; } }),
         summary: f => pfmt(f.angle) + " deg about " + (f.axis === "u" ? "x" : f.axis === "v" ? "y" : f.axis) + (f.mode === "cut" ? ", remove" : "") }].concat(f.new_body && f.mode !== "cut" ? [] : [bodiesStep()]);
@@ -1934,14 +2565,24 @@ const COMMANDS = {
   },
   sweep: {
     title: "Sweep",
-    defaults: () => ({ sketch_ref: null, path_ref: null, path_source: null, mode: "add" }),
+    defaults: () => ({ sketch_ref: null, path_ref: null, path_source: null, mode: "add", kind: "profile" }),
     steps: f => [profileStep(), { key: "path", label: "Path", kinds: ["sketch", "curve"], single: true, before: false, hint: "Click the path sketch or a curve body.",
         accept: (f, h) => { if (h.kind === "sketch") { f.path_ref = h.id; f.path_source = null; } else { f.path_source = h.id; f.path_ref = null; } PT.dirty = true; },
         html: f => sketchField(f, "path_ref", "Path sketch") + sourceSelect("pf-path_source", f, "path_source", false, true).replace("Curve<", "Or a curve body<"),
         bind: (f, box) => { bindSketchField(box, f, "path_ref"); bindAll(box, { "#pf-path_source": el => { f.path_source = el.value || null; if (el.value) f.path_ref = null; } }); },
         done: f => !!(f.path_ref || f.path_source), summary: f => f.path_ref ? itemName(f.path_ref) : f.path_source ? itemName(f.path_source) : "none" },
-      { key: "mode", label: "Mode", html: f => select("pf-mode", "Mode", [["add", "Add material"], ["cut", "Remove material"]], f.mode || "add") + check("pf-newbody", "New body (not fused with the part; combine later with Boolean)", f.new_body) + `<p class="hint">The profile is swept along the path (one open chain). The profile plane should be normal to the path at its start.</p>`,
-        bind: (f, box) => bindAll(box, { "#pf-mode": el => { f.mode = el.value; }, "#pf-newbody": el => { f.new_body = el.checked; } }), summary: f => (f.mode === "cut" ? "remove material" : "add material") + (f.new_body ? ", new body" : "") }].concat(f.new_body && f.mode !== "cut" ? [] : [bodiesStep()]),
+      { key: "mode", label: "Mode", html: f => {
+          const tool = f.kind === "tool";
+          return select("pf-skind", "Sweep", [["profile", "Profile swept along the path"], ["tool", "Moving tool: the profile revolved about its axis"]], f.kind || "profile") +
+            select("pf-mode", "Mode", [["add", "Add material"], ["cut", "Remove material"]], f.mode || "add") + check("pf-newbody", "New body (not fused with the part; combine later with Boolean)", f.new_body) +
+            `<p class="hint">${tool ? "The profile revolved about the tool axis is a tool (for example a V-bit or an end mill) moved along the path without turning; the tool axis is normal to the path plane. Corners of the path tighter than the tool are filled as the tool would cut them." :
+              "The profile is swept along the path (one connected chain); the profile plane should be normal to the path at its start. A profile wider than the radius of a path corner intersects itself there: use the moving tool."}</p>`;
+        },
+        bind: (f, box) => bindAll(box, { "#pf-skind": el => { f.kind = el.value; if (el.value === "tool" && !f.axis) f.axis = "auto"; },
+          "#pf-mode": el => { f.mode = el.value; }, "#pf-newbody": el => { f.new_body = el.checked; } }),
+        summary: f => (f.kind === "tool" ? "moving tool, " : "") + (f.mode === "cut" ? "remove material" : "add material") + (f.new_body ? ", new body" : "") }]
+      .concat(f.kind === "tool" ? [toolAxisStep()] : [])
+      .concat(f.new_body && f.mode !== "cut" ? [] : [bodiesStep()]),
   },
   fillet: { title: "Fillet", needsSolid: true, defaults: () => ({ value: 2, edges: [] }),
     steps: f => [edgesStep("Edges", "edges"), { key: "value", label: "Radius", html: f => `<div class="grid2">` + num("pf-value", "Radius (mm)", f.value) + `<span></span></div>` + resultLine(f), bind: (f, box) => bindAll(box, { "#pf-value": el => { const v = numv(el.value); if (v > 0) f.value = v; } }), summary: f => pfmt(f.value) + " mm" }] },
@@ -1955,11 +2596,15 @@ const COMMANDS = {
     steps: f => {
       const solidStep = (key, label, hint) => ({ key, label, kinds: ["body"], before: true, hint,
         accept: (f, h) => { f[key] = f[key] || []; const i = f[key].indexOf(h.solid); if (i >= 0) f[key].splice(i, 1); else f[key].push(h.solid); PT.dirty = true; },
-        html: f => { const sel = new Set(f[key] || []); return (PT.solids.length ? PT.solids.map((s, i) => `<label class="check"><input type="checkbox" data-ps="${i}"${sel.has(i) ? " checked" : ""}> Solid ${i + 1} (${pfmt(s.volume_mm3 / 1000, 2)} cm^3)</label>`).join("") : '<p class="hint">No solids.</p>') + `<p class="hint">Solids are numbered as in the tree before this feature.</p>`; },
+        html: f => { const sel = new Set(f[key] || []); return (PT.solids.length ? PT.solids.map((s, i, a) => `<label class="check"><input type="checkbox" data-ps="${i}"${sel.has(i) ? " checked" : ""}> ${solidLabel(i, volTexts(a.map(x => x.volume_mm3)))}</label>`).join("") : '<p class="hint">No solids.</p>') + `<p class="hint">Solids are numbered as in the tree before this feature.</p>`; },
         bind: (f, box) => box.querySelectorAll("input[data-ps]").forEach(cb => cb.onchange = () => { f[key] = [...box.querySelectorAll("input[data-ps]:checked")].map(x => +x.dataset.ps); changedPart(); }),
         done: f => (f[key] || []).length > 0, summary: f => (f[key] || []).length ? (f[key] || []).map(i => "Solid " + (i + 1)).join(", ") : "none" });
-      const steps = [{ key: "op", label: "Operation", html: f => select("pf-bop", "Operation", [["union", "Union (fuse)"], ["subtract", "Subtract (target minus tools)"], ["intersect", "Intersect (common volume)"]], f.op || "subtract") + (f.op !== "union" ? check("pf-bkeep", "Keep the tool solids", f.keep_tools) : "") + `<p class="hint">Separate solids come from Extrude, Revolve or Sweep with New body, from Partition or from an imported STEP file.</p>`,
-        bind: (f, box) => bindAll(box, { "#pf-bop": el => { f.op = el.value; }, "#pf-bkeep": el => { f.keep_tools = el.checked; } }),
+      const steps = [{ key: "op", label: "Operation", html: f => select("pf-bop", "Operation", [["union", "Union (fuse)"], ["subtract", "Subtract (target minus tools)"], ["intersect", "Intersect (common volume)"]], f.op || "subtract") + (f.op !== "union" ? check("pf-bkeep", "Keep the tool solids", f.keep_tools) : "") +
+          `<div class="grid2">` + num("pf-bmint", "Sliver thickness (mm)", f.min_thickness != null ? f.min_thickness : 0.01) + num("pf-bminv", "Sliver volume (mm^3)", f.min_volume || 0) + `</div>` +
+          check("pf-bkeeps", "Keep sliver solids", !!f.keep_slivers) +
+          `<p class="hint">Result solids with a mean thickness (2 x volume / area) below the sliver thickness or a volume below the sliver volume are slivers: the Boolean is made again with a fuzzy value of the sliver thickness, and the slivers left are removed.</p>` +
+          `<p class="hint">Separate solids come from Extrude, Revolve or Sweep with New body, from Partition or from an imported STEP file.</p>` + resultLine(f),
+        bind: (f, box) => bindAll(box, { "#pf-bop": el => { f.op = el.value; }, "#pf-bkeep": el => { f.keep_tools = el.checked; }, "#pf-bmint": el => { f.min_thickness = Math.max(0, numv(el.value) || 0); }, "#pf-bminv": el => { f.min_volume = Math.max(0, numv(el.value) || 0); }, "#pf-bkeeps": el => { f.keep_slivers = el.checked; } }),
         summary: f => ({ union: "union", subtract: "subtract", intersect: "intersect" })[f.op || "subtract"] + (f.keep_tools && f.op !== "union" ? ", tools kept" : "") },
         solidStep("targets", f.op === "union" ? "Solids" : "Target", f.op === "union" ? "Click each solid to fuse (click again to deselect), or check them." : "Click the target solid(s) (click again to deselect), or check them.")];
       if (f.op !== "union") steps.push(solidStep("tools", "Tools", "Click the tool solid(s), or check them."));
@@ -2032,7 +2677,7 @@ const COMMANDS = {
           if (h.kind === "body") { f.with = "solid"; f.tool = null; } else if (h.kind === "plane") { f.with = "plane"; f.tool = h.id; } else { f.with = h.kind === "curve" ? "curve" : h.kind === "sketch" ? "sketch" : "surface"; f.tool = h.id; } f.remove = []; PT.cmd.regions = null; PT.dirty = true; },
         html: f => `<p class="hint">${f.with === "solid" ? "The solid." : f.with === "plane" ? "Plane " + planeName(f.tool) + "." : f.tool ? itemName(f.tool) + "." : "No tool yet."}</p>`,
         done: f => f.with === "solid" || !!f.tool, summary: f => f.with === "solid" ? "the solid" : f.with === "plane" ? planeName(f.tool) : f.tool ? itemName(f.tool) : "none" },
-      { key: "regions", label: "Regions", kinds: ["region"], before: true, hint: "Click the regions to remove (click again to keep them). Invert swaps kept and removed.",
+      { key: "regions", label: "Regions", multi: true, kinds: ["region"], before: true, hint: "Click the regions to remove (click again to keep them). Invert swaps kept and removed.",
         enter: f => { if (f.source && (f.with === "solid" || f.tool)) loadRegions(f); },
         accept: (f, h) => { f.keep = "pick"; f.remove = f.remove || []; const i = f.remove.findIndex(p => p.join(",") === h.point.join(",")); if (i >= 0) f.remove.splice(i, 1); else f.remove.push(h.point); PT.dirty = true; drawRegions(); },
         html: f => { const n = (PT.cmd.regions || []).length; return `<p class="hint">${n ? n + " region(s), " + (f.remove || []).length + " removed." : "Computing the regions..."}</p><div class="buttons"><button type="button" id="pf-invert">Invert</button><button type="button" id="pf-keepall">Keep all</button></div>`; },
@@ -2047,7 +2692,9 @@ const COMMANDS = {
     steps: f => {
       const steps = [surfaceOrFacesStep("Surface", "Click the surface body to extend, or a face of the solid.")];
       if (f.mode !== "all") steps.push({ key: "edges", label: "Edges", kinds: ["sedge", "edge"], prop: "edges", hint: "Click the boundary edges of the surface to extend (click again to deselect).",
-        accept: (f, h) => { if ((f.faces || []).length ? !!h.surface : h.surface !== f.source) { msgPart("Click an edge of " + ((f.faces || []).length ? "the picked faces" : itemName(f.source)), true); return; } applyPick(f, { prop: "edges", kinds: ["edge"], single: false }, h); },
+        // picked faces (of the solid or, with Pick single faces, of a surface body): any edge; the build checks that
+        // it bounds the picked faces. A whole surface body: its own edges only
+        accept: (f, h) => { if (!(f.faces || []).length && h.surface !== f.source) { msgPart("Click an edge of " + itemName(f.source), true); return; } applyPick(f, { prop: "edges", kinds: ["edge"], single: false }, h); },
         html: f => `<p class="hint">${(f.edges || []).length} edge(s) selected.</p><div class="buttons"><button type="button" data-clear="edges">Clear</button></div>`,
         bind: (f, box) => box.querySelectorAll("button[data-clear]").forEach(b => b.onclick = () => { f.edges = []; changedPart(); }),
         summary: f => (f.edges || []).length + " edge(s)" });
@@ -2092,10 +2739,10 @@ const COMMANDS = {
           html: f => `<p class="hint">${(f.edges || []).length} edge(s) selected.</p><div class="buttons"><button type="button" data-clear="edges">Clear</button></div>`,
           bind: (f, box) => box.querySelectorAll("button[data-clear]").forEach(b => b.onclick = () => { f.edges = []; changedPart(); }),
           done: f => (f.edges || []).length > 0, summary: f => (f.edges || []).length + " edge(s)" }, opts];
-      return [sourceStep("Surface A", "source_a", false, "Click surface body A, or choose it."), sourceStep("Surface B", "source_b", false, "Click surface body B, or choose it."), opts];
+      return [filletSideStep("a"), filletSideStep("b"), opts];
     } },
   surf_bridge: { title: "Bridge surface", defaults: () => ({ edges_a: [], curves_a: [], edges_b: [], curves_b: [], flip: false }),
-    steps: f => ["a", "b"].map(k => ({ key: "side_" + k, label: "Side " + k.toUpperCase(), kinds: ["edge", "sedge", "curve"], before: false,
+    steps: f => ["a", "b"].map(k => ({ key: "side_" + k, label: "Side " + k.toUpperCase(), multi: true, kinds: ["edge", "sedge", "curve"], before: false,
         hint: `Click the edges of side ${k.toUpperCase()} (one connected chain): edges of the solid or of surface bodies, or curve bodies. Click again to deselect.`,
         accept(f, h) {
           if (h.kind === "curve") { const arr = f["curves_" + k] = f["curves_" + k] || []; const i = arr.indexOf(h.id); if (i >= 0) arr.splice(i, 1); else arr.push(h.id); PT.dirty = true; return; }
@@ -2114,7 +2761,7 @@ const COMMANDS = {
           `<p class="hint">Straight lines join the ends of side A to the nearer ends of side B (corner to corner) and the points between; the result is a surface body. Sew surfaces joins it to the neighbouring surfaces.</p>` + resultLine(f),
         bind: (f, box) => bindAll(box, { "#pf-bflip": el => { f.flip = el.checked; } }), summary: f => f.flip ? "flipped" : "corner to corner" }]) },
   surf_fill: { title: "Fill surface", defaults: () => ({ edges: [], tangent: true, curves: [], sketch_refs: [] }),
-    steps: f => [{ key: "edges", label: "Boundary", kinds: ["edge", "sedge", "face", "sketch", "curve"], before: false,
+    steps: f => [{ key: "edges", label: "Boundary", multi: true, kinds: ["edge", "sedge", "face", "sketch", "curve"], before: false,
         hint: "Click the edges of the closed loop: edges of the solid or of surface bodies, sketch curves (the whole sketch), curve bodies. Click again to deselect.",
         accept(f, h) {
           const toggle = (arr, id) => { const i = arr.indexOf(id); if (i >= 0) arr.splice(i, 1); else arr.push(id); };
@@ -2167,7 +2814,7 @@ function commandRefs(f) {
   if (f.type === "plane" || f.type === "split") { add(f.face); add(f.faces); add(f.edge); add(f.curve); add(f.plane_ref); add(f.sketch_ref); add(f.source); }
   if (f.type === "sweep") { add(f.path_ref); add(f.path_source); }
   if (f.type === "surf_trim") { add(f.source); if (f.with !== "solid") add(f.tool); }
-  if (f.type === "sketch") { if (f.plane === "datum") add(f.plane_ref); else if (BASE_PLANES[f.plane]) add(f.plane); add(f.plane_edge); add(f.plane_curve); add(f.plane_face); add(f.plane_axis); add(f.plane_point); add(f.plane_origin_ref); add(f.plane_xdir_ref); }
+  if (f.type === "sketch") { if (f.plane === "datum") add(f.plane_ref); else if (BASE_PLANES[f.plane]) add(f.plane); add(f.plane_edge); add(f.plane_curve); add(f.plane_face); add(f.plane_axis); add(f.plane_point); add(f.plane_origin_ref); add(f.plane_xdir_ref); if (f.plane_sketch_curve) add(f.plane_sketch_curve.sketch); }
   if (f.type === "point" || f.type === "axis" || f.type === "plane") { add(f.point_ref); add(f.axis_ref); add(f.points_ref); add(f.planes_ref); add(f.plane_ref); add(f.edge); add(f.curve); add(f.face); if (f.sketch_curve) add(f.sketch_curve.sketch); }
   if (f.type === "revolve" || f.type === "pattern") add(f.axis_ref);
   if (f.type === "sketch" && f.plane_origin) out.points.push(f.plane_origin);
@@ -2197,9 +2844,10 @@ async function measureClick(h) {
   const m = PT.measure;
   let it = null;
   if (h.kind === "face" && !h.surface) it = { face: h.fi };
+  else if (h.kind === "face" && h.surface && h.point) it = { point: h.point.slice(), surface: h.surface };
   else if (h.kind === "plane") it = BASE_PLANES[h.id] ? { base: h.id } : { plane: h.id };
   else if (h.kind === "axis") it = { axis: h.id };
-  if (!it) { msgPart("Measure takes faces of the solid, planes and axes", true); return; }
+  if (!it) { msgPart("Measure takes faces of the solid, points on surface bodies, planes and axes", true); return; }
   if (m.items.length >= 2) m.items = [];
   m.items.push(it);
   m.res = null;
@@ -2237,6 +2885,41 @@ function drawMeasure(paint) {
   }
 }
 
+/** Settings of the commands kept for the next use (server: config.local.json "part_last"); picks are not kept. */
+const STICKY = {
+  extrude: ["depth", "symmetric"], cut: ["depth", "through", "symmetric"], revolve: ["angle"],
+  hole: ["dia", "depth", "cbore_dia", "cbore_depth", "csink_dia", "csink_angle", "thread", "tol"],
+  thread: ["thread", "thread_type", "tol", "cut_od"],
+  fillet: ["value"], chamfer: ["value"], shell: ["thickness"],
+  boolean: ["op", "keep_tools", "min_thickness", "min_volume", "keep_slivers"],
+  pattern: ["kind", "count", "step", "count2", "step2", "row_offset", "axis", "angle"],
+  body_delete: ["min_volume", "min_thickness"], body_scale: ["uniform", "factor", "factors", "about", "copy"],
+  import: ["clean"], unify: ["faces", "edges", "angle"], heal: ["tolerance", "small_faces"], defeature: ["min_area"],
+  offset_faces: ["distance", "tangent"], move_faces: ["vector", "tangent"], combine: ["min_area"],
+  hole_mesh: ["factor", "n_circ", "n_rad", "bias", "n_thick"], smooth: ["tolerance", "segments", "continuity"],
+  replace: ["method", "tolerance", "offset", "pad", "min_area"], surf_fit: ["method", "tolerance", "extend", "offset"],
+  surf_sketch: ["depth", "symmetric", "angle"], surf_extend: ["mode", "distance", "sides", "tolerance"],
+  surf_offset: ["distance"], thicken: ["thickness", "side", "mode"], surf_extract: ["offset"],
+  surf_fillet: ["radius", "trim"], surf_fill: ["tangent"], surf_sew: ["tolerance"],
+  curve_extract: ["tangent_chain", "clean", "tolerance"], surf_from_curve: ["depth", "symmetric", "angle"], sweep: ["kind", "mode", "tool_at"],
+};
+async function loadLast() {
+  try { const r = await fetch("/api/part/last"); if (r.ok) PT.last = await r.json(); } catch (e) { /* defaults */ }
+}
+/** Kept settings of a finished feature: sent to the server when they differ from the stored ones. */
+function rememberLast(f) {
+  const keys = STICKY[f.type];
+  if (!keys) return;
+  const vals = {};
+  for (const k of keys) if (f[k] !== undefined) vals[k] = JSON.parse(JSON.stringify(f[k]));
+  const cur = (PT.last || {})[f.type] || {};
+  if (!Object.keys(vals).some(k => JSON.stringify(vals[k]) !== JSON.stringify(cur[k]))) return;
+  PT.last = PT.last || {};
+  PT.last[f.type] = Object.assign({}, cur, vals);
+  PT.lastSave = api("/api/part/last", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type: f.type, values: vals }) })
+    .then(() => true, () => false);     // on failure the settings are kept for this session
+}
+
 function startCommand(type, init, existingId) {
   if (PT.measure) setMeasure(false);
   if (PT.cmd) { if (canFinish(feat(PT.cmd.id))) finishCommand(true); else cancelCommand(); }
@@ -2246,12 +2929,14 @@ function startCommand(type, init, existingId) {
   else {
     if (def.needsSolid && !(PT.mesh && PT.mesh.vertices.length)) { msgPart(TYPE_NAMES[type] + ": the part has no solid yet", true); return; }
     f = Object.assign({ id: newId(), name: nextName(type), type, suppressed: false }, def.defaults(init));
+    const last = (PT.last || {})[type];
+    if (last && STICKY[type]) for (const k of STICKY[type]) if (last[k] !== undefined && !(init && k in init)) f[k] = JSON.parse(JSON.stringify(last[k]));
     if (type === "surf_sketch" && f.kind === "revolve") f.name = "Revolved surface " + (PT.part.features.filter(x => x.type === "surf_sketch" && x.kind === "revolve").length + 1);
     if (type === "sketch" && !init) { const s = PT.sel && (BASE_PLANES[PT.sel] ? PT.sel : feat(PT.sel) && feat(PT.sel).type === "plane" ? PT.sel : null); if (s) { if (BASE_PLANES[s]) f.plane = s; else { f.plane = "datum"; f.plane_ref = s; } } }
     if (SKETCH_TYPES.has(type) || type === "surf_sketch") { const s = PT.sel && feat(PT.sel); if (s && s.type === "sketch") f.sketch_ref = s.id; }
     if (init && init.insertAt !== undefined) PT.part.features.splice(init.insertAt, 0, f); else PT.part.features.push(f);
   }
-  PT.cmd = { id: f.id, step: 0, isNew: !existingId, snapshot: JSON.stringify(f), pick: null, regions: null, emode: "edge", resume: init && init.resume };
+  PT.cmd = { id: f.id, step: 0, isNew: !existingId, snapshot: JSON.stringify(f), pick: null, regions: null, emode: "edge", fmode: "face", resume: init && init.resume };
   // start at the first unfinished step
   const steps = commandSteps(f);
   let i = steps.findIndex(st => !st.optional && !stepDone(f, st));
@@ -2269,6 +2954,7 @@ function gotoStep(i) {
   const c = PT.cmd;
   if (!c) return;
   const f = feat(c.id);
+  if (!f) return;
   const steps = commandSteps(f);
   if (i < 0 || i >= steps.length) return;
   c.step = i; c.pick = null;
@@ -2278,7 +2964,9 @@ function gotoStep(i) {
 }
 function nextStep() {
   const c = PT.cmd;
+  if (!c) return;
   const f = feat(c.id);
+  if (!f) return;
   const steps = commandSteps(f);
   if (c.step + 1 >= steps.length) { finishCommand(); return; }
   gotoStep(c.step + 1);
@@ -2296,6 +2984,7 @@ function finishCommand(silent) {
   const def = commandDef(f.type);
   const resume = c.resume, isNew = c.isNew;
   if (isNew) for (const sid of consumedSources(f)) PT.hidden[sid] = true;
+  rememberLast(f);
   PT.cmd = null;
   PT.sel = f.id;
   if (def.finish) { def.finish(f, isNew, resume); return; }
@@ -2349,7 +3038,7 @@ async function loadProfileRegions(f) {
 }
 /** Optional step: pick the regions of the sketch to use; none picked: every closed loop. */
 function regionsStep() {
-  return { key: "regions", label: "Regions", kinds: ["region"], before: true, optional: true,
+  return { key: "regions", label: "Regions", multi: true, kinds: ["region"], before: true, optional: true,
     hint: "Click the regions of the sketch to use (click again to deselect). None picked: every closed loop.",
     enter: f => { if (f.sketch_ref) loadProfileRegions(f); },
     accept: (f, h) => { f.regions = f.regions || []; const k = (h.uv || []).join(","); const i = f.regions.findIndex(p => p.join(",") === k); if (i >= 0) f.regions.splice(i, 1); else f.regions.push(h.uv); PT.dirty = true; drawRegions(); },
@@ -2375,66 +3064,172 @@ async function loadRegions(f) {
 /** The command bar in the properties panel. A render requested while a field of the bar has the focus (the
  *  user is typing) is deferred to the blur of that field; a nested render during the DOM replacement is skipped. */
 function renderCommand(force) {
-  const box = $("#pt-props");
+  if (PT.quiet) return;
+  const box = $("#pt-cmdbody");
   const c = PT.cmd;
-  if (!c) { renderProps(); return; }
+  if (!c) { $("#pt-cmdwin").hidden = true; renderProps(); return; }
   if (PT.renderingCmd) return;
   const ae = document.activeElement;
   if (!force && ae && box.contains(ae) && ae.matches("input, select, textarea")) { PT.pendingRender = true; return; }
   PT.renderingCmd = true;
   try { renderCommandNow(box, c); } finally { PT.renderingCmd = false; }
 }
+/** Steps whose clicks in the view a command takes: the steps with element kinds. */
+const isPickStep = s => !!(s && s.kinds);
+/** Command window: every step of the command as a section (element steps list their selection, value steps their
+ *  fields); the active section takes the clicks in the view. */
 function renderCommandNow(box, c) {
   const f = feat(c.id);
-  if (!f) { PT.cmd = null; renderProps(); return; }
+  if (!f) { PT.cmd = null; renderCommand(); return; }
   const def = commandDef(f.type);
   const steps = commandSteps(f);
   if (c.step >= steps.length) c.step = steps.length - 1;
   const st = PT.status[f.id] || {};
   const title = f.type === "surf_sketch" && f.kind === "revolve" ? "Revolved surface" : def.title;
-  let h = `<div class="cmd"><div class="cmd-head"><strong>${title}</strong>` + nameField(f) + `</div>`;
+  let h = `<div class="cmd cw"><div class="cw-name">` + nameField(f) + `</div>`;
   steps.forEach((s, i) => {
     const done = stepDone(f, s);
     const active = i === c.step;
-    h += `<div class="cmd-step${active ? " active" : ""}${done ? " done" : ""}" data-step="${i}"><span class="num">${done && !active ? "✓" : i + 1}</span><span class="lbl">${s.label}</span>` + (!active && s.summary ? `<span class="sum">${pesc(s.summary(f))}</span>` : "") + `</div>`;
-    if (active) {
-      h += `<div class="cmd-body">` + (s.hint ? `<p class="hint">${s.hint}</p>` : "") + (s.html ? s.html(f) : "") +
-        `<div class="buttons">` + (i + 1 < steps.length ? `<button type="button" id="cmd-next" class="primary">Next</button>` : "") + `</div></div>`;
-    }
+    const pick = isPickStep(s);
+    h += `<section class="cw-sec${active ? " active" : ""}${done ? " done" : ""}${pick ? " pick" : ""}" data-step="${i}">` +
+      `<div class="cw-sec-head"><span class="cw-mark">${done ? "✓" : s.optional ? "○" : "●"}</span><span class="lbl">${s.label}${s.optional ? '<span class="opt">optional</span>' : ""}</span>` +
+      (pick && s.summary ? `<span class="sum">${pesc(s.summary(f))}</span>` : "<span></span>") + `</div>` +
+      `<div class="cw-sec-body">` + (active && s.hint ? `<p class="hint cw-hint">${s.hint}</p>` : "") + (s.html ? s.html(f) : "") +
+      (active && isMultiFaceStep(s) ? faceModeHtml() : "") + selChips(f, s) +
+      (active && s.kinds && (s.multi || s.multiFace || (s.prop && !s.single)) ? boxToolsHtml(clearBtn(f, s)) : clearBtn(f, s) ? `<div class="buttons">${clearBtn(f, s)}</div>` : "") + `</div></section>`;
   });
-  if (st.error) h += `<p class="hint err">${pesc(st.error)}</p>`;
+  h += `<div class="cw-result">`;
+  if (st.pending) h += pendingText(st);
+  else if (st.error && !h.includes(pesc(st.error))) h += `<p class="hint err">${pesc(st.error)}</p>`;
   else if (st.extent) h += `<p class="hint">${st.profiles} profile(s)${st.note ? "; " + pesc(st.note) : ""}</p>`;
-  h += `<div class="cmd-foot"><button type="button" id="cmd-finish" class="primary"${canFinish(f) ? "" : " disabled"}>${def.finishLabel || "Finish"}</button><button type="button" id="cmd-cancel">Cancel</button></div></div>`;
+  h += `</div><div class="cw-foot cmd-foot"><button type="button" id="cmd-finish" class="primary"${canFinish(f) ? "" : " disabled"}>${def.finishLabel || "OK"}</button><button type="button" id="cmd-cancel">Cancel</button></div></div>`;
   box.innerHTML = h;
   const nm = box.querySelector("#pf-name");
   if (nm) nm.onchange = () => { f.name = nm.value.trim() || f.name; PT.dirty = true; renderTree(); };
-  box.querySelectorAll(".cmd-step").forEach(el => el.onclick = () => gotoStep(+el.dataset.step));
-  const active = steps[c.step];
-  if (active && active.bind) active.bind(f, box.querySelector(".cmd-body") || box);
-  const nx = box.querySelector("#cmd-next"); if (nx) nx.onclick = nextStep;
+  box.querySelectorAll(".cw-sec").forEach(sec => {
+    const i = +sec.dataset.step, s = steps[i];
+    if (s.bind) s.bind(f, sec.querySelector(".cw-sec-body"));
+    // a click on the head of another section makes it the active one (its clicks in the view, or the full preview
+    // for a value section); a field of a value section activates it without redrawing the window
+    sec.querySelector(".cw-sec-head").onclick = () => { if (i !== PT.cmd.step) gotoStep(i); };
+    sec.addEventListener("focusin", () => { if (PT.cmd && i !== PT.cmd.step && !isPickStep(s)) activateStep(i, box); });
+  });
+  bindFaceMode(box.querySelector(".cw-sec.active") || box);
+  bindChips(f, box);
+  foldHelp(box);
+  // the result line once: a section that shows the same error already
+  const re = box.querySelector(".cw-result .err");
+  if (re && [...box.querySelectorAll(".cw-sec-body .err")].some(x => x.textContent === re.textContent)) re.remove();
   box.querySelector("#cmd-finish").onclick = () => finishCommand();
   box.querySelector("#cmd-cancel").onclick = cancelCommand;
-  $("#pt-cmdbar").hidden = false;
-  $("#pt-cmdtitle").textContent = title + ": " + f.name + " — " + (active ? active.label : "") + (active && active.hint ? ". " + active.hint : "");
+  $("#pt-cmdwin-title").textContent = title;
+  $("#pt-cmdwin").hidden = false;
+  placeCmdWin();
+  if (!PT.inspect) $("#pt-props").innerHTML = `<p class="hint">${pesc(f.name)} is open in the command window.</p>`;
+}
+/** Selected faces and edges of an element section (f[prop] an array of face or edge references) as chips: × removes
+ *  one, Clear all. */
+function selChips(f, s) {
+  const v = s.prop && f[s.prop];
+  if (!Array.isArray(v) || !v.length || !v.every(x => x && typeof x === "object" && (x.c || x.mid))) return "";
+  const max = 40;
+  const chip = (x, i) => `<span class="cw-chip" data-i="${i}" title="${x.mid ? "Edge at (" + x.mid.map(q => pfmt(q, 2)).join(", ") + ")" : "Face at (" + x.c.map(q => pfmt(q, 2)).join(", ") + ")"}">` +
+    (x.mid ? "Edge " + (i + 1) + " · " + pfmt(x.len, 2) + " mm" : "Face " + (i + 1) + " · " + pfmt(x.area, 2) + " mm^2") + `<button type="button" data-cwdel="${i}" title="Remove">×</button></span>`;
+  return `<div class="cw-chips" data-prop="${pesc(s.prop)}">` + v.slice(0, max).map(chip).join("") + (v.length > max ? `<span class="hint">+${v.length - max} more</span>` : "") + `</div>`;
+}
+const clearBtn = (f, s) => s.prop && Array.isArray(f[s.prop]) && f[s.prop].length ? `<button type="button" data-cwclear="${pesc(s.prop)}">Clear</button>` : "";
+function bindChips(f, box) {
+  box.querySelectorAll(".cw-chips").forEach(el => {
+    const prop = el.dataset.prop;
+    el.querySelectorAll("[data-cwdel]").forEach(b => b.onclick = e => { e.stopPropagation(); PT.chipHover = null; checkpointPart(); f[prop].splice(+b.dataset.cwdel, 1); changedPart(); });
+    el.querySelectorAll(".cw-chip").forEach(ch => {
+      ch.onmouseenter = () => { PT.chipHover = (f[prop] || [])[+ch.dataset.i] || null; drawSelection(); };
+      ch.onmouseleave = () => { PT.chipHover = null; drawSelection(); };
+    });
+  });
+  box.querySelectorAll("[data-cwclear]").forEach(b => b.onclick = e => { e.stopPropagation(); checkpointPart(); f[b.dataset.cwclear] = []; changedPart(); });
+}
+/** Long explanations of the command window folded under "About" (kept open for the session once opened). */
+function foldHelp(box) {
+  box.querySelectorAll(".cw-sec-body p.hint").forEach(p => {
+    if (p.classList.contains("cw-hint") || p.classList.contains("err") || p.textContent.length < 140) return;
+    const d = document.createElement("details");
+    d.className = "cw-help";
+    d.open = !!PT.helpOpen;
+    d.innerHTML = "<summary>About</summary>";
+    p.replaceWith(d);
+    d.appendChild(p);
+    d.addEventListener("toggle", () => { PT.helpOpen = d.open; });
+  });
+}
+/** Active step changed without redrawing the window (a field of a value section got the focus). */
+function activateStep(i, box) {
+  const c = PT.cmd, f = c && feat(c.id);
+  if (!f) return;
+  const steps = commandSteps(f);
+  c.step = i; c.pick = null;
+  if (steps[i].enter) steps[i].enter(f);
+  box.querySelectorAll(".cw-sec").forEach(sec => sec.classList.toggle("active", +sec.dataset.step === i));
+  box.querySelectorAll(".cw-hint").forEach(el => el.remove());
+  scheduleBuild();
+}
+/** Command window inside the view at its stored place (localStorage "pt-cmdwin-pos"). */
+function placeCmdWin() {
+  const w = $("#pt-cmdwin"), v = $("#pt-view");
+  if (!w || !v) return;
+  let pos = PT.cmdPos;
+  if (!pos) { try { pos = JSON.parse(localStorage.getItem("pt-cmdwin-pos") || "null"); } catch (e) { pos = null; } }
+  pos = pos || { x: 12, y: 12 };
+  const maxX = Math.max(0, v.clientWidth - w.offsetWidth - 4), maxY = Math.max(0, v.clientHeight - 60);
+  pos = { x: Math.min(Math.max(0, pos.x), maxX), y: Math.min(Math.max(0, pos.y), maxY) };
+  PT.cmdPos = pos;
+  w.style.left = pos.x + "px"; w.style.top = pos.y + "px";
+}
+function bindCmdWin() {
+  const head = $("#pt-cmdwin-head");
+  if (!head) return;
+  $("#pt-cmdwin-x").onclick = cancelCommand;
+  head.addEventListener("mousedown", e => {
+    if (e.button !== 0 || e.target.closest("button")) return;
+    const w = $("#pt-cmdwin"), x0 = e.clientX, y0 = e.clientY, p0 = { x: w.offsetLeft, y: w.offsetTop };
+    const move = ev => { PT.cmdPos = { x: p0.x + ev.clientX - x0, y: p0.y + ev.clientY - y0 }; placeCmdWin(); };
+    const up = () => {
+      window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up);
+      try { localStorage.setItem("pt-cmdwin-pos", JSON.stringify(PT.cmdPos)); } catch (err) { /* kept for this session */ }
+    };
+    window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
+    e.preventDefault();
+  });
 }
 
 // ------------------------------------------------------------------ legacy parameter panels (one-step commands)
 
+function pendingText(st) {
+  const f = PT.cmd && feat(PT.cmd.id), stl = f && f.type === "import" && /\.stl$/i.test(f.path || "");
+  return st.pending ? `<p class="hint">Building…${stl ? " (an STL file with many triangles can take a minute or more)" : ""}</p>` : "";
+}
 function resultText(st) {
+  if (st.pending) return pendingText(st);
   if (st.error) return `<p class="hint err">${pesc(st.error)}</p>`;
-  if (st.faces === undefined) return "";
+  if (st.faces === undefined) return st.note ? `<p class="hint">${pesc(st.note)}</p>` : "";
   let t = `<p class="hint">Result: ${st.faces_before} → ${st.faces} faces, ${st.edges_before} → ${st.edges} edges`;
   if (st.note) t += `. ${pesc(st.note)}`;
   return t + "</p>";
 }
 /** Pick buttons of the legacy panels: a pick in the view into f[prop] with the given element kind. */
 function pickButtons(f, kind, prop, single, title, label) {
+  if (kind === "face" && !single) return pickButtonsCore(f, kind, prop, single, title, label) + faceModeHtml() + boxToolsHtml();
+  if (!single) return pickButtonsCore(f, kind, prop, single, title, label) + boxToolsHtml();
+  return pickButtonsCore(f, kind, prop, single, title, label);
+}
+function pickButtonsCore(f, kind, prop, single, title, label) {
   const active = PT.cmd && PT.cmd.pick && PT.cmd.pick.prop === prop;
   const n = single ? (f[prop] ? 1 : 0) : (f[prop] || []).length;
   return `<div class="buttons"><button type="button" data-pick="${prop}" class="${active ? "" : "primary"}">${active ? "Done picking" : label}</button>` +
     (single ? "" : `<button type="button" data-clear="${prop}">Clear</button>`) + `<span class="hint">${n} selected</span></div>`;
 }
 function bindPicks(f, box, defs) {
+  bindFaceMode(box);
   // a click in the view feeds the first pick of the panel without pressing its pick button first
   if (PT.cmd && PT.cmd.id === f.id) PT.cmd.legacyDefs = defs;
   box.querySelectorAll("button[data-pick]").forEach(b => {
@@ -2455,7 +3250,7 @@ function patternBodyChecks(f) {
   const n = st.solids_before !== undefined ? st.solids_before : PT.solids.length;
   const sel = new Set((f.bodies || []).map(b => (typeof b === "object" ? b.solid : b)));
   if (!n) return '<p class="hint">No solids.</p>';
-  return PT.solids.slice(0, n).map((s, i) => `<label class="check"><input type="checkbox" data-pb="${i}"${sel.has(i) ? " checked" : ""}> Solid ${i + 1} (${pfmt(s.volume_mm3 / 1000, 2)} cm^3)</label>`).join("") +
+  return PT.solids.slice(0, n).map((s, i, a) => `<label class="check"><input type="checkbox" data-pb="${i}"${sel.has(i) ? " checked" : ""}> ${solidLabel(i, volTexts(a.map(x => x.volume_mm3)))}</label>`).join("") +
     (PT.solids.length < n ? Array.from({ length: n - PT.solids.length }, (_, k) => `<label class="check"><input type="checkbox" data-pb="${PT.solids.length + k}"${sel.has(PT.solids.length + k) ? " checked" : ""}> Solid ${PT.solids.length + k + 1}</label>`).join("") : "");
 }
 const LEGACY_DEFAULTS = {
@@ -2505,20 +3300,24 @@ const LEGACY_PANELS = {
     const isStl = /\.stl$/i.test(f.path || ""), so = f.stl || {};
     box.innerHTML = `<label>STEP or STL file path on this PC<span class="row"><input type="text" id="pf-path" value="${pesc(f.path || "")}" placeholder="C:\\...\\part.step"><button type="button" id="pf-browse" class="browse" title="Choose the file">…</button></span></label>` +
       (isStl ? `<p class="hint" style="margin-bottom:2px">STL</p>` +
-        check("pf-sfit", "Fit cylinders, cones and spheres to curved areas", so.fit !== false) +
+        select("pf-smode", "Import as", [["solid", "Solid (converted faces)"], ["rough", "Rough mesh (surface body for measuring and tracing, fast)"]], so.mode === "rough" ? "rough" : "solid") : "") +
+      (isStl && so.mode === "rough" ? `<div class="grid2">` + num("pf-smax", "Max triangles (larger meshes are reduced)", so.max_triangles || 20000) + `<span></span></div>` +
+        `<p class="hint">The triangles of the STL (reduced by merging the vertices in grid cells when there are more than the maximum) are planar faces of a surface body. It is shown opaque, can be measured (Measure: a click on it picks a point) and its section shows in sketches. No solid is made: Extrude, Cut and the other solid features do not use it.</p>` + resultText(PT.status[f.id] || {}) : "") +
+      (isStl && so.mode !== "rough" ? check("pf-sfit", "Fit cylinders, cones and spheres to curved areas", so.fit !== false) +
         `<div class="grid2">` + num("pf-stol", "Tolerance (mm, 0: 1/1000 of the size)", so.tolerance || 0) + num("pf-sang", "Flat face: angle between triangles (deg)", so.angle || 0.5) + `</div>` +
         `<div class="grid2">` + num("pf-ssmooth", "Curved area: angle between neighbouring triangles (deg)", so.smooth || 30) + `<span></span></div>` +
         `<p class="hint">The closed mesh is converted to a solid: triangles in one plane within the tolerance form one planar face; with fitting, smooth curved areas that a cylinder, cone or sphere fits within the tolerance form one face (closed cylinders and cones in two halves); other curved areas stay as flat facets. The edges between the faces are the intersection curves of their surfaces.</p>` : "") +
+      (isStl && so.mode === "rough" ? "" : (
       (isStl ? "" : `<label>Solid in the file<input type="text" id="pf-partidx" value="${f.part === null || f.part === undefined ? "" : pesc(f.part)}" placeholder="empty: all solids; or an index 0, 1, ..."></label>`) +
       `<p class="hint" style="margin-bottom:2px">Clean-up</p>` +
       check("pf-crebuild", "Rebuild faces on the wrong range of a periodic surface (torus, cylinder, cone, sphere)", !!cl.rebuild) +
       check("pf-cfix", "Fix topology, tolerances and edge curves on faces", !!cl.fix) +
       check("pf-cunify", "Merge coplanar faces and collinear edges", !!cl.unify) +
       `<div class="grid2">` + num("pf-cminvol", "Remove solids below (mm^3, 0: off)", cl.min_volume || 0) + `<span></span></div>` + resultText(PT.status[f.id] || {}) +
-      `<p class="hint">Each clean-up step is kept only when the solid stays one solid, its volume changes by less than 1 % (rebuilt faces: 5 %) and it does not make a valid solid invalid. The result line gives the invalid solids and faces before and after. The imported solids are the base geometry; partitions and the other features apply to them.</p>`;
+      `<p class="hint">Each clean-up step is kept only when the solid stays one solid, its volume changes by less than 1 % (rebuilt faces: 5 %) and it does not make a valid solid invalid. The result line gives the invalid solids and faces before and after. The imported solids are the base geometry; partitions and the other features apply to them.</p>`));
     const setClean = (k, v) => { f.clean = Object.assign({}, f.clean || {}, { [k]: v }); };
     const setStl = (k, v) => { f.stl = Object.assign({ fit: true }, f.stl || {}, { [k]: v }); };
-    bindAll(box, { "#pf-sfit": el => setStl("fit", el.checked), "#pf-stol": el => setStl("tolerance", Math.max(0, numv(el.value) || 0)),
+    bindAll(box, { "#pf-smode": el => setStl("mode", el.value), "#pf-smax": el => setStl("max_triangles", Math.max(100, Math.round(numv(el.value) || 20000))), "#pf-sfit": el => setStl("fit", el.checked), "#pf-stol": el => setStl("tolerance", Math.max(0, numv(el.value) || 0)),
                    "#pf-sang": el => { const v = numv(el.value); if (v > 0) setStl("angle", v); }, "#pf-ssmooth": el => { const v = numv(el.value); if (v > 0) setStl("smooth", v); } });
     bindAll(box, { "#pf-path": el => { f.path = el.value.trim(); if (/\.stl$/i.test(f.path) && !f.stl) f.stl = { fit: true }; }, "#pf-partidx": el => { const v = el.value.trim(); f.part = v === "" ? null : v; },
                    "#pf-crebuild": el => setClean("rebuild", el.checked), "#pf-cfix": el => setClean("fix", el.checked), "#pf-cunify": el => setClean("unify", el.checked),
@@ -2676,13 +3475,17 @@ async function editSketch(id, isNew, section, resume) {
   if (!f) return;
   const sec = section !== undefined ? (f.sections || [])[section] : null;
   if (!sec && f.type !== "sketch") { if (f.sketch_ref) editSketch(f.sketch_ref); return; }
+  // the command bar is closed before the reference geometry is read (a slow read with many bodies left the bar
+  // of the finished command on screen)
+  if (PT.cmd && PT.cmd.id === id) { resume = resume || PT.cmd.resume; PT.cmd = null; }
+  if (!PT.cmd) { PT.sel = id; renderProps(); }
+  msgPart("Sketch editor: reading the reference geometry");
   let refs = [];
   try {
     const r = await postJSON("/api/part/refs", { part: PT.part, index: featIndex(id), path: false, section: section === undefined ? null : section });
     refs = await r.json();
   } catch (e) { /* reference geometry is optional */ }
   const title = sec ? `${f.name}: section ${section + 1} on ${planeName(sec.plane || "XY")}, offset ${pfmt(+sec.offset || 0)} mm` : `${f.name} on ${planeSummary(f)}`;
-  if (PT.cmd && PT.cmd.id === id) { resume = resume || PT.cmd.resume; PT.cmd = null; }
   sketchEditForPart(sec ? sec.sketch : f.sketch, refs, title, sk => {
     if (sk) { if (sec) sec.sketch = sk; else f.sketch = sk; PT.dirty = true; }
     else if (isNew && !sec && !(f.sketch.entities || []).length) {
@@ -2721,6 +3524,16 @@ function dimName(row) {
 }
 function currentValue(row) { return row.prop ? row.f[row.prop] : row.d.value; }
 
+/** Configurations section of the side panel: folded by default (localStorage "pt-cfg-open"). */
+function bindConfigFold() {
+  const h = $("#pt-cfg-toggle"), box = $("#pt-configs");
+  if (!h || !box) return;
+  let open = false;
+  try { open = localStorage.getItem("pt-cfg-open") === "1"; } catch (e) { /* folded */ }
+  const show = () => { box.hidden = !open; h.querySelector(".fold").textContent = open ? "▾" : "▸"; };
+  h.onclick = () => { open = !open; try { localStorage.setItem("pt-cfg-open", open ? "1" : "0"); } catch (e) { /* this session */ } show(); };
+  show();
+}
 function renderConfigs() {
   const box = $("#pt-configs");
   if (!box) return;
@@ -2820,7 +3633,6 @@ function loadPart(p) {
   PT.dirty = false;
   if (PT.three) PT.three.zoomed = false;
   if (FM) FM.render();
-  $("#pt-cmdbar").hidden = true;
   renderTree();
   renderProps();
   renderConfigs();
@@ -2898,10 +3710,10 @@ window.__partLoadNamed = async function (name) {
 };
 window.__partSetName = name => { if (PT.part) { PT.part.name = name; if (FM) FM.markSaved(name); } };
 window.__partRefresh = refreshList;
-/** Assembly tab: a new (unsaved) part whose base geometry is one solid of a STEP file (Import STEP feature). */
+/** Assembly tab: a new (unsaved) part whose base geometry is one solid of a STEP file (Import geometry feature). */
 window.__partNewFromStep = function (name, path, index) {
   const p = blankPart(name);
-  p.features.push({ id: "f" + (p.next++), name: "Import STEP 1", type: "import", suppressed: false, path, part: index === undefined ? null : index, clean: { rebuild: true, fix: true, unify: false, min_volume: 0 } });
+  p.features.push({ id: "f" + (p.next++), name: "Import geometry 1", type: "import", suppressed: false, path, part: index === undefined ? null : index, clean: { rebuild: true, fix: true, unify: false, min_volume: 0 } });
   loadPart(p);
   if (FM) FM.markUnsaved();
 };
@@ -2915,6 +3727,7 @@ window.partShown = function () {
 };
 
 (function bindPart() {
+  loadLast();
   document.querySelectorAll("#tab-part [data-add]").forEach(b => b.onclick = () => startCommand(b.dataset.add, b.dataset.init ? JSON.parse(b.dataset.init) : null));
   document.querySelectorAll("#tab-part [data-view]").forEach(b => b.onclick = () => view(b.dataset.view));
   $("#pt-measure-btn").onclick = () => setMeasure(!PT.measure);
@@ -2925,9 +3738,9 @@ window.partShown = function () {
   $("#pt-planes").onchange = () => setMesh(PT.mesh);
   $("#pt-axes").onchange = () => setMesh(PT.mesh);
   $("#pt-showsketch").onchange = () => setMesh(PT.mesh);
-  $("#pt-cmdfinish").onclick = () => finishCommand();
-  $("#pt-props").addEventListener("focusout", () => setTimeout(() => { const box = $("#pt-props"); if (PT.pendingRender && !(document.activeElement && box.contains(document.activeElement))) { PT.pendingRender = false; if (PT.cmd) renderCommand(); } }, 0));
-  $("#pt-cmdcancel").onclick = cancelCommand;
+  $("#pt-cmdbody").addEventListener("focusout", () => setTimeout(() => { const box = $("#pt-cmdbody"); if (PT.pendingRender && !(document.activeElement && box.contains(document.activeElement))) { PT.pendingRender = false; if (PT.cmd) renderCommand(); } }, 0));
+  bindCmdWin();
+  bindConfigFold();
   FM = docFileMenu({ pre: "pt", type: "part", label: "part", pane: "#tab-part", listUrl: "/api/part/list",
     cur: () => (PT.part ? { name: PT.part.name, dirty: !!PT.dirty } : null),
     load: async name => loadPart(await (await api("/api/part/file/" + encodeURIComponent(name))).json()),
@@ -2964,7 +3777,7 @@ window.partShown = function () {
   window.addEventListener("beforeunload", e => { if (PT.dirty) { e.preventDefault(); e.returnValue = ""; } });
 })();
 // exposed for tests
-window.__part = { PT, feat, THREE, loadPart, setMesh, viewXdir, setMeasure, measureClick, startCommand, finishCommand, cancelCommand, gotoStep, selectItem, pickAt, commandSteps, changedPart, viewDir, hoverText };
+window.__part = { PT, feat, showOnlyBody, showAllBodies, boxHits, selectShown, addHits, activePick, THREE, loadPart, setMesh, viewXdir, setMeasure, measureClick, startCommand, finishCommand, cancelCommand, gotoStep, nextStep, selectItem, pickAt, commandSteps, changedPart, viewDir, hoverText };
 
 // ------------------------------------------------------------------ mesh preview
 

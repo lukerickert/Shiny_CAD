@@ -13,7 +13,8 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 THIRD_PARTY = ("inp2rad.py", "inertia_calc.py", "inp_to_linear.py")         # drawgen/explicit: kept unchanged
 PY = sorted(glob.glob(os.path.join(ROOT, "drawgen", "*.py"))) + [os.path.join(ROOT, "run.py")] + \
-    sorted(p for p in glob.glob(os.path.join(ROOT, "drawgen", "explicit", "*.py")) if os.path.basename(p) not in THIRD_PARTY)
+    sorted(p for p in glob.glob(os.path.join(ROOT, "drawgen", "explicit", "*.py")) if os.path.basename(p) not in THIRD_PARTY) + \
+    sorted(glob.glob(os.path.join(ROOT, "drawgen", "cam", "*.py")))
 JS = sorted(glob.glob(os.path.join(ROOT, "drawgen", "static", "*.js")))
 HTML = os.path.join(ROOT, "drawgen", "static", "index.html")
 
@@ -66,6 +67,10 @@ def test_js_ids_exist_in_html():
 def test_cross_module_names():
     """module.name used in one drawgen module exists in the other module."""
     mods = {os.path.basename(f)[:-3]: f for f in PY if "drawgen" in f}
+    for pkg in ("cam", "explicit"):                           # a package is imported in place of a module of its name
+        init = os.path.join(ROOT, "drawgen", pkg, "__init__.py")
+        if os.path.exists(init):
+            mods[pkg] = init
     top = {}
     for m, f in mods.items():
         t = ast.parse(open(f, encoding="utf-8").read())

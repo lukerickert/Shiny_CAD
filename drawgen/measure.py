@@ -76,6 +76,39 @@ def item_from_face(face, name=""):
     return it
 
 
+def item_from_edge(edge, name=""):
+    """Item of a placed edge: kind line (straight: p start, q end, n direction, length), circle (c centre, n axis, r,
+    length) or other (c midpoint, length); "shape" the edge for the minimum distance."""
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.GeomAbs import GeomAbs_Circle, GeomAbs_Line
+    from OCP.GCPnts import GCPnts_AbscissaPoint
+    from build123d import Edge
+    e = edge if hasattr(edge, "wrapped") else Edge(edge)
+    ad = BRepAdaptor_Curve(e.wrapped)
+    u0, u1 = ad.FirstParameter(), ad.LastParameter()
+    P = lambda u: [ad.Value(u).X(), ad.Value(u).Y(), ad.Value(u).Z()]
+    length = GCPnts_AbscissaPoint.Length_s(ad)
+    it = {"kind": "other", "name": name, "c": P((u0 + u1) / 2), "length": length, "shape": e.wrapped, "edge": True}
+    t = ad.GetType()
+    if t == GeomAbs_Line:
+        a, b = P(u0), P(u1)
+        it.update(kind="line", p=a, q=b, n=_norm(_sub(b, a)))
+    elif t == GeomAbs_Circle:
+        ci = ad.Circle()
+        L, D = ci.Location(), ci.Axis().Direction()
+        it.update(kind="circle", c=[L.X(), L.Y(), L.Z()], p=[L.X(), L.Y(), L.Z()], n=[D.X(), D.Y(), D.Z()], r=ci.Radius(),
+                  sweep=math.degrees(abs(u1 - u0)))
+    return it
+
+
+def item_from_point(p, name=""):
+    """Item of a point (a vertex): kind point with a vertex shape."""
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
+    from OCP.gp import gp_Pnt
+    q = [float(v) for v in p][:3]
+    return {"kind": "point", "name": name, "c": q, "shape": BRepBuilderAPI_MakeVertex(gp_Pnt(*q)).Vertex()}
+
+
 def _shape_of(it, size):
     """OCC shape of an item for the minimum distance: the face, or a large plane face / long edge for a reference
     plane or axis."""
@@ -105,6 +138,25 @@ def describe(it):
     elif k == "plane":
         rows.append(["Plane" if it.get("shape") is None else "Planar face", "normal " + vec(it["n"])])
         rows.append(["Point" if it.get("shape") is None else "Centre", vec(it["c"])])
+    elif k == "point":
+        rows.append(["Point", vec(it["c"])])
+        return rows
+    elif k == "line":
+        rows.append(["Straight edge", "length " + mm(it["length"])])
+        rows.append(["Direction", vec(it["n"])])
+        rows.append(["Start", vec(it["p"])])
+        rows.append(["End", vec(it["q"])])
+        return rows
+    elif k == "circle":
+        rows.append(["Circular edge", "Ø " + mm(2 * it["r"]) + " (R " + mm(it["r"]) + ")"])
+        rows.append(["Centre", vec(it["c"])])
+        rows.append(["Axis direction", vec(it["n"])])
+        rows.append(["Arc", deg(it.get("sweep", 360.0)) + ", length " + mm(it["length"])])
+        return rows
+    elif k == "other" and it.get("edge"):
+        rows.append(["Edge", "length " + mm(it["length"])])
+        rows.append(["Midpoint", vec(it["c"])])
+        return rows
     elif k == "axis":
         rows.append(["Axis", "direction " + vec(it["n"])])
         rows.append(["Point", vec(it.get("p") or it["c"])])
@@ -146,7 +198,7 @@ def measure(a, b=None):
             points = [[pa.X(), pa.Y(), pa.Z()], [pb.X(), pb.Y(), pb.Z()]]
             rows.append(["Minimum distance", mm(ex.Value())])
     ka, kb = a["kind"], b["kind"]
-    line = lambda k: k in ("cylinder", "axis")
+    line = lambda k: k in ("cylinder", "axis", "line", "circle")
     if ka == "plane" and kb == "plane":
         na, nb = _norm(a["n"]), _norm(b["n"])
         cosv = max(-1.0, min(1.0, _dot(na, nb)))
@@ -158,10 +210,11 @@ def measure(a, b=None):
         da, db = _norm(a["n"]), _norm(b["n"])
         pa, pb = a.get("p") or a["c"], b.get("p") or b["c"]
         ang = math.degrees(math.acos(min(1.0, abs(_dot(da, db)))))
-        rows.append(["Angle between the axes", deg(ang)])
+        w = "lines" if ka == kb == "line" else "line and the axis" if "line" in (ka, kb) else "axes"
+        rows.append(["Angle between the " + w, deg(ang)])
         dist, q1, q2 = _line_line(pa, da, pb, db)
-        rows.append(["Distance between the axes" if _len(_cross(da, db)) < TOL_PAR else "Shortest distance between the axes", mm(dist)])
-        if ka == "cylinder" and kb == "cylinder":
+        rows.append(["Distance between the " + w if _len(_cross(da, db)) < TOL_PAR else "Shortest distance between the " + w, mm(dist)])
+        if ka in ("cylinder", "circle") and kb in ("cylinder", "circle"):
             rows.append(["Diameters", "Ø %.4f mm, Ø %.4f mm" % (2 * a["r"], 2 * b["r"])])
             if _len(_cross(da, db)) < TOL_PAR:
                 rows.append(["Axis distance minus both radii", mm(dist - a["r"] - b["r"])])
@@ -169,12 +222,21 @@ def measure(a, b=None):
         pl, ln = (a, b) if ka == "plane" else (b, a)
         n, d = _norm(pl["n"]), _norm(ln["n"])
         s = abs(_dot(n, d))
-        rows.append(["Angle between the axis and the plane", deg(math.degrees(math.asin(min(1.0, s))))])
+        w = "edge" if ln["kind"] == "line" else "axis"
+        rows.append(["Angle between the %s and the plane" % w, deg(math.degrees(math.asin(min(1.0, s))))])
         if s < TOL_PAR:
             dist = abs(_dot(_sub(ln.get("p") or ln["c"], pl["c"]), n))
-            rows.append(["Distance from the axis to the plane", mm(dist)])
-            if ln["kind"] == "cylinder":
+            rows.append(["Distance from the %s to the plane" % w, mm(dist)])
+            if ln["kind"] in ("cylinder", "circle"):
                 rows.append(["Axis distance minus radius", mm(dist - ln["r"])])
+    elif "point" in (ka, kb) and (ka in ("plane",) or kb in ("plane",) or line(ka) or line(kb)):
+        pt, o = (a, b) if ka == "point" else (b, a)
+        if o["kind"] == "plane":
+            rows.append(["Distance from the point to the plane", mm(abs(_dot(_sub(pt["c"], o["c"]), _norm(o["n"]))))])
+        else:
+            dl = _norm(o["n"])
+            v = _sub(pt["c"], o.get("p") or o["c"])
+            rows.append(["Distance from the point to the " + ("line" if o["kind"] == "line" else "axis"), mm(_len(_sub(v, [_dot(v, dl) * x for x in dl])))])
     d = _sub(b["c"], a["c"])
     rows.append(["Distance between the centres", mm(_len(d)) + "  dx %.4f, dy %.4f, dz %.4f" % tuple(d)])
     return {"rows": rows, "points": points}
@@ -185,5 +247,9 @@ def label(it):
     k = it["kind"]
     if it.get("shape") is None:
         return it.get("name") or k
-    kind = {"plane": "planar face", "cylinder": "cylinder Ø %.4f mm" % (2 * it.get("r", 0)), "other": "face"}.get(k, k)
+    if k == "point":
+        return (it.get("name") or "point") + " " + vec(it["c"])
+    kind = {"plane": "planar face", "cylinder": "cylinder Ø %.4f mm" % (2 * it.get("r", 0)),
+            "line": "straight edge %.4f mm" % it.get("length", 0), "circle": "circular edge Ø %.4f mm" % (2 * it.get("r", 0)),
+            "other": "edge %.4f mm" % it.get("length", 0) if it.get("edge") else "face"}.get(k, k)
     return (it.get("name") + " : " if it.get("name") else "") + kind

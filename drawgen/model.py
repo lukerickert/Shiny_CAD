@@ -79,7 +79,7 @@ _STEP_SOLIDS = {}   # (path, mtime, size) -> (compound, [(name, solid)])
 def step_solids(path):
     """Solids of a STEP file as (name, build123d Shape), indexed and named as load_step lists them, and the compound
     of all solids. The file is read once per path, modification time and size; used by the assembly components and
-    the Import STEP feature of parts, so a solid index means the same solid everywhere."""
+    the Import geometry feature of parts, so a solid index means the same solid everywhere."""
     from build123d import Shape
     st = os.stat(path)
     key = (os.path.normcase(os.path.abspath(path)), st.st_mtime, st.st_size)

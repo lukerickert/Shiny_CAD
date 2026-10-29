@@ -356,7 +356,7 @@ def plate_solid(p, placed_shape):
         if len(pts) < 3:
             raise AnalysisError("plate %s: at least 3 outline points" % name)
         c = pts.mean(0)
-        _, sv, vt = np.linalg.svd(pts - c)
+        _, sv, vt = np.linalg.svd(pts - c, full_matrices=False)
         n = vt[2]
         size = float(np.ptp(pts, axis=0).max()) or 1.0
         if np.abs((pts - c) @ n).max() > 1e-6 * size + 1e-6:

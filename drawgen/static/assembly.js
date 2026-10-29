@@ -1122,7 +1122,7 @@ function showCompMenu(cid, x, y) {
     null] : [];
   const items = multiItems.concat([
     [c.fixed ? "Unfix (moved by mates)" : "Fix in space", () => { c.fixed = !c.fixed; changedAsm(false); status(c.name + (c.fixed ? " fixed" : " not fixed")); }],
-    [src.type === "part" ? "Open part " + src.name + " in the Part tab" : "Open in the Part tab (new part, Import STEP)", () => openInPart(c)],
+    [src.type === "part" ? "Open part " + src.name + " in the Part tab" : "Open in the Part tab (new part, Import geometry)", () => openInPart(c)],
     null,
     [`Show only ${c.name} and the components mated to it`, () => isolateComps(cid, false), !ms.length],
     ["Show only the connected components (also through other components; not continued through fixed ones)", () => isolateComps(cid, true), !ms.length],

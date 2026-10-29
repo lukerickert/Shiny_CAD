@@ -1,7 +1,7 @@
 // Toolbar icons: 24 x 24 line drawings (stroke currentColor). Applied to the Part tab command buttons
 // ([data-add], key = data-add or the kind in data-init), the Sketch tool and constraint buttons ([data-tool], [data-con]:
 // key con_<name>), the Drawings tool buttons ([data-tool]; the Sketch tool: key ann_sketch) and the Assembly and Analysis
-// buttons ([data-icon]).
+// buttons ([data-icon]) and the CAM buttons ([data-icon]).
 (function () {
   const S = 'fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"';
   const F = 'fill="currentColor" stroke="none"';
@@ -138,6 +138,46 @@
     mate_tangent: `<circle cx="12" cy="10" r="6" ${S}/><path ${S} d="M3 16 H21"/><circle cx="12" cy="16" r="1.5" ${F}/>`,
     mate_gear: `<circle cx="8" cy="12" r="4.5" ${S}/><circle cx="17" cy="12" r="3" ${S}/><path ${S} d="M8 5.5 V7.5 M8 16.5 V18.5 M1.5 12 H3.5 M3.4 7.4 L4.8 8.8 M3.4 16.6 L4.8 15.2 M17 7.5 V9 M17 15 V16.5 M20.5 12 H22"/>`,
     mate_point: `<path ${S} d="M12 3 V8.5 M12 15.5 V21 M3 12 H8.5 M15.5 12 H21"/><circle cx="12" cy="12" r="2.6" ${F}/>`,
+    // ---- CAM
+    cam_place: `<path ${S} d="M3 21 L9 15 H21 L15 21 Z"/>${box(8, 3, 8, 7, 3)}<path ${D} d="M12 13 V16"/><path ${S} d="M20 4 A5 5 0 0 1 21 9 M19.6 7.6 L21 9 L22.6 7.6"/>`,
+    cam_thread: `<path ${S} d="M7 3 V21 M17 3 V21"/><path ${S} d="M7 5 L17 8 M7 9 L17 12 M7 13 L17 16 M7 17 L17 20"/>`,
+    cam_dr_axismap: `<ellipse cx="12" cy="12" rx="4" ry="8" ${S}/><path ${S} d="M12 4 H21 M12 20 H21"/><path ${S} d="M3 12 H8 M6 10 L8 12 L6 14"/>`,
+    cam_hop: `<path ${S} d="M3 19 H8 V7 H16 V19 H21"/><path ${S} d="M10 5 L12 3 L14 5"/>`,
+    cam_probe: `<path ${S} d="M10 3 H14 V14 H10 Z M12 14 V19"/><circle cx="12" cy="20" r="1.5" ${F}/><path ${S} d="M3 22 H21"/>`,
+    cam_machine: `<path ${S} d="M2 20 H22 M4 20 V9 H20 V20 M4 9 V6 H20 V9"/><path ${S} d="M10 9 V14 H14 V9 M12 14 V17"/>`,
+    cam_refresh: `<path ${S} d="M19 8 A8 8 0 1 0 20 14"/><path ${S} d="M20 3 V8 H15"/>`,
+    cam_zero: `${box(3, 9, 12, 10, 4)}<circle cx="3" cy="13" r="2" ${F}/><path ${S} d="M3 13 H11 M3 13 V5 M3 13 L0.5 15.5"/><path ${S} d="M9 11 L11 13 L9 15 M1 7 L3 5 L5 7"/>`,
+    cam_face: `<path ${S} d="M3 15 L8 10 H21 L16 15 Z M3 15 V19 H16 V15 M16 19 L21 14 V10"/><path ${S} d="M6 8 V3 M6 8 L8 6 M6 8 L4 6"/><path ${D} d="M5 12.5 H17 M7 11 H19"/>`,
+    cam_profile: `<path ${S} d="M6 6 H18 V18 H6 Z"/><path ${D} d="M3 3 H21 V21 H3 Z"/><circle cx="21" cy="12" r="1.8" ${F}/>`,
+    cam_pocket: `<path ${S} d="M3 5 H21 V19 H3 Z M7 9 H17 V15 H7 Z"/><path ${D} d="M9 11 H15 M9 13 H15"/>`,
+    cam_adaptive: `<path ${S} d="M3 4 H21 V20 H3 Z"/><path ${S} d="M12 12 C12 10 15 10 15 12 C15 15 9 15 9 12 C9 8 18 8 18 12 C18 17 6 17 6 12"/>`,
+    cam_drilling: `<path ${S} d="M10 3 H14 V13 L12 17 L10 13 Z M10 6 L14 8 M10 9 L14 11"/><path ${S} d="M3 15 H8 M16 15 H21 M8 15 V21 H16 V15"/>`,
+    cam_helix: `<path ${S} d="M6 5 C6 3 18 3 18 5 C18 7 6 7 6 9 C6 11 18 11 18 13 C18 15 6 15 6 17 C6 19 18 19 18 21"/>`,
+    cam_slot: `<path ${S} d="M3 6 H21 V18 H3 Z"/><path ${S} d="M8 10 H16 A2 2 0 0 1 16 14 H8 A2 2 0 0 1 8 10 Z"/><path ${D} d="M8 12 H16"/>`,
+    cam_undercut: `<path ${S} d="M3 20 H21 M3 20 V12 H8 L11 7 H21 V20"/><path ${S} d="M14 4 H18 V9 L20 12 H12 L14 9 Z"/>`,
+    cam_engrave: `<path ${S} d="M3 19 H21"/><path ${S} d="M5 15 L8 7 L11 15 M6 12 H10 M14 7 V15 H18"/><path ${S} d="M17 3 L20 6 L15 11 L13 11 L13 9 Z"/>`,
+    cam_vcarve: `<path ${S} d="M3 8 H21"/><path ${S} d="M5 8 L12 19 L19 8"/><path ${D} d="M12 8 V19"/><path ${S} d="M10 2 H14 L12 5 Z"/>`,
+    cam_deburr: `<path ${S} d="M3 20 V9 L8 4 H21"/><path ${D} d="M3 9 V4 H8"/><path ${S} d="M14 9 L18 13 L14 17"/>`,
+    cam_pocket3d: `<path ${S} d="M3 6 H21 M3 6 V18 H21 V6"/><path ${S} d="M6 6 C7 15 17 15 18 6"/><path ${D} d="M8 9 H16 M9.5 12 H14.5"/>`,
+    cam_surface: `<path ${S} d="M3 16 Q8 6 12 11 T21 8"/><path ${D} d="M3 19 L6 13 M6 19 L9 11 M9 19 L12 12 M12 19 L15 11 M15 19 L18 9 M18 19 L21 9"/>`,
+    cam_waterline: `<path ${S} d="M4 20 C6 10 18 10 20 20"/><path ${S} d="M7 14 H17 M9 11 H15 M11 8 H13"/>`,
+    cam_dr_tag: `<path ${S} d="M3 15 H9 V11 H15 V15 H21"/><path ${D} d="M3 18 H21"/>`,
+    cam_dr_ramp: `<path ${S} d="M3 6 H8 L16 18 H21"/><path ${D} d="M8 6 V18"/>`,
+    cam_dr_leadinout: `<path ${S} d="M8 20 H20 V4 H8"/><path ${S} d="M8 20 A5 5 0 0 1 3 15 M8 4 A5 5 0 0 0 3 9"/>`,
+    cam_dr_dogbone: `<path ${S} d="M4 4 V20 H20"/><circle cx="7.5" cy="16.5" r="3" ${S}/><path ${D} d="M9 4 V15 H20"/>`,
+    cam_dr_boundary: `<path ${D} d="M5 5 H19 V19 H5 Z"/><path ${S} d="M2 12 H5 M19 12 H22 M5 12 C9 8 15 16 19 12"/>`,
+    cam_fixture: `<path ${S} d="M3 20 H21 M5 20 V16 H19 V20 M8 16 V12 H16 V16"/><path ${S} d="M12 4 V10 M9 7 H15"/>`,
+    cam_comment: `<path ${S} d="M4 5 H20 V16 H11 L6 20 V16 H4 Z"/><path ${S} d="M8 9 H16 M8 12 H14"/>`,
+    cam_stop: `<path ${S} d="M8 3 H16 L21 8 V16 L16 21 H8 L3 16 V8 Z"/><path ${S} d="M9 12 H15"/>`,
+    cam_custom: `<path ${S} d="M8 6 L3 12 L8 18 M16 6 L21 12 L16 18 M14 4 L10 20"/>`,
+    cam_simulate: `<path ${S} d="M3 18 H21 M3 18 V14 H9 V11 H21 V18"/><path ${S} d="M13 3 V8 M11 3 H15"/><path ${F} d="M13 8 L11.5 11 H14.5 Z"/>`,
+    cam_gcode: `<path ${S} d="M5 3 H15 L19 7 V21 H5 Z M15 3 V7 H19"/><path ${S} d="M8 11 H16 M8 14 H13 M8 17 H15"/>`,
+    cam_job: `<path ${S} d="M4 4 H20 V20 H4 Z"/><path ${S} d="M8 9 H16 M8 13 H16 M8 17 H12"/><circle cx="17" cy="17" r="1.6" ${F}/>`,
+    cam_folder: `<path ${S} d="M3 7 V19 H21 V9 H11 L9 7 Z"/>`,
+    cam_stock: `${box(3, 8, 13, 11, 5)}`,
+    cam_model: `${box(4, 9, 11, 10, 4)}<path ${D} d="M4 13 l4 -4"/>`,
+    cam_sheet: `<path ${S} d="M4 4 H20 V20 H4 Z M4 9 H20 M4 14 H20 M10 4 V20"/>`,
+    cam_tool: `<path ${S} d="M10 3 H14 V10 H10 Z M11 10 V19 L12 21 L13 19 V10 M11 13 L13 14 M11 16 L13 17"/>`,
     balloon: `<circle cx="12" cy="9" r="6" ${S}/><path ${S} d="M9 14 L5 21"/><text x="12" y="12" font-size="8" text-anchor="middle" fill="currentColor" font-family="sans-serif">1</text>`,
   };
   function icon(key) {
@@ -165,8 +205,11 @@
     apply("#tab-part", "data-icon", b => b.dataset.icon);
     apply("#tab-fea", "data-icon", b => b.dataset.icon);
     apply("#tab-xp", "data-icon", b => b.dataset.icon);
+    apply("#tab-cam", "data-icon", b => b.dataset.icon);
     apply("#tab-annotate", "data-tool", b => b.dataset.tool === "sketch" ? "ann_sketch" : b.dataset.tool);
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", applyAll); else applyAll();
   window.toolbarIcon = icon;
+  /** An icon as an inline SVG of size px (tree rows); "" for an unknown key. */
+  window.treeIcon = (key, px = 16) => { const body = ICONS[key]; return body ? `<svg class="tr-ico" viewBox="0 0 24 24" width="${px}" height="${px}" aria-hidden="true">${body}</svg>` : ""; };
 })();

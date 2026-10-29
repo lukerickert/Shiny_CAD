@@ -44,7 +44,7 @@ Installation
    Keep all files and folders together. start.bat does not run from inside the zip file.
 2. Double-click start.bat.
    The first start creates the Python environment in %LOCALAPPDATA%\drawgen\venv
-   and installs build123d, flask, ezdxf, reportlab and gmsh from requirements.txt.
+   and installs build123d, flask, ezdxf, reportlab, gmsh, shapely and fonttools from requirements.txt.
 3. The browser opens http://localhost:8765.
    Close the command window to stop the server.
 

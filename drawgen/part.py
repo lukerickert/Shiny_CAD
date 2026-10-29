@@ -505,7 +505,9 @@ def datum_frame(shape, bodies, datums, f):
 
 def resolve_plane(f, shape, bodies=None, datums=None):
     """Sets f["_frame"] for a feature whose sketch plane is "normal" (normal to an edge of the solid, plane_edge,
-    or to a curve body, plane_curve, at the fraction plane_t of the length; plane_flip reverses the normal) or
+    to a curve body, plane_curve, or to a curve of an earlier sketch, plane_sketch_curve {"sketch", "pick"}, at the
+    fraction plane_t of the length (sketch curve without plane_t: the end nearer the pick); plane_flip reverses the
+    normal) or
     "datum" (a plane feature, plane_ref)."""
     pl = f.get("plane")
     if pl == "normal" and f.get("plane_axis"):
@@ -513,6 +515,14 @@ def resolve_plane(f, shape, bodies=None, datums=None):
         o = ref_point(datums, f["plane_point"]) if f.get("plane_point") else ax["o"]
         d = [-v for v in ax["d"]] if f.get("plane_flip") else ax["d"]
         f["_frame"] = _frame_of(o, d)
+        return f["_frame"]
+    if pl == "normal" and f.get("plane_sketch_curve"):
+        # normal to a curve of an earlier sketch (the connected chain at the pick point); without plane_t at the
+        # end of the chain nearer the pick point
+        sc = f["plane_sketch_curve"]
+        curve = reference_curve(shape, bodies, None, None, {"sketch_curve": sc, "_sketch_curves": f.get("_sketch_curves")})
+        t = curve_t(curve, {"t": f.get("plane_t"), "sketch_curve": sc})
+        f["_frame"] = normal_frame(curve, t, bool(f.get("plane_flip")))
         return f["_frame"]
     if pl == "normal":
         curve = reference_curve(shape, bodies, f.get("plane_edge"), f.get("plane_curve"))
@@ -1125,7 +1135,7 @@ def _axis(f, plane, sketch):
     elif ax == "v":
         a, b = (0.0, 0.0), (0.0, 1.0)
     else:
-        e = next((x for x in sketch.get("entities") or [] if x.get("id") == ax and x["t"] == "line"), None)
+        e = next((x for x in sketch.get("entities") or [] if str(x.get("id")) == str(ax) and x["t"] == "line"), None)
         if e is None:
             raise ValueError("revolve axis line %s not found in the sketch" % ax)
         a, b = (e["x1"], e["y1"]), (e["x2"], e["y2"])
@@ -1161,8 +1171,33 @@ def _solid_of(f, faces, size):
     return out
 
 
-def _fuse(a, b):
-    return b if a is None else a.fuse(b).clean()
+def _cleaned(x):
+    """A Boolean result: build123d merges its coplanar faces and collinear edges in the operation itself
+    (SkipClean.clean); otherwise it is merged here."""
+    try:
+        from build123d.topology.shape_core import SkipClean
+        if SkipClean.clean:
+            return x
+    except ImportError:
+        pass
+    return x.clean()
+
+
+def _fuse(a, *b):
+    """a fused with the shapes b (a None: the shapes b fused), merged once."""
+    b = [x for x in b if x is not None]
+    if a is None:
+        if not b:
+            return None
+        a, b = b[0], b[1:]
+    if not b:
+        return a
+    return _cleaned(a.fuse(*b))
+
+
+def _bbox(shape):
+    """Bounding box from the control polygons (fast, up to a few per cent larger than the exact box): for sizes."""
+    return shape.bounding_box(optimal=False)
 
 
 # --------------------------------------------------------------------------- import, partition, clean-up
@@ -1172,6 +1207,8 @@ def _import(f):
     path, modification time and size (model.step_solids)."""
     import os
     path = (f.get("path") or "").strip().strip('"')
+    if not path:
+        raise ValueError("no file chosen: enter the STEP or STL file path or choose it with …")
     if not os.path.isfile(path):
         raise ValueError("file not found: %s" % path)
     if path.lower().endswith(".stl"):
@@ -1304,7 +1341,7 @@ def _clean_solid(so, opts, rep):
     less than 1 % (rebuilt faces: 5 %) and it is valid or the solid before the step was not."""
     from OCP.BRep import BRep_Tool
     from OCP.ShapeFix import ShapeFix_Shape
-    from OCP.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
+    from .occfix import CheckedUnify as ShapeUpgrade_UnifySameDomain
     from OCP.BRepLib import BRepLib
     from OCP.BRepCheck import BRepCheck_Analyzer
     from build123d import Shape
@@ -1364,6 +1401,21 @@ def _clean_solid(so, opts, rep):
         except Exception:
             pass
     return so
+
+
+_CLEAN_CACHE = {}     # cleaned import result per file (path, modification time, size), solid, STL and clean-up options
+
+
+def _import_key(f, cl):
+    import os
+    import json as _json
+    path = (f.get("path") or "").strip().strip('"')
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (os.path.abspath(path), st.st_mtime, st.st_size, str(f.get("part")), _json.dumps(f.get("stl") or {}, sort_keys=True),
+            _json.dumps(cl, sort_keys=True))
 
 
 def _clean_import(shape, opts):
@@ -1550,7 +1602,7 @@ def _hole_mesh(shape, f):
     from OCP.BRepExtrema import BRepExtrema_DistShapeShape
     from OCP.BRepAdaptor import BRepAdaptor_Surface
     from OCP.GeomAbs import GeomAbs_Plane
-    from OCP.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
+    from .occfix import CheckedUnify as ShapeUpgrade_UnifySameDomain
     from build123d import Compound, Shape
     picked = find_faces(shape, f.get("faces") or [])
     if not picked:
@@ -1833,17 +1885,126 @@ def _split(shape, f):
     return Compound(children=rest + new)
 
 
+def _outward(so):
+    """The solid with its faces oriented outward (a point far outside classified outside; otherwise reversed)."""
+    from OCP.BRepClass3d import BRepClass3d_SolidClassifier
+    from OCP.TopAbs import TopAbs_IN
+    from OCP.gp import gp_Pnt
+    from build123d import Shape, Vector
+    try:
+        bb = so.bounding_box()
+        q = bb.max + (bb.max - bb.min) + Vector(1, 1, 1)
+        cl = BRepClass3d_SolidClassifier(so.wrapped, gp_Pnt(q.X, q.Y, q.Z), 1e-7)
+        if cl.State() == TopAbs_IN or so.volume < 0:
+            r = Shape.cast(so.wrapped.Reversed())
+            return r.solids()[0] if hasattr(r, "solids") and r.solids() else r
+    except Exception:
+        pass
+    return so
+
+
+def _fixed(so):
+    from OCP.ShapeFix import ShapeFix_Shape
+    from build123d import Shape
+    try:
+        fx = ShapeFix_Shape(so.wrapped)
+        fx.Perform()
+        r = Shape.cast(fx.Shape())
+        sols = list(r.solids())
+        return _outward(sols[0]) if len(sols) == 1 else so
+    except Exception:
+        return so
+
+
+def _fuzzy_cut(t, tools, fuzzy=1e-5):
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from build123d import Shape
+    from .surfaces import _shape_list
+    try:
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
+        a, b = _shape_list(), _shape_list()
+        a.Append(BRepBuilderAPI_Copy(t.wrapped).Shape())
+        for u in tools:
+            b.Append(BRepBuilderAPI_Copy(u.wrapped).Shape())
+        op = BRepAlgoAPI_Cut()
+        op.SetArguments(a)
+        op.SetTools(b)
+        op.SetFuzzyValue(fuzzy)
+        op.Build()
+        if not op.IsDone():
+            return None
+        return Shape.cast(op.Shape()).clean()
+    except Exception:
+        return None
+
+
+def _sliver(so, min_t, min_v=0.0):
+    """(volume mm^3, mean thickness 2V/A mm) of a solid when it is below min_v or thinner than min_t, else None."""
+    try:
+        v, a = abs(so.volume), so.area
+    except Exception:
+        return None
+    t = 2 * v / a if a > 0 else 0.0
+    if v < min_v or (min_t > 0 and t < min_t):
+        return (v, t)
+    return None
+
+
+def _fuzzy_op(op, args, tools, fuzzy):
+    """Boolean "subtract" or "union" of build123d solids with a fuzzy value (mm); None when it fails."""
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
+    from build123d import Shape
+    from .surfaces import _shape_list
+    try:
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
+        a, b = _shape_list(), _shape_list()
+        # copies: a fuzzy Boolean raises the tolerances of its arguments, and the originals stay in the part
+        for x in args:
+            a.Append(BRepBuilderAPI_Copy(x.wrapped).Shape())
+        for u in tools:
+            b.Append(BRepBuilderAPI_Copy(u.wrapped).Shape())
+        bo = BRepAlgoAPI_Cut() if op == "subtract" else BRepAlgoAPI_Fuse()
+        bo.SetArguments(a)
+        bo.SetTools(b)
+        bo.SetFuzzyValue(fuzzy)
+        bo.Build()
+        if not bo.IsDone():
+            return None
+        return Shape.cast(bo.Shape()).clean()
+    except Exception:
+        return None
+
+
+def _common_volume(t, tools):
+    """Volume (mm^3) of the common part of the solid t and the tool solids, or None when it cannot be computed."""
+    try:
+        v = 0.0
+        for u in tools:
+            c = t.intersect(u)
+            if c is None:
+                continue
+            for x in (c if isinstance(c, (list, tuple)) else [c]):
+                if x is not None and hasattr(x, "solids"):
+                    v += sum(abs(so.volume) for so in x.solids())
+        return v
+    except Exception:
+        return None
+
+
 def _boolean(shape, f):
     """Boolean between solids of the part: "op": "union" | "subtract" | "intersect"; "targets" and "tools": solid
-    indices (order of shape.solids()); "keep_tools" keeps the tool solids as separate solids."""
+    indices (order of shape.solids()); "keep_tools" keeps the tool solids as separate solids. Result solids thinner
+    than "min_thickness" (mean thickness 2V/A, mm, default 0.01) or smaller than "min_volume" (mm^3, default 0) are
+    slivers: the Boolean is made again with a fuzzy value of min_thickness, and the slivers left are removed
+    ("keep_slivers": true keeps them). The note of the feature (f["_note"]) gives the slivers removed."""
     from build123d import Compound
     solids = list(shape.solids())
     n = len(solids)
     op = f.get("op") or "union"
     ti = [int(i) for i in f.get("targets") or [] if 0 <= int(i) < n]
     ui = [int(i) for i in f.get("tools") or [] if 0 <= int(i) < n and int(i) not in (f.get("targets") or [])]
-    T = [solids[i] for i in ti]
-    U = [solids[i] for i in ui]
+    T = [_outward(solids[i]) for i in ti]
+    U = [_outward(solids[i]) for i in ui]
     if op == "union":
         sel = T + U
         if len(sel) < 2:
@@ -1855,9 +2016,34 @@ def _boolean(shape, f):
         if not T or not U:
             raise ValueError("pick the target solid(s) and the tool solid(s)")
         new = []
+        vu = sum(abs(u.volume) for u in U)
         for t in T:
             if op == "subtract":
                 r = t.cut(*U).clean()
+                # the subtraction removes the common volume of target and tools: a result that lost more or less (a
+                # tool or target solid OpenCascade does not classify correctly, faces touching the tools) is made
+                # again with fixed solids and a fuzzy value; tools that do not overlap the target leave it as it is
+                vt = abs(t.volume)
+                vc = _common_volume(t, U)
+                tol = 1e-3 * max(vt, 1.0) + 1e-6
+                expect = (vt - vc) if vc is not None else None
+                bad = (expect is not None and abs(abs(r.volume) - expect) > tol) or \
+                      (expect is None and vt - abs(r.volume) > vu * 1.001 + 1e-6)
+                if bad:
+                    r2 = _fuzzy_cut(_fixed(t), [_fixed(u) for u in U])
+                    ok2 = r2 is not None and (abs(abs(r2.volume) - expect) <= tol if expect is not None
+                                              else vt - abs(r2.volume) <= vu * 1.001 + 1e-6)
+                    if ok2:
+                        r = r2
+                    elif vc is not None and vc <= 1e-6 * max(vt, 1.0):
+                        r = t
+                        f["_note"] = ((f.get("_note") + "; ") if f.get("_note") else "") + \
+                            "the tools do not overlap target solid %d: it is kept as it is" % (ti[T.index(t)] + 1)
+                    else:
+                        raise ValueError("the subtraction gives %.3f mm^3 instead of %.3f mm^3 (target %.3f mm^3, "
+                                         "common volume with the tools %s mm^3): a tool or the target is not a valid "
+                                         "closed solid (Inspect body)" % (abs(r.volume), expect if expect is not None else vt - vu,
+                                                                          vt, "%.3f" % vc if vc is not None else "unknown"))
             else:
                 r = t
                 for u in U:
@@ -1867,9 +2053,30 @@ def _boolean(shape, f):
                 r = r.clean()
             new += list(r.solids())
         used = set(ti) | (set() if f.get("keep_tools") else set(ui))
-        if not new:
-            raise ValueError("the %s left nothing of the target" % op)
-    rest = [so for i, so in enumerate(solids) if i not in used]
+    min_t = float(f.get("min_thickness", 0.01) if f.get("min_thickness") is not None else 0.01)
+    min_v = float(f.get("min_volume") or 0)
+    if not f.get("keep_slivers") and (min_t > 0 or min_v > 0):
+        thin = [x for x in (_sliver(so, min_t, min_v) for so in new) if x]
+        if thin and op in ("union", "subtract") and min_t > 0:
+            r2 = _fuzzy_op(op, T if op == "subtract" else (T + U)[:1], U if op == "subtract" else (T + U)[1:], min_t)
+            if r2 is not None:
+                new2 = list(r2.solids())
+                thin2 = [x for x in (_sliver(so, min_t, min_v) for so in new2) if x]
+                ok = new2 and len(thin2) < len(thin)
+                if ok and op == "subtract":
+                    vt = sum(abs(t.volume) for t in T)
+                    ok = vt - sum(abs(so.volume) for so in new2) <= sum(abs(u.volume) for u in U) * 1.001 + 1e-6
+                if ok:
+                    new, thin = new2, thin2
+                    f["_note"] = "made again with a fuzzy value of %g mm" % min_t
+        if thin:
+            new = [so for so in new if not _sliver(so, min_t, min_v)]
+            f["_note"] = ((f.get("_note") + "; ") if f.get("_note") else "") + \
+                "%d sliver solid(s) removed (%.4g mm^3 in total, thinnest %.4g mm)" % (
+                    len(thin), sum(v for v, _ in thin), min(t for _, t in thin))
+    if op != "union" and not new:
+        raise ValueError("the %s left nothing of the target" % op)
+    rest = [(_outward(so) if i in ui else so) for i, so in enumerate(solids) if i not in used]
     out = rest + new
     if not out:
         raise ValueError("the boolean left no solid")
@@ -1878,7 +2085,7 @@ def _boolean(shape, f):
 
 def _unify(shape, f):
     """Merges coplanar faces and collinear/cocircular edges (CAE: Virtual topology / Remove redundant entities)."""
-    from OCP.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
+    from .occfix import CheckedUnify as ShapeUpgrade_UnifySameDomain
     from build123d import Shape
     u = ShapeUpgrade_UnifySameDomain(shape.wrapped, bool(f.get("edges", True)), bool(f.get("faces", True)), True)
     ang = float(f.get("angle", 0) or 0)
@@ -2221,6 +2428,10 @@ def _defeature(shape, f):
             continue
         n0 = len(so.faces())
         res = _defeature_solid(so, mine)
+        if res is None or len(res.faces()) >= n0:
+            # neighbouring faces on extrusion, revolution or offset surfaces (an extruded sketch spline) are not
+            # extended by the algorithm: the same removal on the solid with those surfaces converted to B-splines
+            res = _defeature_bspline(so, mine)
         if res is None or len(res.faces()) >= n0:
             res = _patch_faces(so, mine)
             if res is None:
@@ -2670,6 +2881,42 @@ def _defeature_solid(so, faces):
         return None
 
 
+def _defeature_bspline(so, faces):
+    """Remove faces on a copy of the solid whose extrusion, revolution and offset surfaces are converted to
+    B-spline surfaces (ShapeCustom.ConvertToBSpline; same geometry, shared edges kept). None when no neighbouring
+    face is on such a surface, or when the removal fails."""
+    from OCP.ShapeCustom import ShapeCustom
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.GeomAbs import GeomAbs_SurfaceOfExtrusion, GeomAbs_SurfaceOfRevolution, GeomAbs_OffsetSurface
+    from build123d import Shape
+    kinds = (GeomAbs_SurfaceOfExtrusion, GeomAbs_SurfaceOfRevolution, GeomAbs_OffsetSurface)
+    try:
+        edges = [e for fc in faces for e in fc.edges()]
+        nbs = [f2 for f2 in so.faces() if not any(f2.wrapped.IsSame(x.wrapped) for x in faces)
+               and any(e.wrapped.IsSame(x.wrapped) for x in f2.edges() for e in edges)]
+        if not any(BRepAdaptor_Surface(f2.wrapped, True).GetType() in kinds for f2 in nbs + list(faces)):
+            return None
+        conv = Shape.cast(ShapeCustom.ConvertToBSpline_s(so.wrapped, True, True, True, False))
+        sols = list(conv.solids())
+        if len(sols) != 1:
+            return None
+        conv = sols[0]
+        # the faces to remove in the converted solid: same centre and area
+        picked = []
+        for fc in faces:
+            c, a = fc.center(), fc.area
+            best = min(conv.faces(), key=lambda q: (q.center() - c).length + abs(q.area - a))
+            if (best.center() - c).length > 1e-6 + 1e-6 * max(1.0, a) or abs(best.area - a) > 1e-6 + 1e-4 * a:
+                return None
+            picked.append(best)
+        res = _defeature_solid(conv, picked)
+        if res is None or not res.is_valid or abs(res.volume - so.volume) > 0.01 * abs(so.volume) + 1e-9:
+            return None
+        return res
+    except Exception:
+        return None
+
+
 def _patch_faces(so, faces):
     """Fallback: the faces are removed from the shell and the opening is closed with a smooth patch (G1 to the
     neighbouring faces where possible), then the solid is rebuilt. The face count does not drop below the number
@@ -2733,7 +2980,7 @@ SURFACE_TYPES = ("surf_extract", "surf_fit", "surf_sketch", "surf_loft", "surf_f
                  "curve_extract", "curve_section", "surf_from_curve", "surf_trim", "surf_extend", "surf_bridge", "surf_fillet")
 
 
-SKETCH_PLANE_KEYS = ("plane", "offset", "plane_edge", "plane_curve", "plane_t", "plane_flip", "plane_ref", "plane_face", "plane_origin", "plane_xdir", "plane_axis", "plane_point", "plane_origin_ref", "plane_xdir_ref")
+SKETCH_PLANE_KEYS = ("plane", "offset", "plane_edge", "plane_curve", "plane_sketch_curve", "plane_t", "plane_flip", "plane_ref", "plane_face", "plane_origin", "plane_xdir", "plane_axis", "plane_point", "plane_origin_ref", "plane_xdir_ref")
 
 
 def migrate(part):
@@ -2853,21 +3100,91 @@ def _face_sig(fc):
 
 
 def _face_centres(shape):
-    """Rounded face centres of a shape (identity of the faces between build steps) -> (index, signature)."""
+    """Rounded face centres of a shape (identity of the faces between build steps) -> (index, signature). The
+    centre and signature of a face are computed once (faces kept by a later feature are the same TopoDS faces)."""
     out = {}
     if shape is None:
         return out
-    for i, fc in enumerate(shape.faces()):
-        try:
-            c = fc.center()
+    for i, fc in enumerate(_topo(shape).faces):
+        info = _FACE_INFO.get(fc.wrapped)
+        if info is None:
             try:
-                sig = _face_sig(fc)
+                c = fc.center()
+                try:
+                    sig = _face_sig(fc)
+                except Exception:
+                    sig = None
+                info = ((round(c.X, 3), round(c.Y, 3), round(c.Z, 3)), sig)
             except Exception:
-                sig = None
-            out[(round(c.X, 3), round(c.Y, 3), round(c.Z, 3))] = (i, sig)
-        except Exception:
-            continue
+                info = (None, None)
+            _FACE_INFO.put(fc.wrapped, info)
+        if info[0] is not None:
+            out[info[0]] = (i, info[1])
     return out
+
+
+_BUILD_CACHE = {}                   # prefix key -> state before the feature (see build)
+_BUILD_CACHE_ORDER = []
+_BUILD_CACHE_MAX = 400
+import threading as _threading
+_BUILD_LOCK = _threading.Lock()
+
+
+def _feature_key(f):
+    """Content of a feature for the build cache: its fields (not the build's own "_" fields), and the modification
+    time and size of a file it reads."""
+    import json as _json
+    import os as _os
+    g = {k: v for k, v in f.items() if not k.startswith("_") or k == "_missing_sketch"}
+    for k in ("path",):
+        pth = (f.get(k) or "").strip().strip('"') if isinstance(f.get(k), str) else ""
+        if pth:
+            try:
+                stt = _os.stat(pth)
+                g["_file"] = [stt.st_mtime, stt.st_size]
+            except OSError:
+                g["_file"] = None
+    return _json.dumps(g, sort_keys=True, default=str)
+
+
+def _prefix_keys(feats):
+    """keys[i]: key of the features before feature i; keys[len(feats)]: key of all the features."""
+    import hashlib
+    h = hashlib.sha1(b"shinycad-build-1")
+    keys = []
+    for f in feats:
+        keys.append(h.hexdigest())
+        h.update(_feature_key(f).encode("utf-8"))
+    keys.append(h.hexdigest())
+    return keys
+
+
+def _build_cache_get(keys):
+    """(index, state) of the longest cached prefix, or None."""
+    with _BUILD_LOCK:
+        for i in range(len(keys) - 1, 0, -1):
+            snap = _BUILD_CACHE.get(keys[i])
+            if snap is not None:
+                return i, snap
+    return None
+
+
+def build_cache_clear():
+    """Drops the kept build states and the lookup tables of their shapes."""
+    with _BUILD_LOCK:
+        _BUILD_CACHE.clear()
+        del _BUILD_CACHE_ORDER[:]
+    _TOPO.clear()
+
+
+def _build_cache_put(key, snap):
+    with _BUILD_LOCK:
+        if key in _BUILD_CACHE:
+            return
+        _BUILD_CACHE[key] = snap
+        _BUILD_CACHE_ORDER.append(key)
+        while len(_BUILD_CACHE_ORDER) > _BUILD_CACHE_MAX:
+            _BUILD_CACHE.pop(_BUILD_CACHE_ORDER.pop(0), None)
 
 
 def build(part, upto=None, surfaces=None, datums=None, owners=None):
@@ -2902,7 +3219,32 @@ def build(part, upto=None, surfaces=None, datums=None, owners=None):
                 sig_owner[sig] = face_owner[k]
         prev_centres = cur
 
-    for f in feats:
+    # the state before each feature is kept (_BUILD_CACHE, by the content of the features before it): a rebuild after
+    # a change of a later feature (picking the edges of a new fillet) starts from the state before that feature
+    keys = _prefix_keys(feats)
+    start = 0
+    hit = _build_cache_get(keys)
+    if hit is not None:
+        start, snap = hit
+        (shape, status_s, tools_s, bodies_s, planes_s, frames_s, face_owner_s, prev_centres, sig_owner_s, prev_id) = snap
+        status = [dict(x) for x in status_s]
+        tools = dict(tools_s)
+        bodies.clear()
+        bodies.update(bodies_s)
+        planes.clear()
+        planes.update(planes_s)
+        frames.update(frames_s)
+        face_owner.update(face_owner_s)
+        sig_owner.update(sig_owner_s)
+        prev_centres = dict(prev_centres)
+    def snapshot():
+        return (shape, [dict(x) for x in status], dict(tools), dict(bodies), dict(planes), dict(frames),
+                dict(face_owner), dict(prev_centres), dict(sig_owner), prev_id)
+
+    for idx in range(start, len(feats)):
+        f = feats[idx]
+        if idx > 0:
+            _build_cache_put(keys[idx], snapshot())
         if prev_id is not None:
             attribute(prev_id)
         prev_id = f.get("id")
@@ -2922,7 +3264,7 @@ def build(part, upto=None, surfaces=None, datums=None, owners=None):
                     n, x = PRINCIPAL_FRAMES[f.get("plane", "XY")]
                     fr = _frame_of([0, 0, 0], n, x)
                 fr = adjust_frame(fr, f)
-                info = {"id": f.get("id"), "error": None, "sketch": True,
+                info = {"id": f.get("id"), "error": None, "sketch": True, "frame": {k: list(fr[k]) for k in ("o", "x", "y", "z") if k in fr},
                         "entities": len([e for e in (f.get("sketch") or {}).get("entities") or [] if not e.get("constr")])}
                 frames[f.get("id")] = fr
                 try:
@@ -2990,7 +3332,7 @@ def build(part, upto=None, surfaces=None, datums=None, owners=None):
                 elif t == "surf_bridge":
                     body = sfm.bridge(shape, f, find_edges, bodies)
                 elif t == "surf_fillet":
-                    body = sfm.fillet(shape, bodies, f, find_edges)
+                    body = sfm.fillet(shape, bodies, f, find_edges, find_faces)
                 elif t == "surf_fill":
                     sk_edges = [sketch_tool_edges(feats, frames, planes, sid) for sid in f.get("sketch_refs") or []]
                     body = sfm.fill(shape, f, find_edges, bodies, sk_edges)
@@ -3045,6 +3387,25 @@ def build(part, upto=None, surfaces=None, datums=None, owners=None):
             except Exception as e:
                 status.append({"id": f.get("id"), "error": str(e).strip() or "operation failed"})
             continue
+        if f["type"] == "import" and (f.get("path") or "").strip().strip('"').lower().endswith(".stl") and \
+                (f.get("stl") or {}).get("mode") == "rough":
+            # rough STL import: the triangles as a mesh body (surface body) for measuring and tracing
+            try:
+                import os
+                from . import stlimport
+                path = (f.get("path") or "").strip().strip('"')
+                if not os.path.isfile(path):
+                    raise ValueError("file not found: %s" % path)
+                mx = int((f.get("stl") or {}).get("max_triangles") or 20000)
+                body, rep = stlimport.rough_mesh(path, mx)
+                bodies[f.get("id")] = body
+                status.append({"id": f.get("id"), "error": None, "surface": True, "curve": False, "mesh": True,
+                               "faces": rep["faces"], "edges": len(body.edges()), "area": round(body.area, 3), "length": 0,
+                               "note": "Rough mesh: %d triangles -> %d faces, size %s mm" % (
+                                   rep["triangles"], rep["faces"], " x ".join("%.2f" % x for x in rep["size"]))})
+            except Exception as e:
+                status.append({"id": f.get("id"), "error": str(e).strip() or "import failed", "surface": True})
+            continue
         if f["type"] == "import":
             try:
                 imp = _import(f)
@@ -3053,11 +3414,24 @@ def build(part, upto=None, surfaces=None, datums=None, owners=None):
                 if stl:
                     from . import stlimport
                     info.update(stl=stl, note=stlimport.report_note(stl))
-                cl = f.get("clean") or {}
+                cl = dict(f.get("clean") or {})
+                if stl and stl.get("valid"):
+                    # a valid solid from the STL converter: no periodic faces to rebuild, nothing to fix
+                    cl.pop("rebuild", None)
+                    cl.pop("fix", None)
                 if any(cl.get(k) for k in ("rebuild", "fix", "unify", "min_volume")):
-                    f0, e0 = len(imp.faces()), len(imp.edges())
-                    imp, rep = _clean_import(imp, cl)
-                    info.update(faces_before=f0, edges_before=e0, faces=len(imp.faces()), edges=len(imp.edges()),
+                    ck = _import_key(f, cl)
+                    hit = _CLEAN_CACHE.get(ck) if ck else None
+                    if hit is None:
+                        f0, e0 = len(imp.faces()), len(imp.edges())
+                        imp, rep = _clean_import(imp, cl)
+                        hit = (imp, rep, f0, e0, len(imp.faces()), len(imp.edges()))
+                        if ck:
+                            _CLEAN_CACHE[ck] = hit
+                            while len(_CLEAN_CACHE) > 8:
+                                _CLEAN_CACHE.pop(next(iter(_CLEAN_CACHE)))
+                    imp, rep, f0, e0, f1, e1 = hit
+                    info.update(faces_before=f0, edges_before=e0, faces=f1, edges=e1,
                                 note=((info["note"] + ". ") if info.get("note") else "") + _clean_note(rep), clean=rep)
                 shape = _fuse(shape, imp)
                 info["cells"] = len(shape.solids())
@@ -3148,6 +3522,18 @@ def build(part, upto=None, surfaces=None, datums=None, owners=None):
             except Exception as e:
                 status.append({"id": f.get("id"), "error": str(e).strip() or "thread failed"})
             continue
+        if f["type"] == "body_scale":
+            try:
+                shape = _body_scale(shape, bodies, planes, f, status)
+            except Exception as e:
+                status.append({"id": f.get("id"), "error": str(e).strip() or "scale failed"})
+            continue
+        if f["type"] in ("body_delete", "body_copy"):
+            try:
+                shape = _body_op(shape, bodies, f, status)
+            except Exception as e:
+                status.append({"id": f.get("id"), "error": str(e).strip() or "operation failed"})
+            continue
         if f["type"] in ("shell", "pattern", "hole", "mirror", "boolean"):
             try:
                 if shape is None:
@@ -3175,33 +3561,41 @@ def build(part, upto=None, surfaces=None, datums=None, owners=None):
                     info["holes"] = _copied_holes(f, status)
                 if f["type"] == "boolean":
                     info["cells"] = len(shape.solids())
+                    if f.get("_note"):
+                        info["note"] = f.pop("_note")
                     if abs(shape.volume - v0) < 1e-9 and len(shape.solids()) == n0:
-                        info["error"] = "the boolean changed nothing"
+                        info["error"] = "the boolean changed nothing" + ("; " + info["note"] if info.get("note") else "")
                 elif abs(shape.volume - v0) < 1e-9:
                     info["error"] = "the feature changed nothing"
                 status.append(info)
             except Exception as e:
+                f.pop("_note", None)
                 status.append({"id": f.get("id"), "error": str(e).strip() or "operation failed"})
             continue
         if f["type"] in ("fillet", "chamfer"):
             try:
                 if shape is None:
                     raise ValueError("no solid to %s" % f["type"])
-                edges = find_edges(shape, f.get("edges") or [])
+                edges = _picked_edges(shape, f.get("edges") or [])
                 if not edges:
                     raise ValueError("no edges selected")
                 v = float(f.get("value", 1) or 0)
                 if v <= 0:
                     raise ValueError("value must be > 0")
                 new = _round_edges(shape, f["type"], v, edges)
+                note = None
+                if new is None and f["type"] == "fillet":
+                    new, note = _fillet_shallow(shape, v, edges)
+                if new is None and f["type"] == "fillet":
+                    new, note = _fillet_through_rounds(shape, v, edges)
                 if new is None:
                     msg, bad = _round_diagnosis(shape, f["type"], v, edges)
-                    refs = [r for r in f.get("edges") or [] if find_edges(shape, [r])]
+                    refs = [r for r in f.get("edges") or [] if find_edges(shape, [r])][:len(edges)]
                     status.append({"id": f.get("id"), "error": msg,
                                    "bad_edges": [refs[i] for i in bad if i < len(refs)]})
                     continue
                 shape = new
-                status.append({"id": f.get("id"), "error": None})
+                status.append({"id": f.get("id"), "error": None, **({"note": note} if note else {})})
             except Exception as e:
                 status.append({"id": f.get("id"), "error": str(e).strip() or "operation failed"})
             continue
@@ -3212,13 +3606,12 @@ def build(part, upto=None, surfaces=None, datums=None, owners=None):
                 faces = select_regions(f.get("sketch") or {}, plane_of(f), f["regions"])
             size = 100.0
             if shape is not None:
-                bb = shape.bounding_box()
-                size = max(size, bb.diagonal)
+                size = max(size, _bbox(shape).diagonal)
             for fc in faces:
-                bb = fc.bounding_box()
-                size = max(size, bb.diagonal)
+                size = max(size, _bbox(fc).diagonal)
             if f["type"] == "sweep":
                 f["_bodies"] = bodies
+                f["_path_frame"] = frames.get(f.get("path_ref"))
                 try:
                     solids = _sweep_of(f, faces)
                 finally:
@@ -3238,9 +3631,7 @@ def build(part, upto=None, surfaces=None, datums=None, owners=None):
             v0 = shape.volume if shape is not None else 0.0
             def cut_with(sols):
                 def op(t):
-                    for s in sols:
-                        t = t.cut(s).clean()
-                    return t
+                    return _cleaned(t.cut(*sols)) if sols else t
                 return op
             if cut:
                 if shape is None:
@@ -3266,9 +3657,7 @@ def build(part, upto=None, surfaces=None, datums=None, owners=None):
                 info["new_body"] = True
             else:
                 def add_op(t):
-                    for s in solids:
-                        t = _fuse(t, s)
-                    return t
+                    return _fuse(t, *solids)
                 shape = _in_bodies(shape, f, add_op)
                 if shape is not None and abs(shape.volume - v0) < 1e-9:
                     info["error"] = "the feature added nothing"
@@ -3277,6 +3666,10 @@ def build(part, upto=None, surfaces=None, datums=None, owners=None):
             status.append({"id": f.get("id"), "error": str(e)})
     if prev_id is not None:
         attribute(prev_id)
+        prev_id = None
+    if start < len(feats) and feats:
+        # the state after the last feature: a rebuild of an unchanged part returns it without any geometry work
+        _build_cache_put(keys[len(feats)], snapshot())
     if owners is not None:
         owners.update(face_owner)
     for s in status:
@@ -3287,30 +3680,329 @@ def build(part, upto=None, surfaces=None, datums=None, owners=None):
 
 # --------------------------------------------------------------------------- shell, pattern, hole, sweep
 
+def _normal_at(fc, p):
+    """Unit normal of the face at the point p (projected on the surface), as build123d's Face.normal_at without
+    the UV-bounds scan of BRepGProp_Face (slow on a face with many edges)."""
+    from build123d import Vector
+    from OCP.BRep import BRep_Tool
+    from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
+    from OCP.gp import gp_Pnt, gp_Vec
+    from OCP.TopAbs import TopAbs_REVERSED
+    surf = BRep_Tool.Surface_s(fc.wrapped)
+    pr = GeomAPI_ProjectPointOnSurf(gp_Pnt(p.X, p.Y, p.Z), surf)
+    u, v = pr.LowerDistanceParameters()
+    q, du, dv = gp_Pnt(), gp_Vec(), gp_Vec()
+    surf.D1(u, v, q, du, dv)
+    n = du.Crossed(dv)
+    if n.Magnitude() < 1e-14:
+        return fc.normal_at(p)
+    if fc.wrapped.Orientation() == TopAbs_REVERSED:
+        n.Reverse()
+    return Vector(n.X(), n.Y(), n.Z()).normalized()
+
+
 def face_key(fc):
+    k = _FACE_KEYS.get(fc.wrapped)
+    if k is not None:
+        return dict(k)
     c = fc.center()
     try:
-        n = fc.normal_at(c)
+        n = _normal_at(fc, c)
     except Exception:
         n = fc.normal_at()
-    return {"c": [round(c.X, 4), round(c.Y, 4), round(c.Z, 4)], "n": [round(n.X, 4), round(n.Y, 4), round(n.Z, 4)],
-            "area": round(fc.area, 4)}
+    k = {"c": [round(c.X, 4), round(c.Y, 4), round(c.Z, 4)], "n": [round(n.X, 4), round(n.Y, 4), round(n.Z, 4)],
+         "area": round(fc.area, 4)}
+    _FACE_KEYS.put(fc.wrapped, k)
+    return dict(k)
+
+
+# --------------------------------------------------------------------------- lookup tables of a shape
+
+class _ShapeCache(object):
+    """Values stored by TopoDS_Shape (TShape and location; the orientation too with oriented). The oldest entries
+    are dropped above maxsize entries, or above budget when the entries are put with a cost."""
+
+    def __init__(self, maxsize, budget=None, oriented=False):
+        self.max = maxsize
+        self.budget = budget
+        self.total = 0
+        self.d = {}                     # hash -> [(TopoDS_Shape, value, cost)]
+        self.order = []
+        self.lock = _threading.Lock()
+        self.same = (lambda a, b: a.IsEqual(b)) if oriented else (lambda a, b: a.IsSame(b))
+
+    def get(self, w):
+        same = self.same
+        for ew, val, _ in self.d.get(hash(w), ()):
+            if same(ew, w):
+                return val
+        return None
+
+    def put(self, w, val, cost=1):
+        h = hash(w)
+        with self.lock:
+            lst = self.d.get(h)
+            if lst is None:
+                lst = self.d[h] = []
+                self.order.append(h)
+            for i, (ew, _, c0) in enumerate(lst):
+                if self.same(ew, w):
+                    lst[i] = (w, val, cost)
+                    self.total += cost - c0
+                    break
+            else:
+                lst.append((w, val, cost))
+                self.total += cost
+            while self.order and (len(self.order) > self.max or (self.budget and self.total > self.budget)):
+                for _, _, c0 in self.d.pop(self.order.pop(0), ()):
+                    self.total -= c0
+
+    def clear(self):
+        with self.lock:
+            self.d.clear()
+            del self.order[:]
+            self.total = 0
+
+
+_FACE_KEYS = _ShapeCache(20000, oriented=True)     # face -> face_key (the normal follows the orientation)
+_EDGE_KEYS = _ShapeCache(40000)        # edge -> (mid, length, edge_key)
+_FACE_INFO = _ShapeCache(20000)        # face -> (rounded centre, surface signature) for the feature attribution
+_TOPO = _ShapeCache(64)                # shape -> _Topo
+
+
+def _shape_map_types():
+    try:
+        from OCP.TopTools import TopTools_IndexedMapOfShape as ShapeMap, TopTools_IndexedDataMapOfShapeListOfShape as AncMap
+    except ImportError:                       # OCCT 8
+        from OCP.collections import IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher as ShapeMap
+        from OCP.collections import IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher as AncMap
+    return ShapeMap, AncMap
+
+
+class _Topo(object):
+    """Lookup tables of one shape, built once and kept while the shape is in use: the edges with their mid points
+    and lengths, the faces with their centres, the solids with the indices of their edges and faces, and the
+    edge-to-face and vertex-to-face maps. The lists are shared: callers do not change them."""
+
+    def __init__(self, shape):
+        self.shape = shape
+        self.ShapeMap, self.AncMap = _shape_map_types()
+        self._edges = self._faces = self._solids = None
+        self._emap = self._fmap = None
+        self._emid = self._elen = self._fcen = None
+        self._sedges = self._sfaces = None
+        self._eface = self._vface = None
+
+    @property
+    def edges(self):
+        if self._edges is None:
+            self._edges = list(self.shape.edges())
+        return self._edges
+
+    @property
+    def faces(self):
+        if self._faces is None:
+            self._faces = list(self.shape.faces())
+        return self._faces
+
+    @property
+    def solids(self):
+        if self._solids is None:
+            self._solids = list(self.shape.solids()) if hasattr(self.shape, "solids") else []
+        return self._solids
+
+    @property
+    def emap(self):
+        if self._emap is None:
+            m = self.ShapeMap()
+            for e in self.edges:
+                m.Add(e.wrapped)
+            self._emap = m
+        return self._emap
+
+    @property
+    def fmap(self):
+        if self._fmap is None:
+            m = self.ShapeMap()
+            for fc in self.faces:
+                m.Add(fc.wrapped)
+            self._fmap = m
+        return self._fmap
+
+    def edge_index(self, e):
+        """0-based index of the edge in edges, or -1."""
+        return self.emap.FindIndex(e.wrapped if hasattr(e, "wrapped") else e) - 1
+
+    def face_index(self, fc):
+        return self.fmap.FindIndex(fc.wrapped if hasattr(fc, "wrapped") else fc) - 1
+
+    def _edge_keys(self):
+        mids, lens = [], []
+        for e in self.edges:
+            mid, ln, _ = _edge_info(e)
+            mids.append(mid)
+            lens.append(ln)
+        self._emid, self._elen = mids, lens
+
+    @property
+    def edge_mid(self):
+        if self._emid is None:
+            self._edge_keys()
+        return self._emid
+
+    @property
+    def edge_len(self):
+        if self._elen is None:
+            self._edge_keys()
+        return self._elen
+
+    @property
+    def face_centre(self):
+        if self._fcen is None:
+            out = []
+            for fc in self.faces:
+                try:
+                    c = fc.center()
+                    out.append((c.X, c.Y, c.Z))
+                except Exception:
+                    out.append(None)
+            self._fcen = out
+        return self._fcen
+
+    def _solid_sets(self):
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE
+        emap, fmap = self.emap, self.fmap
+        se, sf = [], []
+        for so in self.solids:
+            es, fs = set(), set()
+            ex = TopExp_Explorer(so.wrapped, TopAbs_EDGE)
+            while ex.More():
+                i = emap.FindIndex(ex.Current())
+                if i:
+                    es.add(i - 1)
+                ex.Next()
+            ex = TopExp_Explorer(so.wrapped, TopAbs_FACE)
+            while ex.More():
+                i = fmap.FindIndex(ex.Current())
+                if i:
+                    fs.add(i - 1)
+                ex.Next()
+            se.append(es)
+            sf.append(fs)
+        self._sedges, self._sfaces = se, sf
+
+    @property
+    def solid_edges(self):
+        """Per solid: the set of indices (in edges) of its edges."""
+        if self._sedges is None:
+            self._solid_sets()
+        return self._sedges
+
+    @property
+    def solid_faces(self):
+        if self._sfaces is None:
+            self._solid_sets()
+        return self._sfaces
+
+    def solid_of_edge(self, e, cell=None):
+        """Index of the solid holding the edge: cell when that solid holds it, else the first one; None."""
+        i = self.edge_index(e)
+        if i < 0:
+            return None
+        own = [si for si, s in enumerate(self.solid_edges) if i in s]
+        if not own:
+            return None
+        return cell if cell in own else own[0]
+
+    @property
+    def edge_faces(self):
+        """Edge -> faces map (TopExp.MapShapesAndAncestors)."""
+        if self._eface is None:
+            from OCP.TopExp import TopExp
+            from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE
+            m = self.AncMap()
+            TopExp.MapShapesAndAncestors_s(self.shape.wrapped, TopAbs_EDGE, TopAbs_FACE, m)
+            self._eface = m
+        return self._eface
+
+    @property
+    def vertex_faces(self):
+        if self._vface is None:
+            from OCP.TopExp import TopExp
+            from OCP.TopAbs import TopAbs_VERTEX, TopAbs_FACE
+            m = self.AncMap()
+            TopExp.MapShapesAndAncestors_s(self.shape.wrapped, TopAbs_VERTEX, TopAbs_FACE, m)
+            self._vface = m
+        return self._vface
+
+    def faces_of_edge(self, e):
+        """build123d Faces of the shape at the edge."""
+        from build123d import Face
+        w = e.wrapped if hasattr(e, "wrapped") else e
+        m = self.edge_faces
+        if not m.Contains(w):
+            return []
+        return [Face(x) for x in m.FindFromKey(w)]
+
+    def has_edge(self, e):
+        return self.emap.Contains(e.wrapped if hasattr(e, "wrapped") else e)
+
+    def has_face(self, fc):
+        return self.fmap.Contains(fc.wrapped if hasattr(fc, "wrapped") else fc)
+
+
+def _topo(shape):
+    """The lookup tables of the shape (kept by the shape's TopoDS_Shape)."""
+    t = _TOPO.get(shape.wrapped)
+    if t is None:
+        t = _Topo(shape)
+        _TOPO.put(shape.wrapped, t)
+    return t
+
+
+def _edge_info(e):
+    """(mid point tuple, length, edge_key) of an edge, computed once per edge."""
+    w = e.wrapped
+    v = _EDGE_KEYS.get(w)
+    if v is None:
+        m = e.position_at(0.5)
+        ln = e.length
+        v = ((m.X, m.Y, m.Z), ln, {"mid": [round(m.X, 4), round(m.Y, 4), round(m.Z, 4)], "len": round(ln, 4)})
+        _EDGE_KEYS.put(w, v)
+    return v
 
 
 def find_faces(shape, refs):
-    faces = list(shape.faces())
-    out = []
+    """Faces of shape matching the references (nearest centre). A reference with "cell" is matched in that solid
+    first: coincident faces of other solids are not taken."""
+    tp = _topo(shape)
+    faces, cen = tp.faces, tp.face_centre
+    n = len(faces)
+    out, taken = [], set()
     for r in refs:
         c = r.get("c")
+        if not c:
+            continue
+        cx, cy, cz = c
+        tol = max(0.05, 0.01 * math.sqrt(max(float(r.get("area", 1) or 1), 1.0))) + 1e-6
+        cand = range(n)
+        cell = r.get("cell")
+        if isinstance(cell, int) and len(tp.solids) > 1 and 0 <= cell < len(tp.solids):
+            own = sorted(tp.solid_faces[cell])
+            if any(cen[i] is not None and math.dist(cen[i], c) < tol for i in own):
+                cand = own
         best, bd = None, None
-        for fc in faces:
-            fcc = fc.center()
-            d = math.sqrt((fcc.X - c[0]) ** 2 + (fcc.Y - c[1]) ** 2 + (fcc.Z - c[2]) ** 2)
+        for i in cand:
+            q = cen[i]
+            if q is None:
+                continue
+            d = math.sqrt((q[0] - cx) ** 2 + (q[1] - cy) ** 2 + (q[2] - cz) ** 2)
             if bd is None or d < bd:
-                best, bd = fc, d
-        if best is not None and bd < max(0.05, 0.01 * math.sqrt(max(float(r.get("area", 1) or 1), 1.0))) + 1e-6:
-            if not any(best.wrapped.IsSame(o.wrapped) for o in out):
-                out.append(best)
+                best, bd = i, d
+        if best is not None and bd < tol and best not in taken:
+            taken.add(best)
+            out.append(faces[best])
     return out
 
 
@@ -3332,14 +4024,451 @@ def find_faces_any(shape, bodies, refs):
     return out
 
 
-def _round_edges(shape, kind, v, edges):
+def _picked_edges(shape, refs):
+    """Picked edges and the cell each was picked on: [(edge, cell index or None)]."""
+    tp = _topo(shape)
+    out, taken = [], set()
+    for r in refs or []:
+        es = find_edges(shape, [r])
+        if not es:
+            continue
+        i = tp.edge_index(es[0])
+        if i in taken:
+            continue
+        taken.add(i)
+        cell = r.get("cell") if isinstance(r, dict) else None
+        out.append((es[0], cell if isinstance(cell, int) else None))
+    return out
+
+
+def _round_edges(shape, kind, v, edges, probe=False):
     """Fillet (radius v) or chamfer (distance v) of the edges; None when OpenCascade fails or the result is not
-    a valid solid."""
+    a valid solid. edges: edges or (edge, cell) pairs. A part of several solids is rounded solid by solid: each
+    solid with its own edges, an edge shared by several solids only in the solid it was picked on; the other
+    solids are unchanged. probe: a trial of the diagnosis (OpenCascade's result checked, without the face merging
+    and the ShapeFix repair of the real operation)."""
+    from build123d import Compound, Shape
+    pairs = [e if isinstance(e, tuple) else (e, None) for e in edges]
+    valid = lambda x: x.is_valid() if callable(x.is_valid) else x.is_valid
+
+    def one(so, es):
+        if kind == "fillet" or probe:
+            from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet, BRepFilletAPI_MakeChamfer
+            mk = BRepFilletAPI_MakeFillet(so.wrapped) if kind == "fillet" else BRepFilletAPI_MakeChamfer(so.wrapped)
+            for e in es:
+                mk.Add(v, e.wrapped)
+            mk.Build()
+            if not mk.IsDone():
+                return None
+            new = Shape.cast(mk.Shape())
+        else:
+            new = so.chamfer(v, None, es)
+        if valid(new):
+            return new
+        if probe:
+            return None
+        # a result with a face OpenCascade checks as invalid (a pcurve of a B-spline face): ShapeFix, kept when the
+        # result is valid and the volume change is of the size of a rounding of the edges
+        try:
+            from OCP.ShapeFix import ShapeFix_Shape
+            fx = ShapeFix_Shape(new.wrapped)
+            fx.Perform()
+            fixed = Shape.cast(fx.Shape())
+            sols = list(fixed.solids())
+            if len(sols) == len(list(so.solids())) and valid(fixed) and \
+                    abs(fixed.volume - so.volume) <= 10 * v * v * sum(e.length for e in es) + 1e-9:
+                return fixed
+        except Exception:
+            pass
+        return None
     try:
-        new = shape.fillet(v, edges) if kind == "fillet" else shape.chamfer(v, None, edges)
-        return new if (new.is_valid() if callable(new.is_valid) else new.is_valid) else None
+        tp = _topo(shape)
+        sols = tp.solids
+        if len(sols) <= 1:
+            return one(shape, [e for e, _ in pairs])
+        sets = tp.solid_edges
+        has = [[tp.edge_index(e) in s for s in sets] for e, _ in pairs]
+        out = []
+        for si, so in enumerate(sols):
+            es = [pairs[i][0] for i in range(len(pairs)) if has[i][si] and
+                  (pairs[i][1] is None or pairs[i][1] == si or not (0 <= pairs[i][1] < len(sols) and has[i][pairs[i][1]]))]
+            if not es:
+                out.append(so)
+                continue
+            new = one(so, es)
+            if new is None:
+                return None
+            out += list(new.solids())
+        return Compound(children=out)
     except Exception:
         return None
+
+
+# OpenCascade (ChFi3d) takes no fillet or chamfer on an edge whose faces meet at less than asin(0.1) = 5.74 deg
+OCC_MIN_CREASE = math.degrees(math.asin(0.1))
+# below this angle the faces are taken as tangent: the edge is not filleted
+TANGENT_CREASE = 0.3
+
+
+def _edge_face_map(so):
+    """(edge -> faces map of the solid, map class); the map is kept with the solid's tables."""
+    tp = _topo(so)
+    return tp.edge_faces, tp.AncMap
+
+
+def _crease(so, e, n=5):
+    """(faces, angles deg, mean normals) of the edge e of the solid so: the angle between the outward normals of its
+    two faces and their mean direction at n points along the edge; None for an edge without two faces."""
+    from build123d import Face
+    from OCP.TopoDS import TopoDS
+    m, _ = _edge_face_map(so)
+    i = m.FindIndex(e.wrapped)
+    if not i:
+        return None
+    fl = list(m.FindFromIndex(i))
+    if len(fl) != 2:
+        return None
+    F = [Face(TopoDS.Face(x) if hasattr(TopoDS, "Face") else TopoDS.Face_s(x)) for x in fl]
+    angs, means = [], []
+    for k in range(n):
+        p = e.position_at(k / (n - 1.0))
+        n1, n2 = _normal_at(F[0], p), _normal_at(F[1], p)
+        angs.append(math.degrees(math.acos(max(-1.0, min(1.0, n1.dot(n2))))))
+        s = n1 + n2
+        means.append(s.normalized() if s.length > 1e-12 else n1)
+    return F, angs, means
+
+
+def _gstretch(nv, k, c):
+    """gp_GTrsf moving points along the unit vector nv by (k - 1) times their distance from the point c along nv."""
+    from OCP.gp import gp_GTrsf, gp_Mat, gp_XYZ
+    M = [[(1.0 if i == j else 0.0) + (k - 1.0) * nv[i] * nv[j] for j in range(3)] for i in range(3)]
+    g = gp_GTrsf()
+    g.SetVectorialPart(gp_Mat(*[M[i][j] for i in range(3) for j in range(3)]))
+    g.SetTranslationPart(gp_XYZ(*[c[i] - sum(M[i][j] * c[j] for j in range(3)) for i in range(3)]))
+    return g
+
+
+def _face_on_surface(orig, x):
+    """Face x (a trimmed B-spline copy of the face orig) rebuilt on the surface of orig with the wires of x; x when
+    the rebuilt face is not valid."""
+    from build123d import Face
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+    from OCP.ShapeFix import ShapeFix_Face
+    from OCP.BRepTools import BRepTools
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_WIRE
+    from OCP.TopoDS import TopoDS
+    try:
+        surf = BRep_Tool.Surface_s(orig)
+        outer = BRepTools.OuterWire_s(x)
+        mf = BRepBuilderAPI_MakeFace(surf, outer, True)
+        ex = TopExp_Explorer(x, TopAbs_WIRE)
+        while ex.More():
+            w = ex.Current()
+            if not w.IsSame(outer):
+                mf.Add(TopoDS.Wire(w) if hasattr(TopoDS, "Wire") else TopoDS.Wire_s(w))
+            ex.Next()
+        if not mf.IsDone():
+            return x
+        fx = ShapeFix_Face(mf.Face())
+        fx.Perform()
+        nf = fx.Face()
+        nf.Orientation(orig.Orientation())
+        from OCP.BRepCheck import BRepCheck_Analyzer
+        return nf if BRepCheck_Analyzer(nf).IsValid() else x
+    except Exception:
+        return x
+
+
+def _precise_volume(s):
+    from OCP.GProp import GProp_GProps
+    from OCP.BRepGProp import BRepGProp
+    g = GProp_GProps()
+    BRepGProp.VolumeProperties_s(s.wrapped, g, 1e-9, True)
+    return abs(g.Mass())
+
+
+def _stretch_fillet(so, e, r, half=15.0):
+    """Fillet of radius r (mm) of the edge e of the solid so whose faces meet at less than OCC_MIN_CREASE: the faces
+    around the edge are stretched along the mean normal of the two faces until they meet at 2 x half deg, filleted
+    there by OpenCascade with the radius that gives the setback r tan(angle / 2) of the circular fillet, and
+    stretched back. The blend is tangent to both faces at the setback lines of the circular fillet (an elliptic
+    section; its depth differs from the circular one by under 3 % of r tan^2(angle / 2)). The changed faces are
+    rebuilt on their own surfaces and sewn to the unchanged ones. Returns the solid or None (also when the result
+    is not valid, adds faces other than the blend, or changes the volume or a face area by more than the fillet)."""
+    from build123d import Solid, Face
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_GTransform, BRepBuilderAPI_Sewing, BRepBuilderAPI_MakeSolid
+    from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet
+    from OCP.BRep import BRep_Builder
+    from OCP.TopoDS import TopoDS, TopoDS_Shell
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_EDGE, TopAbs_SHELL
+    cast = lambda f, x: getattr(TopoDS, f)(x) if hasattr(TopoDS, f) else getattr(TopoDS, f + "_s")(x)
+    cr = _crease(so, e)
+    if cr is None:
+        return None
+    F, angs, means = cr
+    th = max(angs)
+    if not TANGENT_CREASE <= th < OCC_MIN_CREASE:
+        return None
+    nb = means[len(means) // 2]
+    if any(math.degrees(math.acos(max(-1.0, min(1.0, m.dot(nb))))) > 2.0 for m in means):
+        return None                                   # the mean normal turns along the edge
+    t = math.tan(math.radians(th) / 2)
+    k = math.tan(math.radians(half)) / t
+    d = r * t                                         # setback of the circular fillet
+    r2 = d / math.sin(math.atan(k * t))
+    L = e.length
+    p = e.position_at(0.5)
+    c, nv = [p.X, p.Y, p.Z], [nb.X, nb.Y, nb.Z]
+    try:
+        # faces touching the edge or its vertices, and the faces sharing an edge with them
+        vm = _topo(so).vertex_faces
+        em, _ = _edge_face_map(so)
+        local = []
+        for vx in e.vertices():
+            i = vm.FindIndex(vx.wrapped)
+            for x in (vm.FindFromIndex(i) if i else []):
+                if not any(x.IsSame(y) for y in local):
+                    local.append(x)
+        for x in list(local):
+            ex = TopExp_Explorer(x, TopAbs_EDGE)
+            while ex.More():
+                i = em.FindIndex(ex.Current())
+                for y in (em.FindFromIndex(i) if i else []):
+                    if not any(y.IsSame(z) for z in local):
+                        local.append(y)
+                ex.Next()
+        bld = BRep_Builder()
+        shl = TopoDS_Shell()
+        bld.MakeShell(shl)
+        for x in local:
+            bld.Add(shl, x)
+        g1 = BRepBuilderAPI_GTransform(shl, _gstretch(nv, k, c), True)
+        e2 = g1.ModifiedShape(e.wrapped)
+        mk = BRepFilletAPI_MakeFillet(g1.Shape())
+        mk.Add(r2, cast("Edge", e2))
+        mk.Build()
+        if not mk.IsDone():
+            return None
+        g2 = BRepBuilderAPI_GTransform(mk.Shape(), _gstretch(nv, 1.0 / k, c), True)
+        keep, new = [], []
+        for f in so.faces():
+            if not any(f.wrapped.IsSame(y) for y in local):
+                keep.append(f.wrapped)
+                continue
+            f2 = g1.ModifiedShape(f.wrapped)
+            if mk.IsDeleted(f2):
+                return None
+            mod = list(mk.Modified(f2))
+            if not mod:
+                keep.append(f.wrapped)
+                continue
+            for x in mod:
+                nf = _face_on_surface(f.wrapped, cast("Face", g2.ModifiedShape(x)))
+                if abs(Face(nf).area - f.area) > 1.5 * d * L + 1e-6:
+                    return None
+                new.append(nf)
+        blend = [cast("Face", g2.ModifiedShape(x)) for x in mk.Generated(e2)]
+        if len(blend) != 1:
+            return None
+        sew = BRepBuilderAPI_Sewing(1e-6)
+        for x in keep + new + blend:
+            sew.Add(x)
+        sew.Perform()
+        ex = TopExp_Explorer(sew.SewedShape(), TopAbs_SHELL)
+        shells = []
+        while ex.More():
+            shells.append(cast("Shell", ex.Current()))
+            ex.Next()
+        if len(shells) != 1:
+            return None
+        res = Solid(BRepBuilderAPI_MakeSolid(shells[0]).Solid())
+        if res.volume < 0:
+            res = Solid(res.wrapped.Reversed())
+        ok = res.is_valid() if callable(res.is_valid) else res.is_valid
+        if not ok or len(res.faces()) != len(so.faces()) + 1:
+            return None
+        phi = math.radians(th) / 2
+        expect = r * r * (math.tan(phi) - phi) * L
+        v0 = _precise_volume(so)
+        if abs(_precise_volume(res) - v0) > 3 * expect + 2e-7 * v0 + 1e-6:
+            return None
+        return res
+    except Exception:
+        return None
+
+
+def _fillet_shallow(shape, v, edges):
+    """Fillet when some picked edges are shallow creases (faces meeting at TANGENT_CREASE to OCC_MIN_CREASE deg):
+    the other edges are filleted by OpenCascade, then each shallow edge by _stretch_fillet; edges whose faces meet
+    at less than TANGENT_CREASE are left as they are. Returns (shape, note) or (None, None)."""
+    from build123d import Compound
+    pairs = [e if isinstance(e, tuple) else (e, None) for e in edges]
+    tp = _topo(shape)
+    sols = tp.solids or [shape]
+
+    def solid_of(e, cell):
+        if len(sols) == 1 and not tp.solids:
+            return 0 if tp.has_edge(e) else None
+        return tp.solid_of_edge(e, cell)
+
+    shallow, tangent, rest = [], [], []
+    for i, (e, cell) in enumerate(pairs):
+        si = solid_of(e, cell)
+        cr = _crease(sols[si], e) if si is not None else None
+        th = max(cr[1]) if cr else None
+        if th is not None and th < TANGENT_CREASE:
+            tangent.append((i, th))
+        elif th is not None and th < OCC_MIN_CREASE:
+            shallow.append((i, th, edge_key(e), cell))
+        else:
+            rest.append((e, cell))
+    if not shallow and not tangent:
+        return None, None
+    cur = shape
+    if rest:
+        cur = _round_edges(shape, "fillet", v, rest)
+        if cur is None:
+            return None, None
+    for i, th, key, cell in shallow:
+        tc = _topo(cur)
+        cs = list(tc.solids) or [cur]
+        es = find_edges(cur, [dict(key, cell=cell) if isinstance(cell, int) else key])
+        if not es:
+            return None, None
+        e = es[0]
+        if not tc.solids:
+            si = 0 if tc.has_edge(e) else None
+        else:
+            si = next((j for j, s in enumerate(tc.solid_edges) if tc.edge_index(e) in s
+                       and (cell is None or j == cell or len(cs) == 1)), None)
+            if si is None:
+                si = tc.solid_of_edge(e)
+        if si is None:
+            return None, None
+        res = _stretch_fillet(cs[si], e, v)
+        if res is None:
+            return None, None
+        cs[si] = res
+        cur = cs[0] if len(cs) == 1 else Compound(children=cs)
+    parts = []
+    if shallow:
+        parts.append("%s: the faces meet at %s deg (OpenCascade fillets from %.1f deg); filleted in a space stretched "
+                     "along the mean normal of the faces and mapped back (same setback as the circular fillet)" % (
+                         ", ".join("edge %d" % (i + 1) for i, _, _, _ in shallow),
+                         "/".join("%.2f" % th for _, th, _, _ in shallow), OCC_MIN_CREASE))
+    if tangent:
+        parts.append("%s not filleted: the faces are tangent there (%s deg)" % (
+            ", ".join("edge %d" % (i + 1) for i, _ in tangent), "/".join("%.2f" % th for _, th in tangent)))
+    return cur, "; ".join(parts)
+
+
+def _fillet_through_rounds(shape, v, edges):
+    """Fillet of edges that end on a round (a cylindrical face of radius up to v next to the edge, meeting the
+    other face at an angle): the rounds are removed (Remove faces: the neighbouring faces are extended to their
+    corner), and the new corner edges are filleted with v together with the other picked edges.
+    Returns (solid, note) or (None, None)."""
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.GeomAbs import GeomAbs_Cylinder
+    from build123d import Compound
+    pairs = [e if isinstance(e, tuple) else (e, None) for e in edges]
+    sols = _topo(shape).solids or [shape]
+    try:
+        out, n_rounds, radii = [], 0, []
+        for si, so in enumerate(sols):
+            ts = _topo(so)
+            mine = [e for e, cell in pairs if ts.has_edge(e) and (cell is None or cell == si or len(sols) == 1)]
+            if not mine:
+                out.append(so)
+                continue
+            sfaces = ts.faces
+            rounds, plain = [], []
+            for e in mine:
+                adj = ts.faces_of_edge(e)
+                rs = []
+                for fc in adj:
+                    a = BRepAdaptor_Surface(fc.wrapped, True)
+                    if a.GetType() == GeomAbs_Cylinder and a.Cylinder().Radius() <= v * 1.1 + 1e-6:
+                        rs.append((fc, a.Cylinder().Radius()))
+                if rs:
+                    for fc, r in rs:
+                        if not any(fc.wrapped.IsSame(x.wrapped) for x, _ in rounds):
+                            rounds.append((fc, r))
+                else:
+                    plain.append(e)
+            if not rounds:
+                return None, None
+            rf = [fc for fc, _ in rounds]
+            res = _defeature_solid(so, rf)
+            if res is None or len(res.faces()) >= len(sfaces):
+                res = _defeature_bspline(so, rf)
+            # the removal adds about the material of the rounds' corners only (a removal that changes more of the part
+            # is not used)
+            if res is None or len(res.faces()) > len(sfaces) - len(rf) or \
+                    abs(res.volume - so.volume) > 1.5 * v * sum(fc.area for fc in rf) + 1e-9:
+                return None, None
+            res = res.solids()[0]
+            tr = _topo(res)
+
+            def corner(e):
+                # the faces at the edge meet at an angle (not a tangent junction)
+                adj = tr.faces_of_edge(e)
+                if len(adj) != 2:
+                    return False
+                q = e.position_at(0.5)
+                try:
+                    return abs(_normal_at(adj[0], q).dot(_normal_at(adj[1], q))) < math.cos(math.radians(2.0))
+                except Exception:
+                    return False
+            pick = []
+            redges, rmids = tr.edges, tr.edge_mid
+            for fc, r in rounds:
+                c = fc.center()
+                cc = (c.X, c.Y, c.Z)
+                near = sorted((i for i in range(len(redges)) if math.dist(rmids[i], cc) <= 3 * max(v, r) + 1e-6),
+                              key=lambda i: math.dist(rmids[i], cc))
+                near = [redges[i] for i in near if corner(redges[i])]
+                if not near:
+                    return None, None
+                if not any(near[0].wrapped.IsSame(x.wrapped) for x in pick):
+                    pick.append(near[0])
+            for e in plain:
+                m = e.position_at(0.5)
+                got = find_edges(res, [{"mid": [m.X, m.Y, m.Z], "len": e.length}])
+                pick += [x for x in got if not any(x.wrapped.IsSame(y.wrapped) for y in pick)]
+            new = _round_edges(res, "fillet", v, pick)
+            if new is None:
+                return None, None
+            out += list(new.solids())
+            n_rounds += len(rounds)
+            radii += [r for _, r in rounds]
+        result = out[0] if len(out) == 1 else Compound(children=out)
+        note = ("%d round(s) of R%s mm next to the picked edge(s) replaced by the fillet of %g mm (the round met the "
+                "neighbouring face at an angle)" % (n_rounds, "/".join(sorted({"%g" % round(r, 3) for r in radii})), v))
+        return result, note
+    except Exception:
+        return None, None
+
+
+def _rounds_at(shape, edges, v):
+    """Radii of the cylindrical faces of radius up to v next to the edges."""
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.GeomAbs import GeomAbs_Cylinder
+    out = []
+    try:
+        tp = _topo(shape)
+        for e in edges:
+            e = e[0] if isinstance(e, tuple) else e
+            for fc in tp.faces_of_edge(e):
+                a = BRepAdaptor_Surface(fc.wrapped, True)
+                if a.GetType() == GeomAbs_Cylinder and a.Cylinder().Radius() <= v * 1.1 + 1e-6:
+                    out.append(a.Cylinder().Radius())
+    except Exception:
+        pass
+    return out
 
 
 def _round_diagnosis(shape, kind, v, edges, budget=5.0):
@@ -3358,7 +4487,7 @@ def _round_diagnosis(shape, kind, v, edges, budget=5.0):
             if time.time() - t0 > budget:
                 return None
             mid = (lo + hi) / 2.0
-            if _round_edges(shape, kind, mid, es) is not None:
+            if _round_edges(shape, kind, mid, es, probe=True) is not None:
                 lo = mid
             else:
                 hi = mid
@@ -3368,7 +4497,7 @@ def _round_diagnosis(shape, kind, v, edges, budget=5.0):
     for i, e in enumerate(edges):
         if time.time() - t0 > budget:
             break
-        if _round_edges(shape, kind, v, [e]) is None:
+        if _round_edges(shape, kind, v, [e], probe=True) is None:
             bad.append(i)
     if bad:
         parts = []
@@ -3376,6 +4505,25 @@ def _round_diagnosis(shape, kind, v, edges, budget=5.0):
             r = largest([edges[i]]) if len(bad) <= 6 else None
             parts.append("edge %d%s" % (i + 1, (": largest %s %.2f mm" % (word, r)) if r else ""))
         msg = "%s of %g mm fails on %d of %d edge(s) (red): %s" % (name, v, len(bad), len(edges), "; ".join(parts))
+        low = []
+        tp = _topo(shape)
+        for i in bad:
+            try:
+                e = edges[i][0] if isinstance(edges[i], tuple) else edges[i]
+                si = tp.solid_of_edge(e)
+                so = tp.solids[si] if si is not None else shape
+                cr = _crease(so, e)
+                if cr and max(cr[1]) < OCC_MIN_CREASE:
+                    low.append("edge %d %.2f deg" % (i + 1, max(cr[1])))
+            except Exception:
+                pass
+        if low:
+            msg += (". The faces meet at a shallow angle (%s): OpenCascade fillets and chamfers only edges whose "
+                    "faces meet at %.1f deg or more" % (", ".join(low), OCC_MIN_CREASE))
+        rr = _rounds_at(shape, [edges[i] for i in bad], v)
+        if rr:
+            msg += (". The edge ends on a round of R%s mm that meets the other face at an angle; Remove faces on that "
+                    "round, then fillet the corner" % "/".join(sorted({"%g" % round(r, 3) for r in rr})))
         return msg, bad
     pairs = []
     if len(edges) <= 10:
@@ -3383,7 +4531,7 @@ def _round_diagnosis(shape, kind, v, edges, budget=5.0):
             for j in range(i + 1, len(edges)):
                 if time.time() - t0 > budget:
                     break
-                if _round_edges(shape, kind, v, [edges[i], edges[j]]) is None:
+                if _round_edges(shape, kind, v, [edges[i], edges[j]], probe=True) is None:
                     pairs.append((i, j))
     r = largest(edges)
     msg = ("%s of %g mm works on each edge alone but not on all %d edges together: the %ss of neighbouring edges "
@@ -3489,6 +4637,169 @@ def _in_bodies(shape, f, op):
     return out[0] if len(out) == 1 else Compound(children=out)
 
 
+def _body_op(shape, bodies, f, status):
+    """Delete body: the listed solids ("bodies": [{"solid": i}], order of shape.solids() before the feature) and
+    surface bodies ("surfaces": [feature ids]) are removed. Copy body: copies of them moved by "move" [dx, dy, dz]
+    (mm) are added as new solids, and the copied surface bodies as one surface body of this feature."""
+    from build123d import Compound
+    idx = _pattern_bodies(f)
+    sids = [s for s in f.get("surfaces") or [] if s]
+    solids = list(shape.solids()) if shape is not None else []
+    small = []
+    if f["type"] == "body_delete" and (float(f.get("min_volume") or 0) > 0 or float(f.get("min_thickness") or 0) > 0):
+        # Delete body: every solid below "min_volume" (mm^3) or with a mean thickness 2V/A below "min_thickness" (mm)
+        small = [i for i, so in enumerate(solids) if i not in idx and
+                 _sliver(so, float(f.get("min_thickness") or 0), float(f.get("min_volume") or 0))]
+    if not idx and not sids and not small and not (f["type"] == "body_delete" and (f.get("min_volume") or f.get("min_thickness"))):
+        raise ValueError("no body selected")
+    bad = [i for i in idx if not 0 <= i < len(solids)]
+    if bad:
+        raise ValueError("solid %d not found (the part has %d solids)" % (bad[0] + 1, len(solids)))
+    miss = [x for x in sids if x not in bodies]
+    if miss:
+        raise ValueError("surface body %s not found" % miss[0])
+    info = {"id": f.get("id"), "error": None, "solids_before": len(solids)}
+    if small:
+        info["small"] = [i for i in small]
+        idx = idx + small
+    if f["type"] == "body_delete":
+        keep = [so for i, so in enumerate(solids) if i not in idx]
+        for x in sids:
+            bodies.pop(x, None)
+        shape = None if not keep else keep[0] if len(keep) == 1 else Compound(children=keep)
+        info["cells"] = len(keep)
+        info["note"] = "%d solid(s) and %d surface body(ies) deleted" % (len(idx), len(sids)) + (
+            " (%d small solid(s): %s)" % (len(small), ", ".join("Solid %d" % (i + 1) for i in small)) if small else
+            "" if not (f.get("min_volume") or f.get("min_thickness")) else " (no small solids)")
+    else:
+        from build123d import Vector
+        mv = ([float(x or 0) for x in (f.get("move") or [])] + [0.0, 0.0, 0.0])[:3]
+        tr = ("t", Vector(*mv))
+        copies = [_apply_trsf(solids[i], tr) for i in idx]
+        if copies:
+            allso = solids + copies
+            shape = allso[0] if len(allso) == 1 else Compound(children=allso)
+        if sids:
+            sc = [_apply_trsf(bodies[x], tr) for x in sids]
+            body = sc[0] if len(sc) == 1 else Compound(children=sc)
+            if any(getattr(bodies[x], "_mesh", False) for x in sids):
+                body._mesh = True
+            bodies[f.get("id")] = body
+            info.update(surface=True, curve=not body.faces(), faces=len(body.faces()), edges=len(body.edges()),
+                        area=round(body.area, 3), length=round(sum(e.length for e in body.edges()), 3) if not body.faces() else 0)
+        info["cells"] = len(shape.solids()) if shape is not None else 0
+        info["note"] = "%d solid(s) and %d surface body(ies) copied, moved by (%s) mm" % (
+            len(copies), len(sids), ", ".join("%g" % v for v in mv))
+    status.append(info)
+    return shape
+
+
+def _scale_shape(shape, k, c):
+    """shape scaled by the factors k = [kx, ky, kz] about the point c (mm). Equal factors: gp_Trsf (the surface
+    types are kept); different factors: gp_GTrsf (the faces become B-spline surfaces)."""
+    from OCP.gp import gp_Trsf, gp_GTrsf, gp_Pnt, gp_Mat, gp_XYZ
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform, BRepBuilderAPI_GTransform
+    from build123d import Shape
+    if abs(k[0] - k[1]) <= 1e-12 * abs(k[0]) and abs(k[0] - k[2]) <= 1e-12 * abs(k[0]):
+        tr = gp_Trsf()
+        tr.SetScale(gp_Pnt(*c), k[0])
+        out = BRepBuilderAPI_Transform(shape.wrapped, tr, True).Shape()
+    else:
+        g = gp_GTrsf()
+        g.SetVectorialPart(gp_Mat(k[0], 0, 0, 0, k[1], 0, 0, 0, k[2]))
+        g.SetTranslationPart(gp_XYZ(c[0] * (1 - k[0]), c[1] * (1 - k[1]), c[2] * (1 - k[2])))
+        mk = BRepBuilderAPI_GTransform(shape.wrapped, g, True)
+        if not mk.IsDone():
+            raise ValueError("the non-uniform scale failed")
+        out = mk.Shape()
+    res = Shape.cast(out)
+    if getattr(shape, "_mesh", False):
+        res._mesh = True
+    return res
+
+
+def _body_scale(shape, bodies, planes, f, status):
+    """Scale body: the listed solids ("bodies": [i], order of shape.solids() before the feature) and surface bodies
+    ("surfaces": [feature ids]) scaled by "factor" ("uniform": true, default) or by "factors" [kx, ky, kz] along
+    the global axes, about "about": "origin", "centroid" (centre of mass of the selection), "bbox" (bounding box
+    centre of the selection) or "point" ("point_ref": point feature or vertex [x, y, z], else "point" [x, y, z],
+    mm). "copy": true keeps the originals and adds the scaled solids as new solids and the scaled surface bodies as
+    one surface body of this feature; otherwise the scaled bodies take the place of the originals."""
+    from build123d import Compound
+    idx = _pattern_bodies(f)
+    sids = [s for s in f.get("surfaces") or [] if s]
+    if not idx and not sids:
+        raise ValueError("no body selected")
+    solids = list(shape.solids()) if shape is not None else []
+    bad = [i for i in idx if not 0 <= i < len(solids)]
+    if bad:
+        raise ValueError("solid %d not found (the part has %d solids)" % (bad[0] + 1, len(solids)))
+    miss = [x for x in sids if x not in bodies]
+    if miss:
+        raise ValueError("surface body %s not found" % miss[0])
+    if f.get("uniform", True):
+        k = [float(f.get("factor", 1) if f.get("factor") is not None else 1)] * 3
+    else:
+        k = ([float(x) if x is not None else 1.0 for x in (f.get("factors") or [])] + [1.0, 1.0, 1.0])[:3]
+    if any(not v > 0 for v in k):
+        raise ValueError("scale factors must be greater than 0")
+    sel = [solids[i] for i in idx] + [bodies[x] for x in sids]
+    about = f.get("about") or "origin"
+    if about == "origin":
+        c = [0.0, 0.0, 0.0]
+    elif about == "point":
+        c = ref_point(planes, f["point_ref"]) if f.get("point_ref") else _vec3(f.get("point") or [0, 0, 0], "point")
+    elif about == "bbox":
+        bb = (sel[0] if len(sel) == 1 else Compound(children=sel)).bounding_box()
+        c = [(bb.min.X + bb.max.X) / 2, (bb.min.Y + bb.max.Y) / 2, (bb.min.Z + bb.max.Z) / 2]
+    elif about == "centroid":
+        from OCP.GProp import GProp_GProps
+        from OCP.BRepGProp import BRepGProp
+        g = GProp_GProps()
+        for so in [solids[i] for i in idx]:
+            BRepGProp.VolumeProperties_s(so.wrapped, g)
+        if not idx:
+            for x in sids:
+                BRepGProp.SurfaceProperties_s(bodies[x].wrapped, g)
+            if g.Mass() <= 0:
+                for x in sids:
+                    BRepGProp.LinearProperties_s(bodies[x].wrapped, g)
+        if g.Mass() <= 0:
+            raise ValueError("the selection has no volume or area for the centre of mass")
+        p = g.CentreOfMass()
+        c = [p.X(), p.Y(), p.Z()]
+    else:
+        raise ValueError("unknown reference point %r" % about)
+    copy = bool(f.get("copy"))
+    info = {"id": f.get("id"), "error": None, "solids_before": len(solids)}
+    v0 = sum(abs(solids[i].volume) for i in idx)
+    scaled = {i: _scale_shape(solids[i], k, c) for i in idx}
+    if idx:
+        allso = solids + [scaled[i] for i in idx] if copy else [scaled.get(i, so) for i, so in enumerate(solids)]
+        shape = allso[0] if len(allso) == 1 else Compound(children=allso)
+    if sids:
+        sc = {x: _scale_shape(bodies[x], k, c) for x in sids}
+        if copy:
+            body = list(sc.values())[0] if len(sc) == 1 else Compound(children=list(sc.values()))
+            if any(getattr(bodies[x], "_mesh", False) for x in sids):
+                body._mesh = True
+            bodies[f.get("id")] = body
+            info.update(surface=True, curve=not body.faces(), faces=len(body.faces()), edges=len(body.edges()),
+                        area=round(body.area, 3), length=round(sum(e.length for e in body.edges()), 3) if not body.faces() else 0)
+        else:
+            bodies.update(sc)
+    info["cells"] = len(shape.solids()) if shape is not None else 0
+    info["centre"] = [round(v, 6) for v in c]
+    info["factors"] = k
+    fac = ("%g" % k[0]) if k[0] == k[1] == k[2] else "(%s)" % ", ".join("%g" % v for v in k)
+    info["note"] = "%d solid(s) and %d surface body(ies) %s, factor %s about (%s) mm" % (
+        len(idx), len(sids), "copied and scaled" if copy else "scaled", fac, ", ".join("%.3f" % v for v in c))
+    if idx:
+        info["note"] += ", volume %.3f to %.3f mm^3" % (v0, sum(abs(scaled[i].volume) for i in idx))
+    status.append(info)
+    return shape
+
+
 def _pattern_bodies(f):
     """Solid indices (order of shape.solids() before the feature) of "bodies": [{"solid": i}] or [i] (pattern, and
     the solids an extrude, cut, revolve or sweep acts on)."""
@@ -3522,12 +4833,18 @@ def _pattern(shape, f, tools):
             raise ValueError("solid %d not found (the part has %d solids)" % (bad[0] + 1, len(solids)))
         copies = [_apply_trsf(solids[i], tr) for tr in trs for i in bodies]
         shape = Compound(children=solids + copies)
+    runs = []                       # consecutive instances of one kind (cut or fuse) applied in one Boolean
     for tr in trs:
         for fid in ids:
             solids, cut = tools[fid]
             for s0 in solids:
                 s1 = _apply_trsf(s0, tr)
-                shape = shape.cut(s1).clean() if cut else _fuse(shape, s1)
+                if runs and runs[-1][0] == cut:
+                    runs[-1][1].append(s1)
+                else:
+                    runs.append((cut, [s1]))
+    for cut, sols in runs:
+        shape = _cleaned(shape.cut(*sols)) if cut else _fuse(shape, *sols)
     return shape
 
 
@@ -3560,11 +4877,17 @@ def _mirror(shape, f, tools):
         raise ValueError("feature %s has no tool body (only sketch features and holes can be mirrored)" % missing[0])
     if f.get("body"):
         shape = _fuse(shape, shape.mirror(mp))
+    runs = []                       # consecutive tools of one kind (cut or fuse) applied in one Boolean
     for fid in ids:
         solids, cut = tools[fid]
         for s0 in solids:
             s1 = s0.mirror(mp)
-            shape = shape.cut(s1).clean() if cut else _fuse(shape, s1)
+            if runs and runs[-1][0] == cut:
+                runs[-1][1].append(s1)
+            else:
+                runs.append((cut, [s1]))
+    for cut, sols in runs:
+        shape = _cleaned(shape.cut(*sols)) if cut else _fuse(shape, *sols)
     return shape
 
 
@@ -3882,39 +5205,278 @@ def callout_text(h, units="mm"):
     return text + ("\n" + mach if mach else "")
 
 
-def _sweep_of(f, faces):
-    """Sweep the profile faces along the path sketch (open chain of lines and arcs on its own plane)."""
-    from build123d import Solid, Wire, Vector
+def _sweep_path(f):
+    """(wire, path plane normal or None) of a sweep: the path sketch (chain of lines, arcs and splines on its own
+    plane) or the curve body path_source."""
+    from build123d import Wire, Vector
     body = (f.get("_bodies") or {}).get(f.get("path_source")) if f.get("path_source") else None
+    normal = None
     if body is not None:
         edges = list(body.edges())
         if not edges:
             raise ValueError("the path curve body has no edges")
     else:
         pf = {"plane": f.get("path_plane", "XY"), "offset": f.get("path_offset", 0)}
+        if f.get("_path_frame"):
+            # the plane of the path sketch as resolved at its own position in the tree (face, datum, normal planes)
+            pf = {"plane": "face", "_frame": f["_path_frame"], "offset": f.get("path_offset", 0)}
         pplane = plane_of(pf)
+        normal = pplane.z_dir
         segs, circles = _segments(f.get("path_sketch") or {})
         if not segs:
             raise ValueError("the path sketch has no lines or arcs")
         W = lambda p: pplane.from_local_coords(Vector(p[0], p[1], 0))
-        edges = []
-        for k, a, b, m in segs:
-            edges.append(seg_edge(k, a, b, m, W))
+        edges = [seg_edge(k, a, b, m, W) for k, a, b, m in segs]
     try:
         path = Wire(edges)
     except Exception:
         raise ValueError("the path is not one connected chain")
+    try:
+        chains = list(Wire.combine(edges, tol=1e-4))
+        if len(chains) > 1:
+            raise ValueError("the path has %d separate chains: one connected chain is needed" % len(chains))
+        path = chains[0]
+    except ValueError:
+        raise
+    except Exception:
+        pass
+    return path, normal
+
+
+def _sweep_of(f, faces):
+    """Sweep: "kind" "profile" (default): the profile faces swept along the path; "tool": the profile revolved
+    about its axis is a tool moved along the path (_tool_sweep)."""
+    from build123d import Solid
+    path, normal = _sweep_path(f)
+    if f.get("kind") == "tool":
+        return [_tool_sweep(f, faces, path, normal)]
     out = []
     for face in faces:
-        out.append(Solid.sweep(face, path, transition=__import__("build123d").Transition.ROUND))
+        so = Solid.sweep(face, path, transition=__import__("build123d").Transition.ROUND)
+        ok = so.is_valid() if callable(so.is_valid) else so.is_valid
+        if not ok:
+            raise ValueError("the swept profile intersects itself (a path corner tighter than the profile is wide); "
+                             "for a groove or edge cut by a tool, use Sweep: Moving tool")
+        out.append(so)
     return out
+
+
+def _tool_sweep(f, faces, path, normal):
+    """Volume swept by a tool of revolution moved along a planar path without turning: the profile faces revolved
+    about the tool axis ("axis": "auto" through the centre of the profile, normal to the path plane; "u", "v" or a
+    line of the profile sketch; "axis_ref": an axis feature). The axis must be normal to the path plane. "tool_at":
+    "path" (default with the automatic axis): the tool is moved so that its axis passes through the start of the
+    path; "drawn" (default with a chosen axis): the tool stays where it is drawn and moves with the path from its
+    start. Exact construction: along a
+    line, the axial section of the tool (normal to the line) is extruded; along an arc, the axial section (on the
+    arc centre side clipped at the arc axis) is revolved about the arc axis; splines are divided into chords; the
+    tool itself is added at every vertex of the path."""
+    from build123d import Solid, Face, Axis, Vector, Box, Pos, Compound, Plane, Location
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Common, BRepAlgoAPI_Fuse
+    from .surfaces import _shape_list
+    from build123d.topology import Shape
+    if not faces:
+        raise ValueError("the profile has no closed region")
+    pl = plane_of(f)
+    pts = [v for fc in faces for v in [fc.center()]]
+    cen = Vector(sum(p.X for p in pts) / len(pts), sum(p.Y for p in pts) / len(pts), sum(p.Z for p in pts) / len(pts))
+    if normal is None:
+        # a curve body: the plane of its points
+        vs = [path.position_at(i / 16.0) for i in range(17)]
+        nv = Vector(0, 0, 0)
+        for i in range(1, 16):
+            nv = nv + (vs[i] - vs[0]).cross(vs[i + 1] - vs[0])
+        if nv.length < 1e-9:
+            raise ValueError("the path is straight: its plane is not defined; use a path sketch")
+        normal = nv.normalized()
+    nrm = Vector(normal.X, normal.Y, normal.Z).normalized()
+    if f.get("axis", "auto") == "auto" and not f.get("axis_ref"):
+        if abs(nrm.dot(pl.z_dir)) > 1e-6:
+            raise ValueError("the profile plane must contain the normal of the path plane (the tool axis)")
+        axis = Axis(cen, nrm)
+    else:
+        axis = _axis(f, pl, f.get("sketch") or {})
+    a = Vector(axis.direction.X, axis.direction.Y, axis.direction.Z).normalized()
+    if abs(abs(a.dot(nrm)) - 1) > 1e-4:
+        raise ValueError("the tool axis is at %.1f deg to the normal of the path plane: it must be normal to the path plane"
+                         % math.degrees(math.acos(min(1.0, abs(a.dot(nrm))))))
+    if abs(a.dot(pl.z_dir)) > 1e-6:
+        raise ValueError("the tool axis must lie in the profile plane")
+    A0 = Vector(axis.position.X, axis.position.Y, axis.position.Z)
+    P0 = path.position_at(0)
+    auto = f.get("axis", "auto") == "auto" and not f.get("axis_ref")
+    if (f.get("tool_at") or ("path" if auto else "drawn")) == "drawn":
+        # the tool stays where it is drawn and moves with the path from its start: the path is moved onto the axis
+        sh = (A0 - P0) - a * (A0 - P0).dot(a)
+        if sh.length > 1e-12:
+            path = path.moved(Location(sh))
+            P0 = path.position_at(0)
+    T = (P0 - A0) - a * (P0 - A0).dot(a)
+    s_dir = a.cross(pl.z_dir).normalized()           # in the profile plane, normal to the axis
+    big = 10.0 * max(1.0, max(fc.bounding_box().diagonal for fc in faces) + T.length)
+
+    def common(shape, solid):
+        op = BRepAlgoAPI_Common(shape.wrapped, solid.wrapped)
+        op.Build()
+        return [Face(x.wrapped) for x in Shape.cast(op.Shape()).faces()] if op.IsDone() else []
+
+    def halfspace(o, d):
+        """Box solid on the side d of the plane through o normal to d."""
+        z = d.normalized()
+        b = Box(big, big, big)
+        loc = Plane(origin=o + z * (big / 2), z_dir=z)
+        return b.moved(Location(loc))
+    # the half profile: the part on the +s side, and the part on the -s side mirrored onto the +s side
+    halves = []
+    for fc in faces:
+        fc = fc.moved(Location(T))
+        halves += common(fc, halfspace(A0 + T, s_dir))
+        for g in common(fc, halfspace(A0 + T, -s_dir)):
+            halves.append(g.mirror(Plane(origin=A0 + T, z_dir=s_dir)))
+    halves = [h for h in halves if h.area > 1e-9]
+    if not halves:
+        raise ValueError("the profile has no area beside the tool axis")
+    ax0 = Axis(P0, a)
+    tool = None
+    tools = []
+    for h in halves:
+        tools.append(Solid.revolve(h, 360, ax0))
+    tool = tools[0] if len(tools) == 1 else Compound(children=tools)
+
+    def placed(faces_, ang, at):
+        """Half profile faces turned about the tool axis by ang deg and moved from the path start to at."""
+        return [g.rotate(ax0, ang).moved(Location(at - P0)) for g in faces_]
+
+    def turn_to(d):
+        """Angle (deg) about a that turns s_dir onto the unit vector d (normal to a)."""
+        return math.degrees(math.atan2(s_dir.cross(d).dot(a), s_dir.dot(d)))
+
+    pieces = []
+    nodes = [P0]
+
+    def line_piece(p, q):
+        d = q - p
+        if d.length < 1e-9:
+            return
+        dn = (d - a * d.dot(a)).normalized()
+        n = a.cross(dn).normalized()
+        for side in (n, -n):
+            for g in placed(halves, turn_to(side), p):
+                pieces.append(Solid.extrude(g, d))
+        nodes.append(q)
+
+    for e in path.edges():
+        # the edge as it runs along the path
+        p, q = e.position_at(0), e.position_at(1)
+        tname = e.geom_type.name if hasattr(e.geom_type, "name") else str(e.geom_type)
+        if tname == "LINE":
+            line_piece(p, q)
+        elif tname == "CIRCLE":
+            c = e.arc_center
+            rho = (p - c).length
+            u0 = (p - c - a * (p - c).dot(a)).normalized()
+            tan0 = e.tangent_at(0)
+            sgn = 1.0 if a.cross(u0).dot(tan0) > 0 else -1.0
+            ang = math.degrees(e.length / rho) * sgn
+            arc_axis = Axis(c, a)
+            outer = placed(halves, turn_to(u0), p)
+            inner = []
+            for g in placed(halves, turn_to(-u0), p):
+                # the part of the inner half beyond the arc axis is covered by the tools at the arc ends
+                inner += common(g, halfspace(c, u0))
+            for g in outer + [x for x in inner if x.area > 1e-9]:
+                pieces.append(Solid.revolve(g, abs(ang), Axis(c, a * sgn)))
+            nodes.append(q)
+        else:
+            n = max(8, int(e.length / 0.5))
+            n = min(n, 200)
+            prev = p
+            for i in range(1, n + 1):
+                cur = e.position_at(i / float(n))
+                line_piece(prev, cur)
+                prev = cur
+    for nd in nodes:
+        pieces.append(tool.moved(Location(nd - P0)))
+    allp = []
+    for x in pieces:
+        allp += list(x.solids()) if hasattr(x, "solids") else [x]
+    args, tls = _shape_list(), _shape_list()
+    args.Append(allp[0].wrapped)
+    for x in allp[1:]:
+        tls.Append(x.wrapped)
+    op = BRepAlgoAPI_Fuse()
+    op.SetArguments(args)
+    op.SetTools(tls)
+    op.SetFuzzyValue(1e-6)
+    op.Build()
+    if not op.IsDone():
+        raise ValueError("the tool sweep could not be fused")
+    res = Shape.cast(op.Shape()).clean()
+    sols = list(res.solids())
+    if not sols:
+        raise ValueError("the tool sweep gave no solid")
+    return sols[0] if len(sols) == 1 else Compound(children=sols)
 
 
 # --------------------------------------------------------------------------- edges
 
 def edge_key(e):
-    m = e.position_at(0.5)
-    return {"mid": [round(m.X, 4), round(m.Y, 4), round(m.Z, 4)], "len": round(e.length, 4)}
+    return dict(_edge_info(e)[2])
+
+
+def expand_faces(body, ref, mode, angle=2.0):
+    """Face references grown from the picked face (ref) on body (the solid or a surface body): mode "tangent": the
+    faces joined to it through edges where the two faces meet with tangent continuity (normals within angle deg at
+    the edge middle); "connected": all faces joined to it through shared edges (within the solid that holds the face,
+    not across cells)."""
+    from OCP.TopExp import TopExp
+    from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE
+    try:
+        from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape as ShapeMap
+    except ImportError:                       # OCCT 8
+        from OCP.collections import IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher as ShapeMap
+    from build123d import Face, Edge
+    seed = find_faces(body, [ref])
+    if not seed:
+        return [ref]
+    seed = seed[0]
+    scope = body
+    sols = list(body.solids()) if hasattr(body, "solids") else []
+    if len(sols) > 1:
+        for so in sols:
+            if any(fc.wrapped.IsSame(seed.wrapped) for fc in so.faces()):
+                scope = so
+                break
+    m = ShapeMap()
+    TopExp.MapShapesAndAncestors_s(scope.wrapped, TopAbs_EDGE, TopAbs_FACE, m)
+    cmin = math.cos(math.radians(angle))
+    out = [seed]
+    queue = [seed]
+
+    def has(fc):
+        return any(fc.wrapped.IsSame(o.wrapped) for o in out)
+
+    def tangent(fa, fb, e):
+        try:
+            p = Edge(e).position_at(0.5)
+            na, nb = _normal_at(fa, p), _normal_at(fb, p)
+            return abs(na.dot(nb)) >= cmin
+        except Exception:
+            return False
+    while queue:
+        fc = queue.pop()
+        for e in fc.edges():
+            if not m.Contains(e.wrapped):
+                continue
+            for g in m.FindFromKey(e.wrapped):
+                other = Face(g)
+                if other.wrapped.IsSame(fc.wrapped) or has(other):
+                    continue
+                if mode == "tangent" and not tangent(fc, other, e.wrapped):
+                    continue
+                out.append(other)
+                queue.append(other)
+    return [face_key(fc) for fc in out]
 
 
 def expand_edges(shape, refs, mode):
@@ -3975,21 +5537,46 @@ def expand_edges(shape, refs, mode):
     return [edge_key(e) for e in out]
 
 
+def _cell_solid(shape, r):
+    """The solid of a part of several solids named by the "cell" of a reference (the solid the element was picked
+    on), or None."""
+    cell = r.get("cell") if isinstance(r, dict) else None
+    if not isinstance(cell, int) or shape is None or not hasattr(shape, "solids"):
+        return None
+    sols = list(shape.solids())
+    return sols[cell] if len(sols) > 1 and 0 <= cell < len(sols) else None
+
+
 def find_edges(shape, refs):
-    """Edges of shape matching the references (nearest mid point, length within 1 %)."""
-    edges = list(shape.edges())
-    out = []
+    """Edges of shape matching the references (nearest mid point, length within 1 %). A reference with "cell"
+    (the solid the edge was picked on) is matched in that solid first: coincident edges of other solids are not
+    taken."""
+    tp = _topo(shape)
+    edges, mids, lens = tp.edges, tp.edge_mid, tp.edge_len
+    n = len(edges)
+    out, taken = [], set()
     for r in refs:
         mid, ln = r.get("mid"), float(r.get("len", 0) or 0)
+        if not mid:
+            continue
+        mx, my, mz = mid
+        tol = max(0.05, 0.01 * max(ln, 1.0))
+        ltol = 0.01 * max(ln, 1.0) + 1e-6
+        cand = range(n)
+        cell = r.get("cell")
+        if isinstance(cell, int) and len(tp.solids) > 1 and 0 <= cell < len(tp.solids):
+            own = sorted(tp.solid_edges[cell])
+            if any(abs(lens[i] - ln) <= ltol and math.dist(mids[i], mid) < tol for i in own):
+                cand = own
         best, bd = None, None
-        for e in edges:
-            m = e.position_at(0.5)
-            d = math.sqrt((m.X - mid[0]) ** 2 + (m.Y - mid[1]) ** 2 + (m.Z - mid[2]) ** 2)
+        for i in cand:
+            m = mids[i]
+            d = math.sqrt((m[0] - mx) ** 2 + (m[1] - my) ** 2 + (m[2] - mz) ** 2)
             if bd is None or d < bd:
-                best, bd = e, d
-        if best is not None and bd < max(0.05, 0.01 * max(ln, 1.0)) and abs(best.length - ln) <= 0.01 * max(ln, 1.0) + 1e-6:
-            if all(best.wrapped.IsSame(o.wrapped) is False for o in out):
-                out.append(best)
+                best, bd = i, d
+        if best is not None and bd < tol and abs(lens[best] - ln) <= ltol and best not in taken:
+            taken.add(best)
+            out.append(edges[best])
     return out
 
 
@@ -4013,50 +5600,160 @@ def round_info(sh):
     return {"r": round(r, 5), "span": round(math.degrees(min(span, 2 * math.pi)), 3)}
 
 
+_MESH_FACES = _ShapeCache(60000, budget=1500000)   # face -> (triangulation key, nodes, triangles, edge polylines); budget: nodes + triangles
+_MESH_RESULTS = _ShapeCache(6)         # shape -> (tol, mesh record)
+_FACE_BBOX = _ShapeCache(60000)        # face -> [loose box, box of the triangulation nodes (or None), exact box (or None)]
+
+
+def _box6(box):
+    lo, hi = box.CornerMin(), box.CornerMax()
+    return (lo.X(), lo.Y(), lo.Z(), hi.X(), hi.Y(), hi.Z())
+
+
+def _union6(a, b):
+    return b if a is None else (min(a[0], b[0]), min(a[1], b[1]), min(a[2], b[2]), max(a[3], b[3]), max(a[4], b[4]), max(a[5], b[5]))
+
+
+def exact_bbox(shape):
+    """Exact bounding box [xmin, ymin, zmin, xmax, ymax, zmax] of a shape, or None for an empty shape. Each face
+    gives a loose box (BRepBndLib.Add: exact for planes, cylinders, cones and spheres, larger for other surfaces)
+    and the box of its triangulation nodes (never larger than the exact box). A bound where the two agree is
+    exact; elsewhere the faces that can reach beyond the node box get the exact box of BRepBndLib.AddOptimal (the
+    slow computation for a torus or B-spline face, done once per face)."""
+    from OCP.BRepBndLib import BRepBndLib
+    from OCP.Bnd import Bnd_Box
+    from OCP.BRep import BRep_Tool
+    from OCP.TopLoc import TopLoc_Location
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_FACE
+    from OCP.TopoDS import TopoDS
+    to_face = getattr(TopoDS, "Face_s", None) or TopoDS.Face
+    recs = []
+    ex = TopExp_Explorer(shape.wrapped, TopAbs_FACE)
+    while ex.More():
+        f = ex.Current()
+        ex.Next()
+        rec = _FACE_BBOX.get(f)
+        if rec is None:
+            box = Bnd_Box()
+            BRepBndLib.Add_s(f, box, False)
+            if box.IsVoid():
+                continue
+            rec = [_box6(box), None, None]
+            _FACE_BBOX.put(f, rec)
+        if rec[1] is None and rec[2] is None:
+            loc = TopLoc_Location()
+            tri = BRep_Tool.Triangulation_s(to_face(f), loc)
+            if tri is not None:
+                box = Bnd_Box()
+                BRepBndLib.Add_s(f, box, True)
+                b = _box6(box)
+                # the box of the nodes: the triangulation box less its enlargement (deflection and tolerance)
+                d = tri.Deflection() + BRep_Tool.Tolerance_s(to_face(f)) + 1e-7
+                rec[1] = (b[0] + d, b[1] + d, b[2] + d, b[3] - d, b[4] - d, b[5] - d)
+        recs.append((f, rec))
+    if not recs:
+        box = Bnd_Box()
+        BRepBndLib.AddOptimal_s(shape.wrapped, box, False, False)
+        return None if box.IsVoid() else list(_box6(box))
+    L = N = None
+    for _, rec in recs:
+        L = _union6(L, rec[0])
+        if rec[2] is not None:
+            N = _union6(N, rec[2])
+        elif rec[1] is not None:
+            N = _union6(N, rec[1])
+    if N is None:
+        N = (L[3], L[4], L[5], L[0], L[1], L[2])        # no triangulation: every face is a candidate
+    out = list(L)
+    for k in range(6):
+        if abs(L[k] - N[k]) <= 1e-5:
+            continue
+        # the faces whose loose box reaches beyond the node box on this bound
+        best = N[k]
+        for f, rec in recs:
+            lb = rec[0][k]
+            if (k < 3 and lb >= N[k] - 1e-5) or (k >= 3 and lb <= N[k] + 1e-5):
+                continue
+            if rec[2] is None:
+                box = Bnd_Box()
+                BRepBndLib.AddOptimal_s(f, box, False, False)
+                rec[2] = _box6(box)
+            best = min(best, rec[2][k]) if k < 3 else max(best, rec[2][k])
+        out[k] = best
+    return [0.0 if abs(v) < 1e-7 else v for v in out]
+
+
+def _face_mesh_data(f, tri, loc):
+    """(nodes [[x, y, z]], triangles [[a, b, c]] (0-based, outward), [(edge TopoDS, [node indices])]) of one face from
+    its triangulation; the nodes in world coordinates, rounded to 1e-5 mm."""
+    from OCP.BRep import BRep_Tool
+    from OCP.TopAbs import TopAbs_REVERSED, TopAbs_EDGE
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopoDS import TopoDS
+    to_edge = getattr(TopoDS, "Edge_s", None) or TopoDS.Edge
+    trsf = loc.Transformation()
+    ident = loc.IsIdentity()
+    node = tri.Node
+    rng = range(1, tri.NbNodes() + 1)
+    # tuples: not traversed by the cyclic garbage collector, which otherwise scans every cached node and triangle
+    if ident:
+        nodes = [(round(x, 5), round(y, 5), round(z, 5)) for x, y, z in (node(i).Coord() for i in rng)]
+    else:
+        nodes = [(round(x, 5), round(y, 5), round(z, 5)) for x, y, z in (node(i).Transformed(trsf).Coord() for i in rng)]
+    rev = f.Orientation() == TopAbs_REVERSED
+    triangle = tri.Triangle
+    rng = range(1, tri.NbTriangles() + 1)
+    if rev:
+        tris = [(a - 1, c - 1, b - 1) for a, b, c in (triangle(i).Get() for i in rng)]
+    else:
+        tris = [(a - 1, b - 1, c - 1) for a, b, c in (triangle(i).Get() for i in rng)]
+    polys = []
+    seen = set()
+    ex = TopExp_Explorer(f, TopAbs_EDGE)
+    while ex.More():
+        e = to_edge(ex.Current())
+        ex.Next()
+        h = hash(e)
+        if h in seen:
+            continue
+        seen.add(h)
+        pt = BRep_Tool.PolygonOnTriangulation_s(e, tri, loc)
+        if pt is None:
+            continue
+        nds = pt.Nodes()
+        polys.append((e, tuple(nds.Value(j) - 1 for j in range(nds.Lower(), nds.Upper() + 1))))
+    return nodes, tris, polys
+
+
 def mesh(shape, tol=None):
     """Triangles and edge polylines for the 3D view. One BRepMesh pass over the shape; the triangles of each face and
     the polyline of each edge are read from the triangulation (edges without a face: sampled along the curve).
-    face_keys, edge_keys: one per face and per edge, in the order of shape.faces() and shape.edges()."""
+    face_keys, edge_keys: one per face and per edge, in the order of shape.faces() and shape.edges().
+    The data of a face is read once per triangulation: faces unchanged by a feature (the same TopoDS faces with the
+    same triangulation) are taken from the last call; an unchanged shape returns the last record."""
     from OCP.BRepMesh import BRepMesh_IncrementalMesh
     from OCP.BRep import BRep_Tool
     from OCP.TopLoc import TopLoc_Location
-    from OCP.TopAbs import TopAbs_REVERSED, TopAbs_EDGE, TopAbs_FACE
-    from OCP.TopExp import TopExp_Explorer
-    from OCP.TopoDS import TopoDS
-    try:
-        from OCP.TopTools import TopTools_IndexedMapOfShape as ShapeMap
-    except ImportError:                       # OCCT 8
-        from OCP.collections import IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher as ShapeMap
-    to_edge = getattr(TopoDS, "Edge_s", None) or TopoDS.Edge
     if shape is None:
         return {"vertices": [], "triangles": [], "edges": [], "bbox": None}
-    bb = shape.bounding_box()
-    tol = tol or max(bb.diagonal / 2000.0, 0.005)
-    BRepMesh_IncrementalMesh(shape.wrapped, tol, False, 0.3, True)
-    faces, edges_b = list(shape.faces()), list(shape.edges())
-    fmap, emap = ShapeMap(), ShapeMap()
-    for fc in faces:
-        fmap.Add(fc.wrapped)
-    for e in edges_b:
-        emap.Add(e.wrapped)
+    hit = _MESH_RESULTS.get(shape.wrapped)
+    if hit is not None and hit[0] == tol:
+        return hit[1]
+    bb0 = _bbox(shape)
+    tol_m = tol or max(bb0.diagonal / 2000.0, 0.005)
+    BRepMesh_IncrementalMesh(shape.wrapped, tol_m, False, 0.3, True)
+    tp = _topo(shape)
+    faces, edges_b = tp.faces, tp.edges
+    emap = tp.emap
     # solid index of each face and solids of each edge (by identity)
     face_solid = [-1] * len(faces)
     edge_solids = [[] for _ in edges_b]
-    for si, so in enumerate(shape.solids()):
-        ex = TopExp_Explorer(so.wrapped, TopAbs_FACE)
-        while ex.More():
-            i = fmap.FindIndex(ex.Current())
-            if i:
-                face_solid[i - 1] = si
-            ex.Next()
-        seen = set()
-        ex = TopExp_Explorer(so.wrapped, TopAbs_EDGE)
-        while ex.More():
-            i = emap.FindIndex(ex.Current())
-            if i and i not in seen:
-                seen.add(i)
-                edge_solids[i - 1].append(si)
-            ex.Next()
+    for si, (fs, es) in enumerate(zip(tp.solid_faces, tp.solid_edges)):
+        for i in fs:
+            face_solid[i] = si
+        for i in es:
+            edge_solids[i].append(si)
     verts, tris, face_of_tri, face_keys = [], [], [], []
     poly = {}                                  # edge index -> polyline
     for fi, fc in enumerate(faces):
@@ -4073,39 +5770,29 @@ def mesh(shape, tol=None):
         tri = BRep_Tool.Triangulation_s(f, loc)
         if tri is None:
             continue
-        trsf = loc.Transformation()
-        ident = loc.IsIdentity()
+        tkey = (hash(tri), tri.NbNodes(), tri.NbTriangles(), f.Orientation(), loc.IsIdentity())
+        data = _MESH_FACES.get(f)
+        if data is None or data[0] != tkey:
+            data = (tkey,) + _face_mesh_data(f, tri, loc)
+            _MESH_FACES.put(f, data, len(data[1]) + len(data[2]))
+        _, nodes, ftris, polys = data
         base = len(verts)
-        for i in range(1, tri.NbNodes() + 1):
-            p = tri.Node(i)
-            if not ident:
-                p = p.Transformed(trsf)
-            verts.append([round(p.X(), 5), round(p.Y(), 5), round(p.Z(), 5)])
-        rev = f.Orientation() == TopAbs_REVERSED
-        for i in range(1, tri.NbTriangles() + 1):
-            a, b, c = tri.Triangle(i).Get()
-            tris.append([base + a - 1, base + c - 1, base + b - 1] if rev else [base + a - 1, base + b - 1, base + c - 1])
-        face_of_tri += [fi] * tri.NbTriangles()
-        ex = TopExp_Explorer(f, TopAbs_EDGE)
-        while ex.More():
-            e = to_edge(ex.Current())
-            ex.Next()
+        verts += nodes
+        tris += [(base + a, base + b, base + c) for a, b, c in ftris]
+        face_of_tri += [fi] * len(ftris)
+        for e, idx in polys:
             k = emap.FindIndex(e)
             if not k or k in poly:
                 continue
-            pt = BRep_Tool.PolygonOnTriangulation_s(e, tri, loc)
-            if pt is None:
-                continue
-            nodes = pt.Nodes()
-            poly[k] = [verts[base + nodes.Value(j) - 1] for j in range(nodes.Lower(), nodes.Upper() + 1)]
+            poly[k] = [verts[base + j] for j in idx]
     edges, keys, esol = [], [], []
     for ei, e in enumerate(edges_b):
         try:
             pl = poly.get(ei + 1)
             if pl is None:                     # an edge on no meshed face (curve bodies): sampled
                 L = e.length
-                n = 1 if e.geom_type.name == "LINE" else max(8, min(96, int(L / (tol * 20)) + 8))
-                pl = [[round(p.X, 5), round(p.Y, 5), round(p.Z, 5)] for p in (e.position_at(i / n) for i in range(n + 1))]
+                n = 1 if e.geom_type.name == "LINE" else max(8, min(96, int(L / (tol_m * 20)) + 8))
+                pl = [(round(p.X, 5), round(p.Y, 5), round(p.Z, 5)) for p in (e.position_at(i / n) for i in range(n + 1))]
             k = edge_key(e)
             ri = round_info(e)
             if ri:
@@ -4115,9 +5802,13 @@ def mesh(shape, tol=None):
         edges.append(pl)
         keys.append(k)
         esol.append(edge_solids[ei])
-    return {"vertices": verts, "triangles": tris, "edges": edges, "edge_keys": keys, "edge_solids": esol,
-            "face_of_tri": face_of_tri, "face_keys": face_keys, "face_solid": face_solid,
-            "bbox": [bb.min.X, bb.min.Y, bb.min.Z, bb.max.X, bb.max.Y, bb.max.Z]}
+    bb = exact_bbox(shape)
+    if bb is None:
+        bb = [bb0.min.X, bb0.min.Y, bb0.min.Z, bb0.max.X, bb0.max.Y, bb0.max.Z]
+    rec = {"vertices": verts, "triangles": tris, "edges": edges, "edge_keys": keys, "edge_solids": esol,
+           "face_of_tri": face_of_tri, "face_keys": face_keys, "face_solid": face_solid, "bbox": bb}
+    _MESH_RESULTS.put(shape.wrapped, (tol, rec))
+    return rec
 
 
 def face_owners(m, owners):
@@ -4186,7 +5877,9 @@ def earlier_sketch_refs(part, feats, upto, plane, status, datums):
         if any(g.get("id") != sid and tag in _json.dumps(g) for g in raw):
             continue
         try:
-            out += _edge_refs(None, plane, sketch_tool_edges(feats, frames, datums, sid))
+            for r in _edge_refs(None, plane, sketch_tool_edges(feats, frames, datums, sid)):
+                r["src"] = "sketch"                 # shown with Earlier sketches in the sketch bar
+                out.append(r)
         except Exception:
             continue
     return out
@@ -4332,7 +6025,9 @@ def _section_refs_of(shape, plane, project, is_solid):
     out = []
     if project:
         try:
-            out += projected_refs(shape, plane) if is_solid else _edge_refs(shape, plane)
+            # a rough mesh body: its section only (the projection of every triangle edge is no use for tracing)
+            if not getattr(shape, "_mesh", False) and (is_solid or len(shape.faces()) <= 3000):
+                out += projected_refs(shape, plane) if is_solid else _edge_refs(shape, plane)
         except Exception:
             pass
     sec = BRepAlgoAPI_Section(shape.wrapped, plane.wrapped)

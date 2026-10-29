@@ -1261,6 +1261,11 @@ def _solve_core(asm, refs_of, datums_of=None, detail=None, drag=None, summary=Tr
                     break
                 stall = stall + 1 if nr > 0.98 * nr_prev else 0
                 continue
+            rs = getattr(_TL, "rot_scale", 1.0)
+            if rs != 1.0:                             # rotations weighted in the minimum norm (CAM placement)
+                Sr = np.array([1.0 if j % 6 < 3 else rs for j in range(n)])
+                Js = J * Sr
+                JJ = Js @ Js.T
             for tries in range(8):
                 # minimum-norm step: dx = J^T (J J^T + mu (1 + diag)) ^-1 (-r)
                 A = JJ + np.diag(mu * (1.0 + np.diag(JJ)))
@@ -1269,7 +1274,8 @@ def _solve_core(asm, refs_of, datums_of=None, detail=None, drag=None, summary=Tr
                 except np.linalg.LinAlgError:
                     mu *= 10
                     continue
-                xn = [a + float(b) for a, b in zip(x, J.T @ y)]
+                step_ = (Sr * (Js.T @ y)) if rs != 1.0 else (J.T @ y)
+                xn = [a + float(b) for a, b in zip(x, step_)]
                 bn = [block(k, xn) for k in range(len(mates))]
                 if [len(b) for b in bn] != [len(b) for b in blocks]:
                     mu *= 10
@@ -1420,7 +1426,20 @@ def _mate_order(cids, mates, comps):
     return out
 
 
-def solve_mates(asm, refs_of, datums_of=None, detail=None, drag=None):
+_TL = threading.local()
+
+
+def solve_mates(asm, refs_of, datums_of=None, detail=None, drag=None, rot_scale=1.0):
+    """See _solve_mates; rot_scale below 1 makes rotations cost more than translations in the minimum-norm steps
+    (1 deg like 1 / rot_scale mm), so a part turns only where its mates need it."""
+    _TL.rot_scale = float(rot_scale)
+    try:
+        return _solve_mates(asm, refs_of, datums_of, detail, drag)
+    finally:
+        _TL.rot_scale = 1.0
+
+
+def _solve_mates(asm, refs_of, datums_of=None, detail=None, drag=None):
     """Solves the mates group by group (components connected by mates); a group is independent of the others.
     When the mates of a group cannot all be satisfied, the group is solved again from its starting placement adding
     one mate at a time (from the fixed components outwards): a mate that cannot be satisfied together with the mates

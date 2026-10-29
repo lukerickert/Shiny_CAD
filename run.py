@@ -71,7 +71,7 @@ def main():
     try:
         from drawgen import fileassoc
         if fileassoc.register(here):
-            print("File types .scpart .scasm .scsketch .scfea .scexp registered (double-click opens them in SHINYCAD)")
+            print("File types .scpart .scasm .scsketch .scfea .scexp .sccam registered (double-click opens them in SHINYCAD)")
     except Exception as e:  # noqa: BLE001
         print("File types not registered: %s" % e)
     print("SHINYCAD running at %s (Ctrl+C to stop)" % url)

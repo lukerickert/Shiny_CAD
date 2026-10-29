@@ -247,21 +247,99 @@
     "units": "mm",
     "keys": "default"
   },
-  "recent_roots": [
+  "cam_machine": {
+    "travel_x": 500.0,
+    "travel_y": 300.0,
+    "travel_z": 100.0,
+    "table_x": 600.0,
+    "table_y": 400.0,
+    "table_t": 20.0,
+    "home_x": 50.0,
+    "home_y": 50.0,
+    "tip_top": 110.0,
+    "gantry_clear": 130.0,
+    "spindle_d": 80.0,
+    "spindle_len": 200.0
+  },
+  "cam_tools": [
     {
-      "path": "C:\\Users\\ricke\\Documents\\000000000000_ORG_STRUCTURE\\BUSINESS\\VISE\\LITA_CAD\\WHEEL_COVER",
-      "used": "2026-10-25 09:32",
-      "project": "STL_IMPORT"
+      "id": "T1",
+      "name": "End mill 6 mm",
+      "shape": "endmill",
+      "d": 6.0,
+      "height": 18.0,
+      "neck": 6.0,
+      "neck_length": 0.0,
+      "shank": 6.0,
+      "shank_length": 30.0,
+      "flutes": 2,
+      "feed": 800.0,
+      "plunge": 200.0,
+      "rpm": 12000.0
     },
     {
-      "path": "C:\\Users\\ricke\\Documents\\000000000000_ORG_STRUCTURE\\BUSINESS\\VISE\\LITA_CAD\\VISE",
-      "used": "2026-10-25 09:22",
-      "project": ""
+      "id": "T2",
+      "name": "Dovetail 10 mm 60 deg 4T",
+      "shape": "dovetail",
+      "d": 10.0,
+      "angle": 60.0,
+      "height": 4.0,
+      "neck": 5.0,
+      "neck_length": 6.0,
+      "shank": 10.0,
+      "shank_length": 30.0,
+      "flutes": 4,
+      "feed": 300.0,
+      "plunge": 100.0,
+      "rpm": 8000.0
     },
     {
-      "path": "C:\\Users\\ricke\\Documents\\000000000000_ORG_STRUCTURE\\BUSINESS\\GENERAL_WORKING",
-      "used": "2026-10-25 09:08",
-      "project": "GATE"
+      "id": "T3",
+      "name": "Drill 6 mm",
+      "shape": "drill",
+      "d": 6.0,
+      "angle": 118.0,
+      "height": 30.0,
+      "neck": 6.0,
+      "neck_length": 0.0,
+      "shank": 6.0,
+      "shank_length": 20.0,
+      "flutes": 2,
+      "feed": 150.0,
+      "plunge": 150.0,
+      "rpm": 3000.0
+    },
+    {
+      "id": "T4",
+      "name": "Ball end mill 6 mm",
+      "shape": "ballend",
+      "d": 6.0,
+      "height": 12.0,
+      "neck": 6.0,
+      "neck_length": 0.0,
+      "shank": 6.0,
+      "shank_length": 30.0,
+      "flutes": 2,
+      "feed": 600.0,
+      "plunge": 200.0,
+      "rpm": 12000.0
+    },
+    {
+      "id": "T5",
+      "name": "V bit 90 deg 6 mm",
+      "shape": "vbit",
+      "d": 6.0,
+      "angle": 90.0,
+      "tip": 0.2,
+      "height": 3.0,
+      "neck": 6.0,
+      "neck_length": 0.0,
+      "shank": 6.0,
+      "shank_length": 30.0,
+      "flutes": 2,
+      "feed": 400.0,
+      "plunge": 150.0,
+      "rpm": 12000.0
     }
   ]
 }

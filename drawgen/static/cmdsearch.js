@@ -7,7 +7,7 @@
     "tab-part": ["part", "Part"], "tab-asm": ["asm", "Assembly"], "tab-fea": ["fea", "Analysis"], "tab-xp": ["xp", "Explicit"] };
   // other names of commands (matched as words of the text or tooltip)
   const ALIAS = {
-    "import step": "stl iges brep open load geometry", "extrude": "pad boss", "cut": "pocket remove", "revolve": "lathe turn",
+    "import geometry": "step stp stl iges brep open load model mesh", "extrude": "pad boss", "cut": "pocket remove", "revolve": "lathe turn",
     "fillet": "round radius", "chamfer": "bevel", "pattern": "array copy repeat", "mirror": "symmetry", "shell": "hollow",
     "hole": "drill thread", "sweep": "path", "loft": "blend", "measure": "distance", "trim": "cut extend",
     "export step": "save stp", "export mesh": "fem msh", "make drawing": "sheet 2d", "coincident": "join connect",
@@ -75,15 +75,23 @@
     if (on) on.scrollIntoView({ block: "nearest" });
   }
 
-  function open() {
-    CS.items = collect();
-    CS.sel = 0;
-    $("#cmd-search").hidden = false;
-    $("#cs-input").value = "";
-    render();
-    $("#cs-input").focus();
+  /** The result list drops down below the search field of the tab bar. */
+  function place() {
+    const r = $("#cs-input").getBoundingClientRect(), box = $("#cmd-search");
+    box.style.left = Math.max(8, Math.min(r.left, window.innerWidth - 560)) + "px";
+    box.style.top = (r.bottom + 4) + "px";
   }
-  function close() { $("#cmd-search").hidden = true; }
+  function open() {
+    if ($("#cmd-search").hidden) { CS.items = collect(); CS.sel = 0; }
+    $("#cmd-search").hidden = false;
+    place();
+    render();
+  }
+  function close() {
+    $("#cmd-search").hidden = true;
+    $("#cs-input").value = "";
+    $("#cs-input").blur();
+  }
 
   function run(it) {
     if (!it) return;
@@ -100,26 +108,30 @@
     status(`${it.label} (${it.where})`);
   }
 
-  window.commandSearch = { open, close, collect, run: q => { open(); $("#cs-input").value = q; render(); run(CS.shown[0]); } };
+  window.commandSearch = { open, close, collect, run: q => { $("#cs-input").value = q; open(); run(CS.shown[0]); } };
 
   document.addEventListener("DOMContentLoaded", () => {
-    document.body.insertAdjacentHTML("beforeend", `<div id="cmd-search" class="cmd-search" hidden><div class="cs-box">
-      <input type="text" id="cs-input" placeholder="Search commands (Enter runs, Esc closes)" autocomplete="off" spellcheck="false">
-      <div id="cs-list"></div></div></div>`);
+    document.body.insertAdjacentHTML("beforeend", '<div id="cmd-search" class="cmd-search" hidden><div id="cs-list"></div></div>');
     const nav = $(".tabs");
-    if (nav) nav.insertAdjacentHTML("beforeend", '<button type="button" id="cs-open" class="cs-open" title="Search commands (Ctrl+K)">Search ⌕</button>');
-    $("#cs-open").onclick = e => { e.stopPropagation(); open(); };
-    $("#cs-input").oninput = () => { CS.sel = 0; render(); };
-    $("#cs-input").onkeydown = e => {
+    if (nav) nav.insertAdjacentHTML("beforeend", '<span class="cs-field" title="Search the commands of all tabs (Ctrl+K)"><span class="cs-glass">⌕</span>' +
+      '<input type="search" id="cs-input" placeholder="Search commands (Ctrl+K)" autocomplete="off" spellcheck="false"></span>');
+    const inp = $("#cs-input");
+    inp.onfocus = open;
+    inp.oninput = () => { CS.sel = 0; open(); };
+    inp.onkeydown = e => {
       if (e.key === "ArrowDown") { e.preventDefault(); CS.sel = Math.min(CS.sel + 1, CS.shown.length - 1); mark(); }
       else if (e.key === "ArrowUp") { e.preventDefault(); CS.sel = Math.max(CS.sel - 1, 0); mark(); }
       else if (e.key === "Enter") { e.preventDefault(); run(CS.shown[CS.sel]); }
       else if (e.key === "Escape") { e.preventDefault(); close(); }
       e.stopPropagation();
     };
-    $("#cmd-search").onmousedown = e => { if (e.target.id === "cmd-search") close(); };
+    // a click outside the field and the list closes the list
+    document.addEventListener("mousedown", e => {
+      if (!$("#cmd-search").hidden && !e.target.closest("#cmd-search, .cs-field")) close();
+    }, true);
+    window.addEventListener("resize", () => { if (!$("#cmd-search").hidden) place(); });
     document.addEventListener("keydown", e => {
-      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "k") { e.preventDefault(); open(); }
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "k") { e.preventDefault(); inp.focus(); open(); }
     }, true);
   });
 })();

@@ -164,7 +164,7 @@ Move, rotate, trim, extend, fillet and chamfer remove the constraints that are n
 
 | Tool | Key | Picks |
 |---|---|---|
-| **Dimension** | A | Line (length), circle (diameter), arc (radius), two points (horizontal or vertical from the position, otherwise aligned), point and line (distance), two lines (angle); then the position |
+| **Dimension** | A | Line (length), circle (diameter), arc (radius), two points (horizontal or vertical from the position, otherwise aligned), point and line (distance), two lines (angle); then the position. A circle or arc clicked on its outline as the second pick, or as the first pick followed by a point, a line or another circle, counts as its centre (distance from the centre); as the first pick followed by a position it is the diameter or radius |
 | **Horizontal**, **Vertical** | S, D | Line or two points; then the position |
 | **Note** | Shift+A | Text position, then the text (Enter = new line, Ctrl+Enter or OK = place) |
 | **Leader** | Shift+S | Arrow point, text position, then the text |

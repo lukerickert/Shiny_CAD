@@ -6,8 +6,8 @@
   const PJ = { info: null, docs: null, states: [], sort: { key: "name", dir: 1 }, allSort: { key: "opened", dir: -1 } };
   try { const as = JSON.parse(localStorage.getItem("pj-allsort") || "null"); if (as && as.key && (as.dir === 1 || as.dir === -1)) PJ.allSort = as; } catch (e) { /* default order */ }
   try { const ps = JSON.parse(localStorage.getItem("pj-sort") || "null"); if (ps && ps.key && (ps.dir === 1 || ps.dir === -1)) PJ.sort = ps; } catch (e) { /* default order */ }
-  const TYPE_LABEL = { part: "Part", sketch: "Sketch", assembly: "Assembly", analysis: "Analysis", explicit: "Explicit" };
-  const TAB_OF = { part: "part", sketch: "sketch", assembly: "asm", analysis: "fea", explicit: "xp" };
+  const TYPE_LABEL = { part: "Part", sketch: "Sketch", assembly: "Assembly", analysis: "Analysis", explicit: "Explicit", cam: "CAM" };
+  const TAB_OF = { part: "part", sketch: "sketch", assembly: "asm", analysis: "fea", explicit: "xp", cam: "cam" };
   const kb = n => n > 1048576 ? (n / 1048576).toFixed(1) + " MB" : n > 1024 ? (n / 1024).toFixed(0) + " kB" : n + " B";
 
   async function refreshProjects() {
@@ -28,13 +28,51 @@
     $("#pj-desc").disabled = !cur;
     $("#pj-rename").disabled = !cur;
     $("#pj-folder").disabled = !cur;
-    $("#pj-paths").textContent = cur ? `${i.root}\\${cur.name}\\  work (documents), drawings (PDF, DXF, SVG, FCStd), step (STEP and mesh exports), step_import (copies of imported STEP files), analysis (solver files and reports), explicit (OpenCourant model and run folders), versions, states` : "";
+    $("#pj-paths").textContent = cur ? `${i.root}\\${cur.name}\\  work (documents), drawings (PDF, DXF, SVG, FCStd), step (STEP and mesh exports), step_import (copies of imported STEP files), analysis (solver files and reports), explicit (OpenCourant model and run folders), cam (G-code files), versions, states` : "";
     $("#pj-adopt").hidden = !(i.root && !i.projects.length);
     renderAll();
     if (i.current) { await refreshDocs(); await refreshStates(); }
     else { $("#pj-docs").innerHTML = ""; $("#pj-exports").innerHTML = ""; $("#pj-states").innerHTML = ""; }
     // the saved lists of the tabs follow the project
-    for (const fn of ["__partRefresh", "__asmRefresh", "__sketchRefresh", "__feaRefresh", "__xpRefresh"]) { try { if (window[fn]) window[fn](); } catch (e) { /* tab not initialised */ } }
+    for (const fn of ["__partRefresh", "__asmRefresh", "__sketchRefresh", "__feaRefresh", "__xpRefresh", "__camRefresh"]) { try { if (window[fn]) window[fn](); } catch (e) { /* tab not initialised */ } }
+  }
+
+  /** Column widths of a table set by dragging the right edge of a header cell (grip); kept in localStorage under
+   *  key (one entry per column, px). A double-click on the grip restores the automatic widths. */
+  function resizableColumns(table, key) {
+    if (!table) return;
+    const ths = [...table.querySelectorAll("tr:first-child th")];
+    let widths = null;
+    try { widths = JSON.parse(localStorage.getItem(key) || "null"); } catch (e) { /* automatic widths */ }
+    if (!Array.isArray(widths) || widths.length !== ths.length) widths = null;
+    const apply = () => {
+      if (!widths) { table.style.tableLayout = ""; table.style.width = ""; ths.forEach(t => { t.style.width = ""; }); return; }
+      table.style.tableLayout = "fixed";
+      let sum = 0;
+      ths.forEach((t, i) => { t.style.width = widths[i] + "px"; sum += widths[i]; });
+      table.style.width = sum + "px";
+    };
+    apply();
+    ths.forEach((th, i) => {
+      const g = document.createElement("div");
+      g.className = "pj-grip";
+      g.title = "Drag: column width. Double-click: automatic widths";
+      th.appendChild(g);
+      g.onclick = e => e.stopPropagation();                      // not a sort click
+      g.ondblclick = e => { e.stopPropagation(); widths = null; try { localStorage.removeItem(key); } catch (e2) { /* nothing kept */ } apply(); };
+      g.onmousedown = e => {
+        e.preventDefault(); e.stopPropagation();
+        if (!widths) widths = ths.map(t => t.offsetWidth);
+        const x0 = e.clientX, w0 = widths[i];
+        const move = ev => { widths[i] = Math.max(32, Math.round(w0 + ev.clientX - x0)); apply(); };
+        const up = () => {
+          document.removeEventListener("mousemove", move); document.removeEventListener("mouseup", up);
+          try { localStorage.setItem(key, JSON.stringify(widths)); } catch (e2) { /* widths kept for this session */ }
+        };
+        document.addEventListener("mousemove", move);
+        document.addEventListener("mouseup", up);
+      };
+    });
   }
 
   /** All known projects of this PC (any folder): open, sort, filter, find in a folder, remove from the list. */
@@ -56,6 +94,7 @@
       rows.slice(0, limit).map((x, k) => `<tr class="${x.current ? "pj-cur" : ""}${x.exists ? "" : " pj-missing"}" data-k="${list.indexOf(x)}"><td><b>${esc(x.name)}</b>${x.current ? " (open)" : ""}</td><td title="${esc(x.path)}">${esc(x.folder)}</td><td>${esc(x.description || "")}</td><td>${x.exists ? x.docs : "not found"}</td><td>${esc(x.modified)}</td><td>${esc((x.opened || "").slice(0, 16))}</td>` +
         `<td class="pj-actions">${x.exists && !x.current ? '<button type="button" data-aop="open">Open</button>' : ""}<button type="button" data-aop="forget" title="Remove from this list (the folder is not changed)">×</button></td></tr>`).join("") + `</table>` +
       (rows.length > limit ? `<p class="hint">${rows.length - limit} more: filter, or check Show all.</p>` : "");
+    resizableColumns(box.querySelector("table.pj-table"), "pj-colw-all");
     box.querySelectorAll("th[data-asort]").forEach(h => h.onclick = () => {
       const k = h.dataset.asort;
       PJ.allSort = PJ.allSort.key === k ? { key: k, dir: -PJ.allSort.dir } : { key: k, dir: (k === "modified" || k === "opened" || k === "docs") ? -1 : 1 };
@@ -118,6 +157,7 @@
         (links ? `<td>${usesHtml(x.links)}</td>` +
           `<td>${x.used_by.map(l => `<span class="pj-link" data-goto="${l.type}:${esc(l.name)}">${esc(l.name)}</span>`).join(", ")}</td><td>${x.exports.map(esc).join(", ")}</td>` : "") +
         `<td class="pj-actions"><button type="button" data-op="open" title="Open in its tab">Open</button><button type="button" data-op="rename">Rename</button><button type="button" data-op="copy">Copy</button><button type="button" data-op="snapshot" title="Store a numbered version with a note">Version</button><button type="button" data-op="versions" title="List, restore">Versions…</button><button type="button" data-op="move" title="Move or copy to another project">Move…</button><button type="button" data-op="savefile" title="Save as a document file in any folder">File…</button><button type="button" data-op="delete" title="Move to the project trash folder">×</button></td></tr>`).join("") + `</table>`;
+    resizableColumns(box.querySelector("table.pj-table"), links ? "pj-colw-docs-links" : "pj-colw-docs");
     box.querySelectorAll("th[data-sort]").forEach(h => h.onclick = () => {
       const k = h.dataset.sort;
       // a new column: names A to Z, dates and sizes newest / largest first
@@ -155,8 +195,8 @@
   }
 
   async function openDoc(type, name, noConfirm) {
-    const loaders = { part: window.__partLoadNamed, assembly: window.__asmLoadNamed, sketch: window.__sketchLoadNamed, analysis: window.__feaLoadNamed, explicit: window.__xpLoadNamed };
-    const cur = { part: window.__partCurrent, assembly: window.__asmCurrent, analysis: window.__feaCurrent, explicit: window.__xpCurrent }[type];
+    const loaders = { part: window.__partLoadNamed, assembly: window.__asmLoadNamed, sketch: window.__sketchLoadNamed, analysis: window.__feaLoadNamed, explicit: window.__xpLoadNamed, cam: window.__camLoadNamed };
+    const cur = { part: window.__partCurrent, assembly: window.__asmCurrent, analysis: window.__feaCurrent, explicit: window.__xpCurrent, cam: window.__camCurrent }[type];
     const c = cur && cur();
     if (c && c.dirty && !noConfirm && !confirm(`Discard the changes to the current ${type}?`)) return;
     showTab(TAB_OF[type]);
@@ -170,7 +210,7 @@
         const nn = prompt(`New name for ${type} ${name}`, name);
         if (!nn || nn === name) return;
         const r = await (await postJSON("/api/project/doc", { op: "rename", type, name, new: nn })).json();
-        const cur = { part: [window.__partCurrent, window.__partSetName], assembly: [window.__asmCurrent, window.__asmSetName], analysis: [window.__feaCurrent, window.__feaSetName], explicit: [window.__xpCurrent, window.__xpSetName] }[type];
+        const cur = { part: [window.__partCurrent, window.__partSetName], assembly: [window.__asmCurrent, window.__asmSetName], analysis: [window.__feaCurrent, window.__feaSetName], explicit: [window.__xpCurrent, window.__xpSetName], cam: [window.__camCurrent, window.__camSetName] }[type];
         if (cur && cur[0] && cur[1] && (cur[0]() || {}).name === name) cur[1](r.name);
       } else if (op === "copy") {
         const nn = prompt(`Name of the copy of ${type} ${name}`, name + " copy");
@@ -194,7 +234,7 @@
         await postJSON("/api/project/doc", { op: "delete", type, name });
       }
       await refreshDocs();
-      for (const fn of ["__partRefresh", "__asmRefresh", "__sketchRefresh", "__feaRefresh", "__xpRefresh"]) { try { if (window[fn]) window[fn](); } catch (e) { /* ignore */ } }
+      for (const fn of ["__partRefresh", "__asmRefresh", "__sketchRefresh", "__feaRefresh", "__xpRefresh", "__camRefresh"]) { try { if (window[fn]) window[fn](); } catch (e) { /* ignore */ } }
     } catch (e) { showErr(e); }
   }
 
@@ -270,6 +310,7 @@
       sketch: (cur("__sketchCurrent") || {}).name || null,
       analysis: (cur("__feaCurrent") || {}).name || null,
       explicit: (cur("__xpCurrent") || {}).name || null,
+      cam: (cur("__camCurrent") || {}).name || null,
       models: (state.files || []).map(f => ({ file_id: f.file_id, name: f.name, source: f.source || "", checked: f.parts.filter(p => p.checked).map(p => p.id) })),
       settings: readSettings(),
       drawing: $("#ann-drawing") ? $("#ann-drawing").value : null,
@@ -295,6 +336,7 @@
       if (st.sketch && window.__sketchLoadNamed) { try { await window.__sketchLoadNamed(st.sketch); } catch (e) { /* unsaved sketch */ } }
       if (st.analysis && window.__feaLoadNamed) { try { await window.__feaLoadNamed(st.analysis); } catch (e) { /* unsaved analysis */ } }
       if (st.explicit && window.__xpLoadNamed) { try { await window.__xpLoadNamed(st.explicit); } catch (e) { /* unsaved explicit analysis */ } }
+      if (st.cam && window.__camLoadNamed) { try { await window.__camLoadNamed(st.cam); } catch (e) { /* unsaved CAM document */ } }
       if (st.settings) applySettings(st.settings);
       // Models: parts and assemblies are rebuilt from their saved files, STEP files reopened by path
       state.files = [];

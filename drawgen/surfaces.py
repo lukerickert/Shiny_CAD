@@ -443,15 +443,24 @@ def thicken(shape, bodies, f, fuse, find_faces):
     d = t if side != "-" else -t
     if side == "-":
         d = -t
-    solid = None
-    try:
-        op = BRepOffset_MakeSimpleOffset(body.wrapped, d)
-        op.SetBuildSolidFlag(True)
-        op.Perform()
-        if op.IsDone():
-            solid = Shape.cast(op.GetResultShape())
-    except Exception:
-        solid = None
+    # a prismatic surface (faces parallel to one direction between two planes, an extruded profile): the profile
+    # offset in its plane, with the corners intersected and the rounds smaller than the thickness dropped
+    solid = _prism_thick(src, t, side)
+    # offset with the joins of the offset faces intersected (clean inside corners); the simple offset, which keeps
+    # the offset faces untrimmed, when it fails
+    if solid is None:
+        solid = _join_thick(body, d)
+    if solid is None:
+        try:
+            op = BRepOffset_MakeSimpleOffset(body.wrapped, d)
+            op.SetBuildSolidFlag(True)
+            op.Perform()
+            if op.IsDone():
+                solid = Shape.cast(op.GetResultShape())
+        except Exception:
+            solid = None
+        if solid is not None and solid.solids():
+            f["_note"] = "simple offset (the offset faces are not trimmed where they meet: inside corners can show folded faces)"
     if solid is None or not solid.solids():
         try:
             mk = BRepOffsetAPI_MakeThickSolid()
@@ -472,6 +481,435 @@ def thicken(shape, bodies, f, fuse, find_faces):
     if mode == "cut":
         return shape.cut(solid).clean()
     return fuse(shape, solid)
+
+
+def _fuzzy_fuse(shapes, fuzzy=1e-5):
+    """Fusion of the shapes (faces in one plane, or solids) with a fuzzy tolerance (mm): regions that meet along
+    nearly the same segment are joined."""
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+    from build123d import Shape
+    if len(shapes) == 1:
+        return shapes[0]
+    args, tools = _shape_list(), _shape_list()
+    args.Append(shapes[0].wrapped)
+    for x in shapes[1:]:
+        tools.Append(x.wrapped)
+    op = BRepAlgoAPI_Fuse()
+    op.SetArguments(args)
+    op.SetTools(tools)
+    op.SetFuzzyValue(fuzzy)
+    op.SetRunParallel(True)
+    op.Build()
+    if not op.IsDone():
+        out = shapes[0]
+        for x in shapes[1:]:
+            out = out.fuse(x)
+        return out
+    return Shape.cast(op.Shape())
+
+
+def _band_slabs(w, faces, D, sg, dist, tol, corners=True, raw=False, info=None):
+    """Faces of the band between the planar wire w and its offset by dist to the side of the face normals (sg = +1)
+    or against them (-1): for each edge the region between the edge and the edge moved along its normal (an arc
+    with its centre on that side and a radius up to dist: the sector to its centre), at each corner where the
+    offsets part the mitre to the intersection of the offset tangents (a round when the mitre is longer than
+    4 x dist); the regions are fused. None when a region cannot be made."""
+    from OCP.GeomAPI import GeomAPI_PointsToBSpline
+    from OCP.GeomAbs import GeomAbs_C2
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+    from OCP.gp import gp_Pnt
+    from build123d import Vector, Edge, Wire, Face
+    try:
+        from OCP.TColgp import TColgp_Array1OfPnt as Arr1
+    except ImportError:
+        from OCP.collections import Array1_gp_Pnt as Arr1
+    try:
+        ordered = list(w.order_edges()) if len(w.edges()) > 1 else list(w.edges())
+        n_e = len(ordered)
+        # direction of each edge along the wire (position_at follows the curve, not the wire)
+        rev = [False] * n_e
+        if n_e > 1:
+            a0, a1 = ordered[0].position_at(0), ordered[0].position_at(1)
+            b0, b1 = ordered[1].position_at(0), ordered[1].position_at(1)
+            rev[0] = min((a0 - b0).length, (a0 - b1).length) < min((a1 - b0).length, (a1 - b1).length)
+            for k in range(1, n_e):
+                prev_end = ordered[k - 1].position_at(0 if rev[k - 1] else 1)
+                c0, c1 = ordered[k].position_at(0), ordered[k].position_at(1)
+                rev[k] = (c1 - prev_end).length < (c0 - prev_end).length
+        pos = lambda k, u: ordered[k].position_at(1 - u if rev[k] else u)
+        tan = lambda k, u: ordered[k].tangent_at(1 - u if rev[k] else u) * (-1.0 if rev[k] else 1.0)
+        owner = []
+        for e in ordered:
+            m = e.position_at(0.5)
+            fc = next((f for f in faces if any(e.wrapped.IsSame(x.wrapped) for x in f.edges())), None)
+            if fc is None:
+                fc = min(faces, key=lambda f: min((x.position_at(0.5) - m).length for x in f.edges()))
+            owner.append(fc)
+        # the normal of each edge from the wire direction (D x tangent, consistent along the wire); its side from the
+        # face normals of the edges, weighted by length (a face of the shell with a reversed normal does not count)
+        vote = 0.0
+        for k, e in enumerate(ordered):
+            try:
+                vote += e.length * D.cross(tan(k, 0.5)).dot(owner[k].normal_at(pos(k, 0.5)))
+            except Exception:
+                pass
+        side_k = sg * (1.0 if vote >= 0 else -1.0)
+        nrm0 = lambda k, u: (D.cross(tan(k, u)) * side_k).normalized()
+        # at a joint where the two edges meet nearly tangent (within 2 deg) both regions end on the mean normal, so
+        # that they share the end segment and fuse into one region
+        over = {}
+        jp = [(k, k + 1) for k in range(n_e - 1)] + ([(n_e - 1, 0)] if w.is_closed and n_e > 1 else [])
+        for a_k, b_k in jp:
+            if (pos(a_k, 1.0) - pos(b_k, 0.0)).length > 1e-4:
+                continue
+            na_, nb_ = nrm0(a_k, 1.0), nrm0(b_k, 0.0)
+            if na_.dot(nb_) > math.cos(math.radians(2.0)):
+                m_ = (na_ + nb_).normalized()
+                over[(a_k, 1.0)] = m_
+                over[(b_k, 0.0)] = m_
+
+        def nrm(k, u):
+            if u in (0.0, 1.0) and (k, u) in over:
+                return over[(k, u)]
+            return nrm0(k, u)
+
+        def bspl(pts):
+            a = Arr1(1, len(pts))
+            for j, q in enumerate(pts):
+                a.SetValue(j + 1, gp_Pnt(q.X, q.Y, q.Z))
+            return Edge(BRepBuilderAPI_MakeEdge(GeomAPI_PointsToBSpline(a, 3, 8, GeomAbs_C2, 1e-6).Curve()).Edge())
+
+        def face_of(first, pts):
+            """Face bounded by the edge first (or None) and the polygon pts (closing back to the start of first);
+            segments shorter than 1e-9 mm are left out. None when no face can be made."""
+            try:
+                es = [first] if first is not None else []
+                q = pts
+                for x, y in zip(q[:-1], q[1:]):
+                    if (y - x).length > 1e-7:
+                        es.append(Edge.make_line(x, y))
+                return Face(Wire(es))
+            except Exception:
+                return None
+
+        def add(fc):
+            # every region with its normal along D, so that the fusion merges them
+            if fc is not None:
+                try:
+                    # degenerate regions (a crossing exactly at the offset) are left out: they break the fusion
+                    if fc.area < 1e-9:
+                        return
+                    if fc.normal_at(fc.center()).dot(D) < 0:
+                        fc = Face(fc.wrapped.Reversed())
+                except Exception:
+                    pass
+                regions.append(fc)
+                if cur[0] is not None and edge_reg[cur[0]] is None:
+                    edge_reg[cur[0]] = fc
+
+        regions = []
+        ends = []
+        edge_reg = [None] * n_e
+        cur = [None]
+        for k, e in enumerate(ordered):
+            cur[0] = k
+            p0, p1 = pos(k, 0.0), pos(k, 1.0)
+            n0, n1 = nrm(k, 0.0), nrm(k, 1.0)
+            ends.append((p0, p1, n0, n1, tan(k, 0.0), tan(k, 1.0)))
+            g = e.geom_type.name
+            if g == "LINE":
+                q0, q1 = p0 + n0 * dist, p1 + n1 * dist
+                add(face_of(e, [p1, q1, q0, p0]))
+                continue
+            if g == "CIRCLE":
+                c = e.arc_center
+                if (c - pos(k, 0.5)).dot(nrm(k, 0.5)) > 0 and e.radius <= dist + 1e-9:
+                    # concave arc smaller than the offset: the sector to its centre
+                    add(face_of(e, [p1, c, p0]))
+                    continue
+            if g == "CIRCLE":
+                # concentric arc
+                qs = [pos(k, u) + nrm(k, u) * dist for u in (0.0, 0.5, 1.0)]
+                off = Edge.make_three_point_arc(qs[0], qs[1], qs[2])
+                add(Face(Wire([e, Edge.make_line(p1, qs[-1]), off, Edge.make_line(qs[0], p0)])))
+                continue
+            n_s = max(12, min(96, int(e.length / max(dist, 1e-6) * 6) + 12))
+            us = [j / n_s for j in range(n_s + 1)]
+            P_ = [pos(k, u) for u in us]
+            N_ = [nrm(k, u) for u in us]
+
+            def cross_at(j):
+                # parameter along the normals where the normals at samples j and j + 1 meet (None: they part)
+                a_, b_ = P_[j], P_[j + 1]
+                den = N_[j].cross(N_[j + 1]).dot(D)
+                if abs(den) < 1e-14:
+                    return None
+                s_ = (b_ - a_).cross(N_[j + 1]).dot(D) / den
+                t_ = (b_ - a_).cross(N_[j]).dot(D) / den
+                return s_ if s_ > 0 and t_ > 0 else None
+            folds = [cross_at(j) for j in range(n_s)]
+            if not any(x is not None and x < dist * 1.02 for x in folds):
+                qs = [p + n * dist for p, n in zip(P_, N_)]
+                off = bspl(qs)
+                add(Face(Wire([e, Edge.make_line(p1, qs[-1]), off, Edge.make_line(qs[0], p0)])))
+                continue
+            # the curve turns tighter than the offset on that side (a small round of a B-spline): one region bounded
+            # by the curve and the points along its normals at the offset, or nearer where neighbouring normals meet
+            # (the swept region beyond the meeting points is covered by the neighbouring edges)
+            rr = [dist] * (n_s + 1)
+            for j in range(n_s):
+                fj = folds[j]
+                if fj is not None and fj < dist:
+                    rr[j] = min(rr[j], fj)
+                    rr[j + 1] = min(rr[j + 1], fj)
+            gs = [P_[j] + N_[j] * rr[j] for j in range(n_s + 1)]
+            pts = [p1]
+            for q in gs[::-1] + [p0]:
+                if (q - pts[-1]).length > 1e-5 or q is p0:
+                    pts.append(q)
+            # the offset side as smooth curves through the points, split where the points turn sharply (where the
+            # region narrows to the meeting point of the normals); single segments as lines
+            inner = pts[1:-1]
+            runs, cur_run = [], [inner[0]] if inner else []
+            for j in range(1, len(inner)):
+                cur_run.append(inner[j])
+                if 0 < j < len(inner) - 1:
+                    d1 = (inner[j] - inner[j - 1]).normalized()
+                    d2 = (inner[j + 1] - inner[j]).normalized()
+                    if d1.dot(d2) < math.cos(math.radians(30)):
+                        runs.append(cur_run)
+                        cur_run = [inner[j]]
+            if cur_run:
+                runs.append(cur_run)
+            es = [e, Edge.make_line(p1, inner[0])] if inner and (inner[0] - p1).length > 1e-7 else [e]
+            try:
+                for r_ in runs:
+                    if len(r_) >= 3:
+                        es.append(bspl(r_))
+                    elif len(r_) == 2 and (r_[1] - r_[0]).length > 1e-7:
+                        es.append(Edge.make_line(r_[0], r_[1]))
+                if inner and (p0 - inner[-1]).length > 1e-7:
+                    es.append(Edge.make_line(inner[-1], p0))
+                add(Face(Wire(es)))
+            except Exception:
+                add(face_of(e, pts))
+        cur[0] = None
+        if info is not None:
+            info["edges"] = edge_reg
+            info["convex"] = []
+        if raw:
+            if info is not None:
+                for a, b in [(k, k + 1) for k in range(n_e - 1)] + ([(n_e - 1, 0)] if w.is_closed and n_e > 1 else []):
+                    v, na, ta = ends[a][1], ends[a][3], ends[a][5]
+                    v2, nb = ends[b][0], ends[b][2]
+                    if (v - v2).length <= 1e-4 and na.dot(nb) <= 1 - 1e-9 and nb.dot(ta) > 1e-9:
+                        info["convex"].append((a, b))
+            return regions
+        # corners
+        pairs = [(k, k + 1) for k in range(n_e - 1)] + ([(n_e - 1, 0)] if w.is_closed and n_e > 1 else []) if corners else []
+        for a, b in pairs:
+            _, v, _, na, ta, _ = ends[a][0], ends[a][1], ends[a][2], ends[a][3], ends[a][5], None
+            v2, nb, tb = ends[b][0], ends[b][2], ends[b][4]
+            if (v - v2).length > 1e-4 or na.dot(nb) > 1 - 1e-9:
+                continue
+            if nb.dot(ta) <= 1e-9:
+                continue                        # the offsets overlap (corner towards the offset side)
+            A, B = v + na * dist, v + nb * dist
+            den = ta.cross(tb).dot(D)
+            M = None
+            if abs(den) > 1e-12:
+                s_ = (B - A).cross(tb).dot(D) / den
+                M = A + ta * s_
+            if M is None or (M - v).length > 4 * dist:
+                mid = (na + nb).normalized()
+                add(Face(Wire([Edge.make_line(v, A), Edge.make_three_point_arc(A, v + mid * dist, B), Edge.make_line(B, v)])))
+            else:
+                add(face_of(None, [v, A, M, B, v]))
+        if not regions:
+            return None
+        fused = _fuzzy_fuse(regions)
+        try:
+            fused = fused.clean()
+        except Exception:
+            pass
+        out = list(fused.faces())
+        if not out or abs(sum(f.area for f in out)) < 1e-12:
+            return None
+        return out
+    except Exception:
+        return None
+
+
+def _prism_thick(body, t, side):
+    """Solid of a prismatic shell or face thickened by t (side "+" along the face normals, "-" against them, "both"
+    half each side): every face is parallel to one direction D and spans the same height between two planes normal
+    to D. The boundary of the faces in the lower plane is offset in that plane (BRepOffsetAPI_MakeOffset,
+    intersection join: arcs whose radius is smaller than the offset vanish into a sharp corner), the band between
+    the boundary and its offset is extruded along D. None when the body is not prismatic or the offset fails."""
+    from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeOffset
+    from OCP.GeomAbs import GeomAbs_Intersection, GeomAbs_Arc
+    from build123d import Shape, Vector, Wire, Face, Solid, Kind, Side
+    try:
+        faces = list(body.faces())
+        if not faces:
+            return None
+        normals = []
+        for fc in faces:
+            for a in (0.1, 0.5, 0.9):
+                for b in (0.1, 0.5, 0.9):
+                    normals.append(fc.normal_at(fc.position_at(a, b)))
+        D = None
+        for n in normals[1:]:
+            c = normals[0].cross(n)
+            if c.length > 1e-3:
+                D = c.normalized()
+                break
+        if D is None or any(abs(n.dot(D)) > 1e-5 for n in normals):
+            return None
+        hs = [Vector(v).dot(D) for v in body.vertices()]
+        h0, h1 = min(hs), max(hs)
+        tol = 1e-6 * max(1.0, body.bounding_box().diagonal)
+        if h1 - h0 < 10 * tol or any(min(abs(h - h0), abs(h - h1)) > tol for h in hs):
+            return None
+        low = lambda p: abs(Vector(p).dot(D) - h0) < tol
+        bottom = [e for e in body.edges() if low(e.position_at(0)) and low(e.position_at(0.5)) and low(e.position_at(1))]
+        if not bottom:
+            return None
+        signs = {"+": [1.0], "-": [-1.0], "both": [1.0, -1.0]}[side]
+        cutters = []
+        dist = t if side != "both" else t / 2.0
+        pieces = []
+        for w in Wire.combine(bottom):
+            # a point on the thickened side of the first edge of the wire, for each sign
+            e0 = w.edges()[0]
+            m = e0.position_at(0.5)
+            fc0 = next(fc for fc in faces if any(e0.wrapped.IsSame(x.wrapped) for x in fc.edges()) or
+                       any(abs((x.position_at(0.5) - m).length) < tol for x in fc.edges()))
+            n0 = fc0.normal_at(m)
+            for sg in signs:
+                tp = m + n0 * (sg * dist / 2.0)
+                # the union of the regions swept by the normals of each edge (and the mitre at convex corners)
+                band = _band_slabs(w, faces, D, sg, dist, tol)
+                if band and not any(x.is_inside(tp) for x in band):
+                    band = None
+                if band:
+                    pass
+                elif w.is_closed:
+                    fw = Face(w)
+                    for jt in (GeomAbs_Intersection, GeomAbs_Arc):
+                        for k in (1.0, -1.0):
+                            mo = BRepOffsetAPI_MakeOffset(fw.wrapped, jt)
+                            mo.Perform(k * dist)
+                            if not mo.IsDone():
+                                continue
+                            ws = [x for x in Shape.cast(mo.Shape()).wires() if x.is_closed]
+                            if not ws:
+                                continue
+                            fo = Face(max(ws, key=lambda x: x.length))
+                            b = (fo - fw) if fo.area > fw.area else (fw - fo)
+                            bf = [x for x in b.faces()] if hasattr(b, "faces") else [b]
+                            if any(x.is_inside(tp) for x in bf):
+                                band = bf
+                                break
+                        if band:
+                            break
+                if not band:
+                    return None
+                hgt = D * (h1 - h0)
+                if w.is_closed:
+                    # a closed loop: the band is clipped by the face of the loop (kept inside or outside of it, the
+                    # side of the thickening), which removes the regions that reach across the surface exactly
+                    try:
+                        lf = Face(w)
+                        L = Solid.extrude(lf, hgt)
+                        B = _fuzzy_fuse([Solid.extrude(x, hgt) for x in band])
+                        inside = lf.is_inside(tp)
+                        clipped = B.intersect(L) if inside else B.cut(L)
+                        cs = list(clipped.solids()) if hasattr(clipped, "solids") else []
+                        if cs and sum(x.volume for x in cs) > 0.5 * B.volume:
+                            pieces += cs
+                            continue
+                    except Exception:
+                        pass
+                pieces += [Solid.extrude(x, hgt) for x in band]
+                # the regions swept by the edge normals to the other side are cut away afterwards: at a corner the
+                # region of one edge can reach across the next edge, to the other side of the surface
+                # at a corner where the offsets part on the thickened side, the region of an edge on the other side
+                # reaches across the next edge instead: there the next edge's region is taken out of the cutter
+                ib, ia = {}, {}
+                _band_slabs(w, faces, D, sg, dist, tol, raw=True, info=ib)
+                _band_slabs(w, faces, D, -sg, dist, tol, raw=True, info=ia)
+                eb, ea = ib.get("edges") or [], ia.get("edges") or []
+                nbr = {}
+                for a_, b_ in ib.get("convex") or []:
+                    nbr.setdefault(a_, []).append(b_)
+                    nbr.setdefault(b_, []).append(a_)
+                hgt = D * (h1 - h0)
+                for k_, fa in enumerate(ea):
+                    if fa is None:
+                        continue
+                    ck = Solid.extrude(fa, hgt)
+                    for j_ in nbr.get(k_, []):
+                        if j_ < len(eb) and eb[j_] is not None:
+                            try:
+                                ck2 = ck.cut(Solid.extrude(eb[j_], hgt))
+                                ck = ck2.solids()[0] if len(ck2.solids()) == 1 else (ck2 if ck2.solids() else ck)
+                            except Exception:
+                                pass
+                    for x in (ck.solids() if hasattr(ck, "solids") else [ck]):
+                        cutters.append(x)
+        solid = _fuzzy_fuse(pieces)
+        if cutters and side != "both":
+            try:
+                cut = solid.cut(cutters[0].fuse(*cutters[1:]) if len(cutters) > 1 else cutters[0])
+                if cut.solids() and cut.volume > 0.5 * solid.volume:
+                    solid = cut
+            except Exception:
+                pass
+        try:
+            solid = solid.clean()
+        except Exception:
+            pass
+        sols = list(solid.solids()) if hasattr(solid, "solids") else [solid]
+        if len(sols) != 1 or not sols[0].is_valid:
+            return None
+        solid = sols[0]
+        if solid.volume < 0:
+            solid = Shape.cast(solid.wrapped.Reversed())
+        expect = body.area * t
+        if not 0.5 * expect <= solid.volume <= 1.5 * expect:
+            return None
+        return solid
+    except Exception:
+        return None
+
+
+def _join_thick(body, d):
+    """Solid of a shell or face thickened by d with BRepOffset_MakeOffset (thickening, intersection join): the
+    offset faces are trimmed where they meet, so inside corners have no folded faces. None when the offset fails,
+    is not one valid solid, or its volume is not near area x thickness (a self-intersecting result)."""
+    from OCP.BRepOffset import BRepOffset_MakeOffset, BRepOffset_Skin
+    from OCP.GeomAbs import GeomAbs_Intersection
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    from build123d import Shape
+    try:
+        mo = BRepOffset_MakeOffset()
+        mo.Initialize(body.wrapped, d, 1e-4, BRepOffset_Skin, False, False, GeomAbs_Intersection, True, False)
+        mo.MakeOffsetShape()
+        if not mo.IsDone():
+            return None
+        r = Shape.cast(mo.Shape())
+        if len(r.solids()) != 1 or not BRepCheck_Analyzer(r.wrapped).IsValid():
+            return None
+        r = r.solids()[0]
+        if r.volume < 0:
+            r = Shape.cast(r.wrapped.Reversed())
+        expect = body.area * abs(d)
+        if expect > 0 and not 0.5 * expect <= r.volume <= 1.5 * expect:
+            return None
+        return r
+    except Exception:
+        return None
 
 
 def _simple_thick(shape, d):
@@ -1161,7 +1599,8 @@ def _strip(face, surf, e, dist, n=24):
         Q.append(qv)
 
     def side(p, q, m=8):
-        return [proj(p + (q - p) * (i / m)) for i in range(m + 1)]
+        # the end points exactly at p and q (the vertices of the strip)
+        return [p] + [proj(p + (q - p) * (i / m)) for i in range(1, m)] + [q]
 
     # the distance measured along the surface (projected side polyline) is made equal to dist
     s0 = side(P[0], Q[0])
@@ -1189,9 +1628,26 @@ def _strip(face, surf, e, dist, n=24):
             a.SetValue(i + 1, gp_Pnt(p.X, p.Y, p.Z))
         return GeomAPI_PointsToBSpline(a, 3, 8, GeomAbs_C2, 1e-5).Curve()
 
-    outer = BRepBuilderAPI_MakeEdge(bspl(Q)).Edge()
-    s1 = BRepBuilderAPI_MakeEdge(bspl(side(P[-1], Q[-1]))).Edge()
-    s2 = BRepBuilderAPI_MakeEdge(bspl(side(Q[0], P[0]))).Edge()
+    # the strip edges share the vertices: the ends of the picked edge and two new vertices at the outer corners
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
+    from OCP.TopExp import TopExp
+    from OCP.BRep import BRep_Tool as BT
+    va, vb = TopExp.FirstVertex_s(e.wrapped), TopExp.LastVertex_s(e.wrapped)
+    pt = lambda v: Vector(*[getattr(BT.Pnt_s(v), k)() for k in ("X", "Y", "Z")])
+    if (pt(va) - P[0]).length > (pt(vb) - P[0]).length:
+        va, vb = vb, va
+    P[0], P[-1] = pt(va), pt(vb)
+    vq0 = BRepBuilderAPI_MakeVertex(gp_Pnt(Q[0].X, Q[0].Y, Q[0].Z)).Vertex()
+    vq1 = BRepBuilderAPI_MakeVertex(gp_Pnt(Q[-1].X, Q[-1].Y, Q[-1].Z)).Vertex()
+
+    def edge(pts, v1, v2):
+        mk = BRepBuilderAPI_MakeEdge(bspl(pts), v1, v2)
+        if not mk.IsDone():
+            raise ValueError("the extension strip is not closed")
+        return mk.Edge()
+    outer = edge(Q, vq0, vq1)
+    s1 = edge(side(P[-1], Q[-1]), vb, vq1)
+    s2 = edge(side(Q[0], P[0]), vq0, va)
     mw = BRepBuilderAPI_MakeWire()
     for x in (e.wrapped, s1, outer, s2):
         mw.Add(x)
@@ -1220,7 +1676,7 @@ def extend_edges(shape, bodies, f, find_edges, find_faces):
     B-spline surface the strip lies on the tangent-extrapolated surface and stays a separate face of the shell."""
     from OCP.BRep import BRep_Tool
     from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
-    from OCP.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
+    from .occfix import CheckedUnify as ShapeUpgrade_UnifySameDomain
     from build123d import Shape
     src = source_body(shape, bodies, f, find_faces)
     dist = float(f.get("distance") or 5.0)
@@ -1258,6 +1714,31 @@ def extend_edges(shape, bodies, f, find_edges, find_faces):
 
 
 def _extended_surface(face, dist, tol):
+    """The surface of a face as a B-spline surface extended by dist (mm) beyond the four sides of the face's
+    parameter range (GeomLib.ExtendSurfByLength, curvature continuous; the surface inside is unchanged); when that
+    fails, the surface re-fitted with a tangent extrapolation."""
+    try:
+        return _extended_bspline(face, dist)
+    except Exception:
+        return _refit_extended_surface(face, dist, tol)
+
+
+def _extended_bspline(face, dist):
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepTools import BRepTools
+    from OCP.Geom import Geom_RectangularTrimmedSurface, Geom_BSplineSurface
+    from OCP.GeomConvert import GeomConvert
+    from OCP.GeomLib import GeomLib
+    surf = BRep_Tool.Surface_s(face.wrapped)
+    u1, u2, v1, v2 = BRepTools.UVBounds_s(face.wrapped)
+    bs = GeomConvert.SurfaceToBSplineSurface_s(Geom_RectangularTrimmedSurface(surf, u1, u2, v1, v2))
+    for in_u in (True, False):
+        for after in (True, False):
+            GeomLib.ExtendSurfByLength_s(bs, dist, 2, in_u, after)
+    return bs
+
+
+def _refit_extended_surface(face, dist, tol):
     """The B-spline surface of a face re-fitted with a tangent extrapolation by dist (mm) beyond all four sides."""
     from OCP.BRep import BRep_Tool
     from OCP.BRepTools import BRepTools
@@ -1347,6 +1828,38 @@ def inspect(body, gap_tol=0.1, min_area=0.01, min_edge=0.01):
         elif n > 2:
             nonman.append((e, n))
     total_free = sum(e.length for e in free)
+    # a part of several cells (solids that share faces, after Partition or an import): an edge with more than two
+    # faces in the whole part but at most two in each solid is where cells meet, not a non-manifold edge of a solid
+    cell_edges = []
+    sols = list(body.solids()) if hasattr(body, "solids") else []
+    if len(sols) > 1 and nonman:
+        smaps = []
+        for so in sols:
+            m = AncestorMap()
+            TopExp.MapShapesAndAncestors_s(so.wrapped, TopAbs_EDGE, TopAbs_FACE, m)
+            smaps.append(m)
+
+        def per_solid(e):
+            out = []
+            for m in smaps:
+                try:
+                    i = m.FindIndex(e.wrapped)
+                    out.append(m.FindFromIndex(i).Size() if i > 0 else 0)
+                except Exception:
+                    out.append(0)
+            return out
+        keep = []
+        for e, n in nonman:
+            ns = per_solid(e)
+            if max(ns) <= 2:
+                cell_edges.append((e, sum(1 for k in ns if k)))
+            else:
+                keep.append((e, n))
+        nonman = keep
+    for e, k in cell_edges:
+        q = e.position_at(0.5)
+        issues.append({"kind": "celledge", "text": "Edge where %d cells meet, length %.3f mm" % (k, e.length),
+                       "pts": _edge_polyline(e), "p": [q.X, q.Y, q.Z], "value": e.length})
     for e, n in nonman:
         q = e.position_at(0.5)
         issues.append({"kind": "nonmanifold", "text": "Non-manifold edge shared by %d faces, length %.3f mm" % (n, e.length),
@@ -1424,11 +1937,12 @@ def inspect(body, gap_tol=0.1, min_area=0.01, min_edge=0.01):
             ex.Next()
     except Exception:
         closed = []
-    order = {"gap": 0, "pointgap": 1, "nonmanifold": 2, "free": 3, "smallface": 4, "smalledge": 5}
+    order = {"gap": 0, "pointgap": 1, "nonmanifold": 2, "free": 3, "smallface": 4, "smalledge": 5, "celledge": 6}
     issues.sort(key=lambda x: (order.get(x["kind"], 9), -x.get("value", 0)))
     summary = {"faces": len(faces), "edges": len(all_edges), "vertices": len(body.vertices()), "free_edges": len(free),
                "free_length": round(total_free, 3), "area": round(body.area, 3), "valid": valid, "shells": len(closed), "closed_shells": sum(1 for c in closed if c),
-               "gaps": sum(1 for x in issues if x["kind"] in ("gap", "pointgap")), "nonmanifold": len(nonman)}
+               "gaps": sum(1 for x in issues if x["kind"] in ("gap", "pointgap")), "nonmanifold": len(nonman),
+               "cells": len(sols), "cell_edges": len(cell_edges)}
     return {"summary": summary, "issues": issues}
 
 
@@ -1663,11 +2177,12 @@ def _trim_at(face, edges, centre_side):
     return keep
 
 
-def fillet(shape, bodies, f, find_edges):
+def fillet(shape, bodies, f, find_edges, find_faces=None):
     """Surface fillet. "mode": "bodies": rolling-ball fillet of "radius" between the surface bodies "source_a" and
-    "source_b" (their nearest faces), the ball on the side of each face facing the other ("flip_a", "flip_b"
-    turn it); "trim": the bodies trimmed at the contact curves and sewn with the fillet into one body (else the
-    fillet alone). "edges": the edges "edges" of the surface body "source" rounded with "radius"."""
+    "source_b" (their nearest faces; "faces_a" / "faces_b": only these faces of the body, so that both sides can be
+    faces of one body), the ball on the side of each face facing the other ("flip_a", "flip_b" turn it); "trim":
+    the bodies trimmed at the contact curves and sewn with the fillet into one body (else the fillet alone).
+    "edges": the edges "edges" of the surface body "source" rounded with "radius"."""
     from build123d import Shape, Vector
     r = float(f.get("radius") or 0)
     if r <= 0:
@@ -1693,12 +2208,29 @@ def fillet(shape, bodies, f, find_edges):
         res = Shape.cast(mk.Shape())
         res._kind = "%d edge(s) rounded" % len(edges)
         return res
+    from build123d import Compound
     ba, bb = (bodies or {}).get(f.get("source_a")), (bodies or {}).get(f.get("source_b"))
     if ba is None or bb is None:
         raise ValueError("choose surface A and surface B")
-    fa, fb = _closest_faces(ba, bb)
-    sa = _default_side(fa, bb) * (-1 if f.get("flip_a") else 1)
-    sb = _default_side(fb, ba) * (-1 if f.get("flip_b") else 1)
+
+    def side(body, refs, name):
+        if not refs:
+            return body.faces()
+        fs = find_faces(body, refs) if find_faces else []
+        if not fs:
+            raise ValueError("the faces of surface %s were not found (pick them again)" % name)
+        return fs
+    fsa, fsb = side(ba, f.get("faces_a"), "A"), side(bb, f.get("faces_b"), "B")
+    same = f.get("source_a") == f.get("source_b")
+    if same and (not f.get("faces_a") or not f.get("faces_b") or
+                 any(x.wrapped.IsSame(y.wrapped) for x in fsa for y in fsb)):
+        raise ValueError("surface A and surface B are one body: pick separate faces of it for each side "
+                         "(Pick single faces)")
+    ca = fsa[0] if len(fsa) == 1 else Compound(children=fsa)
+    cb = fsb[0] if len(fsb) == 1 else Compound(children=fsb)
+    fa, fb = _closest_faces(ca, cb)
+    sa = _default_side(fa, cb) * (-1 if f.get("flip_a") else 1)
+    sb = _default_side(fb, ca) * (-1 if f.get("flip_b") else 1)
     try:
         faces, eas, ebs = fillet_faces(fa, fb, r, sa, sb)
     except ValueError as e:
@@ -1732,8 +2264,11 @@ def fillet(shape, bodies, f, find_edges):
         return g
     ka = _trim_at(fa, eas, side_fn(fa, eas, fb))
     kb = _trim_at(fb, ebs, side_fn(fb, ebs, fa))
-    others = [x for x in ba.faces() if not x.wrapped.IsSame(fa.wrapped)] + \
-             [x for x in bb.faces() if not x.wrapped.IsSame(fb.wrapped)]
+    if same:
+        others = [x for x in ba.faces() if not x.wrapped.IsSame(fa.wrapped) and not x.wrapped.IsSame(fb.wrapped)]
+    else:
+        others = [x for x in ba.faces() if not x.wrapped.IsSame(fa.wrapped)] + \
+                 [x for x in bb.faces() if not x.wrapped.IsSame(fb.wrapped)]
     res = _sew(ka + kb + faces + others, max(1e-4, r * 1e-3))
     res._kind = "fillet between the surfaces, trimmed and sewn (%d faces)" % len(res.faces())
     return res

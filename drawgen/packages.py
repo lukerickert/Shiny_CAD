@@ -18,7 +18,8 @@ import time
 import uuid
 import zipfile
 
-PKG_EXT = {"part": ".scpart", "sketch": ".scsketch", "assembly": ".scasm", "analysis": ".scfea", "explicit": ".scexp"}
+PKG_EXT = {"part": ".scpart", "sketch": ".scsketch", "assembly": ".scasm", "analysis": ".scfea", "explicit": ".scexp",
+           "cam": ".sccam"}
 EXT_TYPE = {v: k for k, v in PKG_EXT.items()}
 CAD_EXT = (".step", ".stp", ".stl", ".iges", ".igs", ".brep")
 FORMAT = "shinycad-package"
@@ -167,7 +168,7 @@ def _write_zip(z, w, dtype, dname, uses_of=None):
 
 def write(projects, w, dtype, dname, dest):
     """Writes the package of the document dname in work folder w to dest (through a temporary file)."""
-    uses = projects._uses(w, dtype, dname) if dtype in ("assembly", "analysis", "explicit") else []
+    uses = projects._uses(w, dtype, dname) if dtype in ("assembly", "analysis", "explicit", "cam") else []
     d = os.path.dirname(os.path.abspath(dest))
     os.makedirs(d, exist_ok=True)
     tmp = os.path.join(d, "." + os.path.basename(dest) + ".tmp")

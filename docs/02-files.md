@@ -6,7 +6,7 @@
 |---|---|
 | `start.bat` | Creates the environment on first start and starts the server |
 | `run.py` | Starts the server and the worker processes; `--open <file>` opens a document file ([section 2.2](#22-document-files)) |
-| `config.json` | Defaults: sheet, scale, views, line widths, sheet sizes, frame, title block layout and field values, options |
+| `config.json` | Defaults: sheet, scale, views, line widths, sheet sizes, frame, title block layout and field values, options, CAM tool bit library (`cam_tools`) |
 | `config.local.json` | Settings of this PC: projects folder, open project, recent projects folders, known projects (**All projects**), Explicit settings, browser command, CalculiX path. Created at the first change; settings of this PC found in `config.json` (older versions) are moved here at start. Not in the repository |
 | `publish.bat` | Publishes the program folder to GitHub ([section 2.3](#23-publishing-to-github)) |
 | `requirements.txt` | Python packages |
@@ -15,7 +15,7 @@
 | `INSTALL.txt` | Installation, troubleshooting and first use, short form |
 | `README.md` | Overview, quick start and the contents of the manual |
 | `docs/` | Manual, one page per section (`01-installation.md` to `15-limitations.md`) |
-| `.gitattributes`, `.gitignore` | Git: line endings normalised (LF in the repository, CRLF for the `.bat` files); not tracked: `__pycache__`, the contents of `solvers/` except `README.txt`, `config.local.json`, the document and output folders of the program folder (`parts/`, `sketches/`, `assemblies/`, `annotations/`, `stacks/`, `analysis/`, `explicit/`, `_export/`) and STEP and .inp files in the program folder |
+| `.gitattributes`, `.gitignore` | Git: line endings normalised (LF in the repository, CRLF for the `.bat` files); not tracked: `__pycache__`, the contents of `solvers/` except `README.txt`, `config.local.json`, the document and output folders of the program folder (`parts/`, `sketches/`, `assemblies/`, `annotations/`, `stacks/`, `analysis/`, `explicit/`, `cam/`, `_export/`) and STEP and .inp files in the program folder |
 | `drawgen/web.py` | Web server |
 | `drawgen/pool.py` | Worker processes for the drawing views and the assembly builds |
 | `drawgen/model.py` | STEP reading: solids and their names |
@@ -37,6 +37,7 @@
 | `drawgen/surfaces.py` | Surface bodies of the Part tab |
 | `drawgen/assembly.py` | Assembly placement, mates, mass, interference, view cache, STEP export |
 | `drawgen/fea.py` | FEA mesh export (gmsh) |
+| `drawgen/cam/` | CAM package ([section 16](16-cam.md#16-cam)): `job.py` (the job document, migration, heights and depths, moves, the run with the stock cut by the tool, sanity check, template), `tools.py` (tool bits: profiles, solids, swept solids), `geom.py` (regions, sections, height maps, text outlines), `ops2d.py` (Face, Pocket Shape, Profile, Drilling, Helix, Slot, Engrave, Deburr, Undercut), `adaptive.py`, `vcarve.py`, `ops3d.py` (3D Pocket, 3D Surface, Waterline), `dressup.py` (Tag, Ramp entry, Lead in/out, Dogbone, Boundary, Copy, Array), `post.py` (G-code of the Estlcam and generic posts) |
 | `drawgen/analysis.py` | Analysis model, CalculiX input file, result reading, report ([section 12](12-analysis.md#12-analysis)) |
 | `drawgen/explicit/` | Explicit tab ([section 13](13-explicit.md#13-explicit)): `routes.py` server requests, `host.py` settings, console and status board, `build.py` deck build, `materials.py` material, failure and time step cards, `runs.py` run folders and settings report, `solve.py` local and remote runs, `post.py` post-processing, `constants.py` material library and modes, `modes.py` analysis types, `scripts.py` ParaView scripts, `model_inp.py` .inp of the ShinyCAD geometry, `meshview.py` mesh view data and .inp and VTK readers, `results.py` frames and fields, `inp2rad.py` and `inp2rad_run.py` .inp to .rad converter, `inp_to_linear.py` second-order to first-order elements, `inertia_calc.py` concentrated mass from primitives, `deck.py` deck generator source (check, model .inp, STEP and part), `deck_mesh.py` and `deck_stepgen.py` DECK_GENERATOR mesh and geometry |
 | `drawgen/femesh.py` | Analysis mesh of the bodies and plates (gmsh) |
@@ -53,6 +54,7 @@
 | `drawgen/static/assembly.js` | Assembly tab |
 | `drawgen/static/analysis.js` | Analysis tab |
 | `drawgen/static/explicit.js` | Explicit tab |
+| `drawgen/static/cam.js` | CAM tab: job tree, command window, preview, tool bits |
 | `drawgen/static/reference.js`, `refdiagrams.js` | Thread and hole reference tables and profile diagrams |
 | `drawgen/static/icons.js` | Toolbar icons |
 | `drawgen/static/cmdsearch.js` | Command search ([section 3](03-use.md#3-use)) |
@@ -70,15 +72,16 @@ The **Project** tab is the first tab. A project is a folder under the projects f
 | Folder | Content |
 |---|---|
 | `project.json` | Name, description, creation date, document versions and notes |
-| `<name>.scpart`, `<name>.scasm`, `<name>.scsketch`, `<name>.scfea`, `<name>.scexp` | Document files of the parts, assemblies, sketches, analyses and explicit analyses ([section 2.2](#22-document-files)) |
-| `work/` | The working documents: `<name>.part.json`, `<name>.sketch.json`, `<name>.asm.json`, `<name>.fea.json`, `<name>.exp.json`; `work/.packages.json` records the state of the document files at the last synchronisation |
+| `<name>.scpart`, `<name>.scasm`, `<name>.scsketch`, `<name>.scfea`, `<name>.scexp`, `<name>.sccam` | Document files of the parts, assemblies, sketches, analyses, explicit analyses and CAM documents ([section 2.2](#22-document-files)) |
+| `work/` | The working documents: `<name>.part.json`, `<name>.sketch.json`, `<name>.asm.json`, `<name>.fea.json`, `<name>.exp.json`, `<name>.cam.json`; `work/.packages.json` records the state of the document files at the last synchronisation |
 | `work/annotations/` | Dimensions, notes and view layouts of the drawings |
 | `work/images/` | Reference images of the sketches and their corrected files `<image>_c<key>.png` / `.jpg` ([section 9.5](09-sketch.md#95-images)) |
 | `drawings/` | Exported PDF, DXF, SVG and FCStd files (the default output folder of **Export** when the folder field is empty) |
 | `step/` | Exported STEP and mesh files (default folder of **Export STEP** and **Export mesh**) |
-| `step_import/` | Local copies of imported STEP files. **Open** in Models and the **Import STEP** feature of a saved part use the copy |
+| `step_import/` | Local copies of imported STEP files. **Open** in Models and the **Import geometry** feature of a saved part use the copy |
 | `analysis/<name>/` | Solver files and report of an analysis ([section 12](12-analysis.md#12-analysis)) |
 | `explicit/<name>/` | Model .inp and run folders of an explicit analysis ([section 13](13-explicit.md#13-explicit)) |
+| `cam/` | G-code files `<name>.nc` of the CAM jobs ([section 16](16-cam.md#16-cam)) |
 | `versions/` | Document versions `<name>.part.v<N>.json` with a `.meta.json` note |
 | `states/` | Saved project states |
 | `trash/` | Deleted documents |
@@ -87,13 +90,13 @@ The **Project** tab is the first tab. A project is a folder under the projects f
 |---|---|
 | **Projects folder**, **…**, **Set** | The folder that holds the projects. A project folder (a folder with `project.json`) entered here sets its parent folder as the projects folder and opens the project |
 | **Recent folders** | The last 10 projects folders used, newest first, each with the number of projects in it and the project last opened there (**last**). Choosing one sets it as the projects folder and opens that project. A folder that no longer exists is shown as (not found) and cannot be chosen |
-| **All projects** | Every project known on this PC, in any folder: the projects of each projects folder used, the projects opened, and the projects found by **Find projects**. Columns **Project**, **Folder** (full path as tooltip), **Description**, **Documents**, **Last change** (newest document in `work/`) and **Last opened**; a click on a heading sorts by that column, a second click reverses (the order is kept in this browser). The open project is marked (open). A project whose folder no longer exists is shown as not found. **Open** sets the parent folder of the project as the projects folder and opens the project. **×** removes the project from the list (the folder is not changed). The list shows 8 rows; **Show all** shows every row. The filter field limits the list to the projects whose name, folder or description contain the text |
-| **Find projects** | Searches the folder in the field next to it (**…** to choose it) and its subfolders, 6 levels deep, for folders with `project.json` and adds them to **All projects**. The folders `work`, `versions`, `trash`, `drawings`, `step`, `step_import`, `analysis`, `explicit`, `states`, hidden folders and links are not searched |
+| **All projects** | Every project known on this PC, in any folder: the projects of each projects folder used, the projects opened, and the projects found by **Find projects**. Columns **Project**, **Folder** (full path as tooltip), **Description**, **Documents**, **Last change** (newest document in `work/`) and **Last opened**; a click on a heading sorts by that column, a second click reverses (the order is kept in this browser). The right edge of a heading dragged sets the column width (kept in this browser); a double-click on it restores the automatic widths. The open project is marked (open). A project whose folder no longer exists is shown as not found. **Open** sets the parent folder of the project as the projects folder and opens the project. **×** removes the project from the list (the folder is not changed). The list shows 8 rows; **Show all** shows every row. The filter field limits the list to the projects whose name, folder or description contain the text |
+| **Find projects** | Searches the folder in the field next to it (**…** to choose it) and its subfolders, 6 levels deep, for folders with `project.json` and adds them to **All projects**. The folders `work`, `versions`, `trash`, `drawings`, `step`, `step_import`, `analysis`, `explicit`, `cam`, `states`, hidden folders and links are not searched |
 | **Project**, **Open** | Opens a project. The saved lists of the **Sketches** pane, the Part and Assembly tabs and **Models** follow the open project; `config.local.json` > `current_project` keeps it for the next start |
 | **New…** | Creates and opens a project (name, description) |
 | **Take over existing files…** | Shown while the projects folder has no project: creates a project and moves the parts, sketches, assemblies, stacks and annotations of the program folder into it |
 | **Rename**, **Description**, **Open folder** | Of the open project |
-| **Documents** | All documents of the project (a click on the **Name**, **Type**, **Version**, **Note**, **Modified** or **Size** heading sorts by that column; a second click reverses; the order is kept in this browser): name, type, version, note, date, size, **File** (the document file in the project folder, its path as tooltip; ↔ and the path of a linked file outside the project, **×** ends the link and leaves the file unchanged), **Uses** (parts of an assembly and the solids of its STEP files, each with the number of components using it as ×N, below the STEP file name; imported STEP files of a part), **Used by** (assemblies using the part, analyses using the part or assembly), **Exports** (files in `drawings/` and `step/` named after the document). **Open** loads the document in its tab; **Rename** (assemblies referencing a renamed part, and analyses referencing a renamed part or assembly, are updated); **Copy** (a part copy gets a new uid and an empty drawing); **Version** stores a numbered snapshot with a note; **Versions…** lists the snapshots with **Restore** (replaces the working file) and **Restore as copy…**; **File…** saves the document as a document file in a folder chosen in the file dialog ([section 2.2](#22-document-files)); **Move…** moves or copies the document to another project (**Project**, **Move** or **Copy**; its versions, drawing annotations and layouts, sketch images and analysis folders go along; **With the documents it uses**: the parts of an assembly, the part or assembly of an analysis, each moved only when no other document left in the project uses it, else copied; a name that exists in the target project is refused); **×** moves the document to `trash/` |
+| **Documents** | All documents of the project (a click on the **Name**, **Type**, **Version**, **Note**, **Modified** or **Size** heading sorts by that column; a second click reverses; the order is kept in this browser; the right edge of a heading dragged sets the column width, kept in this browser, and a double-click on it restores the automatic widths): name, type, version, note, date, size, **File** (the document file in the project folder, its path as tooltip; ↔ and the path of a linked file outside the project, **×** ends the link and leaves the file unchanged), **Uses** (parts of an assembly and the solids of its STEP files, each with the number of components using it as ×N, below the STEP file name; imported STEP files of a part), **Used by** (assemblies using the part, analyses using the part or assembly), **Exports** (files in `drawings/` and `step/` named after the document). **Open** loads the document in its tab; **Rename** (assemblies referencing a renamed part, and analyses referencing a renamed part or assembly, are updated); **Copy** (a part copy gets a new uid and an empty drawing); **Version** stores a numbered snapshot with a note; **Versions…** lists the snapshots with **Restore** (replaces the working file) and **Restore as copy…**; **File…** saves the document as a document file in a folder chosen in the file dialog ([section 2.2](#22-document-files)); **Move…** moves or copies the document to another project (**Project**, **Move** or **Copy**; its versions, drawing annotations and layouts, sketch images and analysis folders go along; **With the documents it uses**: the parts of an assembly, the part or assembly of an analysis, each moved only when no other document left in the project uses it, else copied; a name that exists in the target project is refused); **×** moves the document to `trash/` |
 | **Open file…** | Opens a document file from any folder ([section 2.2](#22-document-files)) |
 | **Exports** | The files in `drawings/`, `step/` and `step_import/`, with buttons that open the folders on this PC |
 | **Project states** | **Save current state** stores which documents are open in the Part, Assembly and Analysis tabs and the **Sketches** pane, the **Models** list with the checked parts, the drawing settings (sheet, scale, mode, views, density) and the active tab. **Load** restores all of it: parts and assemblies are rebuilt from their saved files, STEP files reopened from their paths |
@@ -102,7 +105,7 @@ Without an open project the documents are read from and written to the folders o
 
 ## 2.2 Document files
 
-Each part, assembly, sketch, analysis and explicit analysis of a project is also stored as one document file in the project folder, next to `project.json`. The file is a zip file:
+Each part, assembly, sketch, analysis, explicit analysis and CAM document of a project is also stored as one document file in the project folder, next to `project.json`. The file is a zip file:
 
 | Extension | Document |
 |---|---|
@@ -111,6 +114,7 @@ Each part, assembly, sketch, analysis and explicit analysis of a project is also
 | `.scsketch` | Sketch |
 | `.scfea` | Analysis |
 | `.scexp` | Explicit analysis |
+| `.sccam` | CAM document |
 
 | Entry in the file | Content |
 |---|---|
@@ -119,9 +123,9 @@ Each part, assembly, sketch, analysis and explicit analysis of a project is also
 | `annotations/` | Dimensions, notes, layouts and drawing sketches of the drawing of the document |
 | `images/` | Sketch images used by the document |
 | `step_import/` | The STEP, STL, IGES and BREP files the document references |
-| `uses/` | Document files of the parts an assembly uses, and of the part or assembly (with its parts) an analysis uses |
+| `uses/` | Document files of the parts an assembly uses, of the part or assembly (with its parts) an analysis uses, and of the part a CAM document uses |
 
-Results of analyses (`analysis/`, `explicit/`) and versions (`versions/`) are not in the file.
+Results of analyses (`analysis/`, `explicit/`), G-code files (`cam/`) and versions (`versions/`) are not in the file.
 
 While the program runs, the document files of the open project are synchronised with `work/` every 2 s. Changes outside the program are also read at **Refresh** of **Documents** and at the opening of the project:
 
@@ -138,7 +142,7 @@ STEP files referenced from a document file are placed in `step_import/` of the p
 
 | Control | Function |
 |---|---|
-| **Open file…** (Project tab **Documents**, and the **File ▾** menu of the Part, Assembly, Analysis and Explicit tabs) | Opens a document file chosen in the file dialog. A file in a project folder: that project is opened and the document is opened in its tab. A file in another folder: the document is added to the open project under the file name (`<name>_2` when the name exists) and opened in its tab; the document stays linked to the file, and every save in the program writes the file too. A change of the linked file outside the program is read at the next synchronisation. Opening the same file again opens the same document |
+| **Open file…** (Project tab **Documents**, and the **File ▾** menu of the Part, Assembly, Analysis, Explicit and CAM tabs) | Opens a document file chosen in the file dialog. A file in a project folder: that project is opened and the document is opened in its tab. A file in another folder: the document is added to the open project under the file name (`<name>_2` when the name exists) and opened in its tab; the document stays linked to the file, and every save in the program writes the file too. A change of the linked file outside the program is read at the next synchronisation. Opening the same file again opens the same document |
 | **Save as file…** (**File ▾** menu), **File…** (Project tab **Documents**) | Saves the document first when it has changes, then writes the document file to the path chosen in the file dialog. In the folder of the open project: a copy of the document under the file name. In another project folder: the file only, read when that project is opened. In any other folder: the document is linked to the file |
 
 `run.py` registers the file types for the current user at each start (`HKEY_CURRENT_USER\Software\Classes`, no administrator rights; icon from `logo.png` when Pillow is installed). A double-click on a document file in Explorer runs `run.py --open "<file>"` with the Python of the program. When the program is running, the file opens in a new browser tab of it; otherwise the program starts with the file. The browser opens `http://localhost:<port>/?open=<file>`, and the page opens the file as **Open file…** does. Without an open project a file outside a project folder is refused (open or create a project first). After moving the program folder, a start with `start.bat` updates the registration.

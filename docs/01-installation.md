@@ -9,7 +9,7 @@
 `start.bat` uses the py launcher and selects the newest installed version from 3.14 to 3.10; without the py launcher it uses `python.exe` on PATH (not the Microsoft Store alias in `WindowsApps`) when it is version 3.10 to 3.14.
 `start.bat` runs only from the extracted folder: started from inside the zip file, it reports the missing files and stops.
 An environment whose Python no longer starts (Python removed or reinstalled) is created again.
-The first start creates the environment in `%LOCALAPPDATA%\drawgen\venv` and installs `build123d`, `flask`, `ezdxf`, `reportlab` and `gmsh` (approximately 500 MB, internet connection required).
+The first start creates the environment in `%LOCALAPPDATA%\drawgen\venv` and installs `build123d`, `flask`, `ezdxf`, `reportlab`, `gmsh`, `shapely` and `fonttools` (approximately 500 MB, internet connection required).
 Later starts use the existing environment. When `requirements.txt` differs from the installed copy, the packages are installed again before the start.
 The server runs at `http://localhost:8765` and the browser opens automatically.
 Close the command window to stop the server.
