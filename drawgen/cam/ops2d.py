@@ -168,13 +168,30 @@ def pocket_region(shape, info, R, allowance, z_lo, z_hi, extend_open=True, use_o
     ext = [poly]
     E = 2 * R + allowance + 1.0
     if extend_open:
-        for pl in info["open"]:
-            if len(pl) > 1:
-                ext.append(LineString(pl).buffer(E, G.ARC_SEGS // 4, cap_style="flat"))
-    region = unary_union(ext)
+        # the open edges joined into chains first: a corner between two open edges (a notch in the floor) is
+        # covered by a round join, not left out between two flat end caps
+        from shapely.ops import linemerge
+        snap = lambda pl: [(round(x, 5), round(y, 5)) for x, y in pl]     # the edge ends meet within 1e-5 mm
+        chains = linemerge([LineString(snap(pl)) for pl in info["open"] if len(pl) > 1]) if info["open"] else None
+        for ch in (G.lines(chains) if chains is not None and not chains.is_empty else []):
+            ext.append(ch.buffer(E, G.ARC_SEGS // 4, cap_style="flat", join_style="round"))
+    region = drop_pinholes(unary_union(ext))
     walls = walls_over(shape, z_lo, z_hi, z_reach)
     region = region.difference(walls.buffer(allowance + G.sag(R), G.PATH_SEGS))
     return region.buffer(-R, G.PATH_SEGS)
+
+
+def drop_pinholes(geom, amin=1e-4):
+    """The polygons without the holes of less than amin mm^2: the union of the floor and its extensions can leave a
+    point-sized hole where edges meet (the corner of a notch), which the tool radius offset would grow into a hole
+    of the tool radius."""
+    from shapely.geometry import Polygon, MultiPolygon
+    out = []
+    for p in G.polys(geom):
+        out.append(Polygon(p.exterior, [r for r in p.interiors if Polygon(r).area >= amin]))
+    if not out:
+        return geom
+    return out[0] if len(out) == 1 else MultiPolygon(out)
 
 
 def reach_of(ctx, z):
@@ -200,9 +217,14 @@ def offset_rings(region, stepover, outward=False):
     return rings
 
 
+LINE_INSETS = (0.002, 0.005, 0.01, 0.02, 0.05)       # mm: insets tried for the first and the last line
+
+
 def zigzag_lines(region, stepover, angle_deg, zig=True):
     """Parallel lines across the region at the angle, spaced by the stepover, as polylines of the tool centre,
-    ordered as a zigzag (alternating direction) or all in one direction."""
+    ordered as a zigzag (alternating direction) or all in one direction. The first line runs along one bound of the
+    region and the last along the other bound (closer than the stepover to the line before it when needed), so a
+    wall parallel to the lines is cut at both sides."""
     from shapely.geometry import LineString
     from shapely import affinity
     if region.is_empty:
@@ -210,14 +232,42 @@ def zigzag_lines(region, stepover, angle_deg, zig=True):
     rot = affinity.rotate(region, -angle_deg, origin=(0, 0), use_radians=False)
     x0, y0, x1, y1 = rot.bounds
     out = []
-    y = y0 + 1e-6
+    # the first and the last line inset from the bounds: a line on a bound grazes the boundary and gives only pieces
+    # of the pass (the material along a wall parallel to the lines left); where the bound is a corner a few
+    # micrometres below a wall (the clearance of the wall polygons), the line goes on to where it runs the length
+    # of the region next to it
+    def length_at(yy):
+        return sum(g.length for g in G.lines(rot.intersection(LineString([(x0 - 1, yy), (x1 + 1, yy)]))))
+
+    def inset(sign):
+        yb = y0 if sign > 0 else y1
+        half = min(stepover / 2.0, (y1 - y0) / 2.0)
+        ref = length_at(yb + sign * half)
+        lo = 0.0
+        for d in LINE_INSETS:
+            if d >= half:
+                break
+            if length_at(yb + sign * d) >= 0.98 * ref:
+                hi = d
+                for _ in range(8):              # the smallest inset that runs the length, within 0.2 um
+                    mid = (lo + hi) / 2.0
+                    if length_at(yb + sign * mid) >= 0.98 * ref:
+                        hi = mid
+                    else:
+                        lo = mid
+                return yb + sign * max(hi, 1e-4)
+            lo = d
+        return yb + sign * min(LINE_INSETS[0], half)
+
+    ya, yz = inset(1), inset(-1)
+    y = ya
     k = 0
     ys = []
-    while y <= y1 - 1e-6:
+    while y <= yz + 1e-9:
         ys.append(y)
         y += stepover
-    if not ys or ys[-1] < y1 - stepover * 0.5:
-        ys.append(y1 - 1e-6)
+    if not ys or ys[-1] < yz - 0.01:
+        ys.append(yz)
     for y in ys:
         ln = LineString([(x0 - 1, y), (x1 + 1, y)])
         segs = G.lines(rot.intersection(ln))
@@ -231,20 +281,83 @@ def zigzag_lines(region, stepover, angle_deg, zig=True):
     return out
 
 
+def stays_down(mv, link, pt, z_cur=None):
+    """The tool can feed from its position to pt at its height: it is down (at z_cur when given) and the straight
+    line lies in link."""
+    from shapely.geometry import LineString
+    if link is None or mv.cur is None or (z_cur is not None and abs(mv.cur[2] - z_cur) > 1e-6):
+        return False
+    if math.dist(mv.cur[:2], pt[:2]) < 1e-9:
+        return True
+    return link.buffer(1e-6).contains(LineString([tuple(mv.cur[:2]), tuple(pt[:2])]))
+
+
 def link_or_lift(mv, region, pt, z, keep_down=True):
-    """Move to the point pt at the level z: a feed when the straight line lies in the region (and keep_down),
+    """Move to the point pt at the level z: a feed when the straight line lies in the region (and keep_down), else
+    a feed along the boundary of the region (a path around a corner, at most 3 times the straight distance + 10 mm),
     else up to the clearance height, over and a plunge."""
     from shapely.geometry import LineString
-    if mv.cur is not None and keep_down and region is not None and region.buffer(1e-6).contains(LineString([tuple(mv.cur[:2]), pt])):
-        mv.feed_to(pt[0], pt[1], z)
-        return False
+    if mv.cur is not None and keep_down and region is not None:
+        if region.buffer(1e-6).contains(LineString([tuple(mv.cur[:2]), tuple(pt[:2])])):
+            mv.feed_to(pt[0], pt[1], z)
+            return False
+        path = boundary_route(region, mv.cur[:2], pt[:2])
+        if path is not None:
+            for q in path[1:]:
+                mv.feed_to(q[0], q[1], z)
+            mv.feed_to(pt[0], pt[1], z)
+            return False
     mv.enter(pt[0], pt[1], z)
     return True
 
 
-def helix_entry(mv, region, R, z_from, z_to, pitch, cw=False):
+def boundary_route(region, a, b, inset=1e-3):
+    """A path from a to b in the region along the outer boundary of the part of the region that holds both points
+    (the boundary inset by 1 um): a, the nearest point of that boundary to a, along it the shorter way to the point
+    nearest b, b; None when there is none, it leaves the region or it is longer than 3 times the straight
+    distance + 10 mm."""
+    from shapely.geometry import LineString, Point
+    from shapely.ops import substring
+    pa, pb = Point(a[0], a[1]), Point(b[0], b[1])
+    comp = None
+    for p in G.polys(region):
+        q = p.buffer(1e-6)
+        if q.contains(pa) and q.contains(pb):
+            comp = p
+            break
+    if comp is None:
+        return None
+    inner = comp.buffer(-inset)
+    rings = [r for r in G.polys(inner)]
+    if not rings:
+        return None
+    ring = min((r.exterior for r in rings), key=lambda e: e.distance(pa) + e.distance(pb))
+    L = ring.length
+    ta, tb = ring.project(pa), ring.project(pb)
+    d1 = (tb - ta) % L
+    if d1 <= L - d1:
+        seg = substring(ring, ta, ta + d1) if ta + d1 <= L else None
+        if seg is None:
+            seg = LineString(list(substring(ring, ta, L).coords) + list(substring(ring, 0, ta + d1 - L).coords)[1:])
+    else:
+        d2 = L - d1
+        seg = substring(ring, tb, tb + d2) if tb + d2 <= L else None
+        if seg is None:
+            seg = LineString(list(substring(ring, tb, L).coords) + list(substring(ring, 0, tb + d2 - L).coords)[1:])
+        seg = LineString(list(seg.coords)[::-1])
+    pts = [tuple(a[:2])] + [tuple(c) for c in seg.coords] + [tuple(b[:2])]
+    path = LineString(pts)
+    if path.length > 3.0 * math.dist(a[:2], b[:2]) + 10.0:
+        return None
+    if not comp.buffer(1e-6).contains(path):
+        return None
+    return pts
+
+
+def helix_entry(mv, region, R, z_from, z_to, pitch, cw=False, link=None):
     """Helix down about a point with the tool inside the region: quarter arcs down, then a flat turn. Returns the
-    end point, or None when no helix fits (the caller plunges)."""
+    end point, or None when no helix fits (the caller plunges). link: where the tool may feed at its current height
+    (the tool at z_from: it feeds to the helix start instead of going up and back down)."""
     cen = None
     for rh in (0.5 * R, 0.35 * R, 0.25 * R):
         inner = region.buffer(-rh, G.ARC_SEGS // 4)
@@ -255,9 +368,12 @@ def helix_entry(mv, region, R, z_from, z_to, pitch, cw=False):
     if cen is None:
         return None
     cx, cy, rh = cen
-    mv.rapid_to(cx + rh, cy)
-    mv.to_safe()
-    mv.plunge_to(z_from)
+    if stays_down(mv, link, (cx + rh, cy), z_from):
+        mv.feed_to(cx + rh, cy, z_from)
+    else:
+        mv.rapid_to(cx + rh, cy)
+        mv.to_safe()
+        mv.plunge_to(z_from)
     zc = z_from
     sgn = -1.0 if cw else 1.0
     while zc > z_to + 1e-9:
@@ -292,15 +408,42 @@ def air_entry(ctx, region, z, z_above, R, near):
 
 
 def clear_region(ctx, mv, region, z, z_above, stepover, pattern="offset", angle=0.0, cw=False, start_at="centre",
-                 keep_down=True, entry="plunge", pitch=1.0, finish_region=None):
+                 keep_down=True, entry="plunge", pitch=1.0, finish_region=None, carry=None):
     """Cuts a region at the level z with the pattern. Returns the number of plunges. The first entry of the level
     goes down beside the stock when the region reaches past it (an open side), else by the entry (helix or
-    plunge)."""
+    plunge). carry (a dict kept from level to level of one floor, keep tool down): the tool left down at the end of
+    the level above feeds at that level to the entry of this level when the line stays in the region and the air
+    of that level ("link", "z" of the level above), then goes down; carry gets the link region of this level."""
     plunges = 0
     R = TB.radius(ctx.tool)
     if region is None or region.is_empty:
         return 0
     first = True
+
+    link = [None]
+
+    def link_region():
+        """The region the tool may move through at the level between passes: the region and the air beside it
+        (no stock and no part in the slab within R + 0.1 mm)."""
+        if link[0] is None:
+            link[0] = region
+            st = getattr(ctx, "stock", None)
+            if st is not None and getattr(ctx, "shape", None) is not None:
+                try:
+                    from shapely.geometry import box
+                    from shapely.ops import unary_union
+                    b = region.bounds
+                    m = 2 * R + 2.0
+                    near = box(b[0] - m, b[1] - m, b[2] + m, b[3] + m)
+                    mat = unary_union([walls_over(st, z, z_above), walls_over(ctx.shape, z, z_above, reach_of(ctx, z))])
+                    air = near.difference(mat.buffer(R + 0.1, G.PATH_SEGS)) if not mat.is_empty else near
+                    link[0] = region.union(air)
+                except Exception:  # noqa: BLE001
+                    link[0] = region
+        return link[0]
+
+    prev_link = carry.get("link") if (carry and keep_down) else None
+    prev_z = carry.get("z") if carry else None
 
     def start(pt):
         nonlocal first, plunges
@@ -308,12 +451,16 @@ def clear_region(ctx, mv, region, z, z_above, stepover, pattern="offset", angle=
             first = False
             ae = air_entry(ctx, region, z, z_above, R, pt)
             if ae is not None:
-                mv.enter(ae[0], ae[1], z)
-                if math.dist(ae, pt[:2]) > 1e-6 and link_or_lift(mv, region, pt, z, True):
+                if stays_down(mv, prev_link, ae, prev_z):
+                    mv.feed_to(ae[0], ae[1], mv.cur[2])
+                    mv.plunge_to(z)
+                else:
+                    mv.enter(ae[0], ae[1], z)
+                if math.dist(ae, pt[:2]) > 1e-6 and link_or_lift(mv, link_region(), pt, z, True):
                     plunges += 1
                 return
             if entry == "helix":
-                end = helix_entry(mv, region, R, z_above, z, pitch, cw)
+                end = helix_entry(mv, region, R, z_above, z, pitch, cw, prev_link if prev_z is not None and abs(prev_z - z_above) < 1e-6 else None)
                 if end is not None:
                     if link_or_lift(mv, region, pt, z, True):
                         plunges += 1
@@ -321,8 +468,13 @@ def clear_region(ctx, mv, region, z, z_above, stepover, pattern="offset", angle=
                 ctx.message("Z %.3f mm: no room for a helix of 0.25 x R: plunge entry" % z)
             mv.enter(pt[0], pt[1], z)
             plunges += 1
-        elif link_or_lift(mv, region, pt, z, keep_down):
+        elif link_or_lift(mv, link_region() if keep_down else region, pt, z, keep_down):
             plunges += 1
+
+    def done():
+        if carry is not None:
+            carry["link"] = link_region()
+            carry["z"] = z
     if pattern in ("zigzag", "line", "zigzag_offset"):
         for pl in zigzag_lines(region, stepover, angle, zig=pattern != "line"):
             if pattern == "line":
@@ -358,6 +510,7 @@ def clear_region(ctx, mv, region, z, z_above, stepover, pattern="offset", angle=
             if link_or_lift(mv, finish_region, lp[0], z, keep_down):
                 plunges += 1
             mv.polyline(lp[1:] + [lp[0]], z, finish_feed(ctx))
+    done()
     return plunges
 
 
@@ -367,7 +520,7 @@ def run_face(ctx):
     """Face: the top of the stock (or a bound box, or the picked faces) cleared down to the part top in levels."""
     from shapely.geometry import box as sbox
     from shapely.ops import unary_union
-    check_shape(ctx, "endmill", "bullnose")
+    check_shape(ctx, "endmill", "bullnose", "custom")
     op = ctx.op
     R = TB.radius(ctx.tool)
     sb, pb = ctx.stock_bb, ctx.part_bb
@@ -411,7 +564,7 @@ def run_face(ctx):
 def run_pocket(ctx):
     """Pocket Shape: the material above the picked floor faces (or inside the picked walls) removed in levels
     with the pattern."""
-    check_shape(ctx, "endmill", "bullnose")
+    check_shape(ctx, "endmill", "bullnose", "tslot", "custom")
     op = ctx.op
     faces = base_faces(ctx)
     if not faces:
@@ -460,6 +613,7 @@ def run_pocket(ctx):
             continue
         tops.append(z_top)
         total_levels += len(lv)
+        carry = {}
         for i, z in enumerate(lv):
             zt = z_top if i == 0 else lv[i - 1]
             if info.get("wall"):
@@ -481,10 +635,12 @@ def run_pocket(ctx):
             if region.is_empty:
                 ctx.message("Z %.3f mm: no room for the tool" % z)
                 continue
-            plunges += clear_region(ctx, mv, region, z, zt, stepover, pattern, angle, cw, start_at, keep_down, entry, pitch, fin)
+            plunges += clear_region(ctx, mv, region, z, zt, stepover, pattern, angle, cw, start_at, keep_down, entry, pitch, fin, carry)
             if spring and fin is not None and i == len(lv) - 1:
                 finish_loops(ctx, mv, fin, z, cw, keep_down, finish_feed(ctx))
-            mv.retract()
+            if not keep_down or pattern == "line":
+                mv.retract()
+        mv.retract()
         fill = G.prism(poly, info["z"], z_top)
         if fill is not None:
             pin = G.common_volume(ctx.shape, fill) or 0.0
@@ -574,7 +730,7 @@ def run_profile(ctx):
     """Profile: contours of the model, of faces or of edges, offset by the tool radius to the chosen side, cut in
     levels from the start depth to the final depth."""
     from shapely.geometry import Polygon, LineString
-    check_shape(ctx, "endmill", "bullnose", "ballend")
+    check_shape(ctx, "endmill", "bullnose", "ballend", "tslot", "custom")
     op = ctx.op
     R = TB.radius(ctx.tool)
     extra = max(0.0, _f(op.get("extra_offset"), _f(op.get("allowance"), 0.0)))
@@ -786,7 +942,7 @@ def run_helix(ctx):
 def run_slot(ctx):
     """Slot: a straight or circular slot from two points, an edge or a slot floor, cut along its centre line in
     one pass at the final depth or in levels."""
-    check_shape(ctx, "endmill", "bullnose", "ballend", "tapered")
+    check_shape(ctx, "endmill", "bullnose", "ballend", "tapered", "tslot", "custom")
     op = ctx.op
     R = TB.radius(ctx.tool)
     pts = op.get("points") or []

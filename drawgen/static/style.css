@@ -177,7 +177,9 @@ g.ann.sel text, g.ann.sel polygon { fill: #d0451b !important; }
 .sk-tools .toolbar button { padding: 4px 8px; font-size: 12px; }
 .sk-left { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 #sk-canvas { flex: 1; min-height: 0; overflow: hidden; background: #ffffff; position: relative; outline: none; }
-#sk-canvas svg { display: block; width: 100%; height: 100%; cursor: crosshair; user-select: none; }
+#sk-canvas svg { display: block; width: 100%; height: 100%; cursor: crosshair; user-select: none; position: relative; z-index: 1; }
+/* shaded model under a feature sketch (three.js canvas, the Part tab draws it) */
+#sk-canvas canvas.sk-underlay { position: absolute; left: 0; top: 0; z-index: 0; pointer-events: none; opacity: 0.85; }
 #sk-canvas.select svg { cursor: default; }
 .sk-cmdbar { display: flex; gap: 12px; align-items: center; padding: 4px 10px; border-top: 1px solid var(--line); background: var(--panel); }
 .sk-cmdbar .hint { margin: 0; }
@@ -203,6 +205,7 @@ g.ann.sel text, g.ann.sel polygon { fill: #d0451b !important; }
 #value-dialog input { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; }
 #sk-msg { max-width: 420px; }
 #sk-msg.err { color: var(--danger); }
+.cw-sec .hint.err { color: var(--danger); }
 #sk-canvas.paper { background: #8a8f96; }
 .sk-cmdbar { flex-wrap: nowrap; min-height: 32px; }
 .sk-next { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; padding: 3px 10px; border-top: 1px solid var(--line); background: var(--panel); font-size: 12px; }
@@ -289,6 +292,12 @@ label > span.row input { flex: 1; min-width: 0; }
 
 /* Part tab: tree, command bar, view tooltip */
 .pt-sec { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin: 8px 0 2px; }
+.pt-sec.pt-sech { display: flex; align-items: center; gap: 6px; }
+.pt-sec.pt-sub { margin: 4px 0 0 6px; letter-spacing: 0.02em; }
+.pt-sech button { margin-left: auto; padding: 0 5px; font-size: 11px; border: none; background: none; color: var(--muted); text-transform: none; letter-spacing: 0; }
+.pt-sech button:hover { color: var(--text); }
+.pt-sech button.off { opacity: 0.3; }
+.pt-sech button svg { vertical-align: -2px; }
 .pt-feat .ico { color: var(--muted); font-size: 12px; width: 14px; display: inline-block; text-align: center; }
 .pt-feat.editing { background: #fff4e5; border-color: #e8a04c; }
 .pt-feat .ops button.off { opacity: 0.3; }
@@ -602,6 +611,9 @@ label > span.row input { flex: 1; min-width: 0; }
 .cw-chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0; align-items: center; max-height: 120px; overflow-y: auto; }
 .cw-chip { display: inline-flex; align-items: center; gap: 2px; padding: 1px 2px 1px 7px; border-radius: 10px; font-size: 11px;
   background: rgba(43,178,76,0.12); border: 1px solid rgba(43,178,76,0.45); color: var(--text); }
+.cw-chip { cursor: pointer; }
+.cw-chip:hover { background: rgba(10,132,255,0.12); border-color: rgba(10,132,255,0.5); }
+.cw-chip.on { background: rgba(10,132,255,0.2); border-color: #0a84ff; }
 .cw-chip button { border: none; background: none; padding: 0 4px; font-size: 12px; line-height: 1; color: var(--muted); cursor: pointer; }
 .cw-chip button:hover { color: var(--danger); }
 .cw-chips .cw-clear { margin-left: auto; }

@@ -446,7 +446,8 @@ def simulate(stock, shape, tool, moves, flat=True):
     """Stock after the cutting moves of a tool: the moves grouped by their Z, the footprint of the tool along the
     moves of a level extruded from the level to the cutting height and subtracted, from the top level down. The
     neck and the shank over the footprint are checked against the stock of each level. Returns {"stock",
-    "levels": [{"z", "removed_mm3", "length_mm"}], "removed_mm3", "gouge_mm3" (the part material cut), "errors"}."""
+    "levels": [{"z", "removed_mm3", "length_mm", "gouge_mm3"}], "removed_mm3", "gouge_mm3" (the part material cut),
+    "gouge_shape" (the part material cut, when there is any), "errors"}."""
     R = TB.radius(tool)
     cut, body = TB.tool_profile(tool)
     hcut = cut[-1][1]
@@ -499,7 +500,7 @@ def simulate(stock, shape, tool, moves, flat=True):
         dv = before - G.volume(cur)
         res["removed_mm3"] += dv
         res["levels"].append({"z": round(z, 4), "removed_mm3": round(dv, 3),
-                              "length_mm": round(sum(_plen(pl) for pl in lines_), 1)})
+                              "length_mm": round(sum(_plen(pl) for pl in lines_), 1), "_removed": removed})
     res["stock"] = cur
     # the part material cut: the part inside the stock before less the part inside the stock after
     if res["levels"]:
@@ -507,7 +508,52 @@ def simulate(stock, shape, tool, moves, flat=True):
         v1 = G.common_volume(cur, shape)
         if v0 is not None and v1 is not None:
             res["gouge_mm3"] = max(0.0, v0 - v1)
+    if res["gouge_mm3"] > GOUGE_MIN:
+        try:
+            inside = G.common_shape(stock, shape)
+            g = G.solids_only(G.cut(inside, [cur]), 1e-4) if inside is not None else None
+        except Exception:  # noqa: BLE001
+            g = None
+        if g is not None:
+            res["gouge_shape"] = g
+            for lv in res["levels"]:
+                gv = G.common_volume(lv["_removed"], g)
+                if gv and gv > 1e-4:
+                    lv["gouge_mm3"] = round(gv, 4)
+    for lv in res["levels"]:
+        lv.pop("_removed", None)
     return res
+
+
+GOUGE_MIN = 1e-3            # mm^3: smaller part volumes cut are Boolean noise
+
+
+def gouge_report(g, moves, R, hcut, limit=20):
+    """The places of the part material cut: [{"volume" mm^3, "c" centre, "bbox", "move" index of the first cutting
+    move whose tool (radius R, tip below the top of the place, cutting height hcut) reaches the bounding box of the
+    place (None when none is found), "from" and "p" its start and end points}], the largest first, at most limit."""
+    from shapely.geometry import LineString, Point, box
+    out = []
+    sols = sorted(g.solids(), key=lambda x: -abs(x.volume))[:limit]
+    for sol in sols:
+        bb = G.bbox(sol)
+        c = sol.center()
+        area = box(bb[0], bb[1], bb[3], bb[4]).buffer(R + 0.01)
+        hit, hit_from, prev = None, None, None
+        for i, m in enumerate(moves):
+            if "p" not in m:
+                continue
+            p = m["p"]
+            if m.get("k") != "rapid" and prev is not None and bb[2] - hcut - 1e-6 <= p[2] < bb[5] - 1e-4:
+                seg = LineString([prev[:2], p[:2]]) if math.dist(prev[:2], p[:2]) > 1e-9 else Point(p[0], p[1])
+                if seg.intersects(area):
+                    hit, hit_from = i, list(prev)
+                    break
+            prev = p
+        out.append({"volume": round(abs(sol.volume), 4), "c": [round(c.X, 3), round(c.Y, 3), round(c.Z, 3)],
+                    "bbox": [round(v, 3) for v in bb], "move": hit, "p": moves[hit]["p"] if hit is not None else None,
+                    "from": hit_from})
+    return out
 
 
 def _slabs(cut, R, dr=None):
@@ -763,6 +809,7 @@ def run(doc, shape, bits, upto=None, shape_key="", only=None, cancel=None):
             else:
                 sim = simulate(cur, shape, tool, moves)
             rec["levels"] = sim.get("levels", [])
+            gsh = sim.pop("gouge_shape", None) if isinstance(sim, dict) else None
             rec["removed_mm3"] = round(sim.get("removed_mm3", 0.0), 3)
             rec["gouge_mm3"] = round(sim.get("gouge_mm3", 0.0), 4)
             rec["errors"] += sim.get("errors", [])
@@ -775,6 +822,16 @@ def run(doc, shape, bits, upto=None, shape_key="", only=None, cancel=None):
                 rec["gouge_mm3"] = 0.0
             elif rec["gouge_mm3"] > max(0.05, 1e-6 * G.volume(shape)):
                 rec["messages"].append("gouge: %.3f mm^3 of the part cut" % rec["gouge_mm3"])
+                if gsh is not None:
+                    try:
+                        cut_, _b = TB.tool_profile(tool)
+                        rec["gouges"] = gouge_report(gsh, moves, TB.radius(tool), cut_[-1][1])
+                        from .. import part as P
+                        gm = P.mesh(gsh)
+                        rec["gouge_mesh"] = {"vertices": gm["vertices"], "triangles": gm["triangles"]}
+                    except Exception:  # noqa: BLE001
+                        import traceback
+                        traceback.print_exc()
             cur = sim["stock"]
             if rec.get("_remaining") is not None:
                 rec["remaining_mm3"] = round(rec.pop("_remaining")(cur), 3)

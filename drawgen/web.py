@@ -1585,6 +1585,9 @@ def part_regions():
             out.append({"point": [q.X, q.Y, q.Z], "area": round(pc.area, 3),
                         "mesh": {"vertices": mm["vertices"], "triangles": mm["triangles"], "edges": mm["edges"]}})
         return jsonify(out)
+    except ValueError as e:
+        # a tool that does not cut, a missing tool: the reason for the Regions section
+        return jsonify({"error": str(e)})
     except Exception as e:
         return error("regions failed: %s" % e, 400)
 
@@ -1612,14 +1615,16 @@ def part_inspect():
 
 @app.route("/api/part/section", methods=["POST"])
 def part_section():
-    """Cap faces of the solid on a plane: {"part", "origin": [x, y, z], "normal": [x, y, z]} -> mesh of the
-    section faces ({"vertices", "triangles", "edges"}) for the section view."""
+    """Cap faces of the solid on a plane: {"part", "origin": [x, y, z], "normal": [x, y, z], "upto": feature index
+    or null} -> mesh of the section faces ({"vertices", "triangles", "edges"}) for the section view (of the part
+    built up to the feature when "upto" is given)."""
     req = request.get_json(force=True)
     p = part.migrate(req.get("part") or {})
     try:
         from build123d import Plane, Face, Vector, Compound
         from OCP.BRepAlgoAPI import BRepAlgoAPI_Common
-        shape, st = part.build(p)
+        upto = req.get("upto")
+        shape, st = part.build(p, upto=int(upto) if upto is not None else None)
         if shape is None:
             return jsonify({"vertices": [], "triangles": [], "edges": []})
         o = [float(v) for v in req.get("origin") or [0, 0, 0]]
@@ -1669,7 +1674,11 @@ def part_profile_regions():
 
 @app.route("/api/part/refs", methods=["POST"])
 def part_refs():
+    """Reference geometry of a feature sketch: {"part", "index", "path", "section", "cut": null | "front" |
+    "back"} -> list of reference entities in sketch coordinates. "cut" removes the half of the model on the
+    viewer's side of the sketch plane ("front") or the other half ("back") before the projection."""
     req = request.get_json(force=True)
+    cut = req.get("cut") if req.get("cut") in ("front", "back") else None
     p = req.get("part") or {}
     i = int(req.get("index", 0))
     feats = p.get("features") or []
@@ -1689,7 +1698,7 @@ def part_refs():
         if req.get("section") is not None:
             sec = (f.get("sections") or [])[int(req["section"])]
             f = {"plane": sec.get("plane", "XY"), "offset": sec.get("offset", 0)}
-        out = part.section_refs(shape, f, datums, bodies)
+        out = part.section_refs(shape, f, datums, bodies, cut=cut)
         if f.get("_project", True):
             out += part.earlier_sketch_refs(p, feats, i, part.plane_of(f), st, datums)
         return jsonify(out)
@@ -2667,14 +2676,16 @@ def cam_setup():
     "stock_mesh" (STEP stock: the view mesh of the stock before the first operation)}."""
     doc = (request.get_json(force=True) or {}).get("cam") or {}
     try:
-        doc = cam.migrate(doc)
+        doc = _cam_prepare(doc)
         shape, _ = _cam_shape(doc)
-        stock0 = cam.stock_solid(doc, shape)
+        carried, _c = _cam_chain(doc)
+        stock0 = carried if carried is not None else cam.stock_solid(doc, shape)
         bb = cam._bbox(stock0)
         out = {"stock_bbox": bb, "part_bbox": cam._bbox(shape), "origin": cam.origin_of(doc, bb),
                "clearance_z": bb[5] + cam._f((doc.get("setup") or {}).get("clearance_offset"), 5.0)}
-        if (doc.get("stock") or {}).get("kind") == "step":
+        if carried is not None or (doc.get("stock") or {}).get("kind") == "step":
             out["stock_mesh"] = _view_mesh(stock0)
+        out["setup"] = {"index": int(doc.get("active") or 0), "count": len(doc.get("setups") or [])}
         return jsonify(out)
     except Exception as e:
         traceback.print_exc()
@@ -2685,12 +2696,37 @@ _CAM_PREVIEW = {}                  # client id -> number of its latest preview r
 _CAM_PREVIEW_LOCK = threading.Lock()
 
 
+def _cam_chain(d, bits=None, cancel=None):
+    """(stock before the first operation of the active setup, key of that stock) of a prepared document: the stock of
+    the job for the first setup ((None, "")); for a later setup the stock left by the setups before it (each run
+    on the stock of the one before), moved with the part from one placement to the next."""
+    k = int(d.get("active") or 0)
+    if k <= 0:
+        return None, ""
+    bits = bits or _cam_tools()
+    setups = d["setups"]
+    stock, chain = None, ""
+    for j in range(k):
+        dj = _cam_prepare(cam.job.setup_doc(d, j))
+        shape_j, key_j = _cam_shape(dj)
+        res = cam.run(dj, shape_j, bits, shape_key=key_j + chain, stock0=stock, cancel=cancel)
+        bad = [o for o in res["operations"] if not o.get("ok")]
+        if bad:
+            raise ValueError("%s: operation %s failed (the stock of %s is the stock it leaves)" % (setups[j].get("name"), bad[0].get("name"), setups[k].get("name")))
+        stock = cam.placement.move_between(res["stock"], setups[j].get("placement"), setups[j + 1].get("placement"))
+        chain = ":chain:" + hashlib.sha1((chain + key_j + json.dumps(dj.get("operations"), sort_keys=True, default=str) +
+                                          json.dumps(setups[j + 1].get("placement"), sort_keys=True)).encode("utf-8")).hexdigest()[:16]
+    return stock, chain
+
+
 def _cam_run(doc, upto=None, cancel=None):
-    """(document, shape, bits, result) of a run; the operations before upto come from the cache of the job module."""
+    """(document, shape, bits, result) of a run of the active setup; the operations before upto come from the cache of
+    the job module."""
     d = _cam_prepare(doc)
     shape, key = _cam_shape(d)
     bits = _cam_tools()
-    res = cam.run(d, shape, bits, upto=upto, shape_key=key, cancel=cancel)
+    stock0, chain = _cam_chain(d, bits, cancel)
+    res = cam.run(d, shape, bits, upto=upto, shape_key=key + chain, cancel=cancel, stock0=stock0)
     return d, shape, bits, res
 
 
@@ -2740,8 +2776,10 @@ def cam_measure():
     req = request.get_json(force=True) or {}
     doc = cam.migrate(req.get("cam") or {})
     try:
+        doc = _cam_prepare(doc)
         shape, _ = _cam_shape(doc)
-        stock0 = cam.stock_solid(doc, shape)
+        carried, _c = _cam_chain(doc)
+        stock0 = carried if carried is not None else cam.stock_solid(doc, shape)
         sb = cam._bbox(stock0)
         origin = cam.origin_of(doc, sb)
         items = []
@@ -2887,39 +2925,61 @@ def cam_template():
 @app.route("/api/cam/gcode", methods=["POST"])
 def cam_gcode():
     """G-code of the operations: {"cam": doc, "folder": output folder (empty: the project cam folder; "-": download),
-    "overwrite", "inspect": index (the text of one operation returned as {"text"}), "post"} -> {"written": [path]}
-    or the file."""
+    "overwrite", "inspect": index (the text of one operation of the active setup returned as {"text"}), "post"} ->
+    {"written": [path]} or the file. A job with several setups gives one file per setup, named <name>_<setup name>
+    (a download: a zip of them)."""
     req = request.get_json(force=True) or {}
     doc = req.get("cam") or {}
     inspect = req.get("inspect")
     try:
-        d, shape, bits, res = _cam_run(doc, int(inspect) if inspect is not None else None)
-        bad = [o for o in res["operations"] if not o.get("ok")]
-        if bad and inspect is None:
-            return error("operation %s: %s" % (bad[0].get("name") or bad[0].get("id"), "; ".join(bad[0].get("errors") or ["failed"])))
-        text = cam.gcode(d, res, bits, post=req.get("post") or None, only=int(inspect) if inspect is not None else None)
+        if inspect is not None:
+            d, shape, bits, res = _cam_run(doc, int(inspect))
+            text = cam.gcode(d, res, bits, post=req.get("post") or None, only=int(inspect))
+            return jsonify({"text": text, "lines": len(text.splitlines())})
+        d0 = cam.migrate(doc)
+        n = len(d0["setups"])
+        texts = []
+        for k in range(n):
+            dk = cam.job.setup_doc(d0, k) if n > 1 else d0
+            d, shape, bits, res = _cam_run(dk)
+            bad = [o for o in res["operations"] if not o.get("ok")]
+            if bad:
+                return error("%soperation %s: %s" % ((d0["setups"][k].get("name") + ", ") if n > 1 else "", bad[0].get("name") or bad[0].get("id"), "; ".join(bad[0].get("errors") or ["failed"])))
+            texts.append((d0["setups"][k].get("name") or "setup %d" % (k + 1), cam.gcode(d, res, bits, post=req.get("post") or None)))
     except Exception as e:
         traceback.print_exc()
         return error("G-code failed: %s" % e, 400)
-    if inspect is not None:
-        return jsonify({"text": text, "lines": len(text.splitlines())})
-    out = d.get("output") or {}
-    name = safe_name(out.get("name") or d.get("name") or "cam")
-    if not name.lower().endswith((".nc", ".gcode", ".tap", ".ngc")):
-        name += ".nc"
+    out = d0.get("output") or {}
+    name = safe_name(out.get("name") or d0.get("name") or "cam")
+    ext = ".nc"
+    for e in (".nc", ".gcode", ".tap", ".ngc"):
+        if name.lower().endswith(e):
+            name, ext = name[:-len(e)], name[-len(e):]
+            break
+    files = [(name + ext, texts[0][1])] if len(texts) == 1 else [("%s_%s%s" % (name, safe_name(t[0]).replace(" ", "_"), ext), t[1]) for t in texts]
     folder = (req.get("folder") or out.get("folder") or "").strip().strip('"')
-    if folder == "-":
-        return send_file(io.BytesIO(text.encode("utf-8")), as_attachment=True, download_name=name)
-    folder = folder or (str(CAM_DIR) if PROJECTS.current_name() else "")
-    if not folder:
-        return send_file(io.BytesIO(text.encode("utf-8")), as_attachment=True, download_name=name)
+    if folder != "-":
+        folder = folder or (str(CAM_DIR) if PROJECTS.current_name() else "")
+    if folder in ("-", ""):
+        if len(files) == 1:
+            return send_file(io.BytesIO(files[0][1].encode("utf-8")), as_attachment=True, download_name=files[0][0])
+        import zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            for fn, text in files:
+                z.writestr(fn, text)
+        buf.seek(0)
+        return send_file(buf, as_attachment=True, download_name=name + ".zip", mimetype="application/zip")
     os.makedirs(folder, exist_ok=True)
-    path = os.path.join(folder, name)
-    if os.path.exists(path) and not req.get("overwrite"):
-        return jsonify({"exists": path}), 409
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
-    return jsonify({"written": [path], "lines": len(text.splitlines())})
+    paths = [os.path.join(folder, fn) for fn, _t in files]
+    if not req.get("overwrite"):
+        ex = [p for p in paths if os.path.exists(p)]
+        if ex:
+            return jsonify({"exists": ex[0] if len(ex) == 1 else ", ".join(ex)}), 409
+    for p, (fn, text) in zip(paths, files):
+        with open(p, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+    return jsonify({"written": paths, "lines": sum(len(t.splitlines()) for _fn, t in files)})
 
 
 @app.route("/api/cam/open_folder", methods=["POST"])

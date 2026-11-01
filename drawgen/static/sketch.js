@@ -1677,6 +1677,8 @@ function redraw() {
   const W = $("#sk-canvas").clientWidth, H = $("#sk-canvas").clientHeight;
   const vx0 = Minv(0, H), vx1 = Minv(W, 0);
   const vb = [vx0[0], vx0[1], vx1[0], vx1[1]];
+  // the shaded model under a feature sketch follows the view
+  if (SK.partEdit && SK.partEdit.underlay) { try { SK.partEdit.underlay.update(SK.view, W, H); } catch (e) { console.error(e); } }
   const out = [];
   const selE = new Set(), selP = new Set();
   for (const s of SK.sel) { const q = parseSel(s); if (q.kind === "e") selE.add(q.id); if (q.kind === "p") selP.add(q.id + ":" + q.k); }
@@ -6578,14 +6580,15 @@ async function exportSketch(fmt, overwrite) {
 // ------------------------------------------------------------------ sketch of a part feature
 
 // open a feature sketch from the Part tab; onFinish(sketch) is called with the edited sketch
-window.sketchEditForPart = function (sketch, refs, title, onFinish) {
+// opts.reload(cut): reads the reference geometry again with the model cut at the sketch plane (cut null, "front" or
+// "back"); opts.underlay: the shaded model drawn under the sketch (attach, update, setCut, setVisible, dispose)
+window.sketchEditForPart = function (sketch, refs, title, onFinish, opts) {
   const saved = SK.doc ? { doc: JSON.stringify(SK.doc), dirty: SK.dirty } : null;
-  SK.partEdit = { onFinish, saved };
+  SK.partEdit = { onFinish, saved, reload: opts && opts.reload || null, underlay: opts && opts.underlay || null };
   SK.hostSheet = null;
   const doc = JSON.parse(JSON.stringify(sketch || blankSketch("feature sketch")));
   doc.sheet = { page: "extents", title_block: false, origin: [0, 0] };
-  SK.frameRef = (refs || []).find(e => e.t === "frame") || null;
-  SK.refs = (refs || []).filter(e => e.t !== "frame").map((e, i) => Object.assign({ id: "ref" + i, isRef: true, layer: "" }, e));
+  setRefs(refs);
   bindRefToggles();
   showTab("sketch");
   loadDoc(doc);
@@ -6594,8 +6597,33 @@ window.sketchEditForPart = function (sketch, refs, title, onFinish) {
   $("#sk-partbar").hidden = false;
   document.querySelector("#tab-sketch .sk-file").classList.add("collapsed");
   $("#sk-parttitle").textContent = title;
+  const ul = SK.partEdit.underlay;
+  if (ul) { ul.attach($("#sk-canvas")); ul.setCut(SK.cutMode || null); ul.setVisible(SK.showShaded !== false); }
   fitAll();
 };
+
+/** The reference geometry of the feature sketch (the frame entry apart). */
+function setRefs(refs) {
+  SK.frameRef = (refs || []).find(e => e.t === "frame") || null;
+  SK.refs = (refs || []).filter(e => e.t !== "frame").map((e, i) => Object.assign({ id: "ref" + i, isRef: true, layer: "" }, e));
+}
+
+/** Reads the reference geometry again (Cut at plane, Flip): the model cut at the sketch plane on the server. */
+let refReloadSeq = 0;
+async function reloadRefs() {
+  const pe = SK.partEdit;
+  if (!pe || !pe.reload) return;
+  const seq = ++refReloadSeq;
+  msg("Reading the reference geometry" + (SK.cutMode ? " (model cut at the sketch plane)" : "") + "...");
+  try {
+    const refs = await pe.reload(SK.cutMode || null);
+    if (seq !== refReloadSeq || SK.partEdit !== pe) return;
+    setRefs(refs);
+    bindRefToggles();
+    msg("");
+  } catch (e) { showErr(e); }
+  redraw();
+}
 
 function fitAll() {
   // fit including reference geometry
@@ -7534,19 +7562,34 @@ function includeRef(r) {
  *  the earlier sketches, src "sketch") check boxes of the sketch bar; the section and datums are always shown. */
 function refShown(e) {
   if (e.src === "sketch") return SK.showSketchRefs !== false;
-  return SK.showProj !== false || (e.kind !== "proj" && e.kind !== "hidden");
+  if (e.kind === "hidden") return SK.showProj !== false && SK.showHidden !== false;
+  return SK.showProj !== false || e.kind !== "proj";
 }
+/** Check boxes of the sketch bar: Model edges, Hidden lines, Earlier sketches, Cut at plane with Flip (the model
+ *  cut at the sketch plane before the projection, read again from the server) and Shaded (the shaded model under
+ *  the sketch). The settings are kept for the session. */
 function bindRefToggles() {
   if (SK.showProj === undefined) SK.showProj = true;
+  if (SK.showHidden === undefined) SK.showHidden = true;
   if (SK.showSketchRefs === undefined) SK.showSketchRefs = true;
-  if ($("#sk-partproj")) { $("#sk-partproj").checked = SK.showProj; $("#sk-partproj").onchange = () => { SK.showProj = $("#sk-partproj").checked; redraw(); }; }
-  const sr = $("#sk-sketchrefs");
-  if (sr) {
-    sr.checked = SK.showSketchRefs;
-    sr.onchange = () => { SK.showSketchRefs = sr.checked; redraw(); };
-    sr.closest("label").hidden = !(SK.refs || []).some(e => e.src === "sketch");
-  }
+  if (SK.showShaded === undefined) SK.showShaded = true;
+  if (SK.cutMode === undefined) SK.cutMode = null;
+  const pe = SK.partEdit, partSketch = !!(pe && !pe.drawing);
+  const cb = (id, on, fn) => { const el = $(id); if (!el) return null; el.checked = !!on; el.onchange = () => fn(el.checked); return el; };
+  cb("#sk-partproj", SK.showProj, v => { SK.showProj = v; if ($("#sk-hidden")) $("#sk-hidden").disabled = !v; redraw(); });
+  const hd = cb("#sk-hidden", SK.showHidden, v => { SK.showHidden = v; redraw(); });
+  if (hd) hd.disabled = !SK.showProj;
+  const sr = cb("#sk-sketchrefs", SK.showSketchRefs, v => { SK.showSketchRefs = v; redraw(); });
+  if (sr) sr.closest("label").hidden = !(SK.refs || []).some(e => e.src === "sketch");
+  const cut = cb("#sk-cut", !!SK.cutMode, v => { SK.cutMode = v ? (SK.cutFlip ? "back" : "front") : null; bindRefToggles(); if (pe && pe.underlay) pe.underlay.setCut(SK.cutMode); reloadRefs(); });
+  const flip = cb("#sk-cutflip", SK.cutMode === "back", v => { SK.cutFlip = v; SK.cutMode = v ? "back" : "front"; if (pe && pe.underlay) pe.underlay.setCut(SK.cutMode); reloadRefs(); });
+  if (cut) cut.closest("label").hidden = !(partSketch && pe.reload);
+  if (flip) { flip.closest("label").hidden = !(partSketch && pe.reload); flip.disabled = !SK.cutMode; }
+  const sh = cb("#sk-shaded", SK.showShaded, v => { SK.showShaded = v; if (pe && pe.underlay) pe.underlay.setVisible(v); });
+  if (sh) sh.closest("label").hidden = !(partSketch && pe.underlay);
 }
+/** Options of the reference geometry read for a feature sketch (the Part tab reads them before opening the sketch). */
+window.sketchRefOptions = () => ({ cut: SK.cutMode || null });
 
 function includeAt(p) {
   const tol = HIT_PX / SK.view.s;
@@ -7578,6 +7621,7 @@ function endPartEdit(apply) {
   if (SK.includeMode) setIncludeMode(false);
   const sk = JSON.parse(JSON.stringify(SK.doc));
   const anns = pe.drawing ? SK.doc.dims.map(resolveDim).filter(Boolean) : null;
+  if (pe.underlay) { try { pe.underlay.dispose(); } catch (e) { console.error(e); } }
   SK.partEdit = null;
   SK.refs = [];
   SK.hostSheet = null;

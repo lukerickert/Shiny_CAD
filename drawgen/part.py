@@ -43,14 +43,16 @@ Feature:
   {"type": "split", "method": "principal" (plane, offset, relative) | "point_normal" (point, normal) | "three_points"
    (points) | "face" (face key; its surface, planar or curved, extended through the cells; face_offset: mm along the face normal) |
    "sketch" (plane, offset, sketch: lines, arcs and circles extruded through the part) | "edge" (edge: edge key, or curve: curve body id; t: fraction 0..1 of the length) | "datum" (plane_ref, offset) | "ogrid" (face: cylindrical face key;
-   four planes through the hole axis applied to the cells around the hole), "cells": [face keys {"c", "n", "area"} or
-   points {"p": [x, y, z]} of the cells to partition; empty: all]}                                              partition of cells by a plane
+   four planes through the hole axis applied to the cells around the hole), "cells": [{"solid": index}, face keys
+   {"c", "n", "area"} or points {"p": [x, y, z]} of the cells to partition; empty: all]}                                              partition of cells by a plane
   {"type": "unify", "faces": true, "edges": true, "angle": deg}         merge coplanar faces / collinear edges
   {"type": "heal", "tolerance": mm (small edges dropped), "small_faces": mm (spot and strip faces below this
    width removed)}; the result is rejected when invalid or when the volume changes by more than 1 %
   {"type": "combine", "faces": [face keys], "min_area": mm^2}         virtual topology: the faces are meshed as one
    (gmsh compound surface); faces below min_area are combined with their largest neighbour. Geometry unchanged.
   {"type": "smooth", "tolerance": mm, "segments": n, "continuity": "C2" | "C1"}   re-approximate B-spline surfaces
+  {"type": "merge_tangent", "faces": [face keys] (empty: all faces), "angle": deg, "splines_only": bool, "points": n,
+   "max_dev": mm}   groups of faces meeting at less than angle (tangent patches) replaced by one smooth face each
   {"type": "replace", "faces": [face keys], "min_area": mm^2, "method": "analytic" | "smooth" | "original",
    "tolerance": mm, "offset": mm (+ outward), "pad": mm}             rebuild the picked faces on one clean surface
   {"type": "hole_mesh", "faces": [cylindrical face keys, one per hole], "factor": square side / hole diameter,
@@ -220,12 +222,13 @@ def _frame_of(o, n, x=None):
 PRINCIPAL_FRAMES = {"XY": ([0, 0, 1], [1, 0, 0]), "XZ": ([0, -1, 0], [1, 0, 0]), "YZ": ([1, 0, 0], [0, 1, 0])}
 
 
-def _planar_face(shape, ref, what="face"):
+def _planar_face(shape, ref, what="face", bodies=None):
+    """A planar face of the solid, or (bodies given) of a surface body: (face, centre, normal)."""
     from OCP.BRepAdaptor import BRepAdaptor_Surface
     from OCP.GeomAbs import GeomAbs_Plane
-    if shape is None:
+    if shape is None and not bodies:
         raise ValueError("no solid for the %s" % what)
-    faces = find_faces(shape, [ref or {}])
+    faces = find_faces_any(shape, bodies, [ref or {}]) if bodies else find_faces(shape, [ref or {}])
     if not faces:
         raise ValueError("the %s was not found" % what)
     fc = faces[0]
@@ -465,7 +468,7 @@ def datum_frame(shape, bodies, datums, f):
             raise ValueError("the three points are on one line")
         fr = _frame_of(pts[0], n, pts[1] - pts[0])
     elif m == "face":
-        _, c, n = _planar_face(shape, f.get("face"))
+        _, c, n = _planar_face(shape, f.get("face"), "face", bodies)
         fr = _frame_of(c, n)
     elif m == "edge":
         curve = reference_curve(shape, bodies, f.get("edge"), f.get("curve"), f)
@@ -535,7 +538,7 @@ def resolve_plane(f, shape, bodies=None, datums=None):
         f["_frame"] = dict(base)
         return f["_frame"]
     if pl == "face":
-        _, c, n = _planar_face(shape, f.get("plane_face"), "sketch face")
+        _, c, n = _planar_face(shape, f.get("plane_face"), "sketch face", bodies)
         f["_frame"] = _frame_of(c, n)
         return f["_frame"]
     f.pop("_frame", None)
@@ -1345,12 +1348,15 @@ def _clean_solid(so, opts, rep):
     from OCP.BRepLib import BRepLib
     from OCP.BRepCheck import BRepCheck_Analyzer
     from build123d import Shape
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
     v0 = abs(so.volume)
+    valid = lambda x: BRepCheck_Analyzer(x.wrapped).IsValid()
 
-    def ok(r, rel):
+    def ok(r, rel, was_valid):
+        # was_valid: the solid before the step (checked before the step: some fixes work in place)
         try:
             return (r is not None and len(r.solids()) == 1 and abs(abs(r.volume) - v0) <= rel * max(v0, 1e-9)
-                    and (r.is_valid or not so.is_valid))
+                    and (valid(r.solids()[0]) or not was_valid))
         except Exception:
             return False
     if opts.get("rebuild"):
@@ -1371,20 +1377,22 @@ def _clean_solid(so, opts, rep):
                 r = _sew_solid(faces, tol)
             except Exception:
                 r = None
-            if ok(r, 0.05):
+            if ok(r, 0.05, valid(so)):
                 so = r.solids()[0]
                 rep["rebuilt"] += n
             else:
                 rep["rebuild_failed"] += n
     if opts.get("fix"):
         try:
-            fx = ShapeFix_Shape(so.wrapped)
+            was = valid(so)
+            work = Shape.cast(BRepBuilderAPI_Copy(so.wrapped, True, False).Shape())     # ShapeFix and SameParameter work in place
+            fx = ShapeFix_Shape(work.wrapped)
             fx.Perform()
             sh = fx.Shape()
             BRepLib.SameParameter_s(sh, 1e-5, True)
             BRepLib.UpdateTolerances_s(sh, False)
             r = Shape.cast(sh)
-            if ok(r, 0.01):
+            if ok(r, 0.01, was):
                 so = r.solids()[0]
                 rep["fixed"] += 1
         except Exception:
@@ -1392,10 +1400,11 @@ def _clean_solid(so, opts, rep):
     if opts.get("unify"):
         try:
             n0 = len(so.faces())
+            was = valid(so)
             u = ShapeUpgrade_UnifySameDomain(so.wrapped, True, True, True)
             u.Build()
             r = Shape.cast(u.Shape())
-            if ok(r, 0.01):
+            if ok(r, 0.01, was):
                 so = r.solids()[0]
                 rep["merged"] += n0 - len(so.faces())
         except Exception:
@@ -1777,9 +1786,13 @@ def _split_tools(shape, f, big):
     from OCP.Precision import Precision
     m = f.get("method") or "principal"
     if m == "surface":
-        body = (f.get("_bodies") or {}).get(f.get("source"))
+        bodies = f.get("_bodies") or {}
+        body = bodies.get(f.get("source"))
         if body is None:
             raise ValueError("source surface not found (it must be above this feature)")
+        ext = float(f.get("extend") or 0)
+        if ext > 0:
+            body = _extended_body(shape, bodies, f.get("source"), ext)
         return [fc.wrapped for fc in body.faces()]
     if m == "face":
         faces = find_faces(shape, [f.get("face") or {}])
@@ -1825,6 +1838,50 @@ def _split_tools(shape, f, big):
     return [BRepBuilderAPI_MakeFace(pln, -big, big, -big, big).Face()]
 
 
+def _free_edges(body):
+    """Edges of a surface body that belong to one face only (its boundary)."""
+    faces = list(body.faces())
+    out = []
+    for e in body.edges():
+        n = sum(1 for fc in faces if any(e.wrapped.IsSame(x.wrapped) for x in fc.edges()))
+        if n == 1:
+            out.append(e)
+    return out
+
+
+def _extended_body(shape, bodies, bid, dist):
+    """The surface body bid with its faces extended by dist (mm) across its free edges (Extend surface, mode
+    edges), for a partition tool that does not quite reach the faces of the cell. The body itself when it has
+    no free edge or the extension fails."""
+    from . import surfaces as sfm
+    body = bodies[bid]
+    free = _free_edges(body)
+    if not free:
+        return body
+    fe = {"source": bid, "edges": [edge_key(e) for e in free], "mode": "edges", "distance": dist, "tolerance": 0.01}
+    try:
+        ext = sfm.extend_edges(shape, bodies, fe, lambda s, refs: find_edges_any(s, bodies, refs), lambda s, refs: find_faces_any(s, bodies, refs))
+    except Exception:
+        return body
+    return ext if ext is not None and ext.faces() else body
+
+
+def _surface_cut_hint(shape):
+    """Why a surface may not cut: the largest edge tolerance of the cells (imported geometry whose faces meet only
+    within that distance)."""
+    try:
+        from OCP.ShapeAnalysis import ShapeAnalysis_ShapeTolerance
+        from OCP.TopAbs import TopAbs_EDGE
+        t = ShapeAnalysis_ShapeTolerance().Tolerance(shape.wrapped, 1, TopAbs_EDGE)
+    except Exception:  # noqa: BLE001
+        return ""
+    msg = " (the surface must pass through the cell, crossing its faces, with its edges outside the cell"
+    if t > 0.01:
+        msg += ("; edges of the cell have tolerances up to %.2f mm: where the surface starts on an edge of the cell "
+                "or meets a face at a shallow angle it is within that distance of the face and does not cut" % t)
+    return msg + ")"
+
+
 def _split(shape, f):
     """Partition: cuts cells of the shape with a plane, an extended surface or an extruded sketch
     (Abaqus/CAE: Partition Cell)."""
@@ -1842,11 +1899,16 @@ def _split(shape, f):
     tool_faces = _split_tools(shape, f, big)
     solids = list(shape.solids())
     # cells to partition: the solids owning the picked faces (none picked: all cells)
-    refs = f.get("cells") or []
+    refs = [r for r in (f.get("cells") or []) if isinstance(r, dict)]
     sel = find_faces(shape, [r for r in refs if "c" in r])
     pts = [r["p"] for r in refs if "p" in r]
-    if sel or pts:
+    # cells picked as solids: {"solid": index} (order of the solids before this feature)
+    sidx = [int(r["solid"]) for r in refs if "solid" in r and 0 <= int(r["solid"]) < len(solids)]
+    if sel or pts or sidx:
         chosen = [so for so in solids if any(any(fc.wrapped.IsSame(x.wrapped) for x in so.faces()) for fc in sel)]
+        for i in sidx:
+            if solids[i] not in chosen:
+                chosen.append(solids[i])
         if pts:
             from OCP.BRepClass3d import BRepClass3d_SolidClassifier
             from OCP.gp import gp_Pnt
@@ -1904,10 +1966,12 @@ def _outward(so):
 
 
 def _fixed(so):
+    """A fixed copy of a solid (ShapeFix works in place: the solid of the part stays as it is)."""
     from OCP.ShapeFix import ShapeFix_Shape
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
     from build123d import Shape
     try:
-        fx = ShapeFix_Shape(so.wrapped)
+        fx = ShapeFix_Shape(BRepBuilderAPI_Copy(so.wrapped, True, False).Shape())
         fx.Perform()
         r = Shape.cast(fx.Shape())
         sols = list(r.solids())
@@ -1916,7 +1980,18 @@ def _fixed(so):
         return so
 
 
-def _fuzzy_cut(t, tools, fuzzy=1e-5):
+def _valid_copy(so):
+    """BRepCheck validity of a copy of the solid without its view triangulation (the check also looks at the
+    triangulation the view mesh leaves on the faces)."""
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    try:
+        return BRepCheck_Analyzer(BRepBuilderAPI_Copy(so.wrapped, True, False).Shape()).IsValid()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _fuzzy_cut(t, tools, fuzzy=1e-5, glue=False):
     from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
     from build123d import Shape
     from .surfaces import _shape_list
@@ -1930,6 +2005,9 @@ def _fuzzy_cut(t, tools, fuzzy=1e-5):
         op.SetArguments(a)
         op.SetTools(b)
         op.SetFuzzyValue(fuzzy)
+        if glue:
+            from OCP.BOPAlgo import BOPAlgo_GlueShift
+            op.SetGlue(BOPAlgo_GlueShift)
         op.Build()
         if not op.IsDone():
             return None
@@ -1951,8 +2029,8 @@ def _sliver(so, min_t, min_v=0.0):
 
 
 def _fuzzy_op(op, args, tools, fuzzy):
-    """Boolean "subtract" or "union" of build123d solids with a fuzzy value (mm); None when it fails."""
-    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
+    """Boolean "subtract", "union" or "intersect" of build123d solids with a fuzzy value (mm); None when it fails."""
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse, BRepAlgoAPI_Common
     from build123d import Shape
     from .surfaces import _shape_list
     try:
@@ -1963,7 +2041,7 @@ def _fuzzy_op(op, args, tools, fuzzy):
             a.Append(BRepBuilderAPI_Copy(x.wrapped).Shape())
         for u in tools:
             b.Append(BRepBuilderAPI_Copy(u.wrapped).Shape())
-        bo = BRepAlgoAPI_Cut() if op == "subtract" else BRepAlgoAPI_Fuse()
+        bo = BRepAlgoAPI_Cut() if op == "subtract" else BRepAlgoAPI_Common() if op == "intersect" else BRepAlgoAPI_Fuse()
         bo.SetArguments(a)
         bo.SetTools(b)
         bo.SetFuzzyValue(fuzzy)
@@ -1996,7 +2074,9 @@ def _boolean(shape, f):
     indices (order of shape.solids()); "keep_tools" keeps the tool solids as separate solids. Result solids thinner
     than "min_thickness" (mean thickness 2V/A, mm, default 0.01) or smaller than "min_volume" (mm^3, default 0) are
     slivers: the Boolean is made again with a fuzzy value of min_thickness, and the slivers left are removed
-    ("keep_slivers": true keeps them). The note of the feature (f["_note"]) gives the slivers removed."""
+    ("keep_slivers": true keeps them). "fuzzy" (mm): the Boolean is made with this fuzzy value from the start
+    (faces of the tools that nearly coincide with faces of the target). The note of the feature (f["_note"])
+    gives the slivers removed."""
     from build123d import Compound
     solids = list(shape.solids())
     n = len(solids)
@@ -2005,11 +2085,18 @@ def _boolean(shape, f):
     ui = [int(i) for i in f.get("tools") or [] if 0 <= int(i) < n and int(i) not in (f.get("targets") or [])]
     T = [_outward(solids[i]) for i in ti]
     U = [_outward(solids[i]) for i in ui]
+    # "fuzzy" (mm, default 0): faces, edges and vertices of the target and the tools closer than this are taken as
+    # coincident (a tool whose faces nearly coincide with faces of the target leaves no thin lips)
+    fuzzy = float(f.get("fuzzy") or 0)
+    if fuzzy > 0:
+        f["_note"] = "fuzzy value %g mm" % fuzzy
     if op == "union":
         sel = T + U
         if len(sel) < 2:
             raise ValueError("a union needs at least two solids (targets and tools)")
-        res = sel[0].fuse(*sel[1:]).clean()
+        res = _fuzzy_op("union", sel[:1], sel[1:], fuzzy) if fuzzy > 0 else None
+        if res is None:
+            res = sel[0].fuse(*sel[1:]).clean()
         new = list(res.solids())
         used = set(ti) | set(ui)
     else:
@@ -2019,7 +2106,9 @@ def _boolean(shape, f):
         vu = sum(abs(u.volume) for u in U)
         for t in T:
             if op == "subtract":
-                r = t.cut(*U).clean()
+                r = _fuzzy_op("subtract", [t], U, fuzzy) if fuzzy > 0 else None
+                if r is None:
+                    r = t.cut(*U).clean()
                 # the subtraction removes the common volume of target and tools: a result that lost more or less (a
                 # tool or target solid OpenCascade does not classify correctly, faces touching the tools) is made
                 # again with fixed solids and a fuzzy value; tools that do not overlap the target leave it as it is
@@ -2030,27 +2119,57 @@ def _boolean(shape, f):
                 bad = (expect is not None and abs(abs(r.volume) - expect) > tol) or \
                       (expect is None and vt - abs(r.volume) > vu * 1.001 + 1e-6)
                 if bad:
-                    r2 = _fuzzy_cut(_fixed(t), [_fixed(u) for u in U])
-                    ok2 = r2 is not None and (abs(abs(r2.volume) - expect) <= tol if expect is not None
-                                              else vt - abs(r2.volume) <= vu * 1.001 + 1e-6)
+                    # fixed copies and fuzzy values growing from 0.01 um to 0.05 mm (faces that touch or nearly
+                    # coincide, solids that overlap by a hair), with the touching faces glued
+                    ok2, best = False, None
+                    tf, uf = _fixed(t), [_fixed(u) for u in U]
+                    for fz in (1e-5, 1e-4, 1e-3, 1e-2, 0.05):
+                        for glue in (False, True):
+                            r2 = _fuzzy_cut(tf, uf, fz, glue)
+                            if r2 is None or not r2.solids():
+                                continue
+                            v2 = abs(r2.volume)
+                            err = abs(v2 - expect) if expect is not None else max(0.0, vt - v2 - vu)
+                            if best is None or err < best[0]:
+                                best = (err, r2, fz, glue)
+                            if err <= tol:
+                                ok2 = True
+                                break
+                        if ok2:
+                            break
+                    if not ok2 and best is not None and expect is not None and best[0] <= 0.02 * max(expect, 1.0) and \
+                            all(_valid_copy(so) for so in best[1].solids()):
+                        ok2 = True                     # within 2 %: kept, with the difference in the note
+                        f["_note"] = ((f.get("_note") + "; ") if f.get("_note") else "") + \
+                            "the result differs from target - common volume by %.3f mm^3" % best[0]
                     if ok2:
-                        r = r2
+                        r = best[1]
+                        if best[2] > 1e-5 or best[3]:
+                            f["_note"] = ((f.get("_note") + "; ") if f.get("_note") else "") + \
+                                "subtraction made with a fuzzy value of %g mm%s" % (best[2], " and glued faces" if best[3] else "")
                     elif vc is not None and vc <= 1e-6 * max(vt, 1.0):
                         r = t
                         f["_note"] = ((f.get("_note") + "; ") if f.get("_note") else "") + \
                             "the tools do not overlap target solid %d: it is kept as it is" % (ti[T.index(t)] + 1)
                     else:
+                        bad_s = [("target %d" % (ti[T.index(t)] + 1))] if not _valid_copy(t) else []
+                        bad_s += ["tool %d" % (ui[k] + 1) for k, u in enumerate(U) if not _valid_copy(u)]
                         raise ValueError("the subtraction gives %.3f mm^3 instead of %.3f mm^3 (target %.3f mm^3, "
-                                         "common volume with the tools %s mm^3): a tool or the target is not a valid "
-                                         "closed solid (Inspect body)" % (abs(r.volume), expect if expect is not None else vt - vu,
-                                                                          vt, "%.3f" % vc if vc is not None else "unknown"))
+                                         "common volume with the tools %s mm^3; fuzzy values up to 0.05 mm tried): %s" % (
+                                             abs(r.volume), expect if expect is not None else vt - vu, vt,
+                                             "%.3f" % vc if vc is not None else "unknown",
+                                             ("not a valid closed solid: " + ", ".join(bad_s) + " (Inspect body; Heal or the import clean-up)")
+                                             if bad_s else "the solids are valid; their faces probably cross at very small angles or "
+                                             "nearly coincide over large areas (move or shrink the tool slightly)"))
             else:
-                r = t
-                for u in U:
-                    r = r.intersect(u)
-                    if isinstance(r, (list, tuple)):
-                        r = Compound(children=list(r))
-                r = r.clean()
+                r = _fuzzy_op("intersect", [t], U, fuzzy) if fuzzy > 0 else None
+                if r is None:
+                    r = t
+                    for u in U:
+                        r = r.intersect(u)
+                        if isinstance(r, (list, tuple)):
+                            r = Compound(children=list(r))
+                    r = r.clean()
             new += list(r.solids())
         used = set(ti) | (set() if f.get("keep_tools") else set(ui))
     min_t = float(f.get("min_thickness", 0.01) if f.get("min_thickness") is not None else 0.01)
@@ -2083,14 +2202,309 @@ def _boolean(shape, f):
     return out[0] if len(out) == 1 else Compound(children=out)
 
 
+def to_analytic(shape, tol=1e-3):
+    """The B-spline and Bezier faces whose surface is a plane, cylinder, cone, sphere or torus within tol (mm) rebuilt
+    on that surface (an exporter that writes every face as a spline: Merge faces then sees the faces of one plane or
+    cylinder as the same surface). Solid by solid: all such faces; when that solid is not valid afterwards or its
+    volume differs by more than 0.2 %, the planes only; else the solid unchanged. Returns (shape, converted face
+    count)."""
+    from build123d import Compound
+    sols = list(shape.solids())
+    if not sols:
+        return shape, 0
+    out, n = [], 0
+    for so in sols:
+        done = None
+        for kinds in (None, ("Geom_Plane",)):
+            r, k = _to_analytic_solid(so, tol, kinds)
+            if k:
+                done = (r, k)
+                break
+        if done:
+            out.append(done[0])
+            n += done[1]
+        else:
+            out.append(so)
+    if not n:
+        return shape, 0
+    return (out[0] if len(out) == 1 else Compound(children=out)), n
+
+
+def _to_analytic_solid(solid, tol, kinds=None):
+    """(solid, count) of to_analytic for one solid and the surface kinds allowed (None: all); (solid, 0) when nothing
+    converts or the result is rejected."""
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy, BRepBuilderAPI_MakeFace
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    from OCP.BRepTools import BRepTools, BRepTools_ReShape
+    from OCP.GeomAbs import GeomAbs_BSplineSurface, GeomAbs_BezierSurface
+    from OCP.GeomConvert import GeomConvert_SurfToAnaSurf
+    from OCP.ShapeFix import ShapeFix_Face, ShapeFix_Shape
+    from OCP.TopoDS import TopoDS
+    from build123d import Shape, Face
+    to_face = getattr(TopoDS, "Face_s", None) or TopoDS.Face
+    work = Shape.cast(BRepBuilderAPI_Copy(solid.wrapped, True, False).Shape())
+    rs = BRepTools_ReShape()
+    n = 0
+    for fc in work.faces():
+        if BRepAdaptor_Surface(fc.wrapped).GetType() not in (GeomAbs_BSplineSurface, GeomAbs_BezierSurface):
+            continue
+        try:
+            ana = GeomConvert_SurfToAnaSurf(BRep_Tool.Surface_s(fc.wrapped)).ConvertToAnalytical(tol)
+        except Exception:  # noqa: BLE001
+            ana = None
+        if ana is None or (kinds and ana.DynamicType().Name() not in kinds):
+            continue
+        try:
+            mk = BRepBuilderAPI_MakeFace(ana, BRepTools.OuterWire_s(to_face(fc.wrapped)), True)
+            if not mk.IsDone():
+                continue
+            for w in fc.inner_wires():
+                mk.Add(w.wrapped)
+            fix = ShapeFix_Face(mk.Face())
+            fix.Perform()
+            nf = fix.Face()
+            c = fc.center()
+            if fc.normal_at(c).dot(Face(nf).normal_at(c)) < 0:
+                nf = nf.Reversed()
+            if not BRepCheck_Analyzer(nf).IsValid():
+                continue
+        except Exception:  # noqa: BLE001
+            continue
+        rs.Replace(fc.wrapped, nf)
+        n += 1
+    if not n:
+        return solid, 0
+    sf = ShapeFix_Shape(rs.Apply(work.wrapped))
+    sf.Perform()
+    res = Shape.cast(sf.Shape())
+    try:
+        sols = res.solids()
+        ok = len(sols) == 1 and BRepCheck_Analyzer(res.wrapped).IsValid()
+        v0, v1 = abs(solid.volume), abs(sols[0].volume) if sols else 0.0
+        ok = ok and abs(v1 - v0) <= 2e-3 * max(v0, 1e-9)     # the edges are kept: the volume differs by the pcurve fit
+    except Exception:  # noqa: BLE001
+        ok = False
+    return (sols[0], n) if ok else (solid, 0)
+
+
+def _precise_volume(shape):
+    from OCP.GProp import GProp_GProps
+    from OCP.BRepGProp import BRepGProp
+    g = GProp_GProps()
+    BRepGProp.VolumeProperties_s(shape.wrapped if hasattr(shape, "wrapped") else shape, g, 1e-7)
+    return abs(g.Mass())
+
+
+def _face_normal_at(face, p):
+    """Outward unit normal of a face (its orientation applied) at the point of its surface nearest p."""
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.BRepLProp import BRepLProp_SLProps
+    from OCP.ShapeAnalysis import ShapeAnalysis_Surface
+    from OCP.TopAbs import TopAbs_REVERSED
+    uv = ShapeAnalysis_Surface(BRep_Tool.Surface_s(face.wrapped)).ValueOfUV(p, 1e-6)
+    pr = BRepLProp_SLProps(BRepAdaptor_Surface(face.wrapped), uv.X(), uv.Y(), 1, 1e-6)
+    if not pr.IsNormalDefined():
+        return None
+    n = pr.Normal()
+    v = [n.X(), n.Y(), n.Z()]
+    return [-x for x in v] if face.wrapped.Orientation() == TopAbs_REVERSED else v
+
+
+def tangent_groups(solid, angle=1.0, splines_only=True, only=None):
+    """Groups (lists of face indices of solid.faces(), two faces or more) of faces joined through edges where the
+    faces meet at less than angle (deg): the tangent patches an exporter writes for one smooth surface. splines_only:
+    B-spline and Bezier faces only. only: the face indices allowed (None: all)."""
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.GeomAbs import GeomAbs_BSplineSurface, GeomAbs_BezierSurface
+    faces = solid.faces()
+    ok = [(only is None or i in only) and (not splines_only or BRepAdaptor_Surface(f.wrapped).GetType() in (GeomAbs_BSplineSurface, GeomAbs_BezierSurface))
+          for i, f in enumerate(faces)]
+    edges = [f.edges() for f in faces]
+    parent = list(range(len(faces)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    lim = math.cos(math.radians(angle))
+    for i in range(len(faces)):
+        if not ok[i]:
+            continue
+        for j in range(i + 1, len(faces)):
+            if not ok[j]:
+                continue
+            for e in edges[i]:
+                if any(e.wrapped.IsSame(x.wrapped) for x in edges[j]):
+                    p = e.position_at(0.5).to_pnt()
+                    a, b = _face_normal_at(faces[i], p), _face_normal_at(faces[j], p)
+                    if a and b and sum(x * y for x, y in zip(a, b)) >= lim:
+                        parent[find(j)] = find(i)
+                        break
+    groups = {}
+    for i in range(len(faces)):
+        if ok[i]:
+            groups.setdefault(find(i), []).append(i)
+    return [g for g in groups.values() if len(g) > 1]
+
+
+def _fill_face(sel, npts):
+    """One smooth face over the faces sel (one boundary loop): a plate surface through their outer boundary edges and
+    points inside them. Returns (TopoDS face, sample points) or raises ValueError."""
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepClass import BRepClass_FaceClassifier
+    from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
+    from OCP.BRepTools import BRepTools
+    from OCP.GeomAbs import GeomAbs_C0
+    from OCP.TopAbs import TopAbs_IN
+    from OCP.TopExp import TopExp
+    from OCP.TopoDS import TopoDS
+    from OCP.gp import gp_Pnt2d
+    to_edge = getattr(TopoDS, "Edge_s", None) or TopoDS.Edge
+    to_face = getattr(TopoDS, "Face_s", None) or TopoDS.Face
+    bnd = []
+    for fc in sel:
+        for e in fc.edges():
+            n = sum(1 for g in sel for x in g.edges() if x.wrapped.IsSame(e.wrapped))
+            if n == 1 and not any(e.wrapped.IsSame(b.wrapped) for b in bnd):
+                bnd.append(e)
+    if not bnd:
+        raise ValueError("no boundary")
+
+    def ends(e):
+        E = to_edge(e.wrapped)
+        return TopExp.FirstVertex_s(E), TopExp.LastVertex_s(E)
+    chain = [bnd.pop(0)]
+    start, cur = ends(chain[0])
+    while bnd:
+        k = next((i for i, e in enumerate(bnd) if any(v.IsSame(cur) for v in ends(e))), None)
+        if k is None:
+            break
+        e = bnd.pop(k)
+        v1, v2 = ends(e)
+        cur = v2 if v1.IsSame(cur) else v1
+        chain.append(e)
+    if bnd or not cur.IsSame(start):
+        raise ValueError("the faces do not have one boundary loop")
+    mk = BRepOffsetAPI_MakeFilling(3, 15, 2, False, 1e-5, 1e-4, 1e-2, 0.1, 8, 9)
+    for e in chain:
+        mk.Add(to_edge(e.wrapped), GeomAbs_C0, True)
+    pts = []
+    for fc in sel:
+        F = to_face(fc.wrapped)
+        u1, u2, v1, v2 = BRepTools.UVBounds_s(F)
+        surf = BRep_Tool.Surface_s(F)
+        for i in range(1, npts):
+            for j in range(1, npts):
+                u, v = u1 + (u2 - u1) * i / npts, v1 + (v2 - v1) * j / npts
+                if BRepClass_FaceClassifier(F, gp_Pnt2d(u, v), 1e-7).State() == TopAbs_IN:
+                    pts.append(surf.Value(u, v))
+    for q in pts:
+        mk.Add(q)
+    mk.Build()
+    if not mk.IsDone():
+        raise ValueError("the fill surface could not be built")
+    return mk.Shape(), pts
+
+
+def _merge_tangent(shape, f):
+    """Merge tangent faces: in each solid, the groups of faces that meet at less than "angle" deg (default 1; only
+    spline faces unless "splines_only" is false; only the picked "faces" when given) are replaced by one smooth face
+    each (a plate surface through the boundary edges of the group and "points" x "points" points inside each face,
+    default 8). A group is kept when its face stays within "max_dev" mm (default 0.1) of the sample points and the
+    solid stays valid; the volume may change a little (smoothness before exact shape). Sets f["_note"]."""
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeSolid, BRepBuilderAPI_MakeVertex, BRepBuilderAPI_Sewing
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+    from OCP.ShapeFix import ShapeFix_Solid
+    from OCP.TopAbs import TopAbs_SHELL
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopoDS import TopoDS
+    from build123d import Compound, Shape
+    to_shell = getattr(TopoDS, "Shell_s", None) or TopoDS.Shell
+    angle = float(f.get("angle") or 1.0)
+    npts = max(3, int(f.get("points") or 8))
+    max_dev = float(f.get("max_dev") or 0.1)
+    picked = find_faces(shape, f.get("faces") or []) if f.get("faces") else None
+    out, merged, groups_done, skipped, devs, dv = [], 0, 0, 0, [], 0.0
+
+    def resew(faces):
+        sew = BRepBuilderAPI_Sewing(1e-3)
+        for x in faces:
+            sew.Add(x)
+        sew.Perform()
+        ex = TopExp_Explorer(sew.SewedShape(), TopAbs_SHELL)
+        if not ex.More():
+            return None
+        sol = BRepBuilderAPI_MakeSolid(to_shell(ex.Current())).Solid()
+        fx = ShapeFix_Solid(sol)
+        fx.Perform()
+        sol = fx.Solid()
+        ex.Next()
+        if ex.More() or not BRepCheck_Analyzer(sol).IsValid():
+            return None
+        return Shape.cast(sol)
+    for so in shape.solids():
+        faces = so.faces()
+        only = None
+        if picked is not None:
+            only = {i for i, fc in enumerate(faces) if any(fc.wrapped.IsSame(p.wrapped) for p in picked)}
+            if not only:
+                out.append(so)
+                continue
+        groups = tangent_groups(so, angle, f.get("splines_only", True) and picked is None, only)
+        cur = so
+        v0 = _precise_volume(so)
+        for g in groups:
+            fcs = cur.faces()
+            # the group's faces in the current solid (the earlier groups replaced other faces)
+            sel = [fc for fc in fcs if any(fc.wrapped.IsSame(faces[i].wrapped) for i in g)]
+            if len(sel) != len(g):
+                skipped += 1
+                continue
+            try:
+                nf, pts = _fill_face(sel, npts)
+                dev = max((BRepExtrema_DistShapeShape(BRepBuilderAPI_MakeVertex(q).Vertex(), nf).Value() for q in pts), default=0.0)
+                if dev > max_dev:
+                    raise ValueError("deviation %.3f mm" % dev)
+                r = resew([fc.wrapped for fc in fcs if not any(fc.wrapped.IsSame(x.wrapped) for x in sel)] + [nf])
+                if r is None:
+                    raise ValueError("not a valid solid")
+            except Exception:  # noqa: BLE001
+                skipped += 1
+                continue
+            cur = r
+            merged += len(g)
+            groups_done += 1
+            devs.append(dev)
+        if cur is not so:
+            dv += _precise_volume(cur) - v0
+        out.append(cur)
+    f["_note"] = "%d group(s) of tangent faces (%d faces) merged into one face each%s%s; volume change %.3f mm^3" % (
+        groups_done, merged, ", largest deviation %.4f mm" % max(devs) if devs else "", ", %d group(s) left (no single boundary loop, deviation or an invalid result)" % skipped if skipped else "", dv)
+    if not groups_done:
+        return shape
+    return out[0] if len(out) == 1 else Compound(children=out)
+
+
 def _unify(shape, f):
-    """Merges coplanar faces and collinear/cocircular edges (CAE: Virtual topology / Remove redundant entities)."""
+    """Merges coplanar faces and collinear/cocircular edges (CAE: Virtual topology / Remove redundant entities).
+    "analytic": spline faces that are planes, cylinders, cones, spheres or tori within "tolerance" (mm, default
+    0.001) are first rebuilt on those surfaces (to_analytic), so faces an exporter wrote as splines merge too."""
     from .occfix import CheckedUnify as ShapeUpgrade_UnifySameDomain
     from build123d import Shape
+    if f.get("analytic"):
+        shape, n = to_analytic(shape, float(f.get("tolerance") or 1e-3))
+        f["_note"] = "%d spline face(s) rebuilt as planes, cylinders, cones, spheres or tori" % n
     u = ShapeUpgrade_UnifySameDomain(shape.wrapped, bool(f.get("edges", True)), bool(f.get("faces", True)), True)
     ang = float(f.get("angle", 0) or 0)
     if ang > 0:
         u.SetAngularTolerance(math.radians(ang))
+    if f.get("analytic"):
+        u.SetLinearTolerance(float(f.get("tolerance") or 1e-3))
     u.Build()
     return Shape.cast(u.Shape())
 
@@ -2449,6 +2863,39 @@ def _defeature(shape, f):
 def _occt_offset(so, offsets):
     """Faces moved along their normals with BRepOffset_MakeOffset; None when the result is not valid or its volume
     change is far from the sum of face area x distance (the algorithm can move other faces)."""
+    return _occt_offset1(so, offsets)
+
+
+def _has_c0(shape):
+    from OCP.BRep import BRep_Tool
+    from OCP.GeomAbs import GeomAbs_C0
+    for fc in shape.faces():
+        try:
+            if BRep_Tool.Surface_s(fc.wrapped).Continuity() == GeomAbs_C0:
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def _map_faces(div, offsets):
+    """The faces of div (a solid with faces split) that lie on the faces of offsets, with their distances."""
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+    from OCP.gp import gp_Pnt
+    from . import surfaces as sfm
+    out = []
+    for g in div.faces():
+        q = sfm._point_on(g)
+        v = BRepBuilderAPI_MakeVertex(gp_Pnt(q.X, q.Y, q.Z)).Vertex()
+        for fc, d in offsets:
+            if BRepExtrema_DistShapeShape(v, fc.wrapped).Value() < 1e-5:
+                out.append((g, d))
+                break
+    return out
+
+
+def _occt_offset1(so, offsets):
     from OCP.BRepOffset import BRepOffset_MakeOffset, BRepOffset_Skin
     from OCP.GeomAbs import GeomAbs_Intersection
     from build123d import Shape
@@ -2479,7 +2926,14 @@ def _prism(fc, vec):
     from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
     from OCP.gp import gp_Vec
     from build123d import Shape
-    return Shape.cast(BRepPrimAPI_MakePrism(fc.wrapped, gp_Vec(*vec)).Shape())
+    try:
+        mk = BRepPrimAPI_MakePrism(fc.wrapped, gp_Vec(*vec))
+        r = mk.Shape()
+        if r.IsNull():
+            raise ValueError("null")
+    except Exception:
+        raise ValueError("the face (%.3f mm^2) could not be swept into a solid; the face may be degenerate" % fc.area)
+    return Shape.cast(r)
 
 
 def _slab(fc, d):
@@ -2490,9 +2944,22 @@ def _slab(fc, d):
     from OCP.BRepOffset import BRepOffset_MakeOffset, BRepOffset_Skin
     from OCP.GeomAbs import GeomAbs_Intersection
     from build123d import Shape
-    m = BRepOffset_MakeOffset()
-    m.Initialize(fc.wrapped, float(d), 1e-5, BRepOffset_Skin, False, False, GeomAbs_Intersection, True)
-    m.MakeOffsetShape()
+    def run(shp):
+        m = BRepOffset_MakeOffset()
+        m.Initialize(shp, float(d), 1e-5, BRepOffset_Skin, False, False, GeomAbs_Intersection, True)
+        m.MakeOffsetShape()
+        return m
+    m = run(fc.wrapped)
+    if not m.IsDone() and "C0Geometry" in str(m.Error()):
+        # a surface flagged C0: split into C1 pieces (sewn) and offset as one
+        from . import surfaces as sfm
+        try:
+            div = sfm._c1_divided(fc)
+            m2 = run(sfm._sew(list(div.faces()), 1e-6).wrapped if len(div.faces()) > 1 else div.faces()[0].wrapped)
+            if m2.IsDone():
+                return Shape.cast(m2.Shape())
+        except Exception:  # noqa: BLE001
+            pass
     if not m.IsDone():
         raise ValueError("the face cannot be offset (%s)" % str(m.Error()).split(".")[-1])
     return Shape.cast(m.Shape())
@@ -2502,13 +2969,65 @@ def _is_planar(fc):
     return str(getattr(fc.geom_type, "name", fc.geom_type)).upper().endswith("PLANE")
 
 
+def _bool_fuzzy(a, tools, fuse, fuzzy):
+    """Fuse or cut with a fuzzy value (edges and vertices within fuzzy are taken as coincident); None on failure."""
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse, BRepAlgoAPI_Cut
+    from build123d import Shape
+    try:
+        from OCP.TopTools import TopTools_ListOfShape as ShapeList
+    except ImportError:
+        from OCP.collections import List_TopoDS_Shape as ShapeList
+    op = BRepAlgoAPI_Fuse() if fuse else BRepAlgoAPI_Cut()
+    args, tl = ShapeList(), ShapeList()
+    args.Append(a.wrapped)
+    for t in tools:
+        tl.Append(t.wrapped)
+    op.SetArguments(args)
+    op.SetTools(tl)
+    op.SetFuzzyValue(fuzzy)
+    op.SetRunParallel(False)
+    try:
+        op.Build()
+        if not op.IsDone() or op.HasErrors() or op.Shape().IsNull():
+            return None
+        return Shape.cast(op.Shape())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _edge_tolerance(shape):
+    try:
+        from OCP.ShapeAnalysis import ShapeAnalysis_ShapeTolerance
+        from OCP.TopAbs import TopAbs_EDGE
+        return ShapeAnalysis_ShapeTolerance().Tolerance(shape.wrapped, 1, TopAbs_EDGE)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 def _add_remove(so, adds, cuts):
-    """Part with the solids in adds fused and those in cuts removed; one valid solid (or several) required."""
+    """Part with the solids in adds fused and those in cuts removed; one valid solid (or several) required. A
+    boolean that fails (imported geometry with loose edge tolerances) is repeated with a fuzzy value of twice the
+    largest edge tolerance of the cell."""
     r = so
-    if adds:
-        r = r.fuse(*adds)
-    if cuts:
-        r = r.cut(*cuts)
+    try:
+        if adds:
+            r = r.fuse(*adds)
+        if cuts:
+            r = r.cut(*cuts)
+        if r is None or r.wrapped.IsNull():
+            raise ValueError("null")
+    except Exception as e:  # noqa: BLE001
+        tol = _edge_tolerance(so)
+        fuzzy = max(2 * tol, 1e-4)
+        r = so
+        if adds:
+            r = _bool_fuzzy(r, adds, True, fuzzy)
+        if r is not None and cuts:
+            r = _bool_fuzzy(r, cuts, False, fuzzy)
+        if r is None:
+            raise ValueError("the offset solid could not be joined to the cell (boolean failed%s%s)"
+                             % ("; edges of the cell have tolerances up to %.2f mm" % tol if tol > 0.01 else "",
+                                "" if "Null" in str(e) or not str(e).strip() else "; " + str(e).strip()))
     r = r.clean()
     sols = r.solids()
     if not sols:
@@ -2526,9 +3045,129 @@ def _offset_solid_faces(so, offsets):
     r = _occt_offset(so, offsets)
     if r is not None:
         return r
+    if len(offsets) == 1:
+        try:
+            r = _cyl_offset(so, offsets[0][0], offsets[0][1])
+            if r is not None:
+                return r
+        except Exception:  # noqa: BLE001
+            pass
     adds = [_slab(fc, d) for fc, d in offsets if d > 0]
     cuts = [_slab(fc, d) for fc, d in offsets if d < 0]
     return _add_remove(so, adds, cuts)
+
+
+def _cyl_offset(so, fc, d):
+    """A full cylindrical face (a hole or a boss) offset by d (mm, positive adds material) as a new radius: the
+    cylinder of the new radius is cut by the surfaces of the neighbouring faces (extended) to the region between
+    them, and the ring between the old and the new radius is added or removed. None when the face is not a full
+    cylinder or the result is not one valid solid with the expected volume change."""
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.GeomAbs import GeomAbs_Cylinder
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Splitter
+    from OCP.BRepClass3d import BRepClass3d_SolidClassifier
+    from OCP.TopAbs import TopAbs_IN
+    from OCP.gp import gp_Pnt
+    from build123d import Solid, Vector, Plane, Shape
+    from . import surfaces as sfm
+    ad = BRepAdaptor_Surface(fc.wrapped)
+    if ad.GetType() != GeomAbs_Cylinder:
+        return None
+    if ad.LastUParameter() - ad.FirstUParameter() < 2 * math.pi - 1e-6:
+        return None
+    cyl = ad.Cylinder()
+    R = cyl.Radius()
+    ax = cyl.Axis()
+    o = Vector(ax.Location().X(), ax.Location().Y(), ax.Location().Z())
+    a = Vector(ax.Direction().X(), ax.Direction().Y(), ax.Direction().Z()).normalized()
+    # a hole: the outward normal of the face points to the axis
+    q = fc.center()
+    pt = sfm._point_on(fc)
+    radial = (pt - o) - a * (pt - o).dot(a)
+    hole = fc.normal_at(pt).dot(radial) < 0
+    ts = [(v - o).dot(a) for e in fc.edges() for v in [e.position_at(k / 16.0) for k in range(17)]]
+    t0, t1 = min(ts), max(ts)
+    m = max(1.0, 5 * abs(d)) + 2 * R
+    mid = o + a * ((t0 + t1) / 2)
+    neigh = [g for g in so.faces() if not g.wrapped.IsSame(fc.wrapped) and
+             any(e.wrapped.IsSame(x.wrapped) for e in g.edges() for x in fc.edges())]
+    if not neigh:
+        return None
+    big = so.bounding_box().diagonal + m
+    ext = [sfm.untrimmed_extended(g, big) for g in neigh]
+    from build123d import Location
+
+    def moved(sgn, delta):
+        # the extended neighbouring surfaces moved by delta along their outward normal (sgn +1: away from the solid)
+        out = []
+        for g, x in zip(neigh, ext):
+            n = g.normal_at(sfm._point_on(g))
+            out.append(x.moved(Location(n * (sgn * delta))).wrapped)
+        return out
+    # cutting: the column reaches a little beyond the neighbouring faces (no coincident end faces)
+    eps = max(0.01, 0.05 * abs(d))
+    tools = moved(1.0, eps) if d < 0 else [x.wrapped for x in ext]
+
+    def column(r):
+        # the cylinder of radius r over the face length (plus a margin), cut to the region between the neighbouring
+        # faces: the piece that holds the middle of the axis
+        c = Solid.make_cylinder(r, (t1 - t0) + 2 * m, Plane(origin=o + a * (t0 - m), z_dir=a))
+        args, tl = sfm._shape_list(), sfm._shape_list()
+        args.Append(c.wrapped)
+        for t in tools:
+            tl.Append(t)
+        op = BRepAlgoAPI_Splitter()
+        op.SetArguments(args)
+        op.SetTools(tl)
+        op.Build()
+        if not op.IsDone():
+            return None
+        for piece in Shape.cast(op.Shape()).solids():
+            if BRepClass3d_SolidClassifier(piece.wrapped, gp_Pnt(mid.X, mid.Y, mid.Z), 1e-7).State() == TopAbs_IN:
+                return piece
+        return None
+
+    def long_cyl(r):
+        return Solid.make_cylinder(r, (t1 - t0) + 4 * m, Plane(origin=o + a * (t0 - 2 * m), z_dir=a))
+    if hole:
+        r_new = R - d
+        if r_new <= 1e-6:
+            return None
+        if d > 0:
+            # the ring reaches a little into the material around the hole (no coincident cylinders)
+            col = column(R + eps)
+            if col is None:
+                return None
+            res = so.fuse(col.cut(long_cyl(r_new)))
+        else:
+            col = column(r_new)
+            if col is None:
+                return None
+            res = so.cut(col)
+    else:
+        r_new = R + d
+        if r_new <= 1e-6:
+            return None
+        if d > 0:
+            col = column(r_new)
+            if col is None:
+                return None
+            res = so.fuse(col)
+        else:
+            col = column(R + eps)
+            if col is None:
+                return None
+            res = so.cut(col.cut(long_cyl(r_new)))
+    res = res.clean()
+    sols = res.solids()
+    if len(sols) != 1 or not sols[0].is_valid:
+        return None
+    r = sols[0]
+    L = fc.area / (2 * math.pi * R)
+    expect = math.pi * abs(R * R - r_new * r_new) * L * (1 if d > 0 else -1)
+    if abs((r.volume - so.volume) - expect) > 0.3 * abs(expect) + 1e-6:
+        return None
+    return r
 
 
 def _tangent_chain(so, faces, cos_tol=0.9998):
@@ -2835,8 +3474,12 @@ def _move_faces(shape, f):
             moving = [(fc, s) for fc, s in zip(mine, sides) if s]
             if not moving:
                 raise ValueError("the faces are parallel to the move vector")
-            if all(_is_planar(fc) and abs(abs(fc.normal_at(0.5, 0.5).dot(Vector(*v))) - L) < 1e-6 * L for fc, _ in moving):
-                r = _occt_offset(so, [(fc, s * L) for fc, s in moving])
+            # planar faces: a plane moved by the vector is the plane offset by the vector's component along its
+            # normal, so the faces are offset together and the neighbouring faces are extended or trimmed to meet
+            # them at the corners (a face at a right angle to the vector is extended)
+            if all(_is_planar(fc) for fc, _ in moving):
+                offs = [(fc, fc.normal_at(0.5, 0.5).dot(Vector(*v))) for fc, _ in moving]
+                r = _occt_offset(so, [(fc, d) for fc, d in offs if abs(d) > 1e-9 * L])
                 if r is not None:
                     return r
             try:
@@ -2977,7 +3620,8 @@ def _patch_faces(so, faces):
 
 
 SURFACE_TYPES = ("surf_extract", "surf_fit", "surf_sketch", "surf_loft", "surf_fill", "surf_offset", "surf_sew", "surf_import",
-                 "curve_extract", "curve_section", "surf_from_curve", "surf_trim", "surf_extend", "surf_bridge", "surf_fillet")
+                 "curve_extract", "curve_section", "surf_from_curve", "surf_trim", "surf_extend", "surf_bridge", "surf_fillet", "surf_gaps", "surf_sweep", "curve_project",
+                 "curve_blend", "curve_points")
 
 
 SKETCH_PLANE_KEYS = ("plane", "offset", "plane_edge", "plane_curve", "plane_sketch_curve", "plane_t", "plane_flip", "plane_ref", "plane_face", "plane_origin", "plane_xdir", "plane_axis", "plane_point", "plane_origin_ref", "plane_xdir_ref")
@@ -3338,10 +3982,20 @@ def build(part, upto=None, surfaces=None, datums=None, owners=None):
                     body = sfm.fill(shape, f, find_edges, bodies, sk_edges)
                 elif t == "surf_offset":
                     body = sfm.offset(shape, bodies, f, ffa)
+                elif t == "curve_project":
+                    body = sfm.curve_project(shape, bodies, f)
+                elif t == "surf_sweep":
+                    body = sfm.sweep_surface(bodies, f)
+                elif t == "surf_gaps":
+                    body = sfm.close_gaps(bodies, f)
                 elif t == "curve_extract":
                     body = sfm.curve_extract(shape, bodies, f, fea, expand_edges)
                 elif t == "curve_section":
                     body = sfm.curve_section(shape, bodies, f, ffa)
+                elif t == "curve_blend":
+                    body = sfm.curve_blend(shape, bodies, f, find_edges, planes)
+                elif t == "curve_points":
+                    body = sfm.curve_points(f, planes)
                 elif t == "surf_from_curve":
                     body = sfm.surf_from_curve(bodies, f)
                 elif t == "surf_trim":
@@ -3364,6 +4018,8 @@ def build(part, upto=None, surfaces=None, datums=None, owners=None):
                         "length": round(sum(e.length for e in body.edges()), 3)}
                 if getattr(body, "_kind", None):
                     info["note"] = "%s: %s" % ("clean curve" if is_curve else "clean surface", body._kind)
+                if f.get("_note"):
+                    info["note"] = ((info["note"] + "; ") if info.get("note") else "") + f.pop("_note")
                 status.append(info)
             except Exception as e:
                 status.append({"id": f.get("id"), "error": str(e).strip() or "surface operation failed", "surface": True})
@@ -3419,12 +4075,27 @@ def build(part, upto=None, surfaces=None, datums=None, owners=None):
                     # a valid solid from the STL converter: no periodic faces to rebuild, nothing to fix
                     cl.pop("rebuild", None)
                     cl.pop("fix", None)
-                if any(cl.get(k) for k in ("rebuild", "fix", "unify", "min_volume")):
+                if any(cl.get(k) for k in ("rebuild", "fix", "unify", "min_volume", "analytic")):
                     ck = _import_key(f, cl)
                     hit = _CLEAN_CACHE.get(ck) if ck else None
                     if hit is None:
                         f0, e0 = len(imp.faces()), len(imp.edges())
-                        imp, rep = _clean_import(imp, cl)
+                        an = None
+                        if cl.get("analytic"):
+                            # spline faces to planes, cylinders, ...; then merged with that tolerance when unify is on
+                            cl2 = dict(cl, unify=False)
+                            imp, rep = _clean_import(imp, cl2)
+                            tol = float(cl.get("analytic_tol") or 1e-3)
+                            if cl.get("unify"):
+                                uf = {"analytic": True, "tolerance": tol, "faces": True, "edges": True, "angle": 0.1}
+                                imp = _unify(imp, uf)
+                                an = uf.get("_note")
+                            else:
+                                imp, n_an = to_analytic(imp, tol)
+                                an = "%d spline face(s) rebuilt as planes, cylinders, cones, spheres or tori" % n_an
+                        else:
+                            imp, rep = _clean_import(imp, cl)
+                        rep["analytic"] = an
                         hit = (imp, rep, f0, e0, len(imp.faces()), len(imp.edges()))
                         if ck:
                             _CLEAN_CACHE[ck] = hit
@@ -3432,7 +4103,7 @@ def build(part, upto=None, surfaces=None, datums=None, owners=None):
                                 _CLEAN_CACHE.pop(next(iter(_CLEAN_CACHE)))
                     imp, rep, f0, e0, f1, e1 = hit
                     info.update(faces_before=f0, edges_before=e0, faces=f1, edges=e1,
-                                note=((info["note"] + ". ") if info.get("note") else "") + _clean_note(rep), clean=rep)
+                                note=((info["note"] + ". ") if info.get("note") else "") + _clean_note(rep) + (("; " + rep["analytic"]) if rep.get("analytic") else ""), clean=rep)
                 shape = _fuse(shape, imp)
                 info["cells"] = len(shape.solids())
                 status.append(info)
@@ -3460,12 +4131,13 @@ def build(part, upto=None, surfaces=None, datums=None, owners=None):
             n = len(find_faces(shape, f.get("faces") or [])) if shape is not None else 0
             status.append({"id": f.get("id"), "error": None if (n or f.get("min_area")) else "no faces picked", "combined": n})
             continue
-        if f["type"] in ("split", "unify", "heal", "defeature", "smooth", "replace", "hole_mesh", "offset_faces", "move_faces"):
+        if f["type"] in ("split", "unify", "heal", "defeature", "smooth", "replace", "hole_mesh", "offset_faces", "move_faces", "merge_tangent"):
             try:
                 if shape is None:
                     raise ValueError("no solid for %s" % f["type"])
                 n0 = len(shape.solids())
                 f0, e0 = len(shape.faces()), len(shape.edges())
+                shape_before = shape
                 if f["type"] == "split":
                     f["_bodies"] = bodies
                     f["_datums"] = planes
@@ -3476,6 +4148,8 @@ def build(part, upto=None, surfaces=None, datums=None, owners=None):
                         f.pop("_datums", None)
                 elif f["type"] == "unify":
                     shape = _unify(shape, f)
+                elif f["type"] == "merge_tangent":
+                    shape = _merge_tangent(shape, f)
                 elif f["type"] == "heal":
                     shape = _heal(shape, f)
                 elif f["type"] == "smooth":
@@ -3496,6 +4170,8 @@ def build(part, upto=None, surfaces=None, datums=None, owners=None):
                     shape = _defeature(shape, f)
                 info = {"id": f.get("id"), "error": None, "cells": len(shape.solids()), "faces": len(shape.faces()),
                         "edges": len(shape.edges()), "faces_before": f0, "edges_before": e0}
+                if f.get("_note"):
+                    info["note"] = f.pop("_note")
                 if getattr(shape, "_replace_kind", None):
                     info["note"] = "clean surface: %s" % shape._replace_kind
                 og = getattr(shape, "_ogrid", None)
@@ -3507,6 +4183,8 @@ def build(part, upto=None, surfaces=None, datums=None, owners=None):
                         ", %d other cells (not structured)" % og["other"] if og["other"] else "")
                 if f["type"] == "split" and len(shape.solids()) == n0:
                     info["error"] = "the partition did not cut any cell"
+                    if (f.get("method") or "") == "surface":
+                        info["error"] += _surface_cut_hint(shape_before)
                 if f["type"] in ("unify", "heal") and info["faces"] == f0 and info["edges"] == e0:
                     info["note"] = "nothing to merge: no coplanar faces or collinear edges found"
                 status.append(info)
@@ -5726,6 +6404,39 @@ def _face_mesh_data(f, tri, loc):
     return nodes, tris, polys
 
 
+def _remesh_face(fc, tol_m):
+    """(copy of the face, its triangulation): a copy of one face meshed alone with smaller deflections until its
+    triangles cover at least half of the face area (the copy: meshing the face of the part in place would change the
+    edges of the solid); None when none does."""
+    from OCP.BRepMesh import BRepMesh_IncrementalMesh
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
+    from OCP.TopLoc import TopLoc_Location
+    from OCP.TopoDS import TopoDS
+    to_face = getattr(TopoDS, "Face_s", None) or TopoDS.Face
+    area = abs(fc.area)
+    fcw = to_face(BRepBuilderAPI_Copy(fc.wrapped, True, False).Shape())
+    for d, ang in ((tol_m / 2, 0.2), (tol_m / 5, 0.1), (min(tol_m / 10, 0.002), 0.1), (min(tol_m / 40, 0.0005), 0.05)):
+        try:
+            BRepMesh_IncrementalMesh(fcw, d, False, ang, True)
+        except Exception:  # noqa: BLE001
+            continue
+        loc = TopLoc_Location()
+        tri = BRep_Tool.Triangulation_s(fcw, loc)
+        if tri is None or tri.NbTriangles() == 0:
+            continue
+        tot = 0.0
+        for k in range(1, tri.NbTriangles() + 1):
+            a_, b_, c_ = tri.Triangle(k).Get()
+            p, q, r = tri.Node(a_), tri.Node(b_), tri.Node(c_)
+            ux, uy, uz = q.X() - p.X(), q.Y() - p.Y(), q.Z() - p.Z()
+            vx, vy, vz = r.X() - p.X(), r.Y() - p.Y(), r.Z() - p.Z()
+            tot += 0.5 * math.sqrt((uy * vz - uz * vy) ** 2 + (uz * vx - ux * vz) ** 2 + (ux * vy - uy * vx) ** 2)
+        if area <= 1e-12 or tot >= 0.5 * area:
+            return fcw, tri
+    return None
+
+
 def mesh(shape, tol=None):
     """Triangles and edge polylines for the 3D view. One BRepMesh pass over the shape; the triangles of each face and
     the polyline of each edge are read from the triangulation (edges without a face: sampled along the curve).
@@ -5768,12 +6479,20 @@ def mesh(shape, tol=None):
         f = fc.wrapped
         loc = TopLoc_Location()
         tri = BRep_Tool.Triangulation_s(f, loc)
-        if tri is None:
-            continue
+        if tri is None or tri.NbTriangles() == 0:
+            # a face the pass over the shape left without triangles (a narrow spline strip): meshed alone, finer,
+            # until the triangles cover it (else the view shows a gap in the solid)
+            rm = _remesh_face(fc, tol_m)
+            loc = TopLoc_Location()
+            if rm is None:
+                continue
+            fm, tri = rm                       # the copy and its triangles (its edges are not those of the shape)
+        else:
+            fm = f
         tkey = (hash(tri), tri.NbNodes(), tri.NbTriangles(), f.Orientation(), loc.IsIdentity())
         data = _MESH_FACES.get(f)
         if data is None or data[0] != tkey:
-            data = (tkey,) + _face_mesh_data(f, tri, loc)
+            data = (tkey,) + _face_mesh_data(fm, tri, loc)
             _MESH_FACES.put(f, data, len(data[1]) + len(data[2]))
         _, nodes, ftris, polys = data
         base = len(verts)
@@ -5840,6 +6559,10 @@ def _circle_from_points(pts, tol):
     r = math.hypot(ax - ux, ay - uy)
     if r < tol:
         return None
+    # a nearly straight piece (a projected or cut curve seen almost edge-on): no arc of a huge radius
+    span = max(math.hypot(p[0] - ax, p[1] - ay) for p in pts)
+    if r > 100.0 * max(span, tol):
+        return None
     if any(abs(math.hypot(p[0] - ux, p[1] - uy) - r) > tol for p in pts):
         return None
     a0 = math.degrees(math.atan2(pts[0][1] - uy, pts[0][0] - ux)) % 360
@@ -5851,7 +6574,14 @@ def _circle_from_points(pts, tol):
 
 
 def _curve_ref(pts2, kind, tol=1e-4):
-    """Reference entity for a sampled curve: a circle or arc when the points lie on a circle, else a polyline."""
+    """Reference entity for a sampled curve: a line when the points lie on the chord, a circle or arc when they lie
+    on a circle, else a polyline."""
+    if len(pts2) >= 2:
+        (ax, ay), (bx, by) = pts2[0], pts2[-1]
+        L = math.hypot(bx - ax, by - ay)
+        if L > tol and all(abs((p[0] - ax) * (by - ay) - (p[1] - ay) * (bx - ax)) / L <= tol and
+                           -tol <= ((p[0] - ax) * (bx - ax) + (p[1] - ay) * (by - ay)) / L <= L + tol for p in pts2):
+            return {"t": "line", "x1": ax, "y1": ay, "x2": bx, "y2": by, "kind": kind}
     c = _circle_from_points(pts2, tol)
     if c:
         cx, cy, r, a0, a1, closed = c
@@ -5922,7 +6652,15 @@ def projected_refs(shape, plane):
     seen = set()
     for kind, prims in (("proj", res["visible"]), ("hidden", res["hidden"])):
         for pr in prims:
-            key = (pr[0],) + tuple(round(v, 3) for v in pr[1:] if isinstance(v, float))
+            if pr[0] == "P":
+                # a polyline: its points (all polylines would otherwise share one key)
+                q = pr[1]
+                key = ("P", len(q)) + tuple(round(c, 3) for pt in (q[0], q[len(q) // 2], q[-1]) for c in pt[:2])
+                key2 = ("P", len(q)) + tuple(round(c, 3) for pt in (q[-1], q[len(q) // 2], q[0]) for c in pt[:2])
+                if key2 in seen:
+                    continue
+            else:
+                key = (pr[0],) + tuple(round(v, 3) for v in pr[1:] if isinstance(v, float))
             if pr[0] == "L":
                 key2 = (pr[0], round(pr[3], 3), round(pr[4], 3), round(pr[1], 3), round(pr[2], 3))
                 if key2 in seen:
@@ -5988,9 +6726,11 @@ def datum_refs(plane, datums, exclude=None):
     return out
 
 
-def section_refs(shape, f, datums=None, bodies=None):
+def section_refs(shape, f, datums=None, bodies=None, cut=None):
     """Reference geometry for sketching on the feature plane: section of the shape with the plane
-    (lines and arcs in local coordinates), plus the outline projected along the normal is not included."""
+    (lines and arcs in local coordinates), plus the outline projected along the normal is not included.
+    cut "front": the half of the solid and of the surface bodies on the viewer's side of the sketch plane
+    (along the plane normal) is removed before the projection; "back": the other half is removed."""
     from build123d import Vector
     plane = plane_of(f)
     out = datum_refs(plane, datums)
@@ -6001,7 +6741,9 @@ def section_refs(shape, f, datums=None, bodies=None):
     for k, d in (("x", Vector(1, 0, 0)), ("y", Vector(0, 1, 0)), ("z", Vector(0, 0, 1))):
         q = L(d) - L(Vector(0, 0, 0))
         ax[k] = [q.X, q.Y]
-    out.append({"t": "frame", "kind": "frame", "o": [o.X, o.Y], "x": ax["x"], "y": ax["y"], "z": ax["z"]})
+    v3 = lambda v: [v.X, v.Y, v.Z]
+    out.append({"t": "frame", "kind": "frame", "o": [o.X, o.Y], "x": ax["x"], "y": ax["y"], "z": ax["z"],
+                "o3": v3(plane.origin), "x3": v3(plane.x_dir), "y3": v3(plane.y_dir), "z3": v3(plane.z_dir)})
     out.append({"t": "point", "x": 0.0, "y": 0.0, "kind": "origin"})
     if abs(o.X) > 1e-9 or abs(o.Y) > 1e-9:
         out.append({"t": "point", "x": o.X, "y": o.Y, "kind": "origin"})
@@ -6014,20 +6756,70 @@ def section_refs(shape, f, datums=None, bodies=None):
             continue
         targets.append(body)
     for tgt in targets:
-        out += _section_refs_of(tgt, plane, f.get("_project", True), tgt is shape)
+        proj_shape = cut_at_plane(tgt, plane, cut) if cut in ("front", "back") else None
+        refs = _section_refs_of(tgt, plane, f.get("_project", True), tgt is shape, proj_shape)
+        if proj_shape is not None:
+            # the edges of the cut face coincide with the section curves: listed once, as the section
+            keys = set(_ref_key(r) for r in refs if r.get("kind") == "section")
+            refs = [r for r in refs if r.get("kind") not in ("proj", "hidden") or _ref_key(r) not in keys]
+        out += refs
     return out
 
 
-def _section_refs_of(shape, plane, project, is_solid):
-    """Section (kind section) and projection (kind proj / hidden) of one shape onto the sketch plane."""
+def cut_at_plane(shape, plane, side):
+    """The part of a solid, surface or curve body on one side of the plane: side "front" keeps the half against
+    the plane normal (the viewer of the sketch is along the normal), "back" keeps the half along the normal.
+    The shape itself when the cut fails or the body is a rough mesh."""
+    from . import project as prj
+    from build123d import Shape as B3Shape
+    if getattr(shape, "_mesh", False):
+        return shape
+    try:
+        o = [plane.origin.X, plane.origin.Y, plane.origin.Z]
+        n = [plane.z_dir.X, plane.z_dir.Y, plane.z_dir.Z]
+        if side == "back":
+            n = [-c for c in n]
+        res = prj.cut_half(shape.wrapped, o, n)
+        if res is None or res.IsNull():
+            return shape
+        return B3Shape.cast(res)
+    except Exception:
+        return shape
+
+
+def _ref_key(r):
+    """Key of a reference entity for duplicate detection (coordinates rounded; a line in either direction)."""
+    q = lambda v: round(float(v), 3)
+    t = r.get("t")
+    if t == "line":
+        a, b = (q(r["x1"]), q(r["y1"])), (q(r["x2"]), q(r["y2"]))
+        return ("line",) + (a + b if a <= b else b + a)
+    if t == "circle":
+        return ("circle", q(r["cx"]), q(r["cy"]), q(r["r"]))
+    if t == "arc":
+        return ("arc", q(r["cx"]), q(r["cy"]), q(r["r"]), round(float(r["a0"]) % 360, 1), round(float(r["a1"]) % 360, 1))
+    if t == "poly":
+        pts = r.get("pts") or []
+        if not pts:
+            return ("poly",)
+        a, b = (q(pts[0][0]), q(pts[0][1])), (q(pts[-1][0]), q(pts[-1][1]))
+        m = pts[len(pts) // 2]
+        return ("poly", len(pts), q(m[0]), q(m[1])) + (a + b if a <= b else b + a)
+    return (t, id(r))
+
+
+def _section_refs_of(shape, plane, project, is_solid, proj_shape=None):
+    """Section (kind section) and projection (kind proj / hidden) of one shape onto the sketch plane. The
+    projection is of proj_shape when given (the shape cut at the plane)."""
     from OCP.BRepAlgoAPI import BRepAlgoAPI_Section
     from build123d import Shape as B3Shape
     out = []
     if project:
         try:
             # a rough mesh body: its section only (the projection of every triangle edge is no use for tracing)
-            if not getattr(shape, "_mesh", False) and (is_solid or len(shape.faces()) <= 3000):
-                out += projected_refs(shape, plane) if is_solid else _edge_refs(shape, plane)
+            ps = proj_shape if proj_shape is not None else shape
+            if not getattr(shape, "_mesh", False) and (is_solid or len(ps.faces()) <= 3000):
+                out += projected_refs(ps, plane) if is_solid else _edge_refs(ps, plane)
         except Exception:
             pass
     sec = BRepAlgoAPI_Section(shape.wrapped, plane.wrapped)

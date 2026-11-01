@@ -3277,6 +3277,59 @@ def test_part_body_show_only(page, client):
     assert page.evaluate("Object.values(window.__part.PT.hidden).filter(Boolean).length") == 0
 
 
+def test_part_body_groups(page, client):
+    """The tree lists solids, surface bodies and curve bodies in their own sections; the eye of a section header
+    hides every body of the section and, when all are hidden, shows them again."""
+    from drawgen import part
+    pp = plate("ui_grp")
+    base, _ = part.build(pp)
+    top = [f for f in base.faces() if abs(f.center().Z - 20) < 1e-6][0]
+    pp["features"].append({"id": "x1", "name": "Extract surface 1", "type": "surf_extract", "faces": [part.face_key(top)], "offset": 0})
+    client.put("/api/part/file/ui_grp", json=pp)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_grp')")
+    page.wait_for_function("window.__part.PT.solids.length === 1 && !!window.__part.PT.surfaces['x1']", timeout=60000)
+    heads = page.evaluate("[...document.querySelectorAll('#pt-features .pt-sub')].map(e => e.textContent.trim())")
+    assert heads == ["Solids", "Surfaces"], heads
+    assert page.evaluate("window.__part.bodyGroupIds('solid')") == ["solid:0"]
+    assert page.evaluate("window.__part.bodyGroupIds('surface')") == ["x1"]
+    page.click("#pt-features [data-grp=surface]")
+    assert page.evaluate("[!!window.__part.PT.hidden['solid:0'], !!window.__part.PT.hidden['x1']]") == [False, True]
+    assert page.evaluate("document.querySelector('#pt-features [data-grp=surface]').classList.contains('off')")
+    page.click("#pt-features [data-grp=solid]")
+    assert page.evaluate("[!!window.__part.PT.hidden['solid:0'], !!window.__part.PT.hidden['x1']]") == [True, True]
+    assert page.evaluate("window.__part.PT.faceObjs.filter(o => o.userData.solid === 0).every(o => !o.visible)")
+    page.click("#pt-features [data-grp=solid]")
+    assert page.evaluate("[!!window.__part.PT.hidden['solid:0'], !!window.__part.PT.hidden['x1']]") == [False, True]
+    page.click("#pt-showall")
+    assert page.evaluate("Object.values(window.__part.PT.hidden).filter(Boolean).length") == 0
+
+
+def test_part_pick_panel_chips(page, client):
+    """A parameter panel with a Pick faces button (Offset faces) lists the picked faces as chips: a click on a chip
+    keeps its face highlighted (PT.chipPin), a second click releases it, × removes the face, Clear removes all."""
+    client.put("/api/part/file/ui_chips", json=plate("ui_chips"))
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_chips')")
+    page.wait_for_function("window.__part.PT.mesh && window.__part.PT.mesh.face_keys && window.__part.PT.mesh.face_keys.length > 0", timeout=60000)
+    page.evaluate("window.__part.startCommand('offset_faces')")
+    page.wait_for_selector("#pt-cmdbody button[data-pick=faces]")
+    n = page.evaluate("window.__part.selectShown()")
+    assert n > 0
+    page.wait_for_function("window.__part.feat(window.__part.PT.cmd.id).faces.length === %d" % n)
+    assert page.locator("#pt-cmdbody .cw-chips[data-prop=faces] .cw-chip").count() == min(n, 40)
+    page.click("#pt-cmdbody .cw-chip[data-i='0']")
+    assert page.evaluate("!!window.__part.PT.chipPin") and page.locator("#pt-cmdbody .cw-chip.on").count() == 1
+    page.click("#pt-cmdbody .cw-chip[data-i='0']")
+    assert page.evaluate("window.__part.PT.chipPin === null") and page.locator("#pt-cmdbody .cw-chip.on").count() == 0
+    page.click("#pt-cmdbody .cw-chip [data-cwdel='0']")
+    page.wait_for_function("window.__part.feat(window.__part.PT.cmd.id).faces.length === %d" % (n - 1))
+    page.click("#pt-cmdbody button[data-clear=faces]")
+    page.wait_for_function("window.__part.feat(window.__part.PT.cmd.id).faces.length === 0")
+    assert page.locator("#pt-cmdbody .cw-chip").count() == 0
+    page.evaluate("window.__part.cancelCommand()")
+
+
 def test_part_body_scale(page, client):
     """Scale body from the tree: the command opens at the factor; a factor of 2 about the bounding box centre gives
     8 times the volume; non-uniform factors show X, Y, Z fields; the Point reference adds the Point step."""
@@ -3376,6 +3429,140 @@ def test_sketch_earlier_sketches_toggle(page, client):
     assert count() == n0
 
 
+def test_sketch_hidden_lines_cut_and_shaded(page, client):
+    """Sketch bar of a feature sketch through a plate with a hole (XZ through the hole centre): Hidden lines hides
+    the dotted edges; Cut at plane reads the reference geometry of the model cut at the plane (the hole no longer
+    hidden lines) and Flip the other half; the shaded model is a canvas under the sketch that follows the view and
+    is hidden by Shaded; the canvas is removed when the sketch is closed. The settings are kept for the next sketch."""
+    pp = plate("ui_cut")
+    pp["features"].append({"id": "s9", "name": "Sketch 9", "type": "sketch", "plane": "XZ", "offset": -25, "sketch": {"entities": [], "layers": [{"name": "0", "on": True}]}})
+    client.put("/api/part/file/ui_cut", json=pp)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_cut')")
+    page.wait_for_selector("#pt-features .pt-feat[data-id=s9]")
+    page.dblclick("#pt-features .pt-feat[data-id=s9] .nm")
+    page.wait_for_function("window.__sk.SK.refs && window.__sk.SK.refs.some(e => e.kind === 'hidden')", timeout=30000)
+    hidden = lambda: page.evaluate("document.querySelectorAll('#sk-canvas [stroke=\"#b8bfc9\"]').length")
+    assert hidden() == 4
+    assert page.is_visible("#sk-hidden") and page.is_visible("#sk-cut") and page.is_visible("#sk-cutflip") and page.is_visible("#sk-shaded")
+    page.uncheck("#sk-hidden")
+    assert hidden() == 0
+    page.check("#sk-hidden")
+    assert hidden() == 4
+    # the shaded model: a canvas under the SVG, sized like the sketch box, hidden by Shaded
+    assert page.evaluate("document.querySelector('#sk-canvas').firstElementChild.classList.contains('sk-underlay')")
+    assert page.evaluate("Math.abs(document.querySelector('#sk-canvas canvas.sk-underlay').clientWidth - document.querySelector('#sk-canvas').clientWidth) <= 1")
+    page.uncheck("#sk-shaded")
+    assert page.evaluate("document.querySelector('#sk-canvas canvas.sk-underlay').hidden")
+    page.check("#sk-shaded")
+    assert not page.evaluate("document.querySelector('#sk-canvas canvas.sk-underlay').hidden")
+    # cut at the plane: the hole's four hidden lines become visible edges of the kept half (two) and the frame's
+    # section is unchanged; Flip keeps the other half
+    assert page.is_disabled("#sk-cutflip")
+    page.check("#sk-cut")
+    page.wait_for_function("window.__sk.SK.cutMode === 'front' && window.__sk.SK.refs.filter(e => e.kind === 'hidden').length < 4", timeout=30000)
+    assert not page.is_disabled("#sk-cutflip")
+    proj = "JSON.stringify(window.__sk.SK.refs.filter(e => e.kind === 'proj').map(e => [e.x1, e.y1, e.x2, e.y2].map(v => Math.round(v))).sort())"
+    p_front = page.evaluate(proj)
+    page.check("#sk-cutflip")
+    page.wait_for_function("window.__sk.SK.cutMode === 'back'")
+    page.wait_for_function("([s, p]) => eval(s) !== p", arg=[proj, p_front], timeout=30000)
+    assert page.evaluate("window.__sk.SK.refs.filter(e => e.kind === 'section').length") == 8
+    page.uncheck("#sk-cut")
+    page.wait_for_function("window.__sk.SK.cutMode === null && window.__sk.SK.refs.filter(e => e.kind === 'hidden').length === 4", timeout=30000)
+    page.uncheck("#sk-hidden")
+    page.click("#sk-partcancel")
+    page.wait_for_selector("#sk-partbar", state="hidden")
+    assert page.evaluate("!document.querySelector('#sk-canvas canvas.sk-underlay')")
+    # the next sketch keeps the setting
+    page.dblclick("#pt-features .pt-feat[data-id=s9] .nm")
+    page.wait_for_function("window.__sk.SK.refs && window.__sk.SK.refs.some(e => e.kind === 'hidden')", timeout=30000)
+    assert not page.is_checked("#sk-hidden") and hidden() == 0
+    page.check("#sk-hidden")
+    page.click("#sk-partcancel")
+    page.wait_for_selector("#sk-partbar", state="hidden")
+
+
+def test_part_delete_or_suppress_shows_consumed_bodies(page, client):
+    """The bodies a feature consumed (hidden when it was made) are shown when the feature is suppressed or deleted,
+    and hidden again when it is unsuppressed."""
+    from conftest import part_rec, rect
+    p = part_rec("ui_cons", [
+        {"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(40, 20, -20, 1)}},
+        {"id": "b", "name": "B", "type": "surf_sketch", "kind": "planar", "plane": "XZ", "offset": 0, "sketch": {"entities": rect(40, 20, -20, 1)}},
+        {"id": "s", "name": "Sew 1", "type": "surf_sew", "sources": ["a", "b"], "tolerance": 0.001}])
+    client.put("/api/part/file/ui_cons", json=p)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_cons')")
+    page.wait_for_function("window.__part.PT.surfaces && window.__part.PT.surfaces.s")
+    hidden = lambda: page.evaluate("[!!window.__part.PT.hidden.a, !!window.__part.PT.hidden.b, !!window.__part.PT.hidden.s]")
+    assert hidden() == [True, True, False]
+    page.uncheck("#pt-features .pt-feat[data-id=s] input[data-k=on]")
+    page.wait_for_function("window.__part.feat('s').suppressed")
+    assert hidden() == [False, False, False]
+    page.check("#pt-features .pt-feat[data-id=s] input[data-k=on]")
+    page.wait_for_function("!window.__part.feat('s').suppressed")
+    assert hidden() == [True, True, False]
+    page.click("#pt-features .pt-feat[data-id=s] button[data-k=del]")
+    page.wait_for_function("!window.__part.feat('s')")
+    assert hidden()[:2] == [False, False]
+
+
+def test_part_blend_curve_and_curve_through_points(page, client):
+    """Blend curve: the ends fed as an edge end of the solid and a vertex; the continuity select and the result note.
+    Curve through points: vertices as chips, a chip removed, the method changed to spline; the bodies appear under
+    Curves in the tree. Partition with a surface has the Extend field."""
+    client.put("/api/part/file/ui_blend", json=plate("ui_blend"))
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_blend')")
+    page.wait_for_function("window.__part.PT.mesh && window.__part.PT.mesh.edge_keys && window.__part.PT.mesh.edge_keys.length > 0", timeout=60000)
+    page.evaluate("window.__part.startCommand('curve_blend')")
+    page.wait_for_selector("#pt-cmdwin:not([hidden])")
+    assert page.inner_text("#pt-cmdwin-title") == "Blend curve"
+    # end A: the top edge along x at y = 0 (mid (50, 0, 20)), near its end at x = 100
+    page.evaluate("""() => { const P = window.__part, m = P.PT.mesh; const i = m.edge_keys.findIndex(k => k && Math.abs(k.mid[0] - 50) < 1e-6 && Math.abs(k.mid[1]) < 1e-6 && Math.abs(k.mid[2] - 20) < 1e-6);
+        P.feedCommand({ kind: "edge", key: m.edge_keys[i], index: i, point: [100, 0, 20] }); }""")
+    page.wait_for_function("(() => { const f = window.__part.feat(window.__part.PT.cmd.id); return f.ends[0] && f.ends[0].kind === 'edge' && f.ends[0].at[0] === 100; })()")
+    page.wait_for_selector("#pf-bcont0")
+    page.select_option("#pf-bcont0", "curvature")
+    page.wait_for_function("window.__part.feat(window.__part.PT.cmd.id).ends[0].cont === 'curvature'")
+    page.evaluate("window.__part.gotoStep(1)")
+    page.evaluate("window.__part.feedCommand({ kind: 'point', vertex: true, point: [140, 30, 20] })")
+    page.wait_for_function("(() => { const f = window.__part.feat(window.__part.PT.cmd.id); return f.ends[1] && f.ends[1].kind === 'point'; })()")
+    cid = page.evaluate("window.__part.PT.cmd.id")
+    page.wait_for_function("id => window.__part.PT.status[id] && !window.__part.PT.status[id].pending && window.__part.PT.surfaces[id]", arg=cid, timeout=60000)
+    assert "blend curvature / position" in page.evaluate("id => window.__part.PT.status[id].note || ''", cid)
+    page.click("#cmd-finish")
+    page.wait_for_function("!window.__part.PT.cmd")
+    assert page.evaluate("[...document.querySelectorAll('#pt-features .pt-sub')].map(e => e.textContent.trim())") == ["Solids", "Curves"]
+    # curve through points
+    page.evaluate("window.__part.startCommand('curve_points')")
+    page.wait_for_selector("#pt-cmdwin:not([hidden])")
+    for q in ([0, 0, 20], [50, 10, 25], [100, 0, 20]):
+        page.evaluate("q => window.__part.feedCommand({ kind: 'point', vertex: true, point: q })", q)
+    page.wait_for_function("window.__part.feat(window.__part.PT.cmd.id).points.length === 3")
+    assert page.locator("#pt-cmdbody .cw-chips[data-prop=points] .cw-chip").count() == 3
+    page.click("#pt-cmdbody .cw-chip [data-cwdel='1']")
+    page.wait_for_function("window.__part.feat(window.__part.PT.cmd.id).points.length === 2")
+    page.evaluate("q => window.__part.feedCommand({ kind: 'point', vertex: true, point: q })", [50, 10, 25])
+    page.wait_for_function("window.__part.feat(window.__part.PT.cmd.id).points.length === 3")
+    page.evaluate("window.__part.gotoStep(1)")
+    page.wait_for_selector("#pf-cpm")
+    page.select_option("#pf-cpm", "spline")
+    cid = page.evaluate("window.__part.PT.cmd.id")
+    page.wait_for_function("id => window.__part.PT.status[id] && !window.__part.PT.status[id].pending && (window.__part.PT.status[id].note || '').includes('spline')", arg=cid, timeout=60000)
+    page.click("#cmd-finish")
+    page.wait_for_function("!window.__part.PT.cmd")
+    assert page.evaluate("window.__part.bodyGroupIds('curve').length") == 2
+    # partition with a surface: the Extend field
+    page.evaluate("window.__part.startCommand('split')")
+    page.wait_for_selector("#pf-method")
+    page.select_option("#pf-method", "surface")
+    page.wait_for_selector("#pf-sext")
+    assert page.input_value("#pf-sext") == "1"
+    page.evaluate("window.__part.cancelCommand()")
+
+
 def test_part_surface_fillet_faces_of_one_body_by_click(page, client):
     """Surface fillet with Pick single faces: a click on a face of a surface body sets the side (A, then B, both faces
     of one sewn body); Finish gives the fillet."""
@@ -3436,8 +3623,9 @@ def test_part_inspect_join_cells(page, client):
 
 
 def test_part_extend_surface_face_of_body_edge_click(page, client):
-    """Extend surface with Pick single faces: a face of a sewn surface body, then a click on its outer edge; the
-    face is extended by 5 mm across that edge."""
+    """Extend surface by an edge click alone: the command opens on the Edges step, a click on the outer edge of
+    face A of a sewn surface body picks the body and the edge; A is extended by 5 mm across that edge and the strip
+    is part of A (two faces as before)."""
     from conftest import part_rec, rect
     p = part_rec("ui_ext1", [
         {"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(40, 20, -20, 1)}},
@@ -3449,8 +3637,6 @@ def test_part_extend_surface_face_of_body_edge_click(page, client):
     page.wait_for_function("window.__part.PT.surfaces && window.__part.PT.surfaces.s")
     page.evaluate("() => { window.__part.PT.hidden.a = true; window.__part.PT.hidden.b = true; window.__part.setMesh(window.__part.PT.mesh); }")
     page.evaluate("window.__part.startCommand('surf_extend')")
-    page.wait_for_selector("#pf-sface")
-    page.check("#pf-sface")
     find = """([kinds, test]) => { const P = window.__part, t = P.PT.three, r = t.renderer.domElement.getBoundingClientRect();
         const ok = new Function('h', 'return ' + test);
         for (let i = 2; i < 120; i++) for (let j = 2; j < 120; j++) {
@@ -3459,18 +3645,49 @@ def test_part_extend_surface_face_of_body_edge_click(page, client):
           if (h && ok(h)) return [x, y];
         }
         return null; }"""
-    xy = page.evaluate(find, [["sface", "face"], "h.kind === 'face' && h.surface === 's' && Math.abs(h.key.c[1] - 11) < 0.5 && Math.abs(h.key.c[2]) < 0.5"])
-    assert xy, "face A not found"
-    page.mouse.click(*xy)
-    page.wait_for_function("(window.__part.feat(window.__part.PT.cmd.id).faces || []).length === 1")
-    page.evaluate("window.__part.gotoStep(1)")
     xy = page.evaluate(find, [["sedge", "edge"], "h.kind === 'edge' && h.surface === 's' && Math.abs(h.key.mid[1] - 21) < 0.5 && Math.abs(h.key.mid[2]) < 0.5"])
     assert xy, "outer edge of A not found"
     page.mouse.click(*xy)
-    page.wait_for_function("(window.__part.feat(window.__part.PT.cmd.id).edges || []).length === 1")
+    page.wait_for_function("(() => { const f = window.__part.feat(window.__part.PT.cmd.id); return f.source === 's' && (f.edges || []).length === 1; })()")
     page.evaluate("window.__part.finishCommand()")
     page.wait_for_function("""(() => { const PT = window.__part.PT; const f = PT.part.features.find(x => x.type === 'surf_extend');
-        const st = f && PT.status[f.id]; return st && !st.pending && st.error === null && Math.abs(st.area - (800 + 200)) < 0.01; })()""", timeout=60000)
+        const st = f && PT.status[f.id]; return st && !st.pending && st.error === null && Math.abs(st.area - (1600 + 200)) < 0.01 && st.faces === 2; })()""", timeout=60000)
+
+
+def test_part_surface_fillet_edge_click(page, client):
+    """Surface fillet, Edges of a surface body: with the Radius section active and no surface chosen, a click on the
+    edge where the two faces of a sewn body meet picks the body and the edge; R3 rounds it (3 faces)."""
+    from conftest import part_rec, rect
+    p = part_rec("ui_sfe1", [
+        {"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(40, 20, -20, 0)}},
+        {"id": "b", "name": "B", "type": "surf_sketch", "kind": "planar", "plane": "XZ", "offset": 0, "sketch": {"entities": rect(40, 20, -20, 0)}},
+        {"id": "s", "name": "Sew 1", "type": "surf_sew", "sources": ["a", "b"], "tolerance": 0.001}])
+    client.put("/api/part/file/ui_sfe1", json=p)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_sfe1')")
+    page.wait_for_function("window.__part.PT.surfaces && window.__part.PT.surfaces.s")
+    page.evaluate("() => { window.__part.PT.hidden.a = true; window.__part.PT.hidden.b = true; window.__part.setMesh(window.__part.PT.mesh); }")
+    page.evaluate("window.__part.startCommand('surf_fillet')")
+    page.wait_for_selector("#pf-sfmode")
+    page.select_option("#pf-sfmode", "edges")
+    page.wait_for_selector("#pf-sfr")
+    page.fill("#pf-sfr", "3")
+    page.dispatch_event("#pf-sfr", "change")
+    find = """([kinds, test]) => { const P = window.__part, t = P.PT.three, r = t.renderer.domElement.getBoundingClientRect();
+        const ok = new Function('h', 'return ' + test);
+        for (let i = 2; i < 120; i++) for (let j = 2; j < 120; j++) {
+          const x = r.left + r.width * i / 121, y = r.top + r.height * j / 121;
+          const h = P.pickAt({ clientX: x, clientY: y }, kinds);
+          if (h && ok(h)) return [x, y];
+        }
+        return null; }"""
+    xy = page.evaluate(find, [["sedge", "surface"], "h.kind === 'edge' && h.surface === 's' && Math.abs(h.key.mid[1]) < 0.5 && Math.abs(h.key.mid[2]) < 0.5"])
+    assert xy, "shared edge not found"
+    page.mouse.click(*xy)
+    page.wait_for_function("(() => { const f = window.__part.feat(window.__part.PT.cmd.id); return f.source === 's' && (f.edges || []).length === 1; })()")
+    page.evaluate("window.__part.finishCommand()")
+    page.wait_for_function("""(() => { const PT = window.__part.PT; const f = PT.part.features.find(x => x.type === 'surf_fillet');
+        const st = f && PT.status[f.id]; return st && !st.pending && st.error === null && st.faces === 3; })()""", timeout=60000)
 
 
 def test_part_face_click_tangent_and_connected(page, client):
@@ -4186,3 +4403,199 @@ def test_cam_tab_bit_editor(page, client):
     page.wait_for_function("n => window.__cam.CM.bits.length === n + 2 && window.__cam.CM.bits[n + 1].height === 12", arg=n0)
     saved = client.get("/api/cam/tools").get_json()
     assert saved[n0]["shape"] == "tslot" and saved[n0 + 1]["shape"] == "custom" and saved[n0 + 1]["d"] == 10
+
+
+def test_cam_tab_setups(page, client):
+    """CAM tab: Add setup from the Job properties: the setup rows in the tree (the active one with its Operations,
+    Model and Stock), the second setup starts with the placement of the first and no operations, its stock from
+    Setup 1 (setup line), operations kept per setup when switching, rename, move, delete."""
+    from test_cam import job_part, BITS
+    client.put("/api/part/file/ui_su", json=job_part("ui_su"))
+    client.put("/api/cam/tools", json=BITS)
+    tab(page, "cam")
+    page.wait_for_function("window.__cam && window.__cam.CM.doc && window.__cam.CM.bits.length")
+    page.select_option("#cm-source", "ui_su")
+    page.wait_for_function("window.__cam.CM.geo && window.__cam.CM.setup")
+    page.click("#tab-cam [data-addop=face]")
+    page.click("#cm-cmd-ok")
+    o1 = page.evaluate("window.__cam.CM.doc.operations[0].id")
+    assert page.locator("#cm-tree .pt-feat[data-id^='su:']").count() == 0
+    page.click("#cm-tree .pt-feat[data-id=job]")
+    page.click("#cm-su-add2")
+    page.wait_for_function("window.__cam.CM.doc.setups.length === 2 && window.__cam.CM.doc.active === 1")
+    assert page.evaluate("window.__cam.CM.doc.operations.length") == 0
+    ids = page.evaluate("[...document.querySelectorAll('#cm-tree .pt-feat')].map(e => e.dataset.id)")
+    assert ids[:6] == ["job", "su:S1", "su:S2", "ops", "model", "part"], ids
+    assert "from Setup 1" in page.text_content("#cm-tree .pt-feat[data-id=stock]")
+    page.wait_for_function("window.__cam.CM.setup && window.__cam.CM.setup.setup && window.__cam.CM.setup.setup.index === 1 && window.__cam.CM.setup.stock_mesh", timeout=60000)
+    page.click("#tab-cam [data-addop=face]")
+    page.click("#cm-cmd-ok")
+    o2 = page.evaluate("window.__cam.CM.doc.operations[0].id")
+    assert o2 != o1
+    page.click("#cm-tree .pt-feat[data-id='su:S1']")
+    page.wait_for_function("o => window.__cam.CM.doc.active === 0 && window.__cam.CM.doc.operations[0].id === o", arg=o1)
+    assert page.evaluate("window.__cam.CM.doc.setups[1].operations[0].id") == o2
+    page.click("#cm-tree .pt-feat[data-id='su:S1']")
+    page.wait_for_selector("#cm-props input[data-k=name]")
+    page.fill("#cm-props input[data-k=name]", "Top")
+    page.press("#cm-props input[data-k=name]", "Tab")
+    page.wait_for_function("window.__cam.CM.doc.setups[0].name === 'Top'")
+    page.click("#cm-tree .pt-feat[data-id='su:S2'] [data-k=up]")
+    page.wait_for_function("window.__cam.CM.doc.setups[0].id === 'S2' && window.__cam.CM.doc.active === 1")
+    page.on("dialog", lambda dlg: dlg.accept())
+    page.click("#cm-tree .pt-feat[data-id='su:S2'] [data-k=del]")
+    page.wait_for_function("window.__cam.CM.doc.setups.length === 1 && window.__cam.CM.doc.setups[0].name === 'Top' && window.__cam.CM.doc.active === 0")
+    assert page.locator("#cm-tree .pt-feat[data-id^='su:']").count() == 0
+
+
+def test_part_merge_tangent_faces_command(page, client):
+    """Faces ▾ Merge tangent faces on a box with a rounded vertical edge: the panel, Spline faces only off, Max
+    deviation 0.2 mm, finish;
+    the two side faces and the round become one face (the result line)."""
+    from conftest import part_rec, rect
+    p = part_rec("ui_mt", [{"id": "f1", "name": "Extrude 1", "type": "extrude", "plane": "XY", "offset": 0, "sketch": {"entities": rect(20, 10)}, "depth": 5},
+                           {"id": "fl", "name": "Fillet 1", "type": "fillet", "value": 3, "edges": [{"mid": [20, 10, 2.5], "len": 5}]}])
+    client.put("/api/part/file/ui_mt", json=p)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_mt')")
+    page.wait_for_function("window.__part.PT.mesh && window.__part.PT.mesh.vertices.length")
+    page.click("#tab-part .dd-btn:has-text('Faces')")
+    page.click("#tab-part [data-add=merge_tangent]")
+    page.wait_for_function("window.__part.PT.cmd && window.__part.PT.cmd.legacyDefs")
+    page.uncheck("#pf-mtspl")
+    page.fill("#pf-mtdev", "0.2")
+    page.press("#pf-mtdev", "Tab")
+    page.evaluate("window.__part.finishCommand()")
+    page.wait_for_function("""(() => { const PT = window.__part.PT; const f = PT.part.features.find(x => x.type === 'merge_tangent');
+        const st = f && PT.status[f.id]; return st && !st.pending && st.error === null && st.faces === 5 && /1 group/.test(st.note || ''); })()""", timeout=60000)
+
+
+def test_part_trim_surface_plane(page, client):
+    """Trim surface with a plane feature: the plane at x = 5 mm cuts the extruded rectangle (4 faces) into 2 regions; the plane
+    at x = 50 mm misses it and the Regions section shows the reason."""
+    from conftest import part_rec, rect
+    p = part_rec("ui_trp", [
+        {"id": "a", "name": "A", "type": "surf_sketch", "kind": "extrude", "depth": 10, "plane": "XY", "offset": 0, "sketch": {"entities": rect(40, 20, -20, 0)}},
+        {"id": "pl1", "name": "Plane 1", "type": "plane", "method": "principal", "plane": "YZ", "offset": 5},
+        {"id": "pl2", "name": "Plane 2", "type": "plane", "method": "principal", "plane": "YZ", "offset": 50}])
+    client.put("/api/part/file/ui_trp", json=p)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_trp')")
+    page.wait_for_function("window.__part.PT.surfaces && window.__part.PT.surfaces.a")
+    page.evaluate("window.__part.startCommand('surf_trim')")
+    page.wait_for_selector("#pf-source")
+    page.select_option("#pf-source", "a")
+    page.evaluate("window.__part.gotoStep(1)")
+    page.evaluate("window.__part.feedCommand({ kind: 'plane', id: 'pl1' })")
+    page.wait_for_function("window.__part.PT.cmd.step === 2 && (window.__part.PT.cmd.regions || []).length === 2")
+    page.evaluate("window.__part.gotoStep(1)")
+    page.evaluate("window.__part.feedCommand({ kind: 'plane', id: 'pl2' })")
+    page.wait_for_function("window.__part.PT.cmd.step === 2 && /does not cut/.test(document.querySelector('#pt-cmdbody').innerText)")
+
+
+def test_part_close_gaps_command(page, client):
+    """Close gaps from the Surfaces menu: a sewn body of two planar faces with a V-shaped split (0.3 mm wide at its
+    open end) gives one shell of area 200 mm^2 with the note "1 gap(s) closed"; the source body is hidden."""
+    from conftest import part_rec, rect
+    p4 = [(10, 0), (20, 0), (20, 10), (10.3, 10)]
+    poly = [{"id": 11 + i, "t": "line", "x1": p4[i][0], "y1": p4[i][1], "x2": p4[(i + 1) % 4][0], "y2": p4[(i + 1) % 4][1], "layer": "0"} for i in range(4)]
+    p = part_rec("ui_gaps", [
+        {"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(10, 10)}},
+        {"id": "b", "name": "B", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": poly}},
+        {"id": "s", "name": "Sew 1", "type": "surf_sew", "sources": ["a", "b"], "tolerance": 0.001}])
+    p["hidden"] = ["a", "b"]
+    client.put("/api/part/file/ui_gaps", json=p)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_gaps')")
+    page.wait_for_function("window.__part.PT.surfaces && window.__part.PT.surfaces.s")
+    page.evaluate("document.querySelector('[data-add=surf_gaps]').click()")
+    page.wait_for_selector("#pf-source")
+    page.select_option("#pf-source", "s")
+    page.evaluate("window.__part.finishCommand()")
+    page.wait_for_function("""(() => { const PT = window.__part.PT; const f = PT.part.features.find(x => x.type === 'surf_gaps');
+        const st = f && PT.status[f.id]; return st && !st.pending && st.error === null && Math.abs(st.area - 200) < 1e-6 && st.faces === 2; })()""", timeout=60000)
+    assert page.evaluate("window.__part.PT.hidden.s === true")
+    assert "1 gap(s) closed" in page.evaluate("(() => { const PT = window.__part.PT; return PT.status[PT.part.features.find(x => x.type === 'surf_gaps').id].note; })()")
+
+
+def test_part_sweep_surface_command(page, client):
+    """Sweep surface from the Surfaces menu: profile Sketch 1 (6 mm line), path Sketch 2 (20 mm line) chosen in the
+    lists; the result is a surface of 120 mm^2."""
+    from conftest import part_rec
+    line = lambda i, a, b: {"id": i, "t": "line", "layer": "0", "x1": a[0], "y1": a[1], "x2": b[0], "y2": b[1]}
+    p = part_rec("ui_sweep", [
+        {"id": "s1", "name": "Sketch 1", "type": "sketch", "plane": "XY", "offset": 0, "sketch": {"entities": [line(1, (-3, 0), (3, 0))]}},
+        {"id": "s2", "name": "Sketch 2", "type": "sketch", "plane": "XZ", "offset": 0, "sketch": {"entities": [line(1, (0, 0), (0, 20))]}}])
+    client.put("/api/part/file/ui_sweep", json=p)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_sweep')")
+    page.wait_for_function("window.__part.PT.part && window.__part.PT.part.features.length === 2")
+    page.evaluate("document.querySelector('[data-add=surf_sweep]').click()")
+    page.wait_for_selector("#pf-swprofile")
+    page.select_option("#pf-swprofile", "s1")
+    page.evaluate("window.__part.gotoStep(1)")
+    page.wait_for_selector("#pf-swpath")
+    page.select_option("#pf-swpath", "s2")
+    page.evaluate("window.__part.finishCommand()")
+    page.wait_for_function("""(() => { const PT = window.__part.PT; const f = PT.part.features.find(x => x.type === 'surf_sweep');
+        const st = f && PT.status[f.id]; return st && !st.pending && st.error === null && Math.abs(st.area - 120) < 1e-3; })()""", timeout=60000)
+
+
+def test_part_project_curve_command(page, client):
+    """Project curve from the Surfaces menu: Sketch 1 (circle R5 at z = 10 mm) chosen in the list, surface A
+    (planar 40 x 20 mm at z = 0) chosen as Onto; the result is a curve of length 2 pi 5 mm."""
+    from conftest import part_rec, rect
+    p = part_rec("ui_proj", [
+        {"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(40, 20, -20, -10)}},
+        {"id": "s1", "name": "Sketch 1", "type": "sketch", "plane": "XY", "offset": 10, "sketch": {"entities": [{"id": 1, "t": "circle", "layer": "0", "cx": 0, "cy": 0, "r": 5}]}}])
+    client.put("/api/part/file/ui_proj", json=p)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_proj')")
+    page.wait_for_function("window.__part.PT.surfaces && window.__part.PT.surfaces.a")
+    page.evaluate("document.querySelector('[data-add=curve_project]').click()")
+    page.wait_for_selector("#pf-pjsrc")
+    page.select_option("#pf-pjsrc", "s1")
+    page.wait_for_selector("#pf-pjtgt")
+    page.select_option("#pf-pjtgt", "a")
+    page.evaluate("window.__part.finishCommand()")
+    page.wait_for_function("""(() => { const PT = window.__part.PT; const f = PT.part.features.find(x => x.type === 'curve_project');
+        const st = f && PT.status[f.id]; return st && !st.pending && st.error === null && st.curve && Math.abs(st.length - 2 * Math.PI * 5) < 1e-3; })()""", timeout=60000)
+
+
+def test_part_extend_surface_reopen_edges_pickable(page, client):
+    """Extend surface reopened for editing: its source body (hidden since the feature was made) is drawn on the part
+    before the feature with pickable edges; a click on the outer edge of A deselects it (0 edges), a second click
+    selects it again."""
+    from conftest import part_rec, rect
+    from drawgen import part as dpart, surfaces as sfm
+    import copy
+    feats = [{"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(40, 20, -20, 1)}}]
+    p = part_rec("ui_ext_re", feats)
+    bodies = {}
+    dpart.build(copy.deepcopy(p), surfaces=bodies)
+    e = [x for x in bodies["a"].edges() if abs(x.center().Y - 21) < 1e-6][0]
+    p["features"].append({"id": "x", "name": "Extend surface 1", "type": "surf_extend", "source": "a", "edges": [dpart.edge_key(e)], "mode": "edges", "distance": 5, "sides": "all", "tolerance": 0.01, "target": None})
+    p["hidden"] = ["a"]
+    client.put("/api/part/file/ui_ext_re", json=p)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_ext_re')")
+    page.wait_for_function("window.__part.PT.status && window.__part.PT.status.x && window.__part.PT.status.x.error === null")
+    page.evaluate("window.__part.startCommand('surf_extend', null, 'x')")
+    page.evaluate("window.__part.gotoStep(0)")
+    find = """() => { const P = window.__part, t = P.PT.three, r = t.renderer.domElement.getBoundingClientRect();
+        for (let i = 2; i < 120; i++) for (let j = 2; j < 120; j++) {
+          const x = r.left + r.width * i / 121, y = r.top + r.height * j / 121;
+          const h = P.pickAt({ clientX: x, clientY: y }, ['sedge', 'edge']);
+          if (h && h.kind === 'edge' && h.surface === 'a' && Math.abs(h.key.mid[1] - 21) < 0.5) return [x, y];
+        }
+        return null; }"""
+    page.wait_for_function("window.__part.PT.edgeLines.some(l => l.userData.surface === 'a')", timeout=30000)
+    xy = page.evaluate(find)
+    assert xy, "edge of the source body not pickable"
+    page.mouse.click(*xy)
+    page.wait_for_function("(window.__part.feat('x').edges || []).length === 0")
+    page.wait_for_timeout(800)
+    xy = page.evaluate(find)
+    assert xy, "edge not pickable after the deselection"
+    page.mouse.click(*xy)
+    page.wait_for_function("(window.__part.feat('x').edges || []).length === 1")

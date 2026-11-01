@@ -5,6 +5,7 @@ engrave, vcarve, deburr, adaptive, 3D pocket, 3D surface, waterline, copy, array
 by the tool, the sanity check, the template, the G-code of both posts and the server routes."""
 import copy
 import math
+import os
 
 import pytest
 
@@ -327,7 +328,7 @@ def test_job_basic_workflow():
     assert len(ops["Clear"]["levels"]) == 3 and abs(ops["Clear"]["remaining_mm3"] - FILL) < 2.0     # the undercut stays for the dovetail
     assert ops["Clear"]["heights"]["start"] == 16.0 and any(m["k"] == "arc" for m in ops["Clear"]["moves"])
     assert len(ops["Pocket"]["levels"]) == 2 and ops["Pocket"]["heights"]["start"] == 10.0            # starts at the cleared plate
-    assert ops["Pocket"]["remaining_mm3"] < 40 and "plunge(s) between separate loops" in ops["Pocket"]["messages"][0]
+    assert ops["Pocket"]["remaining_mm3"] < 40
     assert ops["Drill"]["levels"] and ops["Drill"]["heights"]["final"] < -1.0 and any(m.get("k") == "dwell" for m in ops["Drill"]["moves"])
     assert abs(ops["Undercut"]["removed_mm3"] - FILL) < 10.0
     assert "3 tag(s) 6 x 1 mm" in " ".join(ops["Profile"]["messages"]) and "plunge(s) replaced" in " ".join(ops["Profile"]["messages"])
@@ -897,7 +898,7 @@ def test_pocket_entry_beside_stock(tmp_path):
 def test_pocket_floor_with_notch(tmp_path):
     """The tilted V-groove jaw with a cross V-notch through the groove floor: the open edges of the floor are joined
     at the notch corners (no pinholes grown to the tool radius), so the ZigZag passes run through the notch and the
-    tool stays down; no gouge."""
+    tool stays down (ZigZag and Offset: no lift until the end); no gouge."""
     from build123d import Box, Location, Vector, Polyline, make_face, extrude, Axis, export_step
     from shapely.geometry import LineString
     from drawgen import cam, part as P
@@ -920,6 +921,13 @@ def test_pocket_floor_with_notch(tmp_path):
     r = cam.run(doc, part, BITS)["operations"][0]
     assert r["ok"] and r["gouge_mm3"] < 0.05
     assert sum(1 for m in r["moves"] if m.get("k") == "plunge") <= 4 * len(r["levels"])
+    # Keep tool down: no lift from the first entry to the end (links along the region boundary at the notch, the next
+    # level entered from the level above)
+    for pat in ("zigzag", "offset"):
+        rr = cam.run(dict(doc, operations=[dict(op, pattern=pat, stepover_pct=40, entry="helix")]), part, BITS)["operations"][0]
+        ms = [m for m in rr["moves"] if "p" in m]
+        lifts = [i for i in range(1, len(ms)) if ms[i]["k"] == "rapid" and ms[i]["p"][2] > ms[i - 1]["p"][2] + 1e-6]
+        assert rr["ok"] and rr["gouge_mm3"] < 0.05 and len(lifts) == 1 and lifts[0] == len(ms) - 1, (pat, lifts)
 
 
 def test_tslot_and_custom_bits():
@@ -953,6 +961,50 @@ def test_tslot_and_custom_bits():
     r1 = cam.run(job_doc(sh, ops=[op]), sh, bits_em)["operations"][0]
     r2 = cam.run(job_doc(sh, ops=[op]), sh, bits_cu)["operations"][0]
     assert r1["ok"] and r2["ok"] and r2["removed_mm3"] == pytest.approx(r1["removed_mm3"], rel=1e-6) and r2["gouge_mm3"] < 0.05
+
+
+def test_setups(client, web, tmp_path):
+    """Two setups: migration of a job without setups, setup_doc, the second setup starts from the stock the first
+    leaves moved with the part to its placement (setup and run routes), its operations only, sanity without the
+    stock cover check, one G-code file per setup (names, own machine zero, existing files refused), a zip download,
+    a failing first setup refused for the second; placement.move_between."""
+    from drawgen.cam import job, placement as PL, geom
+    from build123d import Box
+    d = job.migrate({"name": "n", "operations": [{"id": "o1", "type": "face"}], "placement": {"pos": [1, 2, 3]}})
+    assert d["active"] == 0 and len(d["setups"]) == 1 and d["setups"][0]["operations"][0]["id"] == "o1" and d["setups"][0]["placement"]["pos"] == [1, 2, 3]
+    b = PL.move_between(Box(10, 10, 10), {"pos": [5, 0, 0]}, {"pos": [0, 0, 10], "rot": [0, 0, 90]})
+    assert geom.bbox(b) == pytest.approx([-5, -10, 5, 5, 0, 15], abs=1e-6)
+    ok(client.put("/api/part/file/su", json=job_part("su")))
+    ok(client.put("/api/cam/tools", json=BITS))
+    face1 = {"id": "o1", "name": "Face top", "type": "face", "tc": "TC1", "pattern": "zigzag", "stepover_pct": 60, "step_down": 1}
+    face2 = {"id": "o2", "name": "Face again", "type": "face", "tc": "TC1", "pattern": "zigzag", "stepover_pct": 60, "step_down": 1}
+    s1 = {"id": "S1", "name": "Setup 1", "placement": {"pos": [0, 0, 0], "rot": [0, 0, 0], "constraints": []}, "origin": {"xy": "stock_min", "z": "stock_top"}, "operations": [face1]}
+    s2 = {"id": "S2", "name": "Setup 2", "placement": {"pos": [0, 0, 10], "rot": [0, 0, 0], "constraints": []}, "origin": {"xy": "stock_min", "z": "stock_top"}, "operations": [face2]}
+    doc = {"name": "sujob", "source": {"type": "part", "name": "su"}, "stock": {"kind": "offsets", "xneg": 2, "xpos": 2, "yneg": 2, "ypos": 2, "zneg": 0, "zpos": 2},
+           "tools": controllers(), "post": "generic", "setups": [s1, s2], "active": 1}
+    doc.update({k: s2[k] for k in ("placement", "origin", "operations")})
+    su = ok(client.post("/api/cam/setup", json={"cam": doc}))
+    # the first setup faced the stock top from 18 to 16 mm; moved up 10 mm it is at 26 mm
+    assert su["stock_bbox"][5] == pytest.approx(26.0, abs=1e-4) and su["stock_bbox"][2] == pytest.approx(10.0, abs=1e-4) and su["stock_mesh"]["triangles"]
+    assert su["origin"][2] == pytest.approx(26.0, abs=1e-4) and su["setup"] == {"index": 1, "count": 2}
+    j = ok(client.post("/api/cam/run", json={"cam": doc, "meshes": False}))
+    assert [o["id"] for o in j["operations"]] == ["o2"] and j["operations"][0]["removed_mm3"] < 1.0
+    sa = ok(client.post("/api/cam/sanity", json={"cam": doc}))
+    assert not any("does not cover" in x["text"] for x in sa)
+    folder = str(tmp_path / "nc")
+    w = ok(client.post("/api/cam/gcode", json={"cam": doc, "folder": folder}))
+    names = sorted(os.path.basename(p) for p in w["written"])
+    assert names == ["sujob_Setup_1.nc", "sujob_Setup_2.nc"]
+    t1 = open(os.path.join(folder, "sujob_Setup_1.nc")).read()
+    t2 = open(os.path.join(folder, "sujob_Setup_2.nc")).read()
+    assert "Face top" in t1 and "Face again" not in t1 and "Face top" not in t2
+    assert "(machine zero at job X-2.000 Y-2.000 Z18.000)" in t1 and "(machine zero at job X-2.000 Y-2.000 Z26.000)" in t2
+    assert client.post("/api/cam/gcode", json={"cam": doc, "folder": folder}).status_code == 409
+    r = client.post("/api/cam/gcode", json={"cam": doc, "folder": "-"})
+    assert r.status_code == 200 and r.headers["Content-Type"].startswith("application/zip")
+    bad = dict(doc, setups=[dict(s1, operations=[dict(face1, tc="TC99")]), s2])
+    r = client.post("/api/cam/run", json={"cam": bad, "meshes": False})
+    assert r.status_code == 400 and "Setup 1" in r.get_json()["error"]
 
 
 def test_gouge_report():

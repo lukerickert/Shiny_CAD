@@ -410,6 +410,24 @@ def test_part_refs_earlier_sketches(client):
     assert r.status_code == 200
 
 
+def test_part_refs_cut(client):
+    """"cut": "front" removes the half of the model on the viewer's side of the sketch plane before the projection:
+    the hole of the plate is no longer hidden lines; the section and the frame (with the 3D plane) are unchanged."""
+    from conftest import plate
+    p = plate("cutp")
+    p["features"].append({"id": "s1", "name": "Sketch 1", "type": "sketch", "plane": "XZ", "offset": -25, "sketch": {"entities": []}})
+    base = client.post("/api/part/refs", json={"part": p, "index": 2, "path": False, "section": None}).get_json()
+    cut = client.post("/api/part/refs", json={"part": p, "index": 2, "path": False, "section": None, "cut": "front"}).get_json()
+    assert len([x for x in base if x.get("kind") == "hidden"]) == 4
+    assert len([x for x in cut if x.get("kind") == "hidden"]) < 4
+    key = lambda refs: sorted(tuple(round(x[k], 3) for k in ("x1", "y1", "x2", "y2")) for x in refs if x.get("kind") == "section" and x["t"] == "line")
+    assert key(base) == key(cut) and len(key(cut)) == 8
+    assert next(x for x in cut if x["t"] == "frame")["z3"] == [0.0, -1.0, 0.0]
+    # an unknown value is no cut
+    same = client.post("/api/part/refs", json={"part": p, "index": 2, "path": False, "section": None, "cut": "x"}).get_json()
+    assert len([x for x in same if x.get("kind") == "hidden"]) == 4
+
+
 def test_sketch_loops(client):
     """Closed profiles and open ends: a triangle, a circle and a single line (two open ends)."""
     sk = {"entities": [{"t": "line", "x1": 0, "y1": 0, "x2": 10, "y2": 0}, {"t": "line", "x1": 10, "y1": 0, "x2": 10, "y2": 5},

@@ -16,13 +16,13 @@ const PT = {
 };
 const TYPE_NAMES = { sketch: "Sketch", plane: "Plane", point: "Point", axis: "Axis", extrude: "Extrude", cut: "Cut", revolve: "Revolve", fillet: "Fillet", chamfer: "Chamfer",
                      shell: "Shell", pattern: "Pattern", mirror: "Mirror", boolean: "Boolean", hole: "Hole", thread: "Thread", sweep: "Sweep",
-                     import: "Import geometry", body_delete: "Delete body", body_copy: "Copy body", body_scale: "Scale body", place: "Place", split: "Partition", unify: "Merge faces", heal: "Heal", defeature: "Remove faces", offset_faces: "Offset faces", move_faces: "Move faces", combine: "Combine faces", hole_mesh: "Hole mesh", smooth: "Smooth surfaces", replace: "Replace faces",
+                     import: "Import geometry", body_delete: "Delete body", body_copy: "Copy body", body_scale: "Scale body", place: "Place", split: "Partition", unify: "Merge faces", heal: "Heal", defeature: "Remove faces", offset_faces: "Offset faces", move_faces: "Move faces", combine: "Combine faces", hole_mesh: "Hole mesh", smooth: "Smooth surfaces", replace: "Replace faces", merge_tangent: "Merge tangent faces",
                      surf_extract: "Extract surface", surf_fit: "Fit surface", surf_sketch: "Extruded surface", surf_loft: "Loft surface",
                      surf_fill: "Fill surface", surf_offset: "Offset surface", surf_sew: "Sew surfaces", surf_import: "Import surface", thicken: "Thicken", surf_cut: "Cut with surface",
-                     curve_extract: "Extract curve", curve_section: "Intersection curve", surf_from_curve: "Surface from curve", surf_trim: "Trim surface", surf_extend: "Extend surface", surf_bridge: "Bridge surface", surf_fillet: "Surface fillet" };
-const SURFACE_TYPES = new Set(["surf_extract", "surf_fit", "surf_sketch", "surf_loft", "surf_fill", "surf_offset", "surf_sew", "surf_import", "curve_extract", "curve_section", "surf_from_curve", "surf_trim", "surf_extend", "surf_bridge", "surf_fillet"]);
-const CURVE_TYPES = new Set(["curve_extract", "curve_section"]);
-const SOLID_TYPES = new Set(["extrude", "cut", "revolve", "hole", "sweep", "fillet", "chamfer", "shell", "pattern", "mirror", "boolean", "import", "place", "split", "unify", "heal", "defeature", "smooth", "replace", "thicken", "surf_cut", "hole_mesh", "offset_faces", "move_faces"]);
+                     curve_extract: "Extract curve", curve_section: "Intersection curve", surf_from_curve: "Surface from curve", surf_trim: "Trim surface", surf_extend: "Extend surface", surf_bridge: "Bridge surface", surf_fillet: "Surface fillet", surf_gaps: "Close gaps", surf_sweep: "Sweep surface", curve_project: "Project curve", curve_blend: "Blend curve", curve_points: "Curve through points" };
+const SURFACE_TYPES = new Set(["surf_extract", "surf_fit", "surf_sketch", "surf_loft", "surf_fill", "surf_offset", "surf_sew", "surf_import", "curve_extract", "curve_section", "surf_from_curve", "surf_trim", "surf_extend", "surf_bridge", "surf_fillet", "surf_gaps", "surf_sweep", "curve_project", "curve_blend", "curve_points"]);
+const CURVE_TYPES = new Set(["curve_extract", "curve_section", "curve_project", "curve_blend", "curve_points"]);
+const SOLID_TYPES = new Set(["extrude", "cut", "revolve", "hole", "sweep", "fillet", "chamfer", "shell", "pattern", "mirror", "boolean", "import", "place", "split", "unify", "heal", "defeature", "smooth", "replace", "merge_tangent", "thicken", "surf_cut", "hole_mesh", "offset_faces", "move_faces"]);
 const SPLIT_METHODS = { principal: "Principal plane + offset", datum: "Plane feature + offset", face: "Extend a face (planar or curved)", sketch: "Sketch extruded through the part",
                         edge: "Normal to an edge or curve", surface: "Surface body", point_normal: "Point and normal", three_points: "Three points", ogrid: "Around a hole (4 planes through the axis)" };
 const POINT_METHODS = { coords: "Coordinates", edge: "On an edge or curve", face: "Centre of a face", offset: "Offset from a point", axis: "On an axis at a distance", axis_plane: "Axis and plane intersection", midpoint: "Midpoint of two points" };
@@ -67,6 +67,8 @@ function surfaceItems(i, curves) { return itemsAbove(i, x => SURFACE_TYPES.has(x
 function planeName(ref) { if (!ref) return "?"; if (BASE_PLANES[ref]) return BASE_PLANES[ref]; const f = feat(ref); return f ? f.name : ref; }
 /** A vertex of the part used as a point reference is stored as its coordinates [x, y, z] (mm). */
 const isVertexRef = v => Array.isArray(v) && v.length === 3 && v.every(x => typeof x === "number" && isFinite(x));
+/** Coordinates of a point reference: a vertex [x, y, z] as it is, a point feature from its drawn object. */
+function pointOf(ref) { if (isVertexRef(ref)) return ref; const o = (PT.pointObjs || []).find(x => x.userData.id === ref); return o ? o.userData.point : null; }
 function itemName(id) { if (isVertexRef(id)) return "vertex (" + id.map(v => pfmt(v, 2)).join(", ") + ")"; if (BASE_PLANES[id]) return BASE_PLANES[id]; if (String(id).startsWith("solid:")) return "Solid " + (+id.slice(6) + 1); const f = feat(id); return f ? f.name : id; }
 
 // ------------------------------------------------------------------ 3D view
@@ -280,8 +282,12 @@ function setMesh(m) {
 function drawSurfaces() {
   const t = PT.three;
   const trimming = PT.cmd && PT.cmd.regions && feat(PT.cmd.id);
+  // a command reopened on the part before its feature: the bodies it uses are shown (hidden since the feature was
+  // made) so that their edges and faces can be picked
+  const cf = PT.cmd && buildUpto() !== null && feat(PT.cmd.id);
+  const used = new Set(cf ? consumedSources(cf) : []);
   for (const [id, sm] of Object.entries(PT.surfaces || {})) {
-    if (PT.hidden[id]) continue;
+    if (PT.hidden[id] && !used.has(id)) continue;
     const f = feat(id);
     if (!f || f.suppressed) continue;
     if (trimming && trimming.source === id) continue;
@@ -605,13 +611,20 @@ function drawSelection() {
     for (const did of refs.datums || []) paintDatum(did, 0xe8590c);
     if (c.type === "sweep" || c.type === "revolve") { const ln = axisLine3(c); if (ln) paintLine3(ln[0], ln[1], 0xe8590c); }
     // the solids the command acts on (Bodies section): tinted in the view
-    const bsel = new Set((c.bodies || []).map(b => (typeof b === "object" ? b.solid : b)));
+    const bsel = new Set((c.bodies || []).map(b => (typeof b === "object" ? b.solid : b)).concat(c.type === "split" ? (c.cells || []).filter(r => r && r.solid !== undefined).map(r => r.solid) : []));
     if (bsel.size && m && m.face_solid) { const bf = new Set(); m.face_solid.forEach((s, fi) => { if (bsel.has(s)) bf.add(fi); }); paint(bf, 0xe8590c, 0.3, 4); }
     for (const q of refs.points || []) { const sg = new THREE.SphereGeometry(planeSize() * 0.02, 12, 12); const sp = new THREE.Mesh(sg, new THREE.MeshBasicMaterial({ color: 0xe8590c, depthTest: false })); sp.position.set(...q); sp.renderOrder = 11; t.overlay.add(sp); }
     // the face or edge under the mouse in the selection chips of the command window
-    const hv = PT.chipHover;
-    if (hv && hv.mid) paintEdges(new Set([keyOfEdge(hv)]), 0x0a84ff);
-    else if (hv && hv.c && m && m.face_keys) { const fi = m.face_keys.findIndex(k => k && keyOfFace(k) === keyOfFace(hv)); if (fi >= 0) paint(new Set([fi]), 0x0a84ff, 0.7, 5); }
+    // (hover, and the chip clicked to stay highlighted)
+    for (const hv of [PT.chipPin, PT.chipHover]) {
+      if (!hv) continue;
+      if (hv.mid) { paintEdges(new Set([keyOfEdge(hv)]), 0x0a84ff); continue; }
+      if (hv.point) { const sg = new THREE.SphereGeometry(planeSize() * 0.018, 12, 12); const sp = new THREE.Mesh(sg, new THREE.MeshBasicMaterial({ color: 0x0a84ff, depthTest: false })); sp.position.set(...hv.point); sp.renderOrder = 12; t.overlay.add(sp); continue; }
+      if (!hv.c) continue;
+      const fi = m && m.face_keys ? m.face_keys.findIndex(k => k && keyOfFace(k) === keyOfFace(hv)) : -1;
+      if (fi >= 0) { paint(new Set([fi]), 0x0a84ff, 0.7, 5); continue; }
+      for (const [sid, sm] of Object.entries(PT.surfaces || {})) { const si = (sm.face_keys || []).findIndex(k => k && keyOfFace(k) === keyOfFace(hv)); if (si >= 0) { paintSurface(sid, 0x0a84ff, 0.7, si); break; } }
+    }
   }
   // inspection results: the active issue red, the others orange
   if (PT.inspect && PT.inspect.issues) {
@@ -788,20 +801,23 @@ function axisLine3(f) {
 // ------------------------------------------------------------------ hover and click in the view
 
 /** Element under the cursor, filtered by kinds (array of kinds or null for all). */
-/** Vertices of the solid (ends of the edge polylines), cached per mesh. */
+/** Vertices of the solid and of the shown surface and curve bodies (ends of the edge polylines), cached per mesh
+ *  and set of shown bodies. */
 function meshVertices() {
   const m = PT.mesh;
-  if (!m) return [];
-  if (PT.vtxCache && PT.vtxCache.mesh === m) return PT.vtxCache.list;
+  const shown = Object.keys(PT.surfaces || {}).filter(id => !PT.hidden[id] && feat(id) && !feat(id).suppressed).join(",");
+  if (PT.vtxCache && PT.vtxCache.mesh === m && PT.vtxCache.surfaces === PT.surfaces && PT.vtxCache.shown === shown) return PT.vtxCache.list;
   const seen = new Set(), list = [];
-  for (const pl of m.edges || []) {
-    if (!pl || !pl.length) continue;
+  const add = pl => {
+    if (!pl || !pl.length) return;
     for (const q of [pl[0], pl[pl.length - 1]]) {
       const k = q.map(x => x.toFixed(4)).join(",");
       if (!seen.has(k)) { seen.add(k); list.push(q.slice()); }
     }
-  }
-  PT.vtxCache = { mesh: m, list };
+  };
+  for (const pl of (m && m.edges) || []) add(pl);
+  for (const id of shown ? shown.split(",") : []) for (const pl of (PT.surfaces[id] || {}).edges || []) add(pl);
+  PT.vtxCache = { mesh: m, surfaces: PT.surfaces, shown, list };
   return list;
 }
 function vertexAt(e, r, rc, px) {
@@ -1111,7 +1127,7 @@ function setPivot(e) {
 
 function dblclickView(e) {
   if (PT.cmd && !isPlaneStep()) return;
-  const h = pickAt(e, ["plane", "face", "edge", "curve", "sketch"]);
+  const h = pickAt(e, ["plane", "face", "sface", "edge", "curve", "sketch"]);
   if (h) sketchOnPlane(h);
 }
 
@@ -1654,6 +1670,18 @@ function showAllBodies() {
   for (const k of bodyIds()) delete PT.hidden[k];
   renderTree(); renderProps(); setMesh(PT.mesh);
 }
+/** Tree keys of one group of bodies: "solid" (solids), "surface" (surface bodies), "curve" (curve bodies). */
+function bodyGroupIds(grp) {
+  if (grp === "solid") return PT.solids.map((_, i) => "solid:" + i);
+  return PT.part.features.filter(f => !f.suppressed && PT.surfaces[f.id] && CURVE_TYPES.has(f.type) === (grp === "curve")).map(f => f.id);
+}
+/** Eye of a group header: hides every body of the group when any is shown, else shows them all. */
+function toggleBodyGroup(grp) {
+  const ids = bodyGroupIds(grp);
+  const anyShown = ids.some(k => !PT.hidden[k]);
+  for (const k of ids) { if (anyShown) PT.hidden[k] = true; else delete PT.hidden[k]; }
+  renderTree(); renderProps(); setMesh(PT.mesh);
+}
 
 function renderTree() {
   const box = $("#pt-features");
@@ -1670,12 +1698,23 @@ function renderTree() {
       (st.error && !st.pending && o.ops ? `<span class="err">${pesc(st.error)}</span>` : "") + "</div>";
   };
   let h = `<div class="pt-sec">Reference planes</div>` + Object.entries(BASE_PLANES).map(([k, n]) => row(k, ICON.plane, n, { eye: true })).join("");
-  h += `<div class="pt-sec">Bodies${bodyIds().some(k => PT.hidden[k]) ? ` <button type="button" id="pt-showall" class="small" title="Show all bodies">Show all</button>` : ""}</div>`;
+  h += `<div class="pt-sec pt-sech">Bodies${bodyIds().some(k => PT.hidden[k]) ? `<button type="button" id="pt-showall" title="Show all bodies">Show all</button>` : ""}</div>`;
   const nSolids = PT.solids.length;
+  const surfs = fs.filter(f => !f.suppressed && PT.surfaces[f.id] && !CURVE_TYPES.has(f.type));
+  const curves = fs.filter(f => !f.suppressed && PT.surfaces[f.id] && CURVE_TYPES.has(f.type));
+  // sub-section header with an eye for the whole group: off (dimmed) when every body of the group is hidden
+  const grpHead = (grp, name) => {
+    const ids = bodyGroupIds(grp), allHidden = ids.length > 0 && ids.every(k => PT.hidden[k]);
+    return `<div class="pt-sec pt-sub pt-sech">${name}<button type="button" data-grp="${grp}" class="${allHidden ? "off" : ""}" title="${allHidden ? "Show all " : "Hide all "}${name.toLowerCase()}">${EYE}</button></div>`;
+  };
+  if (nSolids || !surfs.length && !curves.length) h += grpHead("solid", "Solids");
   if (nSolids > 6 && !PT.showCells) h += `<div class="pt-feat" data-id="cells"><span class="ico">${ICON.solid}</span><span class="nm">${nSolids} solid cells</span><span class="ops"><button type="button" data-k="cells" title="List the cells">…</button></span></div>`;
   else for (let i = 0; i < nSolids; i++) h += row("solid:" + i, swatch("solid:" + i, COL.solid), "Solid " + (i + 1), { eye: true, body: true });
-  for (const f of fs) if (!f.suppressed && PT.surfaces[f.id]) h += row(f.id, CURVE_TYPES.has(f.type) ? swatch(f.id, COL.curve, true) : swatch(f.id, (PT.status[f.id] || {}).mesh ? COL.mesh : COL.surf), f.name, { eye: true, body: true });
-  if (!nSolids && !fs.some(f => PT.surfaces[f.id])) h += `<p class="hint">No body yet.</p>`;
+  if (surfs.length) h += grpHead("surface", "Surfaces");
+  for (const f of surfs) h += row(f.id, swatch(f.id, (PT.status[f.id] || {}).mesh ? COL.mesh : COL.surf), f.name, { eye: true, body: true });
+  if (curves.length) h += grpHead("curve", "Curves");
+  for (const f of curves) h += row(f.id, swatch(f.id, COL.curve, true), f.name, { eye: true, body: true });
+  if (!nSolids && !surfs.length && !curves.length) h += `<p class="hint">No body yet.</p>`;
   h += `<div class="pt-sec">Features</div>`;
   if (!fs.length) h += '<p class="hint">Sketch on a reference plane, then Extrude.</p>';
   for (const f of fs) {
@@ -1684,6 +1723,7 @@ function renderTree() {
   }
   box.innerHTML = h;
   if ($("#pt-showall")) $("#pt-showall").onclick = showAllBodies;
+  box.querySelectorAll("[data-grp]").forEach(b => b.onclick = () => toggleBodyGroup(b.dataset.grp));
   box.querySelectorAll(".pt-feat").forEach(el => {
     const id = el.dataset.id;
     el.onclick = e => {
@@ -1696,7 +1736,12 @@ function renderTree() {
       if (id === "cells") { PT.showCells = !PT.showCells; renderTree(); return; }
       if (!k && PT.cmd) { const th = treeHit(id); if (th && feedCommand(th)) return; }
       if (!f) { selectItem(id); return; }
-      if (k === "on") { f.suppressed = !e.target.checked; changedPart(); return; }
+      if (k === "on") {
+        f.suppressed = !e.target.checked;
+        // a suppressed feature shows the bodies it consumed; an active one hides them again
+        for (const sid of sourcesOf(f)) { if (f.suppressed) { if (!consumedBy(sid).length) delete PT.hidden[sid]; } else PT.hidden[sid] = true; }
+        changedPart(); return;
+      }
       if (k === "up" && i > 0) { checkpointPart(); [fs[i - 1], fs[i]] = [fs[i], fs[i - 1]]; changedPart(); return; }
       if (k === "down" && i < fs.length - 1) { checkpointPart(); [fs[i + 1], fs[i]] = [fs[i], fs[i + 1]]; changedPart(); return; }
       if (k === "del") { deleteFeature(id); return; }
@@ -1761,14 +1806,25 @@ function redoPart() {
 function deleteFeature(id) {
   const f = feat(id);
   if (!f) return;
-  const users = PT.part.features.filter(x => x.sketch_ref === id || x.path_ref === id || x.plane_ref === id || x.source === id || x.tool === id || (x.sources || []).includes(id) || (x.curves || []).includes(id) || (x.features || []).includes(id) || x.point_ref === id || x.axis_ref === id || x.plane_axis === id || x.plane_point === id || x.plane_origin_ref === id || x.plane_xdir_ref === id || (x.plane_sketch_curve && x.plane_sketch_curve.sketch === id) || (x.points_ref || []).includes(id) || (x.planes_ref || []).includes(id) || (x.sketch_refs || []).includes(id));
+  const users = PT.part.features.filter(x => usesFeature(x, id));
   checkpointPart();
   if (PT.cmd && PT.cmd.id === id) PT.cmd = null;
   PT.part.features.splice(featIndex(id), 1);
   if (PT.sel === id) PT.sel = null;
+  // the bodies the feature consumed (hidden when it was made) are shown again
+  for (const sid of sourcesOf(f)) if (!consumedBy(sid).length) delete PT.hidden[sid];
   changedPart();
   msgPart("Deleted " + f.name + (users.length ? "; used by " + users.map(u => u.name).join(", ") : "") + " (Ctrl+Z undoes)", users.length > 0);
 }
+/** Whether feature x references the feature id (sketch, plane, source bodies, curves, points, axes, ...). */
+function usesFeature(x, id) {
+  const one = ["sketch_ref", "path_ref", "plane_ref", "source", "tool", "point_ref", "axis_ref", "plane_axis", "plane_point", "plane_origin_ref", "plane_xdir_ref", "source_a", "source_b", "target", "other", "profile", "path", "project", "plane_face_body"];
+  const many = ["sources", "curves", "features", "points_ref", "planes_ref", "sketch_refs", "curves_a", "curves_b", "surfaces"];
+  return one.some(k => x[k] === id) || many.some(k => (x[k] || []).includes(id)) || !!(x.plane_sketch_curve && x.plane_sketch_curve.sketch === id) ||
+    (x.ends || []).some(e => e && (e.body === id || e.point === id));
+}
+/** The active (not suppressed) features that consume the body sid (it is hidden while one exists). */
+function consumedBy(sid) { return PT.part.features.filter(x => !x.suppressed && consumedSources(x).includes(sid)); }
 
 // ------------------------------------------------------------------ properties (no active command)
 
@@ -1996,6 +2052,129 @@ async function refreshSectionCap() {
   } catch (e) { showErr(e); }
 }
 
+// ------------------------------------------------------------------ shaded model under a feature sketch
+
+/** The shaded model (the part built up to the sketch feature) drawn under the sketch editor: an orthographic view
+ *  along the sketch plane normal, in sketch coordinates, that follows the pan and zoom of the sketch. With a cut
+ *  ("front" or "back") the half of the model on one side of the sketch plane is clipped and the section is capped.
+ *  model: {mesh, surfaces} of /api/part/build; frame: {o3, x3, y3, z3} of the sketch plane (3D, offset included);
+ *  upto: the feature index (the cap is of the model up to it). */
+function createSketchUnderlay(model, frame, upto) {
+  const m = model.mesh;
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setPixelRatio(window.devicePixelRatio || 1);
+  renderer.localClippingEnabled = true;
+  const el = renderer.domElement;
+  el.className = "sk-underlay";
+  const scene = new THREE.Scene();
+  const camera = new THREE.OrthographicCamera(-100, 100, 100, -100, -1e6, 1e6);
+  const o = new THREE.Vector3(...frame.o3), x = new THREE.Vector3(...frame.x3).normalize(), y = new THREE.Vector3(...frame.y3).normalize(), z = new THREE.Vector3(...frame.z3).normalize();
+  camera.up.copy(y);
+  camera.position.copy(o.clone().add(z.clone().multiplyScalar(1e4)));
+  camera.lookAt(o);
+  camera.updateMatrixWorld();
+  scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+  const d1 = new THREE.DirectionalLight(0xffffff, 0.75);
+  d1.position.set(1, 1, 2);
+  camera.add(d1);
+  scene.add(camera);
+  const group = new THREE.Group();
+  scene.add(group);
+  const clip = new THREE.Plane();
+  let cut = null, capObj = null, visible = true, W = 0, H = 0, capSeq = 0;
+  const mats = [];
+  // the solids
+  if (m && m.vertices && m.vertices.length) {
+    let nSolids = 0;
+    for (const s of m.face_solid) if (s + 1 > nSolids) nSolids = s + 1;
+    const solidFaces = Array.from({ length: nSolids }, () => new Set());
+    m.face_solid.forEach((s, fi) => { if (s >= 0) solidFaces[s].add(fi); });
+    for (let si = 0; si < nSolids; si++) {
+      const mat = new THREE.MeshStandardMaterial({ color: bodyColor("solid:" + si, COL.solid), metalness: 0.15, roughness: 0.6, side: THREE.DoubleSide });
+      mats.push(mat);
+      group.add(new THREE.Mesh(facesGeometry(m, solidFaces[si]), mat));
+    }
+  }
+  // the surface and curve bodies
+  for (const [id, sm] of Object.entries(model.surfaces || {})) {
+    const f = feat(id);
+    if (f && f.suppressed) continue;
+    if (sm.triangles && sm.triangles.length) {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.Float32BufferAttribute(sm.vertices.flat(), 3));
+      g.setIndex(sm.triangles.flat());
+      g.computeVertexNormals();
+      const isMesh = !!(PT.status[id] && PT.status[id].mesh);
+      const mat = new THREE.MeshStandardMaterial({ color: bodyColor(id, isMesh ? COL.mesh : COL.surf), transparent: !isMesh, opacity: isMesh ? 1 : 0.45, side: THREE.DoubleSide, depthWrite: isMesh, flatShading: isMesh, metalness: 0, roughness: isMesh ? 0.7 : 1 });
+      mats.push(mat);
+      const mesh = new THREE.Mesh(g, mat);
+      mesh.renderOrder = 2;
+      group.add(mesh);
+    } else if (sm.edges && sm.edges.length) {
+      const pos = [];
+      for (const pl of sm.edges) for (let k = 0; k + 1 < pl.length; k++) pos.push(...pl[k], ...pl[k + 1]);
+      if (pos.length) {
+        const eg = new THREE.BufferGeometry();
+        eg.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+        const mat = new THREE.LineBasicMaterial({ color: COL.curve });
+        mats.push(mat);
+        group.add(new THREE.LineSegments(eg, mat));
+      }
+    }
+  }
+  const render = () => { if (visible && W && H) renderer.render(scene, camera); };
+  const applyClip = () => { for (const mat of mats) mat.clippingPlanes = cut ? [clip] : []; };
+  async function refreshCap() {
+    if (capObj) { scene.remove(capObj); capObj = null; }
+    if (!cut || !m || !m.vertices || !m.vertices.length) { render(); return; }
+    const seq = ++capSeq;
+    try {
+      const r = await postJSON("/api/part/section", { part: PT.part, origin: o.toArray(), normal: z.toArray(), upto });
+      const cm = await r.json();
+      if (seq !== capSeq || !cut || !cm.vertices.length) { render(); return; }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.Float32BufferAttribute(cm.vertices.flat(), 3));
+      g.setIndex(cm.triangles.flat());
+      g.computeVertexNormals();
+      capObj = new THREE.Group();
+      capObj.add(new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: 0x9aa3ad, metalness: 0.1, roughness: 0.7, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 })));
+      scene.add(capObj);
+      render();
+    } catch (e) { console.error(e); }
+  }
+  return {
+    el,
+    /** The canvas under the sketch's SVG (first child of the sketch canvas box). */
+    attach(box) { if (el.parentNode !== box) box.insertBefore(el, box.firstChild); },
+    /** The view of the sketch (SK.view: ox, oy, s; screen = (ox + s u, oy - s v)) and the size of the sketch box. */
+    update(view, w, h) {
+      if (!el.isConnected && el.parentNode) el.parentNode.insertBefore(el, el.parentNode.firstChild);
+      if (w !== W || h !== H) { W = w; H = h; renderer.setSize(w, h); }
+      if (!w || !h || !view.s) return;
+      camera.left = -view.ox / view.s; camera.right = (w - view.ox) / view.s;
+      camera.top = view.oy / view.s; camera.bottom = (view.oy - h) / view.s;
+      camera.updateProjectionMatrix();
+      render();
+    },
+    /** null: the whole model; "front": the half toward the viewer (along the plane normal) clipped; "back": the
+     *  other half clipped. The cap of the section is read from the server. */
+    setCut(mode) {
+      cut = mode === "front" || mode === "back" ? mode : null;
+      if (cut) clip.setFromNormalAndCoplanarPoint(z.clone().multiplyScalar(cut === "front" ? -1 : 1), o);
+      applyClip();
+      refreshCap();
+    },
+    setVisible(on) { visible = !!on; el.hidden = !visible; if (visible) render(); },
+    dispose() {
+      ++capSeq;
+      if (el.parentNode) el.parentNode.removeChild(el);
+      group.traverse(ob => { if (ob.geometry) ob.geometry.dispose(); });
+      for (const mat of mats) mat.dispose();
+      renderer.dispose();
+    },
+  };
+}
+
 function renderSectionPanel() {
   const S = PT.section, box = $("#pt-section");
   if (!S) return;
@@ -2140,10 +2319,11 @@ function viewXdir(n) {
 function acceptPlanePick(item, h) {
   if (h.kind === "plane") { if (BASE_PLANES[h.id]) item.plane = h.id; else { item.plane = "datum"; item.plane_ref = h.id; } item.offset = 0; }
   else if (h.kind === "face") {
-    item.plane = "face"; item.plane_face = refOf(h); item.offset = 0;
+    // a face of the solid, or (h.surface) of a surface body
+    item.plane = "face"; item.plane_face = refOf(h); item.plane_face_body = h.surface || null; item.offset = 0;
     // sketch x axis from the view: the principal direction nearest the screen right (the sketch opens as the face
     // is seen in the view); an x axis feature of the sketch is kept
-    const k = PT.mesh && PT.mesh.face_keys && PT.mesh.face_keys[h.fi];
+    const k = h.surface ? ((PT.surfaces[h.surface] || {}).face_keys || [])[h.fi] : PT.mesh && PT.mesh.face_keys && PT.mesh.face_keys[h.fi];
     if (!item.plane_xdir_ref && k && k.n) { const xd = viewXdir(k.n); if (xd) item.plane_xdir = xd; }
   }
   else if (h.kind === "edge") { item.plane = "normal"; item.plane_edge = refOf(h); item.plane_curve = null; item.plane_axis = null; item.plane_sketch_curve = null; if (item.plane_t === undefined || item.plane_t === null) item.plane_t = 0.5; }
@@ -2347,7 +2527,7 @@ const COMMANDS = {
   sketch: {
     title: "Sketch", startStep: 0,
     defaults: init => ({ plane: (init && init.plane) || "XY", offset: 0, sketch: emptySketch() }),
-    steps: f => [{ key: "plane", label: "Plane", kinds: ["plane", "face", "edge", "curve", "axis", "sketch"], before: false, hint: "Click a reference plane, a plane feature, a planar face, an edge, a curve or an axis feature (plane normal to it), or a curve of a sketch (plane normal to it at the end nearer the click). Double-click opens the sketch editor on it.",
+    steps: f => [{ key: "plane", label: "Plane", kinds: ["plane", "face", "sface", "edge", "curve", "axis", "sketch"], before: false, hint: "Click a reference plane, a plane feature, a planar face (of the solid or of a surface body), an edge, a curve or an axis feature (plane normal to it), or a curve of a sketch (plane normal to it at the end nearer the click). Double-click opens the sketch editor on it.",
       accept: acceptPlanePick, html: planeSelectField, bind: (f, box) => bindPlaneSelect(box, f), done: f => !!f.plane && (f.plane !== "normal" || f.plane_edge || f.plane_curve || f.plane_axis), summary: planeSummary },
       { key: "origin", label: "Origin and x axis", kinds: ["edge", "face", "point", "axis", "sketch"], optional: true, before: false, hint: "Click an edge: the sketch origin goes to its nearer end and the sketch x axis along it. Click a curve of an earlier sketch: the origin goes to its nearer end. Click a face: the origin goes to its centre. Click a point feature: the origin. Click an axis feature: the sketch x axis. Nothing clicked: the plane origin.",
         accept: (f, h) => {
@@ -2600,11 +2780,13 @@ const COMMANDS = {
         bind: (f, box) => box.querySelectorAll("input[data-ps]").forEach(cb => cb.onchange = () => { f[key] = [...box.querySelectorAll("input[data-ps]:checked")].map(x => +x.dataset.ps); changedPart(); }),
         done: f => (f[key] || []).length > 0, summary: f => (f[key] || []).length ? (f[key] || []).map(i => "Solid " + (i + 1)).join(", ") : "none" });
       const steps = [{ key: "op", label: "Operation", html: f => select("pf-bop", "Operation", [["union", "Union (fuse)"], ["subtract", "Subtract (target minus tools)"], ["intersect", "Intersect (common volume)"]], f.op || "subtract") + (f.op !== "union" ? check("pf-bkeep", "Keep the tool solids", f.keep_tools) : "") +
+          `<div class="grid2">` + num("pf-bfuzzy", "Fuzzy value (mm, 0: exact)", f.fuzzy || 0) + `<span></span></div>` +
+          `<p class="hint">Faces, edges and vertices of the target and the tools closer than the fuzzy value are taken as coincident. A tool whose faces lie a hair inside or outside faces of the target leaves thin lips along those faces: a fuzzy value above that distance (0.05 to 0.2 mm) removes them.</p>` +
           `<div class="grid2">` + num("pf-bmint", "Sliver thickness (mm)", f.min_thickness != null ? f.min_thickness : 0.01) + num("pf-bminv", "Sliver volume (mm^3)", f.min_volume || 0) + `</div>` +
           check("pf-bkeeps", "Keep sliver solids", !!f.keep_slivers) +
           `<p class="hint">Result solids with a mean thickness (2 x volume / area) below the sliver thickness or a volume below the sliver volume are slivers: the Boolean is made again with a fuzzy value of the sliver thickness, and the slivers left are removed.</p>` +
           `<p class="hint">Separate solids come from Extrude, Revolve or Sweep with New body, from Partition or from an imported STEP file.</p>` + resultLine(f),
-        bind: (f, box) => bindAll(box, { "#pf-bop": el => { f.op = el.value; }, "#pf-bkeep": el => { f.keep_tools = el.checked; }, "#pf-bmint": el => { f.min_thickness = Math.max(0, numv(el.value) || 0); }, "#pf-bminv": el => { f.min_volume = Math.max(0, numv(el.value) || 0); }, "#pf-bkeeps": el => { f.keep_slivers = el.checked; } }),
+        bind: (f, box) => bindAll(box, { "#pf-bop": el => { f.op = el.value; }, "#pf-bkeep": el => { f.keep_tools = el.checked; }, "#pf-bfuzzy": el => { f.fuzzy = Math.max(0, numv(el.value) || 0); }, "#pf-bmint": el => { f.min_thickness = Math.max(0, numv(el.value) || 0); }, "#pf-bminv": el => { f.min_volume = Math.max(0, numv(el.value) || 0); }, "#pf-bkeeps": el => { f.keep_slivers = el.checked; } }),
         summary: f => ({ union: "union", subtract: "subtract", intersect: "intersect" })[f.op || "subtract"] + (f.keep_tools && f.op !== "union" ? ", tools kept" : "") },
         solidStep("targets", f.op === "union" ? "Solids" : "Target", f.op === "union" ? "Click each solid to fuse (click again to deselect), or check them." : "Click the target solid(s) (click again to deselect), or check them.")];
       if (f.op !== "union") steps.push(solidStep("tools", "Tools", "Click the tool solid(s), or check them."));
@@ -2614,7 +2796,7 @@ const COMMANDS = {
   },
   split: {
     title: "Partition", needsSolid: true, startStep: 0,
-    defaults: () => ({ method: "principal", plane: "XY", offset: 0, relative: false, point: [0, 0, 0], normal: [0, 0, 1], points: [[0, 0, 0], [1, 0, 0], [0, 1, 0]], face: null, edge: null, curve: null, t: 0.5, cells: [] }),
+    defaults: () => ({ method: "principal", plane: "XY", offset: 0, relative: false, point: [0, 0, 0], normal: [0, 0, 1], points: [[0, 0, 0], [1, 0, 0], [0, 1, 0]], face: null, edge: null, curve: null, t: 0.5, cells: [], extend: 1 }),
     steps: f => {
       const m = f.method || "principal";
       const steps = [{ key: "method", label: "Method", html: f => select("pf-method", "Method", Object.entries(SPLIT_METHODS), m) +
@@ -2649,8 +2831,19 @@ const COMMANDS = {
         html: f => sourceSelect("pf-curve", f, "curve", false, true).replace("Curve<", "Or a curve body<") + `<div class="grid2">` + num("pf-st", "Position along the edge (0 to 1)", f.t === undefined ? 0.5 : f.t) + `<span></span></div>`,
         bind: (f, box) => bindAll(box, { "#pf-curve": el => { f.curve = el.value || null; if (el.value) f.edge = null; }, "#pf-st": el => { const t = numv(el.value); f.t = t >= 0 && t <= 1 ? t : 0.5; } }),
         done: f => !!(f.edge || f.curve), summary: f => f.curve ? itemName(f.curve) : f.edge ? "edge" : "none" });
-      if (m === "surface") steps.push(sourceStep("Surface", "source", false, "Click the surface body that cuts the cells."));
-      if (m !== "ogrid") steps.push(Object.assign(facesStep("Cells", "cells", "Click a face of each cell to partition; none: all cells."), { optional: true, summary: f => (f.cells || []).length ? (f.cells || []).length + " cell(s)" : "all cells" }));
+      if (m === "surface") { const st = sourceStep("Surface", "source", false, "Click the surface body that cuts the cells.");
+        const h0 = st.html; st.html = f => h0(f) + `<div class="grid2">` + num("pf-sext", "Extend the surface beyond its edges (mm, 0: as it is)", f.extend === undefined ? 1 : f.extend) + `<span></span></div>` +
+          `<p class="hint">The faces of the surface body are extended across their free edges by this distance before the cut, so the surface need not reach the faces of the cell exactly.</p>`;
+        const b0 = st.bind; st.bind = (f, box) => { b0(f, box); bindAll(box, { "#pf-sext": el => { const v = numv(el.value); f.extend = v >= 0 ? v : 0; } }); };
+        steps.push(st); }
+      if (m !== "ogrid") steps.push({ key: "cells", label: "Cells", kinds: ["body"], multi: true, before: true, optional: true,
+        hint: "Click each cell (solid) to partition (click again to deselect), or check them; none: all cells.",
+        accept: (f, h) => { f.cells = (f.cells || []).filter(r => r && "solid" in r); const i = f.cells.findIndex(r => r.solid === h.solid); if (i >= 0) f.cells.splice(i, 1); else f.cells.push({ solid: h.solid }); PT.dirty = true; },
+        html: f => { const sel = new Set((f.cells || []).filter(r => r && "solid" in r).map(r => r.solid)); const old = (f.cells || []).filter(r => r && !("solid" in r)).length;
+          return (PT.solids.length ? PT.solids.map((s, i, a) => `<label class="check"><input type="checkbox" data-pc="${i}"${sel.has(i) ? " checked" : ""}> ${solidLabel(i, volTexts(a.map(x => x.volume_mm3)))}</label>`).join("") : '<p class="hint">No solids.</p>') +
+            (old ? `<p class="hint">${old} cell(s) picked by face (older part); a click here replaces them.</p>` : "") + `<p class="hint">Solids are numbered as in the tree before this feature.</p>`; },
+        bind: (f, box) => box.querySelectorAll("input[data-pc]").forEach(cb => cb.onchange = () => { f.cells = [...box.querySelectorAll("input[data-pc]:checked")].map(x => ({ solid: +x.dataset.pc })); changedPart(); }),
+        done: () => true, summary: f => (f.cells || []).length ? (f.cells || []).length + " cell(s)" : "all cells" });
       return steps;
     },
   },
@@ -2680,7 +2873,7 @@ const COMMANDS = {
       { key: "regions", label: "Regions", multi: true, kinds: ["region"], before: true, hint: "Click the regions to remove (click again to keep them). Invert swaps kept and removed.",
         enter: f => { if (f.source && (f.with === "solid" || f.tool)) loadRegions(f); },
         accept: (f, h) => { f.keep = "pick"; f.remove = f.remove || []; const i = f.remove.findIndex(p => p.join(",") === h.point.join(",")); if (i >= 0) f.remove.splice(i, 1); else f.remove.push(h.point); PT.dirty = true; drawRegions(); },
-        html: f => { const n = (PT.cmd.regions || []).length; return `<p class="hint">${n ? n + " region(s), " + (f.remove || []).length + " removed." : "Computing the regions..."}</p><div class="buttons"><button type="button" id="pf-invert">Invert</button><button type="button" id="pf-keepall">Keep all</button></div>`; },
+        html: f => { const n = (PT.cmd.regions || []).length; return `<p class="hint${PT.cmd.regionError ? " err" : ""}">${PT.cmd.regionError ? pesc(PT.cmd.regionError) : n ? n + " region(s), " + (f.remove || []).length + " removed." : "Computing the regions..."}</p><div class="buttons"><button type="button" id="pf-invert">Invert</button><button type="button" id="pf-keepall">Keep all</button></div>`; },
         bind: (f, box) => { const b = box.querySelector("#pf-invert"); if (b) b.onclick = () => { const all = (PT.cmd.regions || []).map(r => r.point); const rem = new Set((f.remove || []).map(p => p.join(","))); f.remove = all.filter(p => !rem.has(p.join(","))); f.keep = "pick"; changedPart(); };
           const k = box.querySelector("#pf-keepall"); if (k) k.onclick = () => { f.remove = []; changedPart(); }; },
         done: f => true, summary: f => (f.remove || []).length + " region(s) removed" },
@@ -2688,29 +2881,78 @@ const COMMANDS = {
   },
   surf_extend: {
     title: "Extend surface",
-    defaults: () => ({ source: null, edges: [], mode: "edges", distance: 5, sides: "all", tolerance: 0.01 }),
+    defaults: () => ({ source: null, edges: [], mode: "edges", distance: 5, sides: "all", tolerance: 0.01, target: null }),
     steps: f => {
-      const steps = [surfaceOrFacesStep("Surface", "Click the surface body to extend, or a face of the solid.")];
-      if (f.mode !== "all") steps.push({ key: "edges", label: "Edges", kinds: ["sedge", "edge"], prop: "edges", hint: "Click the boundary edges of the surface to extend (click again to deselect).",
-        // picked faces (of the solid or, with Pick single faces, of a surface body): any edge; the build checks that
-        // it bounds the picked faces. A whole surface body: its own edges only
-        accept: (f, h) => { if (!(f.faces || []).length && h.surface !== f.source) { msgPart("Click an edge of " + itemName(f.source), true); return; } applyPick(f, { prop: "edges", kinds: ["edge"], single: false }, h); },
-        html: f => `<p class="hint">${(f.edges || []).length} edge(s) selected.</p><div class="buttons"><button type="button" data-clear="edges">Clear</button></div>`,
+      const steps = [];
+      // older features with faces of the solid keep the surface step; otherwise a click on an edge picks the surface too
+      if ((f.faces || []).length) steps.push(surfaceOrFacesStep("Surface", "Click the surface body to extend, or a face of the solid."));
+      steps.push({ key: "edges", label: f.mode === "all" ? "Surface" : "Edges", kinds: ["sedge", "edge"], prop: "edges",
+        hint: f.mode === "all" ? "Click an edge of the surface body to extend." : "Click the edges to extend (edges of one surface body; click again to deselect). A click on an edge of another surface body starts again with that body.",
+        accept: (f, h) => {
+          if (!(f.faces || []).length) {
+            if (!h.surface) { msgPart("Click an edge of a surface body", true); return; }
+            if (h.surface !== f.source) { f.source = h.surface; f.edges = []; }
+            if (f.mode === "all") { PT.dirty = true; return; }
+          }
+          applyPick(f, { prop: "edges", kinds: ["edge"], single: false }, h);
+        },
+        html: f => `<p class="hint">${f.source ? itemName(f.source) + ": " : ""}${f.mode === "all" ? "the whole boundary." : (f.edges || []).length + " edge(s) selected."}</p>` + (f.mode === "all" ? "" : `<div class="buttons"><button type="button" data-clear="edges">Clear</button></div>`),
         bind: (f, box) => box.querySelectorAll("button[data-clear]").forEach(b => b.onclick = () => { f.edges = []; changedPart(); }),
-        summary: f => (f.edges || []).length + " edge(s)" });
+        done: f => f.mode === "all" ? !!f.source || (f.faces || []).length > 0 : (f.edges || []).length > 0,
+        summary: f => f.mode === "all" ? (f.source ? itemName(f.source) : "none") : (f.edges || []).length + " edge(s)" });
+      if (f.mode === "upto") steps.push({ key: "target", label: "Up to", kinds: ["surface"], single: true, before: false, hint: "Click the surface body to extend up to.",
+        accept: (f, h) => { if (h.id === f.source) { msgPart("Click another surface body", true); return; } f.target = h.id; PT.dirty = true; },
+        html: f => `<p class="hint">${f.target ? itemName(f.target) + "." : "No surface yet."} The extension is cut where it meets this surface; a surface that does not quite reach is extended beyond its own edges for the cut.</p>`,
+        done: f => !!f.target, summary: f => f.target ? itemName(f.target) : "none" });
       steps.push({ key: "extent", label: "Extent", html: f => { const sides = f.sides || "all"; const isList = Array.isArray(sides); const all = f.mode === "all";
-        return `<div class="grid2">` + num("pf-edist", "Distance (mm)", f.distance || 5) + select("pf-emode", "Extend", [["edges", "Across the selected edges (trim kept)"], ["all", "Whole boundary: untrimmed patch"]], f.mode || "edges") + `</div>` +
+        return `<div class="grid2">` + (f.mode === "upto" ? `<span></span>` : num("pf-edist", "Distance (mm)", f.distance || 5)) + select("pf-emode", "Extend", [["edges", "Across the selected edges by a distance"], ["upto", "Across the selected edges up to a surface"], ["all", "Whole boundary: untrimmed patch"]], f.mode || "edges") + `</div>` +
           (all ? select("pf-esides", "Sides", [["all", "All four sides"], ["point", "The side nearest to a point"], ["list", "Chosen parameter sides"]], isList ? "list" : sides) +
             (sides === "point" ? v3("pf-ep", "Point (mm)", f.point || [0, 0, 0]) : "") + (isList ? ["umin", "umax", "vmin", "vmax"].map(k => `<label class="check inline"><input type="checkbox" data-side="${k}"${sides.includes(k) ? " checked" : ""}> ${k}</label>`).join("") : "") : "") +
-          `<div class="grid2">` + num("pf-etol", "Fit tolerance (mm, splines)", f.tolerance || 0.01) + `<span></span></div>` + resultLine(f); },
+          `<div class="grid2">` + num("pf-etol", "Fit tolerance (mm, splines)", f.tolerance || 0.01) + `<span></span></div>` +
+          `<p class="hint">The extension is part of the face it extends: one face with the surface continued smoothly (a spline surface lengthened with curvature continuity, a plane, cylinder, cone, sphere or torus on itself).</p>` + resultLine(f); },
         bind: (f, box) => { bindAll(box, { "#pf-edist": el => { const x = numv(el.value); if (x > 0) f.distance = x; }, "#pf-emode": el => { f.mode = el.value; }, "#pf-etol": el => { const x = numv(el.value); if (x > 0) f.tolerance = x; }, "#pf-esides": el => { f.sides = el.value === "list" ? ["umin", "umax", "vmin", "vmax"] : el.value; } });
           bind3(box, "pf-ep", v => { f.point = v; }); box.querySelectorAll("input[data-side]").forEach(cb => cb.onchange = () => { f.sides = [...box.querySelectorAll("input[data-side]:checked")].map(x => x.dataset.side); changedPart(); }); },
-        summary: f => pfmt(f.distance || 5) + " mm" + (f.mode === "all" ? ", untrimmed patch" : "") });
+        summary: f => f.mode === "upto" ? "up to " + (f.target ? itemName(f.target) : "?") : pfmt(f.distance || 5) + " mm" + (f.mode === "all" ? ", untrimmed patch" : "") });
       return steps;
     },
   },
-  surf_offset: { title: "Offset surface", defaults: () => ({ source: null, faces: [], distance: 2 }),
-    steps: f => [surfaceOrFacesStep("Surface", "Click a surface body or faces of the solid to offset."), { key: "distance", label: "Distance", html: f => `<div class="grid2">` + num("pf-odist", "Distance (mm, along the normals)", f.distance || 0) + `<span></span></div>` + resultLine(f), bind: (f, box) => bindAll(box, { "#pf-odist": el => { f.distance = numv(el.value) || 0; } }), summary: f => pfmt(f.distance || 0) + " mm" }] },
+  surf_offset: { title: "Offset surface", defaults: () => ({ source: null, faces: [], distance: 2, join: "auto" }),
+    steps: f => [surfaceOrFacesStep("Surface", "Click a surface body or faces of the solid to offset."), { key: "distance", label: "Distance", html: f => `<div class="grid2">` + num("pf-odist", "Distance (mm, along the normals)", f.distance || 0) +
+          select("pf-ojoin", "Join at the edges", [["auto", "Automatic (intersection, then arcs, then face by face)"], ["intersection", "Intersection: faces extended or trimmed to meet"], ["arcs", "Arcs at the convex edges"], ["faces", "Face by face, cut at the sharp edges"], ["simple", "Each face on its own (no join)"]], f.join || "auto") + `</div>` +
+          `<p class="hint">Automatic takes the first join that gives a valid body. A spike or an overshoot at a corner comes from an intersection join: choose Arcs or Face by face there.</p>` + resultLine(f),
+        bind: (f, box) => bindAll(box, { "#pf-odist": el => { f.distance = numv(el.value) || 0; }, "#pf-ojoin": el => { f.join = el.value; } }), summary: f => pfmt(f.distance || 0) + " mm" + (f.join && f.join !== "auto" ? ", " + f.join : "") }] },
+  curve_project: { title: "Project curve", defaults: () => ({ source: null, target: null, method: "normal", direction: [0, 0, 0], keep: "nearest" }),
+    steps: f => [{ key: "source", label: "Curve", kinds: ["curve", "sketch"], single: true, before: false, hint: "Click the curve to project: a curve body or a sketch.",
+        accept: (f, h) => { f.source = h.id; PT.dirty = true; },
+        html: f => refSelect("pf-pjsrc", "Curve", itemsAbove(featIndex(f.id), x => CURVE_TYPES.has(x.type) || x.type === "sketch"), f.source),
+        bind: (f, box) => bindAll(box, { "#pf-pjsrc": el => { f.source = el.value || null; } }), done: f => !!f.source, summary: f => f.source ? itemName(f.source) : "none" },
+      { key: "target", label: "Onto", kinds: ["surface", "body"], single: true, before: false, hint: "Click the surface body to project onto, or the solid.",
+        accept: (f, h) => { f.target = h.kind === "surface" ? h.id : null; PT.dirty = true; },
+        html: f => refSelect("pf-pjtgt", "Surface", surfaceItems(featIndex(f.id), false), f.target, "(the solid)"),
+        bind: (f, box) => bindAll(box, { "#pf-pjtgt": el => { f.target = el.value || null; } }), done: f => true,
+        summary: f => f.target ? itemName(f.target) : "the solid" },
+      { key: "opts", label: "Options", html: f => select("pf-pjm", "Projection", [["normal", "Normal to the surface (nearest points)"], ["direction", "Along a direction"]], f.method || "normal") +
+          (f.method === "direction" ? v3("pf-pjd", "Direction (0, 0, 0: normal of the sketch plane)", f.direction || [0, 0, 0]) +
+            select("pf-pjk", "Keep", [["nearest", "The projection nearest to the curve"], ["all", "All projections (every side the direction meets)"]], f.keep || "nearest") : "") + resultLine(f),
+        bind: (f, box) => { bindAll(box, { "#pf-pjm": el => { f.method = el.value; }, "#pf-pjk": el => { f.keep = el.value; } }); bind3(box, "pf-pjd", v => { f.direction = v; }); },
+        summary: f => f.method === "direction" ? "along a direction" : "normal" }] },
+  surf_sweep: { title: "Sweep surface", defaults: () => ({ profile: null, path: null, orient: "corrected", smooth: 0.02 }),
+    steps: f => ["profile", "path"].map(k => ({ key: k, label: k === "profile" ? "Profile" : "Path", kinds: ["curve", "sketch"], single: true, before: false,
+        hint: k === "profile" ? "Click the profile: a curve body or a sketch (each separate chain is swept)." : "Click the path: a curve body or a sketch (one connected chain).",
+        accept: (f, h) => { if (h.id === (k === "profile" ? f.path : f.profile)) { msgPart("The profile and the path must differ", true); return; } f[k] = h.id; PT.dirty = true; },
+        html: f => refSelect("pf-sw" + k, k === "profile" ? "Profile" : "Path", itemsAbove(featIndex(f.id), x => CURVE_TYPES.has(x.type) || x.type === "sketch"), f[k]),
+        bind: (f, box) => bindAll(box, { ["#pf-sw" + k]: el => { f[k] = el.value || null; } }),
+        done: f => !!f[k], summary: f => f[k] ? itemName(f[k]) : "none" }))
+      .concat([{ key: "opts", label: "Options", html: f => select("pf-sworient", "Profile orientation", [["corrected", "Corrected Frenet (no twist)"], ["discrete", "Discrete frame (paths with tight bends)"], ["frenet", "Frenet (follows the path curvature)"], ["fixed", "Fixed (moved without turning)"]], f.orient || "corrected") +
+          `<div class="grid2">` + num("pf-swsmooth", "Smooth the path within (mm, 0: off)", f.smooth === undefined ? 0.02 : f.smooth) + `<span></span></div>` +
+          `<p class="hint">The profile is swept from where it lies along the path; the path corners are joined by extended and intersected sections. Open profiles give open surfaces; a closed profile gives a tube. Smooth: the path is replaced by one smooth spline within the tolerance (short edges, kinks and breaks up to 1 mm of an extracted curve removed).</p>` + resultLine(f),
+        bind: (f, box) => bindAll(box, { "#pf-sworient": el => { f.orient = el.value; }, "#pf-swsmooth": el => { const v = numv(el.value); if (v >= 0) f.smooth = v; } }),
+        summary: f => ({ frenet: "Frenet", discrete: "discrete frame", fixed: "fixed" }[f.orient] || "corrected Frenet") + ((f.smooth === undefined ? 0.02 : f.smooth) ? ", smoothed" : "") }]) },
+  surf_gaps: { title: "Close gaps", defaults: () => ({ source: null, max_gap: 0.5 }),
+    steps: f => [sourceStep("Surface", "source", false, "Click the surface body whose gaps to close, or choose it."),
+      { key: "opts", label: "Gap", html: f => `<div class="grid2">` + num("pf-gmax", "Maximum gap (mm)", f.max_gap || 0.5) + `<span></span></div>` +
+          `<p class="hint">A gap is a free edge of one face with free edges of another face beside it, at most the maximum gap apart over its whole length (a split between two faces). One of the two faces is extended to the edges of the other and the faces are sewn into one shell. The source body is hidden.</p>` + resultLine(f),
+        bind: (f, box) => bindAll(box, { "#pf-gmax": el => { const v = numv(el.value); if (v > 0) f.max_gap = v; } }), summary: f => "up to " + pfmt(f.max_gap || 0.5) + " mm" }] },
   thicken: { title: "Thicken", defaults: () => ({ source: null, faces: [], thickness: 1, side: "+", mode: "add" }),
     steps: f => [surfaceOrFacesStep("Surface", "Click a surface body or faces of the solid to thicken.", true), { key: "thickness", label: "Thickness", html: f => `<div class="grid2">` + num("pf-tth", "Thickness (mm)", f.thickness || 1) + select("pf-tside", "Side", [["+", "Along the normal"], ["-", "Against the normal"], ["both", "Both (half each)"]], f.side || "+") + `</div>` +
         select("pf-tmode", "Result", [["add", "Add to the part"], ["cut", "Remove from the part"], ["new", "New cell"]], f.mode || "add") + resultLine(f),
@@ -2734,8 +2976,13 @@ const COMMANDS = {
           "#pf-sffa": el => { f.flip_a = el.checked; }, "#pf-sffb": el => { f.flip_b = el.checked; }, "#pf-sftrim": el => { f.trim = el.checked; } }),
         summary: f => "R" + pfmt(f.radius || 2) + (f.mode === "edges" ? ", edges" : (f.flip_a || f.flip_b ? ", flipped" : "") + (f.trim === false ? ", fillet only" : ", trimmed")) };
       if (f.mode === "edges") return [sourceStep("Surface", "source", false, "Click the surface body whose edges to round, or choose it."),
-        { key: "edges", label: "Edges", kinds: ["sedge"], prop: "edges", before: false, hint: "Click the edges to round (where two faces of the body meet); click again to deselect.",
-          accept: (f, h) => { if (h.surface !== f.source) { msgPart("Click an edge of " + itemName(f.source), true); return; } applyPick(f, { prop: "edges", kinds: ["edge"], single: false }, h); },
+        { key: "edges", label: "Edges", kinds: ["sedge", "edge"], prop: "edges", before: false, hint: "Click the edges to round (where two faces of a surface body meet); click again to deselect.",
+          accept: (f, h) => {
+            if (!h.surface) { msgPart("Click an edge of a surface body", true); return; }
+            // an edge of another surface body: that body becomes the surface
+            if (h.surface !== f.source) { f.source = h.surface; f.edges = []; }
+            applyPick(f, { prop: "edges", kinds: ["edge"], single: false }, h);
+          },
           html: f => `<p class="hint">${(f.edges || []).length} edge(s) selected.</p><div class="buttons"><button type="button" data-clear="edges">Clear</button></div>`,
           bind: (f, box) => box.querySelectorAll("button[data-clear]").forEach(b => b.onclick = () => { f.edges = []; changedPart(); }),
           done: f => (f.edges || []).length > 0, summary: f => (f.edges || []).length + " edge(s)" }, opts];
@@ -2757,9 +3004,47 @@ const COMMANDS = {
         },
         done: f => (f["edges_" + k] || []).length > 0 || (f["curves_" + k] || []).length > 0,
         summary: f => [(f["edges_" + k] || []).length ? (f["edges_" + k] || []).length + " edge(s)" : "", (f["curves_" + k] || []).length ? (f["curves_" + k] || []).length + " curve(s)" : ""].filter(Boolean).join(", ") || "none" }))
-      .concat([{ key: "opts", label: "Options", html: f => check("pf-bflip", "Flip (join the ends of side A to the other ends of side B)", f.flip) +
-          `<p class="hint">Straight lines join the ends of side A to the nearer ends of side B (corner to corner) and the points between; the result is a surface body. Sew surfaces joins it to the neighbouring surfaces.</p>` + resultLine(f),
-        bind: (f, box) => bindAll(box, { "#pf-bflip": el => { f.flip = el.checked; } }), summary: f => f.flip ? "flipped" : "corner to corner" }]) },
+      .concat([{ key: "opts", label: "Options", html: f => select("pf-bcont", "Continuity", [["ruled", "Ruled (straight lines between the sides)"], ["tangent", "Tangent to the faces of both sides"]], f.continuity || "ruled") +
+          (f.continuity === "tangent" ? `<div class="grid2">` + num("pf-bfac", "Tangent length (x the distance between the sides)", f.factor === undefined ? 1 : f.factor) + `<span></span></div>` : "") +
+          check("pf-bflip", "Flip (join the ends of side A to the other ends of side B)", f.flip) +
+          `<p class="hint">The ends of side A are joined to the nearer ends of side B (corner to corner) and the points between; the result is a surface body. Tangent: the surface leaves each side in the plane of the face that owns the side's edges (a side on a curve body: position only). Sew surfaces joins it to the neighbouring surfaces.</p>` + resultLine(f),
+        bind: (f, box) => bindAll(box, { "#pf-bcont": el => { f.continuity = el.value; }, "#pf-bfac": el => { const v = numv(el.value); if (v > 0) f.factor = v; }, "#pf-bflip": el => { f.flip = el.checked; } }),
+        summary: f => (f.continuity === "tangent" ? "tangent" : "ruled") + (f.flip ? ", flipped" : "") }]) },
+  curve_blend: { title: "Blend curve", needsSolid: false, defaults: () => ({ ends: [null, null] }),
+    steps: f => [0, 1].map(i => ({ key: "end_" + i, label: "End " + "AB"[i], kinds: ["edge", "sedge", "curve", "point"], before: false,
+        hint: `Click the end of an edge (of the solid or of a surface body) or of a curve body near end ${"AB"[i]}, or a vertex or point feature. The curve continues the edge from the end nearer the click.`,
+        accept(f, h) {
+          f.ends = f.ends || [null, null];
+          const prev = f.ends[i] || {};
+          const at = (h.point || [0, 0, 0]).map(v => +(+v).toFixed(6));
+          if (h.kind === "point") f.ends[i] = { kind: "point", point: refOf(h) };
+          else if (h.kind === "curve") f.ends[i] = { kind: "curve", body: h.id, at, cont: prev.cont || "tangent", factor: prev.factor || 1 };
+          else f.ends[i] = { kind: "edge", ref: refOf(h), body: h.surface || null, at, cont: prev.cont || "tangent", factor: prev.factor || 1 };
+          PT.dirty = true;
+        },
+        html: f => { const e = (f.ends || [])[i]; if (!e) return `<p class="hint">Nothing picked.</p>`;
+          if (e.kind === "point") return `<p class="hint">Point: ${pesc(itemName(e.point))}.</p><div class="buttons"><button type="button" data-eclear="${i}">Clear</button></div>`;
+          return `<p class="hint">${e.kind === "curve" ? "End of " + pesc(itemName(e.body)) : "Edge end"} at (${e.at.map(v => pfmt(v, 2)).join(", ")}).</p>` +
+            select("pf-bcont" + i, "Continuity", [["position", "Position"], ["tangent", "Tangent (continues the edge)"], ["curvature", "Curvature"]], e.cont || "tangent") +
+            (e.cont !== "position" ? `<div class="grid2">` + num("pf-bfac" + i, "Tangent length (x the distance between the ends)", e.factor === undefined ? 1 : e.factor) + `<span></span></div>` : "") +
+            `<div class="buttons"><button type="button" data-eclear="${i}">Clear</button></div>`; },
+        bind: (f, box) => { bindAll(box, { ["#pf-bcont" + i]: el => { f.ends[i].cont = el.value; }, ["#pf-bfac" + i]: el => { const v = numv(el.value); if (v > 0) f.ends[i].factor = v; } });
+          box.querySelectorAll("button[data-eclear]").forEach(b => b.onclick = () => { f.ends[i] = null; changedPart(); }); },
+        done: f => !!(f.ends || [])[i],
+        summary: f => { const e = (f.ends || [])[i]; return e ? (e.kind === "point" ? itemName(e.point) : (e.kind === "curve" ? itemName(e.body) : "edge") + ", " + (e.cont || "tangent")) : "none"; } }))
+      .concat([{ key: "opts", label: "Result", html: f => `<p class="hint">A curve body: a cubic (tangent) or quintic (curvature) Bezier curve between the two ends. Fill surface, Loft surface, Bridge surface, Extend surface (up to) and Sweep surface take it.</p>` + resultLine(f), summary: f => "" }]) },
+  curve_points: { title: "Curve through points", needsSolid: false, defaults: () => ({ points: [], method: "polyline", closed: false }),
+    steps: f => [{ key: "points", label: "Points", kinds: ["point"], multi: true, before: false,
+        hint: "Click vertices of the solid, of surface and curve bodies, or point features, in order. Click again to remove a point.",
+        accept(f, h) { f.points = f.points || []; const ref = refOf(h); const k = f.points.findIndex(x => sameRef(x, ref)); if (k >= 0) f.points.splice(k, 1); else f.points.push(ref); PT.dirty = true; },
+        // the chips (hover and click highlight the point, x removes it, Clear) are bound by bindChips
+        html: f => ((f.points || []).length ? `<div class="cw-chips" data-prop="points">` + (f.points || []).map((p, k) => `<span class="cw-chip" data-i="${k}" title="${pesc(itemName(p))}. Click: keep highlighted">${k + 1} · ${pesc(isVertexRef(p) ? "(" + p.map(v => pfmt(v, 2)).join(", ") + ")" : itemName(p))}<button type="button" data-cwdel="${k}" title="Remove">×</button></span>`).join("") + `</div>` +
+          `<div class="buttons"><button type="button" data-cwclear="points">Clear</button></div>` : `<p class="hint">No point yet.</p>`),
+        done: f => (f.points || []).length >= 2, summary: f => (f.points || []).length + " point(s)" },
+      { key: "opts", label: "Curve", html: f => select("pf-cpm", "Curve", [["polyline", "Polyline (straight segments)"], ["spline", "Smooth spline through the points"], ["line", "Best-fit straight line"], ["arc", "Circular arc through three points"]], f.method || "polyline") +
+          (f.method === "polyline" || f.method === "spline" || !f.method ? check("pf-cpclosed", "Closed", !!f.closed) : "") + resultLine(f),
+        bind: (f, box) => bindAll(box, { "#pf-cpm": el => { f.method = el.value; }, "#pf-cpclosed": el => { f.closed = el.checked; } }),
+        summary: f => (f.method || "polyline") + (f.closed && (f.method === "polyline" || f.method === "spline" || !f.method) ? ", closed" : "") }] },
   surf_fill: { title: "Fill surface", defaults: () => ({ edges: [], tangent: true, curves: [], sketch_refs: [] }),
     steps: f => [{ key: "edges", label: "Boundary", multi: true, kinds: ["edge", "sedge", "face", "sketch", "curve"], before: false,
         hint: "Click the edges of the closed loop: edges of the solid or of surface bodies, sketch curves (the whole sketch), curve bodies. Click again to deselect.",
@@ -2780,10 +3065,11 @@ const COMMANDS = {
         done: f => (f.edges || []).length > 0 || (f.curves || []).length > 0 || (f.sketch_refs || []).length > 0,
         summary: f => [(f.edges || []).length ? (f.edges || []).length + " edge(s)" : "", (f.sketch_refs || []).length ? (f.sketch_refs || []).map(itemName).join(", ") : "", (f.curves || []).length ? (f.curves || []).length + " curve(s)" : ""].filter(Boolean).join(", ") || "none" },
       { key: "opts", label: "Options", html: f => check("pf-ftan", "Tangent to the adjacent faces", f.tangent !== false) + resultLine(f), bind: (f, box) => bindAll(box, { "#pf-ftan": el => { f.tangent = el.checked; } }), summary: f => f.tangent !== false ? "tangent" : "position only" }] },
-  curve_extract: { title: "Extract curve", needsSolid: false, defaults: () => ({ edges: [], tangent_chain: false, clean: "none", tolerance: 0.05, project: "" }),
+  curve_extract: { title: "Extract curve", needsSolid: false, defaults: () => ({ edges: [], tangent_chain: false, clean: "none", tolerance: 0.05, gap: 0.5, project: "" }),
     steps: f => [Object.assign(edgesStep("Edges", "edges", "Click the edges of the curve: edges of the solid or of surface bodies."), { kinds: ["edge", "sedge", "face"] }), { key: "opts", label: "Clean", html: f => select("pf-cclean", "Clean", [["none", "None (edges as they are)"], ["smooth", "Join into one smooth spline within tolerance"], ["analytic", "Line or circular arc within tolerance, else smooth spline"]], f.clean || "none") +
-        `<div class="grid2">` + num("pf-ctol", "Tolerance (mm)", f.tolerance || 0.05) + `<span></span></div>` + sourceSelect("pf-cproj", f, "project", false, false).replace("Surface<", "Project onto surface<") + resultLine(f),
-      bind: (f, box) => bindAll(box, { "#pf-cclean": el => { f.clean = el.value; }, "#pf-ctol": el => { const v = numv(el.value); if (v > 0) f.tolerance = v; }, "#pf-cproj": el => { f.project = el.value; } }), summary: f => f.clean || "none" }] },
+        `<div class="grid2">` + num("pf-ctol", "Tolerance (mm)", f.tolerance || 0.05) + num("pf-cgap", "Bridge gaps up to (mm, 0: off)", f.gap || 0) + `</div>` +
+        `<p class="hint">Breaks between the picked edges up to the gap are bridged with straight lines and the curve is one chain (with Clean the spline is fitted across them).</p>` + sourceSelect("pf-cproj", f, "project", false, false).replace("Surface<", "Project onto surface<") + resultLine(f),
+      bind: (f, box) => bindAll(box, { "#pf-cclean": el => { f.clean = el.value; }, "#pf-ctol": el => { const v = numv(el.value); if (v > 0) f.tolerance = v; }, "#pf-cgap": el => { const v = numv(el.value); if (v >= 0) f.gap = v; }, "#pf-cproj": el => { f.project = el.value; } }), summary: f => (f.clean || "none") + (f.gap ? ", gaps up to " + pfmt(f.gap) + " mm" : "") }] },
 };
 
 /** Legacy single-step commands: the parameter panel of the feature type (LEGACY_PANELS). */
@@ -2898,10 +3184,10 @@ const STICKY = {
   offset_faces: ["distance", "tangent"], move_faces: ["vector", "tangent"], combine: ["min_area"],
   hole_mesh: ["factor", "n_circ", "n_rad", "bias", "n_thick"], smooth: ["tolerance", "segments", "continuity"],
   replace: ["method", "tolerance", "offset", "pad", "min_area"], surf_fit: ["method", "tolerance", "extend", "offset"],
-  surf_sketch: ["depth", "symmetric", "angle"], surf_extend: ["mode", "distance", "sides", "tolerance"],
+  surf_sketch: ["depth", "symmetric", "angle"], surf_extend: ["distance", "sides", "tolerance"],
   surf_offset: ["distance"], thicken: ["thickness", "side", "mode"], surf_extract: ["offset"],
-  surf_fillet: ["radius", "trim"], surf_fill: ["tangent"], surf_sew: ["tolerance"],
-  curve_extract: ["tangent_chain", "clean", "tolerance"], surf_from_curve: ["depth", "symmetric", "angle"], sweep: ["kind", "mode", "tool_at"],
+  surf_fillet: ["radius", "trim"], surf_fill: ["tangent"], surf_sew: ["tolerance"], surf_gaps: ["max_gap"], surf_sweep: ["orient", "smooth"], curve_project: ["method", "keep"],
+  curve_extract: ["tangent_chain", "clean", "tolerance", "gap"], surf_from_curve: ["depth", "symmetric", "angle"], sweep: ["kind", "mode", "tool_at"],
 };
 async function loadLast() {
   try { const r = await fetch("/api/part/last"); if (r.ok) PT.last = await r.json(); } catch (e) { /* defaults */ }
@@ -2985,7 +3271,7 @@ function finishCommand(silent) {
   const resume = c.resume, isNew = c.isNew;
   if (isNew) for (const sid of consumedSources(f)) PT.hidden[sid] = true;
   rememberLast(f);
-  PT.cmd = null;
+  PT.cmd = null; PT.chipPin = null; PT.chipHover = null;
   PT.sel = f.id;
   if (def.finish) { def.finish(f, isNew, resume); return; }
   changedPart();
@@ -3000,7 +3286,7 @@ function cancelCommand() {
     else Object.assign(f, JSON.parse(c.snapshot));
   }
   const resume = c.resume;
-  PT.cmd = null;
+  PT.cmd = null; PT.chipPin = null; PT.chipHover = null;
   changedPart();
   if (resume) resumeCommand(resume);
 }
@@ -3017,7 +3303,7 @@ function newSketchFor(f, prop) {
   const item = Object.assign({ id: newId(), name: nextName("sketch"), type: "sketch", suppressed: false }, COMMANDS.sketch.defaults());
   PT.part.features.splice(featIndex(f.id), 0, item);
   f[prop] = item.id;
-  PT.cmd = null;
+  PT.cmd = null; PT.chipPin = null; PT.chipHover = null;
   startCommand("sketch", { resume: r }, item.id);
   PT.cmd.isNew = true;
   renderTree(); renderCommand();
@@ -3049,16 +3335,21 @@ function regionsStep() {
 }
 
 async function loadRegions(f) {
-  PT.cmd.regions = null; PT.cmd.regionMode = "remove";
+  PT.cmd.regions = null; PT.cmd.regionMode = "remove"; PT.cmd.regionError = null;
   try {
     const r = await postJSON("/api/part/regions", { part: PT.part, index: featIndex(f.id) });
     const regs = await r.json();
     if (!PT.cmd || PT.cmd.id !== f.id) return;
+    if (regs && regs.error) { PT.cmd.regions = null; PT.cmd.regionError = "Regions: " + regs.error; renderCommand(); setMesh(PT.mesh); return; }
     PT.cmd.regions = regs;
     if (!f.keep) f.keep = "pick";
     renderCommand();
     setMesh(PT.mesh);
-  } catch (e) { msgPart("Regions: " + (e.message || e), true); }
+  } catch (e) {
+    msgPart("Regions: " + (e.message || e), true);
+    // the reason in the Regions section (in place of "Computing the regions...")
+    if (PT.cmd && PT.cmd.id === f.id) { PT.cmd.regionError = "Regions: " + (e.message || e); renderCommand(); }
+  }
 }
 
 /** The command bar in the properties panel. A render requested while a field of the bar has the focus (the
@@ -3133,7 +3424,9 @@ function selChips(f, s) {
   const v = s.prop && f[s.prop];
   if (!Array.isArray(v) || !v.length || !v.every(x => x && typeof x === "object" && (x.c || x.mid))) return "";
   const max = 40;
-  const chip = (x, i) => `<span class="cw-chip" data-i="${i}" title="${x.mid ? "Edge at (" + x.mid.map(q => pfmt(q, 2)).join(", ") + ")" : "Face at (" + x.c.map(q => pfmt(q, 2)).join(", ") + ")"}">` +
+  const pin = PT.chipPin;
+  const same = x => pin && ((x.mid && pin.mid && keyOfEdge(x) === keyOfEdge(pin)) || (x.c && pin.c && keyOfFace(x) === keyOfFace(pin)));
+  const chip = (x, i) => `<span class="cw-chip${same(x) ? " on" : ""}" data-i="${i}" title="${x.mid ? "Edge at (" + x.mid.map(q => pfmt(q, 2)).join(", ") + ")" : "Face at (" + x.c.map(q => pfmt(q, 2)).join(", ") + ")"}. Click: keep highlighted">` +
     (x.mid ? "Edge " + (i + 1) + " · " + pfmt(x.len, 2) + " mm" : "Face " + (i + 1) + " · " + pfmt(x.area, 2) + " mm^2") + `<button type="button" data-cwdel="${i}" title="Remove">×</button></span>`;
   return `<div class="cw-chips" data-prop="${pesc(s.prop)}">` + v.slice(0, max).map(chip).join("") + (v.length > max ? `<span class="hint">+${v.length - max} more</span>` : "") + `</div>`;
 }
@@ -3141,10 +3434,14 @@ const clearBtn = (f, s) => s.prop && Array.isArray(f[s.prop]) && f[s.prop].lengt
 function bindChips(f, box) {
   box.querySelectorAll(".cw-chips").forEach(el => {
     const prop = el.dataset.prop;
-    el.querySelectorAll("[data-cwdel]").forEach(b => b.onclick = e => { e.stopPropagation(); PT.chipHover = null; checkpointPart(); f[prop].splice(+b.dataset.cwdel, 1); changedPart(); });
+    el.querySelectorAll("[data-cwdel]").forEach(b => b.onclick = e => { e.stopPropagation(); PT.chipHover = null; PT.chipPin = null; checkpointPart(); f[prop].splice(+b.dataset.cwdel, 1); changedPart(); });
+    // the highlight of a chip: a face or edge reference as it is, a point (vertex or point feature) as {point}
+    const hoverOf = x => !x ? null : (x.c || x.mid) ? x : { point: pointOf(x) };
     el.querySelectorAll(".cw-chip").forEach(ch => {
-      ch.onmouseenter = () => { PT.chipHover = (f[prop] || [])[+ch.dataset.i] || null; drawSelection(); };
+      ch.onmouseenter = () => { PT.chipHover = hoverOf((f[prop] || [])[+ch.dataset.i]); drawSelection(); };
       ch.onmouseleave = () => { PT.chipHover = null; drawSelection(); };
+      // a click keeps the element highlighted in the view until the chip is clicked again or another chip is clicked
+      ch.onclick = e => { if (e.target.closest("[data-cwdel]")) return; const x = hoverOf((f[prop] || [])[+ch.dataset.i]); PT.chipPin = ch.classList.contains("on") ? null : x; el.querySelectorAll(".cw-chip").forEach(c => c.classList.toggle("on", c === ch && !!PT.chipPin)); drawSelection(); };
     });
   });
   box.querySelectorAll("[data-cwclear]").forEach(b => b.onclick = e => { e.stopPropagation(); checkpointPart(); f[b.dataset.cwclear] = []; changedPart(); });
@@ -3226,10 +3523,12 @@ function pickButtonsCore(f, kind, prop, single, title, label) {
   const active = PT.cmd && PT.cmd.pick && PT.cmd.pick.prop === prop;
   const n = single ? (f[prop] ? 1 : 0) : (f[prop] || []).length;
   return `<div class="buttons"><button type="button" data-pick="${prop}" class="${active ? "" : "primary"}">${active ? "Done picking" : label}</button>` +
-    (single ? "" : `<button type="button" data-clear="${prop}">Clear</button>`) + `<span class="hint">${n} selected</span></div>`;
+    (single ? "" : `<button type="button" data-clear="${prop}">Clear</button>`) + `<span class="hint">${n} selected</span></div>` +
+    (single ? "" : selChips(f, { prop }));
 }
 function bindPicks(f, box, defs) {
   bindFaceMode(box);
+  bindChips(f, box);
   // a click in the view feeds the first pick of the panel without pressing its pick button first
   if (PT.cmd && PT.cmd.id === f.id) PT.cmd.legacyDefs = defs;
   box.querySelectorAll("button[data-pick]").forEach(b => {
@@ -3265,6 +3564,7 @@ const LEGACY_DEFAULTS = {
   combine: () => ({ faces: [], min_area: 0 }),
   hole_mesh: () => ({ faces: [], factor: 2, n_circ: 3, n_rad: 4, bias: 2, n_thick: 4 }),
   smooth: () => ({ tolerance: 0.05, segments: 6, continuity: "C2" }),
+  merge_tangent: () => ({ faces: [], angle: 1, splines_only: true, points: 8, max_dev: 0.1 }),
   replace: () => ({ faces: [], method: "analytic", tolerance: 0.05, offset: 0, pad: 1, min_area: 0 }),
   surf_fit: () => ({ faces: [], method: "analytic", tolerance: 0.05, extend: 0.3, offset: 0 }),
   surf_loft: () => ({ sections: [{ plane: "XY", offset: 0, sketch: emptySketch() }, { plane: "XY", offset: 20, sketch: emptySketch() }], ruled: false, curves: [] }),
@@ -3313,22 +3613,26 @@ const LEGACY_PANELS = {
       check("pf-crebuild", "Rebuild faces on the wrong range of a periodic surface (torus, cylinder, cone, sphere)", !!cl.rebuild) +
       check("pf-cfix", "Fix topology, tolerances and edge curves on faces", !!cl.fix) +
       check("pf-cunify", "Merge coplanar faces and collinear edges", !!cl.unify) +
-      `<div class="grid2">` + num("pf-cminvol", "Remove solids below (mm^3, 0: off)", cl.min_volume || 0) + `<span></span></div>` + resultText(PT.status[f.id] || {}) +
+      check("pf-cana", "Spline faces to planes, cylinders, cones, spheres and tori (an exporter that writes every face as a spline)", !!cl.analytic) +
+      `<div class="grid2">` + num("pf-cminvol", "Remove solids below (mm^3, 0: off)", cl.min_volume || 0) + num("pf-canatol", "Spline to surface tolerance (mm)", cl.analytic_tol || 0.001) + `</div>` + resultText(PT.status[f.id] || {}) +
       `<p class="hint">Each clean-up step is kept only when the solid stays one solid, its volume changes by less than 1 % (rebuilt faces: 5 %) and it does not make a valid solid invalid. The result line gives the invalid solids and faces before and after. The imported solids are the base geometry; partitions and the other features apply to them.</p>`));
     const setClean = (k, v) => { f.clean = Object.assign({}, f.clean || {}, { [k]: v }); };
     const setStl = (k, v) => { f.stl = Object.assign({ fit: true }, f.stl || {}, { [k]: v }); };
     bindAll(box, { "#pf-smode": el => setStl("mode", el.value), "#pf-smax": el => setStl("max_triangles", Math.max(100, Math.round(numv(el.value) || 20000))), "#pf-sfit": el => setStl("fit", el.checked), "#pf-stol": el => setStl("tolerance", Math.max(0, numv(el.value) || 0)),
                    "#pf-sang": el => { const v = numv(el.value); if (v > 0) setStl("angle", v); }, "#pf-ssmooth": el => { const v = numv(el.value); if (v > 0) setStl("smooth", v); } });
     bindAll(box, { "#pf-path": el => { f.path = el.value.trim(); if (/\.stl$/i.test(f.path) && !f.stl) f.stl = { fit: true }; }, "#pf-partidx": el => { const v = el.value.trim(); f.part = v === "" ? null : v; },
-                   "#pf-crebuild": el => setClean("rebuild", el.checked), "#pf-cfix": el => setClean("fix", el.checked), "#pf-cunify": el => setClean("unify", el.checked),
+                   "#pf-crebuild": el => setClean("rebuild", el.checked), "#pf-cfix": el => setClean("fix", el.checked), "#pf-cunify": el => setClean("unify", el.checked), "#pf-cana": el => setClean("analytic", el.checked), "#pf-canatol": el => setClean("analytic_tol", Math.max(1e-6, numv(el.value) || 0.001)),
                    "#pf-cminvol": el => setClean("min_volume", Math.max(0, numv(el.value) || 0)) });
     box.querySelector("#pf-browse").onclick = async () => { try { const p = await window.browse("open", "model", "", "STEP or STL file to import"); if (p) { f.path = p; if (/\.stl$/i.test(p) && !f.stl) f.stl = { fit: true }; changedPart(); } } catch (e) { showErr(e); } };
   },
   unify(f, box) {
     box.innerHTML = check("pf-uf", "Merge coplanar and co-cylindrical faces", f.faces !== false) + check("pf-ue", "Merge collinear and co-circular edges", f.edges !== false) +
-      `<div class="grid2">` + num("pf-uang", "Angular tolerance (deg, 0: exact)", f.angle || 0) + `<span></span></div>` + resultText(PT.status[f.id] || {}) +
-      `<p class="hint">Removes the face and edge splits left by imports and booleans (CAE: virtual topology, remove redundant entities).</p>`;
-    bindAll(box, { "#pf-uf": el => { f.faces = el.checked; }, "#pf-ue": el => { f.edges = el.checked; }, "#pf-uang": el => { f.angle = numv(el.value) || 0; } });
+      `<div class="grid2">` + num("pf-uang", "Angular tolerance (deg, 0: exact)", f.angle || 0) + `<span></span></div>` +
+      check("pf-uana", "Spline faces to planes, cylinders, cones, spheres and tori first", !!f.analytic) +
+      `<div class="grid2">` + num("pf-utol", "Spline to surface tolerance (mm)", f.tolerance || 0.001) + `<span></span></div>` + resultText(PT.status[f.id] || {}) +
+      `<p class="hint">Removes the face and edge splits left by imports and booleans (CAE: virtual topology, remove redundant entities). Faces merge only when they lie on the same surface. An exporter that writes planes and cylinders as splines gives each face its own surface: with the first option those faces are rebuilt on a plane, cylinder, cone, sphere or torus when they lie on one within the tolerance, and then merge (the line above gives the count). Free-form faces stay as they are.</p>`;
+    bindAll(box, { "#pf-uf": el => { f.faces = el.checked; }, "#pf-ue": el => { f.edges = el.checked; }, "#pf-uang": el => { f.angle = numv(el.value) || 0; },
+                   "#pf-uana": el => { f.analytic = el.checked; }, "#pf-utol": el => { f.tolerance = Math.max(1e-6, numv(el.value) || 0.001); } });
   },
   heal(f, box) {
     box.innerHTML = `<div class="grid2">` + num("pf-htol", "Small edges below (mm, 0: off)", f.tolerance || 0) + num("pf-hsmall", "Small faces narrower than (mm, 0: off)", f.small_faces || 0) + `</div>` + resultText(PT.status[f.id] || {}) +
@@ -3343,6 +3647,16 @@ const LEGACY_PANELS = {
       `<div class="grid2">` + num("pf-rpad", "Pad depth (mm)", f.pad || 1) + num("pf-rmin", "Also small faces below (mm^2)", f.min_area || "") + `</div>` + resultText(PT.status[f.id] || {}) +
       `<p class="hint">The surface of the largest picked face is cleaned (fitted) and offset. Within the footprint of the picked faces, material outside the clean surface is cut away and material up to the clean surface is added (CAE: replace faces).</p>`;
     bindAll(box, { "#pf-rmethod": el => { f.method = el.value; }, "#pf-rsrc": el => { f.source = el.value; }, "#pf-rtol": el => { const v = numv(el.value); if (v > 0) f.tolerance = v; }, "#pf-roff": el => { f.offset = numv(el.value) || 0; }, "#pf-rpad": el => { const v = numv(el.value); if (v > 0) f.pad = v; }, "#pf-rmin": el => { f.min_area = numv(el.value) || 0; } });
+    bindPicks(f, box, { faces: { kind: "face", single: false } });
+  },
+  merge_tangent(f, box) {
+    box.innerHTML = pickButtons(f, "face", "faces", false, "", "Pick faces (none: all)") +
+      `<div class="grid2">` + num("pf-mtang", "Faces meeting at less than (deg)", f.angle || 1) + num("pf-mtdev", "Max deviation (mm)", f.max_dev || 0.1) + `</div>` +
+      `<div class="grid2">` + num("pf-mtpts", "Points per face (n x n)", f.points || 8) + `<span></span></div>` +
+      check("pf-mtspl", "Spline faces only (with no faces picked)", f.splines_only !== false) + resultText(PT.status[f.id] || {}) +
+      `<p class="hint">Groups of faces that meet at less than the angle (the tangent patches an exporter writes for one smooth surface) are each replaced by one smooth face through the boundary edges of the group and points inside its faces. A group whose faces do not have one boundary loop, whose new face is farther than the deviation from the old faces, or that would make the solid invalid stays as it is. Smoothness comes before the exact shape: the volume can change a little (the line above gives it).</p>`;
+    bindAll(box, { "#pf-mtang": el => { const v = numv(el.value); if (v > 0) f.angle = v; }, "#pf-mtdev": el => { const v = numv(el.value); if (v > 0) f.max_dev = v; },
+                   "#pf-mtpts": el => { const v = parseInt(el.value); if (v >= 3) f.points = v; }, "#pf-mtspl": el => { f.splines_only = el.checked; } });
     bindPicks(f, box, { faces: { kind: "face", single: false } });
   },
   smooth(f, box) {
@@ -3480,12 +3794,22 @@ async function editSketch(id, isNew, section, resume) {
   if (PT.cmd && PT.cmd.id === id) { resume = resume || PT.cmd.resume; PT.cmd = null; }
   if (!PT.cmd) { PT.sel = id; renderProps(); }
   msgPart("Sketch editor: reading the reference geometry");
-  let refs = [];
-  try {
-    const r = await postJSON("/api/part/refs", { part: PT.part, index: featIndex(id), path: false, section: section === undefined ? null : section });
-    refs = await r.json();
-  } catch (e) { /* reference geometry is optional */ }
+  const index = featIndex(id);
+  // the reference geometry (again on Cut at plane / Flip in the sketch bar) and the model up to the sketch for the
+  // shaded view under the sketch
+  const readRefs = async cut => { const r = await postJSON("/api/part/refs", { part: PT.part, index, path: false, section: section === undefined ? null : section, cut: cut || null }); return await r.json(); };
+  const readModel = async () => { const r = await postJSON("/api/part/build", { part: PT.part, upto: index }); const j = await r.json(); return { mesh: j.mesh, surfaces: j.surfaces || {} }; };
+  const cut = window.sketchRefOptions ? window.sketchRefOptions().cut : null;
+  let refs = [], model = null;
+  const [rr, rm] = await Promise.allSettled([readRefs(cut), readModel()]);
+  if (rr.status === "fulfilled") refs = rr.value;            // reference geometry and the shaded view are optional
+  if (rm.status === "fulfilled") model = rm.value;
   const title = sec ? `${f.name}: section ${section + 1} on ${planeName(sec.plane || "XY")}, offset ${pfmt(+sec.offset || 0)} mm` : `${f.name} on ${planeSummary(f)}`;
+  const frame = (refs || []).find(e => e.t === "frame");
+  let underlay = null;
+  if (model && frame && frame.o3 && ((model.mesh && model.mesh.vertices.length) || Object.keys(model.surfaces).length)) {
+    try { underlay = createSketchUnderlay(model, frame, index); } catch (e) { console.error(e); underlay = null; }
+  }
   sketchEditForPart(sec ? sec.sketch : f.sketch, refs, title, sk => {
     if (sk) { if (sec) sec.sketch = sk; else f.sketch = sk; PT.dirty = true; }
     else if (isNew && !sec && !(f.sketch.entities || []).length) {
@@ -3496,7 +3820,7 @@ async function editSketch(id, isNew, section, resume) {
     changedPart();
     if (resume) resumeCommand(resume);
     setTimeout(resize3, 0);
-  });
+  }, { reload: readRefs, underlay });
 }
 
 // ------------------------------------------------------------------ configurations
@@ -3625,11 +3949,11 @@ function loadPart(p) {
   if (!p.uid) { p.uid = newUid(); p.legacy_ann = true; }      // uid identifies the part's drawing annotations; legacy_ann: annotations stored by name are taken over
   PT.part = p; PT.undo = []; PT.redo = [];
   PT.sel = null;
-  PT.cmd = null;
+  PT.cmd = null; PT.chipPin = null; PT.chipHover = null;
   PT.status = {};
   PT.hidden = {};
   if (Array.isArray(p.hidden)) for (const id of p.hidden) PT.hidden[id] = true;
-  else for (const f of p.features || []) for (const sid of consumedSources(f)) PT.hidden[sid] = true;
+  else for (const f of p.features || []) if (!f.suppressed) for (const sid of consumedSources(f)) PT.hidden[sid] = true;
   PT.dirty = false;
   if (PT.three) PT.three.zoomed = false;
   if (FM) FM.render();
@@ -3642,7 +3966,12 @@ function loadPart(p) {
 /** Surface bodies a feature replaces (trim, extend, sew, offset, thicken): hidden when the feature is created. */
 function consumedSources(f) {
   if (!f || f.suppressed) return [];
-  if (f.type === "surf_trim" || f.type === "surf_extend" || f.type === "thicken") return f.source ? [f.source] : [];
+  return sourcesOf(f);
+}
+/** The bodies a feature of these types consumes, suppressed or not. */
+function sourcesOf(f) {
+  if (!f) return [];
+  if (f.type === "surf_trim" || f.type === "surf_extend" || f.type === "thicken" || f.type === "surf_gaps") return f.source ? [f.source] : [];
   if (f.type === "surf_sew") return f.sources || [];
   if (f.type === "surf_fillet") return f.mode === "edges" ? (f.source ? [f.source] : []) : f.trim === false ? [] : [f.source_a, f.source_b].filter(Boolean);
   return [];
@@ -3777,7 +4106,7 @@ window.partShown = function () {
   window.addEventListener("beforeunload", e => { if (PT.dirty) { e.preventDefault(); e.returnValue = ""; } });
 })();
 // exposed for tests
-window.__part = { PT, feat, showOnlyBody, showAllBodies, boxHits, selectShown, addHits, activePick, THREE, loadPart, setMesh, viewXdir, setMeasure, measureClick, startCommand, finishCommand, cancelCommand, gotoStep, nextStep, selectItem, pickAt, commandSteps, changedPart, viewDir, hoverText };
+window.__part = { PT, feat, feedCommand, showOnlyBody, showAllBodies, toggleBodyGroup, bodyGroupIds, boxHits, selectShown, addHits, activePick, THREE, loadPart, setMesh, viewXdir, setMeasure, measureClick, startCommand, finishCommand, cancelCommand, gotoStep, nextStep, selectItem, pickAt, commandSteps, changedPart, viewDir, hoverText };
 
 // ------------------------------------------------------------------ mesh preview
 

@@ -12,8 +12,14 @@ Surface features (part.py build dispatches here):
   {"type": "surf_sketch", "plane", "offset", "sketch", "kind": "planar" | "extrude" | "revolve", "depth": mm,
    "symmetric", "angle": deg, "axis"}                                      planar face of a closed sketch; open or
                                                                            closed curves extruded or revolved
-  {"type": "surf_bridge", "edges_a", "curves_a", "edges_b", "curves_b", "flip"}   ruled surface between two chains
-   of edges, ends joined corner to corner
+  {"type": "surf_bridge", "edges_a", "curves_a", "edges_b", "curves_b", "flip", "continuity": "ruled" | "tangent",
+   "factor"}                                                               ruled surface between two chains of
+                                                                           edges, ends joined corner to corner; tangent:
+                                                                           G1 to the faces owning the edges
+  {"type": "curve_blend", "ends": [{"kind": "edge" | "curve" | "point", "ref", "body", "point", "at", "cont":
+   "position" | "tangent" | "curvature", "factor"} x 2]}                  curve body between two ends
+  {"type": "curve_points", "points": [point feature ids or [x, y, z]], "method": "polyline" | "spline" | "line" |
+   "arc", "closed"}                                                        curve body through points
   {"type": "surf_loft", "sections": [{"plane", "offset", "sketch"}, ...], "ruled": bool, "smooth": bool (default true),
    "smooth_angle": deg (default 15)}   loft through sketch curves; with smooth the edges of a section that meet at
    less than smooth_angle are joined into one B-spline (one smooth face instead of one face per segment)
@@ -23,6 +29,11 @@ Surface features (part.py build dispatches here):
    surface bodies (trimmed and sewn into one body), or rounded edges of one surface body
   {"type": "surf_offset", "source": feature id, "distance": mm}            offset of a surface body
   {"type": "surf_sew", "sources": [feature ids], "tolerance": mm}          sewn shell of several bodies
+  {"type": "surf_gaps", "source": feature id, "max_gap": mm}               splits between faces of a body closed
+  {"type": "curve_project", "source": curve body or sketch id, "target": surface body id | null (the solid),
+   "method": "normal" | "direction", "direction": [x, y, z], "keep": "nearest" | "all"}   projected curve body
+  {"type": "surf_sweep", "profile": curve body or sketch id, "path": curve body or sketch id, "orient":
+   "corrected" | "frenet"}                                                 profile swept along a path
   {"type": "surf_import", "path": STEP file, "label": component name | ""}  faces of a STEP file (of the component
                                                                            with that label; empty: all) as one body
 Consumer features:
@@ -52,25 +63,69 @@ def _sew(shapes, tol=1e-4):
     return Shape.cast(sew.SewedShape())
 
 
-def _offset_body(body, d):
-    """Offset of a face or shell along its normals. Adjacent faces are extended or trimmed to meet at the
-    offset (intersection join); when that fails each face is offset on its own (simple offset)."""
+def _c1_divided(body):
+    """The body with its C0 B-spline surfaces split into C1 pieces (the joined offset refuses C0 surfaces, common
+    in imported STEP files)."""
+    from OCP.GeomAbs import GeomAbs_C1
+    from OCP.ShapeUpgrade import ShapeUpgrade_ShapeDivideContinuity
+    from build123d import Shape
+    dv = ShapeUpgrade_ShapeDivideContinuity(body.wrapped)
+    dv.SetBoundaryCriterion(GeomAbs_C1)
+    dv.SetPCurveCriterion(GeomAbs_C1)
+    dv.SetSurfaceCriterion(GeomAbs_C1)
+    dv.Perform()
+    return Shape.cast(dv.Result())
+
+
+def _offset_body(body, d, join="auto"):
+    """Offset of a face or shell along its normals. join "auto": adjacent faces are extended or trimmed to meet
+    at the offset (intersection join), on the body as it is, then with its C0 surfaces split into C1 pieces; then
+    with arcs at the convex edges; then (up to 12 faces) face by face joined at the sharp edges; else each face is
+    offset on its own (simple offset). join "intersection" | "arcs" | "faces" | "simple": that join only."""
     from OCP.BRepOffset import BRepOffset_MakeSimpleOffset, BRepOffset_Skin
     from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeOffsetShape
-    from OCP.GeomAbs import GeomAbs_Intersection
+    from OCP.GeomAbs import GeomAbs_Intersection, GeomAbs_Arc
     from build123d import Shape
     if abs(d) < 1e-12:
         return body
-    try:
-        op = BRepOffsetAPI_MakeOffsetShape()
-        op.PerformByJoin(body.wrapped, float(d), 1e-6, BRepOffset_Skin, False, False, GeomAbs_Intersection)
-        res = Shape.cast(op.Shape())
+    if join and join != "auto":
+        return _offset_body_join(body, d, join)
+    nf, ns = len(body.faces()), max(1, len(body.shells()))
+    reach = body.bounding_box().diagonal + 4 * abs(d) + 1.0
+
+    def joined(sh, join):
+        try:
+            op = BRepOffsetAPI_MakeOffsetShape()
+            op.PerformByJoin(sh.wrapped, float(d), 1e-6, BRepOffset_Skin, False, False, join)
+            res = Shape.cast(op.Shape())
+        except Exception:  # noqa: BLE001
+            return None
         valid = res.is_valid() if callable(res.is_valid) else res.is_valid
-        if res.faces() and valid and abs(res.area) > 1e-9:
-            res._offset_kind = "joined"
+        if not res.faces() or not valid or abs(res.area) < 1e-9 or len(res.faces()) < nf or \
+                len(res.shells()) > ns or res.bounding_box().diagonal > reach:
+            return None
+        return res
+    res = joined(body, GeomAbs_Intersection)
+    if res is not None:
+        res._offset_kind = "joined"
+        return res
+    try:
+        div = _c1_divided(body)
+    except Exception:  # noqa: BLE001
+        div = body
+    for join, kind in ((GeomAbs_Intersection, "joined"), (GeomAbs_Arc, "arcs")):
+        res = joined(div, join)
+        if res is not None:
+            res._offset_kind = kind
             return res
-    except Exception:
-        pass
+    if 1 < nf <= 12:
+        try:
+            res = offset_joined(body, d)
+            if res is not None:
+                res._offset_kind = "face_joined"
+                return res
+        except Exception:  # noqa: BLE001
+            pass
     op = BRepOffset_MakeSimpleOffset(body.wrapped, d)
     op.SetBuildSolidFlag(False)
     op.Perform()
@@ -79,6 +134,44 @@ def _offset_body(body, d):
     res = Shape.cast(op.GetResultShape())
     res._offset_kind = "simple"
     return res
+
+
+def _offset_body_join(body, d, join):
+    """Offset with one join only (see _offset_body)."""
+    from OCP.BRepOffset import BRepOffset_MakeSimpleOffset, BRepOffset_Skin
+    from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeOffsetShape
+    from OCP.GeomAbs import GeomAbs_Intersection, GeomAbs_Arc
+    from build123d import Shape
+    if join == "simple":
+        op = BRepOffset_MakeSimpleOffset(body.wrapped, d)
+        op.SetBuildSolidFlag(False)
+        op.Perform()
+        if not op.IsDone():
+            raise ValueError("the offset failed: %s" % op.GetErrorMessage())
+        res = Shape.cast(op.GetResultShape())
+        res._offset_kind = "simple"
+        return res
+    if join == "faces":
+        res = offset_joined(body, d)
+        if res is None:
+            raise ValueError("the face by face offset failed (try Arcs or Automatic)")
+        res._offset_kind = "face_joined"
+        return res
+    jt = GeomAbs_Arc if join == "arcs" else GeomAbs_Intersection
+    last = None
+    for sh in (body, _c1_divided(body)):
+        try:
+            op = BRepOffsetAPI_MakeOffsetShape()
+            op.PerformByJoin(sh.wrapped, float(d), 1e-6, BRepOffset_Skin, False, False, jt)
+            res = Shape.cast(op.Shape())
+            valid = res.is_valid() if callable(res.is_valid) else res.is_valid
+            if res.faces() and valid:
+                res._offset_kind = "arcs" if join == "arcs" else "joined"
+                return res
+            last = "the result is not a valid body"
+        except Exception as e:  # noqa: BLE001
+            last = str(e).strip() or "failed"
+    raise ValueError("the %s offset failed: %s (try another join)" % (join, last))
 
 
 def source_body(shape, bodies, f, find_faces):
@@ -270,7 +363,8 @@ def _ref_edges(shape, refs, find_edges, bodies):
 def bridge(shape, f, find_edges, bodies=None):
     """Ruled surface between two chains of edges (side A: "edges_a" edge references and "curves_a" curve bodies;
     side B likewise): straight lines join the ends of A to the nearer ends of B (corner to corner) and the
-    corresponding points between ("flip" joins the other ends)."""
+    corresponding points between ("flip" joins the other ends). "continuity": "tangent": the surface leaves each
+    side tangent to the face owning that side's edges (bridge_tangent), "factor" the tangent length."""
     from OCP.BRepOffsetAPI import BRepOffsetAPI_ThruSections
     from build123d import Shape
 
@@ -292,6 +386,8 @@ def bridge(shape, f, find_edges, bodies=None):
     rev = ((a0 - b0).length + (a1 - b1).length) > ((a0 - b1).length + (a1 - b0).length)
     if f.get("flip"):
         rev = not rev
+    if (f.get("continuity") or "ruled") == "tangent":
+        return bridge_tangent(shape, bodies, wa, wb, rev, float(f.get("factor") or 1.0))
     op = BRepOffsetAPI_ThruSections(False, True, 1e-6)
     op.CheckCompatibility(False)                    # the orientation set here (corner to corner, or Flip) is kept
     op.AddWire(wa.wrapped)
@@ -372,10 +468,16 @@ def fill(shape, f, find_edges, bodies=None, sketches=None):
 
 
 def offset(shape, bodies, f, find_faces):
+    """Offset surface: "join" (default "auto") chooses how the offset faces meet at the edges, see _offset_body."""
     src = source_body(shape, bodies, f, find_faces)
-    res = _offset_body(src, float(f.get("distance") or 0))
-    if getattr(res, "_offset_kind", "") == "simple":
+    res = _offset_body(src, float(f.get("distance") or 0), f.get("join") or "auto")
+    kind = getattr(res, "_offset_kind", "")
+    if kind == "simple":
         res._kind = "faces offset one by one (the joins could not be computed)"
+    elif kind == "arcs":
+        res._kind = "joined with arcs at the convex edges"
+    elif kind == "face_joined":
+        res._kind = "faces offset one by one, extended and cut at the sharp edges"
     return res
 
 
@@ -1134,6 +1236,47 @@ def _chain_wires(edges):
         return [Wire([e]) for e in edges]
 
 
+def _join_gaps(wires, gap):
+    """Wires whose ends are at most gap (mm) apart joined into one wire each, every gap bridged by a straight line;
+    a chain whose two ends are at most gap apart (and longer than 10 x gap) closed the same way.
+    Returns (wires, number of bridges)."""
+    from build123d import Wire, Edge
+    rest = list(wires)
+    out, n = [], 0
+    while rest:
+        chain = [rest.pop(0)]
+        a, b = chain[0].position_at(0), chain[0].position_at(1)
+        while True:
+            best = None
+            for k, w in enumerate(rest):
+                s, e = w.position_at(0), w.position_at(1)
+                for side, p in (("b", b), ("a", a)):
+                    for q, other in ((s, e), (e, s)):
+                        d = (q - p).length
+                        if d <= gap and (best is None or d < best[0]):
+                            best = (d, k, side, p, q, other)
+            if best is None:
+                break
+            d, k, side, p, q, other = best
+            w = rest.pop(k)
+            bridge = [Edge.make_line(p, q)] if d > 1e-6 else []
+            n += len(bridge)
+            if side == "b":
+                chain += bridge + [w]
+                b = other
+            else:
+                chain = [w] + bridge + chain
+                a = other
+        d = (b - a).length
+        if 1e-6 < d <= gap and sum(x.length for x in chain) > 10 * gap:
+            chain.append(Edge.make_line(b, a))
+            n += 1
+        edges = [e for x in chain for e in x.edges()]
+        joined = list(Wire.combine(edges, tol=1e-4))
+        out += joined
+    return out, n
+
+
 def _approx_wire(wire, tol, analytic):
     """One smooth edge through a wire: a line or a circular arc within tol when analytic is set and the shape
     allows it, else a degree-3 C2 B-spline fitted to the wire (joins the pieces, removes small kinks)."""
@@ -1188,10 +1331,14 @@ def curve_extract(shape, bodies, f, find_edges, expand_edges):
     if not edges:
         raise ValueError("no edges picked")
     wires = _chain_wires(edges)
+    gap = float(f.get("gap") or 0)
+    bridged = 0
+    if gap > 0 and wires:
+        wires, bridged = _join_gaps(wires, gap)
     clean = f.get("clean") or "none"
     tol = float(f.get("tolerance") or 0.05)
     out = []
-    kinds = []
+    kinds = ["%d gap(s) bridged" % bridged] if bridged else []
     for w in wires:
         if clean == "none":
             out.append(w)
@@ -1226,7 +1373,7 @@ def curve_extract(shape, bodies, f, find_edges, expand_edges):
             projected.append(best[1])
         out = projected
     body = out[0] if len(out) == 1 else Compound(children=out)
-    body._kind = ", ".join(sorted(set(k for k in kinds if k))) or None
+    body._kind = ", ".join(dict.fromkeys(k for k in kinds if k)) or None
     return body
 
 
@@ -1269,7 +1416,14 @@ def surf_from_curve(bodies, f):
         base = src
         if f.get("symmetric"):
             base = src.moved(Location(Vector(-d[0] / 2, -d[1] / 2, -d[2] / 2)))
-        return Shape.cast(BRepPrimAPI_MakePrism(base.wrapped, gp_Vec(*d)).Shape())
+        res = Shape.cast(BRepPrimAPI_MakePrism(base.wrapped, gp_Vec(*d)).Shape())
+        # an edge along the direction gives a face of zero area: left out
+        faces = list(res.faces())
+        good = [fc for fc in faces if fc.area > 1e-9]
+        if good and len(good) < len(faces):
+            res = good[0] if len(good) == 1 else _sew(good, 1e-6)
+            res._kind = "%d face(s) of zero area left out (curve edges along the direction)" % (len(faces) - len(good))
+        return res
     p = [float(v) for v in (f.get("axis_point") or [0, 0, 0])]
     d = [float(v) for v in (f.get("axis_dir") or [0, 0, 1])]
     ang = math.radians(float(f.get("angle") or 360))
@@ -1305,6 +1459,10 @@ def _point_on(face):
     from OCP.TopAbs import TopAbs_IN
     from OCP.BRep import BRep_Tool
     from build123d import Vector
+    from OCP.TopAbs import TopAbs_FACE
+    if face.wrapped.ShapeType() != TopAbs_FACE:
+        # a region of several faces: a point on its largest face
+        face = max(face.faces(), key=lambda x: x.area)
     u1, u2, v1, v2 = BRepTools.UVBounds_s(face.wrapped)
     surf = BRep_Tool.Surface_s(face.wrapped)
     for fu, fv in ((0.5, 0.5), (0.25, 0.5), (0.75, 0.5), (0.5, 0.25), (0.5, 0.75), (0.25, 0.25), (0.75, 0.75), (0.1, 0.5), (0.9, 0.5), (0.5, 0.1), (0.5, 0.9)):
@@ -1351,9 +1509,12 @@ def trim_pieces(shape, bodies, f):
             fr = (f.get("_datums") or {}).get(ref)
             if not fr:
                 raise ValueError("the trimming plane was not found")
+        # a square on the plane centred at the projection of the middle of the surface, larger than the surface
         bb = src.bounding_box()
-        size = max(bb.diagonal, 10.0) * 2 + (abs(bb.center().X) + abs(bb.center().Y) + abs(bb.center().Z))
-        tool_shapes = [plane_face(fr, size)]
+        c, o, z = bb.center(), fr["o"], fr["z"]
+        h = (c.X - o[0]) * z[0] + (c.Y - o[1]) * z[1] + (c.Z - o[2]) * z[2]
+        fr = dict(fr, o=[c.X - h * z[0], c.Y - h * z[1], c.Z - h * z[2]])
+        tool_shapes = [plane_face(fr, max(bb.diagonal, 10.0) * 2)]
     else:
         curves = None
         if with_kind == "sketch":
@@ -1380,22 +1541,124 @@ def trim_pieces(shape, bodies, f):
                     pr.Next()
             if not tool_shapes:
                 raise ValueError("the curve projection misses the surface")
-    args, tools = _shape_list(), _shape_list()
-    for fc in src.faces():
-        args.Append(fc.wrapped)
-    for t in tool_shapes:
-        tools.Append(t)
-    op = BRepAlgoAPI_Splitter()
-    op.SetArguments(args)
-    op.SetTools(tools)
-    op.SetRunParallel(True)
-    op.Build()
-    if not op.IsDone():
-        raise ValueError("the split failed")
-    pieces = list(Shape.cast(op.Shape()).faces())
+    def run(faces, tool_list, fuzzy):
+        args, tools = _shape_list(), _shape_list()
+        for fc in faces:
+            args.Append(fc.wrapped)
+        for t in tool_list:
+            tools.Append(t)
+        op = BRepAlgoAPI_Splitter()
+        op.SetArguments(args)
+        op.SetTools(tools)
+        op.SetRunParallel(True)
+        if fuzzy:
+            op.SetFuzzyValue(fuzzy)
+        op.Build()
+        if not op.IsDone():
+            return None
+        try:
+            return list(Shape.cast(op.Shape()).faces())
+        except Exception:  # noqa: BLE001
+            return None
+
+    def split(tool_list):
+        # faces of zero area (they make the split fail) left out
+        faces = [fc for fc in src.faces() if fc.area > 1e-9]
+        for fuzzy in (0.0, 1e-4):
+            res = run(faces, tool_list, fuzzy)
+            if res:
+                return res
+        # the faces split one at a time (faces of the body that overlap or touch each other make the split of the
+        # whole body fail), the pieces sewn again; a face that does not split stays whole
+        out, bad = [], 0
+        for fc in faces:
+            res = None
+            for fuzzy in (0.0, 1e-4, 1e-3):
+                res = run([fc], tool_list, fuzzy)
+                if res:
+                    break
+            if not res:
+                bad += 1
+                res = [fc]
+            out += res
+        if bad == len(faces):
+            raise ValueError("the split failed")
+        f["_note"] = "split face by face" + (" (%d face(s) not split)" % bad if bad else "")
+        if len(out) < 2:
+            return out
+        return list(_sew(out, 1e-4).faces())
+    pieces = _regions(split(tool_shapes), tool_shapes)
+    if len(pieces) < 2 and with_kind == "surface" and tool_body is not None and tool_body.faces():
+        # a tool surface that does not quite reach across the target: its faces extended beyond their edges
+        bb = src.bounding_box()
+        reach = max(bb.diagonal, 1.0)
+        ext = [untrimmed_extended(fc, reach).wrapped for fc in tool_body.faces()]
+        pieces = _regions(split(ext), ext)
+        if len(pieces) >= 2:
+            f["_note"] = "the tool surface was extended beyond its edges to cut across the target"
     if len(pieces) < 2:
         raise ValueError("the tool does not cut the surface")
     return pieces, tool_body
+
+
+def _regions(faces, tool_shapes):
+    """The split faces grouped into regions: faces joined through an edge stay in one region unless that edge lies
+    on the tool (the cut). A region of one face is that face, else a shell of its faces."""
+    from OCP.BRep import BRep_Builder, BRep_Tool
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+    from OCP.TopoDS import TopoDS_Compound, TopoDS_Shell
+    from OCP.gp import gp_Pnt
+    from build123d import Shape
+    if len(faces) < 2:
+        return list(faces)
+    bld = BRep_Builder()
+    tool = TopoDS_Compound()
+    bld.MakeCompound(tool)
+    for t in tool_shapes:
+        bld.Add(tool, t)
+
+    def on_tool(e):
+        tol = max(1e-5, 2 * BRep_Tool.Tolerance_s(e.wrapped))
+        for t in (0.0, 0.5, 1.0):
+            q = e.position_at(t)
+            v = BRepBuilderAPI_MakeVertex(gp_Pnt(q.X, q.Y, q.Z)).Vertex()
+            if BRepExtrema_DistShapeShape(v, tool).Value() > tol:
+                return False
+        return True
+    parent = list(range(len(faces)))
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    owners = {}
+    for i, fc in enumerate(faces):
+        for e in fc.edges():
+            owners.setdefault(hash(e.wrapped), []).append((i, e))
+    for lst in owners.values():
+        for a in range(len(lst)):
+            for b in range(a + 1, len(lst)):
+                (i, ei), (j, ej) = lst[a], lst[b]
+                if i != j and ei.wrapped.IsSame(ej.wrapped) and root(i) != root(j) and not on_tool(ei):
+                    parent[root(i)] = root(j)
+    groups = {}
+    for i in range(len(faces)):
+        groups.setdefault(root(i), []).append(faces[i])
+    out = []
+    for g in groups.values():
+        if sum(fc.area for fc in g) <= 1e-9:
+            continue
+        if len(g) == 1:
+            out.append(g[0])
+            continue
+        sh = TopoDS_Shell()
+        bld.MakeShell(sh)
+        for fc in g:
+            bld.Add(sh, fc.wrapped)
+        out.append(Shape.cast(sh))
+    return out
 
 
 def trim(shape, bodies, f):
@@ -1432,7 +1695,7 @@ def trim(shape, bodies, f):
         solids = list(shape.solids())
         for p in pieces:
             c = _point_on(p)
-            n = p.normal_at(c)
+            n = (p if len(p.faces()) == 1 else max(p.faces(), key=lambda x: x.area)).faces()[0].normal_at(c)
             # a point just off the face on both sides: inside when either is in the solid
             ins = False
             for sg in (1.0, -1.0):
@@ -1556,6 +1819,30 @@ def extend(shape, bodies, f, find_faces):
     return out
 
 
+def _inside_near(face, p, w, dist):
+    """The point a small step from the edge point p along w, projected onto the face's surface, lies inside the
+    face (classified in its parameter plane): w points into the face."""
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepClass import BRepClass_FaceClassifier
+    from OCP.ShapeAnalysis import ShapeAnalysis_Surface
+    from OCP.TopAbs import TopAbs_IN
+    from OCP.TopoDS import TopoDS
+    from OCP.gp import gp_Pnt
+    to_face = getattr(TopoDS, "Face_s", None) or TopoDS.Face
+    sa = ShapeAnalysis_Surface(BRep_Tool.Surface_s(face.wrapped))
+    for k in (0.01, 0.003, 0.03):
+        q = p + w * (dist * k)
+        uv = sa.ValueOfUV(gp_Pnt(q.X, q.Y, q.Z), 1e-7)
+        st = BRepClass_FaceClassifier(to_face(face.wrapped), uv, 1e-7).State()
+        if st == TopAbs_IN:
+            return True
+        q2 = p - w * (dist * k)
+        uv2 = sa.ValueOfUV(gp_Pnt(q2.X, q2.Y, q2.Z), 1e-7)
+        if BRepClass_FaceClassifier(to_face(face.wrapped), uv2, 1e-7).State() == TopAbs_IN:
+            return False
+    return face.is_inside(p + w * (dist * 0.01))
+
+
 def _strip(face, surf, e, dist, n=24):
     """Extension strip of face across its boundary edge e by dist (mm), as a face on the surface surf: the edge,
     the edge moved outward along the surface, and two side curves. A closed edge gives the parametric band."""
@@ -1579,14 +1866,15 @@ def _strip(face, surf, e, dist, n=24):
         q = pr.NearestPoint()
         return Vector(q.X(), q.Y(), q.Z())
 
+    # the outward side decided once, at the middle of the edge (classifying near the ends is ambiguous)
+    pm, tm = e.position_at(0.5), e.tangent_at(0.5)
+    sgn = -1.0 if _inside_near(face, pm, face.normal_at(pm).cross(tm).normalized(), dist) else 1.0
     P, Q = [], []
     for i in range(n + 1):
         t = i / n
         p, tg = e.position_at(t), e.tangent_at(t)
         nrm = face.normal_at(p)
-        w = nrm.cross(tg).normalized()
-        if face.is_inside(p + w * (dist * 0.01)):
-            w = -w
+        w = nrm.cross(tg).normalized() * sgn
         P.append(p)
         step = dist
         qv = p
@@ -1667,39 +1955,406 @@ def _strip(face, surf, e, dist, n=24):
             out = out2
     if out.area <= 0:
         raise ValueError("the extension strip could not be built")
+    # the strip runs along the picked edge the other way round than the face does (consistent orientation: the
+    # sewn face and strip keep their normals and merge)
+    if _edge_sense(out, e) == _edge_sense(face, e):
+        out2 = make(TopoDS.Wire(mw.Wire().Reversed()))
+        if out2.area > 0 and BRepCheck_Analyzer(out2.wrapped).IsValid() and _edge_sense(out2, e) != _edge_sense(face, e):
+            out = out2
+        else:
+            out = Shape.cast(out.wrapped.Reversed())
     return out
 
 
-def extend_edges(shape, bodies, f, find_edges, find_faces):
-    """Extend a surface body across selected boundary edges ("edges": edge keys) by "distance" (mm). The trim of
-    the surface (holes, other edges) is kept. Strips on the same analytic surface merge with the face; on a
-    B-spline surface the strip lies on the tangent-extrapolated surface and stays a separate face of the shell."""
+def _edge_sense(face, e):
+    """The direction in which a face runs along its edge e (the edge orientation in the face, with the face's own
+    orientation applied): True forward."""
+    from OCP.TopAbs import TopAbs_REVERSED
+    for x in face.edges():
+        if x.wrapped.IsSame(e.wrapped):
+            fwd = x.wrapped.Orientation() != TopAbs_REVERSED
+            return fwd != (face.wrapped.Orientation() == TopAbs_REVERSED)
+    return None
+
+
+def _face_on_surface(face, surf):
+    """The face rebuilt on another surface (one that holds it, such as its surface extended): the same wires, the
+    edge curves on the new surface added (ShapeFix_Face, SameParameter), the normal on the side of the old face."""
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    from OCP.BRepLib import BRepLib
+    from OCP.BRepTools import BRepTools
+    from OCP.ShapeFix import ShapeFix_Face
+    from OCP.TopoDS import TopoDS
+    from build123d import Shape
+    to_face = getattr(TopoDS, "Face_s", None) or TopoDS.Face
+    to_wire = getattr(TopoDS, "Wire_s", None) or TopoDS.Wire
+    F = to_face(face.wrapped)
+    outer = BRepTools.OuterWire_s(F)
+    inner = [w.wrapped for w in face.wires() if not w.wrapped.IsSame(outer)]
+    nf = None
+    # the edges get their curves on the new surface in the first pass; the second builds on them
+    for attempt in range(3):
+        for wire in (outer, to_wire(outer.Reversed())):
+            mk = BRepBuilderAPI_MakeFace(surf, wire, True)
+            if not mk.IsDone():
+                continue
+            for w in inner:
+                mk.Add(to_wire(w))
+            fx = ShapeFix_Face(mk.Face())
+            fx.Perform()
+            cand = fx.Face()
+            BRepLib.SameParameter_s(cand, 1e-5, True)
+            c = Shape.cast(cand)
+            if c.area > 0 and BRepCheck_Analyzer(cand).IsValid() and abs(c.area - face.area) <= 1e-3 * max(face.area, 1e-6):
+                nf = c
+                break
+        if nf is not None:
+            break
+    if nf is None:
+        raise ValueError("the face cannot be rebuilt on the extended surface")
+    pc = _point_on(face)
+    try:
+        if face.normal_at(pc).dot(nf.normal_at(pc)) < 0:
+            nf = Shape.cast(nf.wrapped.Reversed())
+    except Exception:  # noqa: BLE001
+        pass
+    return nf
+
+
+_DEBUG = False
+
+
+def _merged_face(owner, surf, strips, picked):
+    """One face on surf bounded by the outer wire of owner with each picked edge replaced by the three other edges
+    of its strip (the extension made part of the face); the inner wires of owner kept. Raises ValueError."""
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace, BRepBuilderAPI_MakeWire
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    from OCP.BRepLib import BRepLib
+    from OCP.BRepTools import BRepTools
+    from OCP.ShapeFix import ShapeFix_Face
+    from OCP.TopoDS import TopoDS
+    from build123d import Shape, Edge
+    to_face = getattr(TopoDS, "Face_s", None) or TopoDS.Face
+    to_wire = getattr(TopoDS, "Wire_s", None) or TopoDS.Wire
+    to_edge = getattr(TopoDS, "Edge_s", None) or TopoDS.Edge
+    outer = BRepTools.OuterWire_s(to_face(owner.wrapped))
+    pool = [e for e in Shape.cast(outer).edges() if not any(e.wrapped.IsSame(p.wrapped) for p in picked)]
+    for st, p in zip(strips, picked):
+        pool += [e for e in st.edges() if not e.wrapped.IsSame(p.wrapped)]
+    mw = BRepBuilderAPI_MakeWire()
+    left = list(pool)
+    mw.Add(to_edge(left.pop(0).wrapped))
+    guard = 0
+    while left and guard < 10 * len(pool):
+        guard += 1
+        e = left.pop(0)
+        mw.Add(to_edge(e.wrapped))
+        if not mw.IsDone():
+            left.append(e)                 # not connected yet
+            mw = _rebuild_wire(mw, pool, left)
+    if left or not mw.IsDone():
+        raise ValueError("the extended boundary is not one closed wire")
+    wire = mw.Wire()
+    inner = [w.wrapped for w in owner.wires() if not w.wrapped.IsSame(outer)]
+    for attempt in range(3):
+        for wr in (wire, to_wire(wire.Reversed())):
+            mk = BRepBuilderAPI_MakeFace(surf, wr, True)
+            if not mk.IsDone():
+                continue
+            for w in inner:
+                mk.Add(to_wire(w))
+            fx = ShapeFix_Face(mk.Face())
+            fx.Perform()
+            cand = fx.Face()
+            BRepLib.SameParameter_s(cand, 1e-5, True)
+            c = Shape.cast(cand)
+            want = owner.area + sum(st.area for st in strips)
+            if _DEBUG:
+                print("merged face attempt", attempt, c.area, want, BRepCheck_Analyzer(cand).IsValid())
+            if c.area > 0 and BRepCheck_Analyzer(cand).IsValid() and abs(c.area - want) <= 2e-3 * max(want, 1e-6):
+                pc = _point_on(owner)
+                try:
+                    if owner.normal_at(pc).dot(c.normal_at(pc)) < 0:
+                        c = Shape.cast(c.wrapped.Reversed())
+                except Exception:  # noqa: BLE001
+                    pass
+                return c
+    raise ValueError("the extended face could not be built")
+
+
+def _rebuild_wire(mw, pool, left):
+    """A wire maker with the connected edges of pool so far (MakeWire keeps no state after a failed Add)."""
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeWire
+    from OCP.TopoDS import TopoDS
+    to_edge = getattr(TopoDS, "Edge_s", None) or TopoDS.Edge
+    used = [e for e in pool if not any(e.wrapped.IsSame(x.wrapped) for x in left)]
+    m = BRepBuilderAPI_MakeWire()
+    for e in used:
+        m.Add(to_edge(e.wrapped))
+    return m
+
+
+def _natural_extension(owner, es, dist):
+    """The face extended across its picked edges when it is an untrimmed patch (its boundary is the four iso-curves
+    of its parameter range) and the picked edges are sides of it: one face on the surface converted to a B-spline
+    and lengthened at those sides (GeomLib.ExtendSurfByLength, curvature continuous; the surface inside unchanged).
+    None otherwise."""
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+    from OCP.BRepTools import BRepTools
+    from OCP.Geom import Geom_RectangularTrimmedSurface
+    from OCP.GeomConvert import GeomConvert
+    from OCP.GeomLib import GeomLib
+    from build123d import Shape, Vector
+    try:
+        surf = BRep_Tool.Surface_s(owner.wrapped)
+        u1, u2, v1, v2 = BRepTools.UVBounds_s(owner.wrapped)
+        patch = Shape.cast(BRepBuilderAPI_MakeFace(surf, u1, u2, v1, v2, 1e-6).Face())
+        if abs(patch.area - owner.area) > 1e-6 * max(owner.area, 1e-9) or len(owner.wires()) != 1:
+            return None
+        um, vm = (u1 + u2) / 2, (v1 + v2) / 2
+        side_pts = {(True, False): surf.Value(u1, vm), (True, True): surf.Value(u2, vm),
+                    (False, False): surf.Value(um, v1), (False, True): surf.Value(um, v2)}
+        sides = []
+        for e in es:
+            m = e.position_at(0.5)
+            key = min(side_pts, key=lambda k: (Vector(side_pts[k].X(), side_pts[k].Y(), side_pts[k].Z()) - m).length)
+            q = side_pts[key]
+            if (Vector(q.X(), q.Y(), q.Z()) - m).length > 1e-4 * max(1.0, owner.bounding_box().diagonal):
+                return None                     # not a side of the patch
+            sides.append(key)
+        out = _extend_patch(surf, (u1, u2, v1, v2), dist, set(sides))
+        if out is None:
+            return None
+        c = _point_on(owner)
+        if owner.normal_at(c).dot(out.normal_at(c)) < 0:
+            out = Shape.cast(out.wrapped.Reversed())
+        return out
+    except Exception as ex:  # noqa: BLE001
+        if _DEBUG:
+            import traceback
+            traceback.print_exc()
+        return None
+
+
+def _same_edge(face, e):
+    """The edge of face that is e (the same edge, else the one with the nearest middle)."""
+    for x in face.edges():
+        if x.wrapped.IsSame(e.wrapped):
+            return x
+    m = e.position_at(0.5)
+    return min(face.edges(), key=lambda x: (x.position_at(0.5) - m).length)
+
+
+def untrimmed_extended(face, dist, tol=0.01):
+    """The surface of a face as an untrimmed patch extended by dist (mm) beyond all sides (a trimming tool that does
+    not quite reach across the target)."""
+    return extend(None, {"_f": face}, {"source": "_f", "distance": dist, "sides": "all", "tolerance": tol}, None)
+
+
+def extend_face(face, es, dist, tol=0.01, single=True):
+    """One face extended across its edges es by dist (mm): the extension part of the face (see extend_edges);
+    a shell of the face and its strips when the face cannot be rebuilt."""
     from OCP.BRep import BRep_Tool
     from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
     from .occfix import CheckedUnify as ShapeUpgrade_UnifySameDomain
     from build123d import Shape
+    surf = BRep_Tool.Surface_s(face.wrapped)
+    name = surf.DynamicType().Name()
+    analytic = name in ("Geom_Plane", "Geom_CylindricalSurface", "Geom_ConicalSurface", "Geom_SphericalSurface", "Geom_ToroidalSurface")
+    if not analytic:
+        surf = _extended_surface(face, dist * 1.5, tol)
+        if single:
+            nat = _natural_extension(face, es, dist)
+            if nat is not None:
+                return nat
+    strips = [_strip(face, surf, e, dist) for e in es]
+    try:
+        return _merged_face(face, surf, strips, es)
+    except ValueError:
+        pass
+    base = face
+    if not analytic:
+        try:
+            base = _face_on_surface(face, surf)
+        except ValueError:
+            base = face
+    sew = BRepBuilderAPI_Sewing(1e-5)
+    sew.Add(base.wrapped)
+    for st in strips:
+        sew.Add(st.wrapped)
+    sew.Perform()
+    u = ShapeUpgrade_UnifySameDomain(sew.SewedShape(), True, True, False)
+    u.Build()
+    return Shape.cast(u.Shape())
+
+
+def _keep_side(piece_src, tools, mark):
+    """The pieces of piece_src split by the tool shapes that hold the point mark (or are nearest to it)."""
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Splitter
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+    from OCP.gp import gp_Pnt
+    from build123d import Shape
+    args, tl = _shape_list(), _shape_list()
+    for fc in piece_src.faces():
+        args.Append(fc.wrapped)
+    for t in tools:
+        tl.Append(t)
+    op = BRepAlgoAPI_Splitter()
+    op.SetArguments(args)
+    op.SetTools(tl)
+    op.Build()
+    if not op.IsDone():
+        return piece_src
+    pieces = list(Shape.cast(op.Shape()).faces())
+    if len(pieces) < 2:
+        return piece_src
+    v = BRepBuilderAPI_MakeVertex(gp_Pnt(mark.X, mark.Y, mark.Z)).Vertex()
+    d = [BRepExtrema_DistShapeShape(v, p.wrapped).Value() for p in pieces]
+    best = min(d)
+    keep = [p for p, x in zip(pieces, d) if x <= best + 1e-6]
+    return keep[0] if len(keep) == 1 else _sew(keep)
+
+
+def offset_joined(body, d, angle=1.0):
+    """Offset of a shell face by face, joined at the sharp edges: each face offset on its own (its exact offset
+    surface), then at each edge where the faces meet at more than angle (deg) both offset faces are extended across
+    that edge and cut where they meet (the intersection join); the faces sewn. Returns the shell or raises
+    ValueError."""
+    import math as _m
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy, BRepBuilderAPI_Sewing
+    from OCP.BRepOffset import BRepOffset_MakeSimpleOffset
+    from build123d import Shape
+    faces = list(body.faces())
+    offs = []
+    for fc in faces:
+        op = BRepOffset_MakeSimpleOffset(BRepBuilderAPI_Copy(fc.wrapped, True, False).Shape(), d)
+        op.SetBuildSolidFlag(False)
+        op.Perform()
+        if not op.IsDone():
+            raise ValueError("a face could not be offset")
+        o = Shape.cast(op.GetResultShape()).faces()
+        if len(o) != 1:
+            raise ValueError("a face could not be offset")
+        offs.append(o[0])
+    # sharp edges between faces: (i, j, edge)
+    sharp = []
+    edges = [fc.edges() for fc in faces]
+    for i in range(len(faces)):
+        for j in range(i + 1, len(faces)):
+            for e in edges[i]:
+                if any(e.wrapped.IsSame(x.wrapped) for x in edges[j]):
+                    p = e.position_at(0.5)
+                    a, b = faces[i].normal_at(p), faces[j].normal_at(p)
+                    if a.dot(b) < _m.cos(_m.radians(angle)):
+                        sharp.append((i, j, e))
+    if not sharp:
+        return None
+    L = 4.0 * abs(d) + 1.0
+
+    def image(k, e):
+        # the edge of offset face k that is the offset of the source edge e
+        p = e.position_at(0.5)
+        q = p + faces[k].normal_at(p) * d
+        return min(offs[k].edges(), key=lambda x: (x.position_at(0.5) - q).length)
+    by_face = {}
+    for i, j, e in sharp:
+        by_face.setdefault(i, []).append((j, e))
+        by_face.setdefault(j, []).append((i, e))
+    ext = {}
+    for k, lst in by_face.items():
+        es = [image(k, e) for _, e in lst]
+        ext[k] = extend_face(offs[k], es, L, 0.01, single=False)
+    tool_of = {}
+    out = []
+    for k in range(len(faces)):
+        if k not in by_face:
+            out.append(offs[k])
+            continue
+        cur = ext[k]
+        mark = _point_on(offs[k])
+        for j, e in by_face[k]:
+            if j not in tool_of:
+                tool_of[j] = [untrimmed_extended(fc, 2 * L).wrapped for fc in ext[j].faces()]
+            cur = _keep_side(cur, tool_of[j], mark)
+        out += list(cur.faces())
+    sew = BRepBuilderAPI_Sewing(max(1e-4, 1e-3 * abs(d)))
+    for fc in out:
+        sew.Add(fc.wrapped)
+    sew.Perform()
+    res = Shape.cast(sew.SewedShape())
+    if not res.faces():
+        raise ValueError("the joined offset failed")
+    return res
+
+
+def extend_edges(shape, bodies, f, find_edges, find_faces):
+    """Extend a surface body across selected boundary edges ("edges": edge keys) by "distance" (mm), or up to
+    another surface body ("mode": "upto", "target": body id; the extension is cut where it meets that surface, the
+    target extended beyond its own edges when it is too small). The trim of the surface (holes, other edges) is
+    kept. The extension is part of the face it extends: an analytic surface is extended on itself; a B-spline face
+    is rebuilt on its surface extended beyond its sides (GeomLib, curvature continuous) and the strip lies on that
+    same surface, so the face and the strip merge into one face."""
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Splitter
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+    from .occfix import CheckedUnify as ShapeUpgrade_UnifySameDomain
+    from build123d import Shape
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
     src = source_body(shape, bodies, f, find_faces)
-    dist = float(f.get("distance") or 5.0)
+    # a copy: the edge curves on the extended surfaces are added to the edges in place (the body is cached)
+    src = Shape.cast(BRepBuilderAPI_Copy(src.wrapped, True, False).Shape())
     edges = find_edges(src, f.get("edges") or [])
     if not edges:
         raise ValueError("no edges of the surface selected")
+    tol = float(f.get("tolerance") or 0.01)
+    upto = f.get("mode") == "upto"
+    target = None
+    if upto:
+        target = bodies.get(f.get("target"))
+        if target is None or not target.faces():
+            raise ValueError("choose the surface to extend up to")
+        far = max(BRepExtrema_DistShapeShape(e.wrapped, target.wrapped).Value() for e in edges)
+        bb = src.bounding_box()
+        dist = max(3.0 * far + 2.0, 0.5 * bb.diagonal)
+    else:
+        dist = float(f.get("distance") or 5.0)
     faces = list(src.faces())
-    strips = []
-    kinds = set()
+    by_owner = {}
     for e in edges:
-        owner = None
-        for fc in faces:
-            if any(x.wrapped.IsSame(e.wrapped) for x in fc.edges()):
-                owner = fc
-                break
-        if owner is None:
+        k = next((i for i, fc in enumerate(faces) if any(x.wrapped.IsSame(e.wrapped) for x in fc.edges())), None)
+        if k is None:
             raise ValueError("an edge does not belong to the surface")
+        by_owner.setdefault(k, []).append(e)
+    strips, kinds, merged = [], set(), True
+    for k, es in by_owner.items():
+        owner = faces[k]
         surf = BRep_Tool.Surface_s(owner.wrapped)
         name = surf.DynamicType().Name()
-        if name not in ("Geom_Plane", "Geom_CylindricalSurface", "Geom_ConicalSurface", "Geom_SphericalSurface", "Geom_ToroidalSurface"):
-            surf = _extended_surface(owner, dist * 1.5, float(f.get("tolerance") or 0.01))
         kinds.add(name.replace("Geom_", ""))
-        strips.append(_strip(owner, surf, e, dist))
+        analytic = name in ("Geom_Plane", "Geom_CylindricalSurface", "Geom_ConicalSurface", "Geom_SphericalSurface", "Geom_ToroidalSurface")
+        if not analytic:
+            surf = _extended_surface(owner, dist * 1.5, tol)
+        # the strips first (their edge curves on the extended surface), then one face on that surface bounded by the
+        # face's boundary with the strips added; when that fails, the face and its strips are sewn (and merged where
+        # they share a surface)
+        nat = _natural_extension(owner, es, dist) if not analytic and len(faces) == 1 else None
+        if nat is not None:
+            faces[k] = nat
+            continue
+        mine = [_strip(owner, surf, e, dist) for e in es]
+        try:
+            faces[k] = _merged_face(owner, surf, mine, es)
+        except ValueError:
+            strips += mine
+            if not analytic:
+                try:
+                    faces[k] = _face_on_surface(owner, surf)
+                except ValueError:
+                    merged = False
     sew = BRepBuilderAPI_Sewing(1e-5)
     for fc in faces:
         sew.Add(fc.wrapped)
@@ -1709,8 +2364,53 @@ def extend_edges(shape, bodies, f, find_edges, find_faces):
     u = ShapeUpgrade_UnifySameDomain(sew.SewedShape(), True, True, False)
     u.Build()
     out = Shape.cast(u.Shape())
-    out._kind = "%s extended by %g mm across %d edge(s)" % (", ".join(sorted(kinds)), dist, len(edges))
+    if upto:
+        out = _cut_at(out, target, src, dist, tol)
+        out._kind = "%s extended across %d edge(s) up to the surface" % (", ".join(sorted(kinds)), len(edges))
+    else:
+        out._kind = "%s extended by %g mm across %d edge(s)" % (", ".join(sorted(kinds)), dist, len(edges))
+    if not merged:
+        out._kind += " (the extension is a separate face: the face could not be rebuilt on the extended surface)"
     return out
+
+
+def _cut_at(ext, target, src, dist, tol):
+    """The extended surface ext cut where it meets the target surface body: the pieces that hold the surface before
+    the extension are kept. The target is extended beyond its own edges when the cut does not separate the
+    extension."""
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Splitter
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+    from build123d import Shape
+    marks = [_point_on(fc) for fc in src.faces()]
+
+    def split(tools):
+        args, tl = _shape_list(), _shape_list()
+        for fc in ext.faces():
+            args.Append(fc.wrapped)
+        for t in tools:
+            tl.Append(t)
+        op = BRepAlgoAPI_Splitter()
+        op.SetArguments(args)
+        op.SetTools(tl)
+        op.Build()
+        if not op.IsDone():
+            return None
+        pieces = list(Shape.cast(op.Shape()).faces())
+        keep = []
+        for p in pieces:
+            from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
+            from OCP.gp import gp_Pnt
+            if any(BRepExtrema_DistShapeShape(BRepBuilderAPI_MakeVertex(gp_Pnt(m.X, m.Y, m.Z)).Vertex(), p.wrapped).Value() < 1e-4 for m in marks):
+                keep.append(p)
+        if not keep or len(keep) == len(pieces):
+            return None
+        return keep
+    keep = split([fc.wrapped for fc in target.faces()])
+    if keep is None:
+        keep = split([untrimmed_extended(fc, dist * 2, tol).wrapped for fc in target.faces()])
+    if keep is None:
+        raise ValueError("the extension does not reach the surface (within %.3g mm)" % dist)
+    return keep[0] if len(keep) == 1 else _sew(keep)
 
 
 def _extended_surface(face, dist, tol):
@@ -1723,19 +2423,37 @@ def _extended_surface(face, dist, tol):
         return _refit_extended_surface(face, dist, tol)
 
 
+def _extend_patch(surf, bounds, dist, sides):
+    """The patch of surf over bounds (u1, u2, v1, v2) as a B-spline face lengthened by dist (mm) at the sides
+    {(in_u, after)} (BRepLib.ExtendFace: curvature continuous, the surface inside unchanged), or None."""
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+    from OCP.BRepLib import BRepLib
+    from OCP.Geom import Geom_RectangularTrimmedSurface
+    from OCP.GeomConvert import GeomConvert
+    from OCP.TopoDS import TopoDS_Face
+    from build123d import Shape
+    u1, u2, v1, v2 = bounds
+    bs = GeomConvert.SurfaceToBSplineSurface_s(Geom_RectangularTrimmedSurface(surf, u1, u2, v1, v2))
+    a1, a2, b1, b2 = bs.Bounds()
+    F = BRepBuilderAPI_MakeFace(bs, a1, a2, b1, b2, 1e-6).Face()
+    out = TopoDS_Face()
+    BRepLib.ExtendFace_s(F, dist, (True, False) in sides, (True, True) in sides, (False, False) in sides, (False, True) in sides, out)
+    if out.IsNull():
+        return None
+    r = Shape.cast(out)
+    return r if r.area > Shape.cast(F).area else None
+
+
 def _extended_bspline(face, dist):
+    """The surface of a face as a B-spline surface lengthened by dist (mm) beyond the four sides of its parameter
+    range (BRepLib.ExtendFace)."""
     from OCP.BRep import BRep_Tool
     from OCP.BRepTools import BRepTools
-    from OCP.Geom import Geom_RectangularTrimmedSurface, Geom_BSplineSurface
-    from OCP.GeomConvert import GeomConvert
-    from OCP.GeomLib import GeomLib
     surf = BRep_Tool.Surface_s(face.wrapped)
-    u1, u2, v1, v2 = BRepTools.UVBounds_s(face.wrapped)
-    bs = GeomConvert.SurfaceToBSplineSurface_s(Geom_RectangularTrimmedSurface(surf, u1, u2, v1, v2))
-    for in_u in (True, False):
-        for after in (True, False):
-            GeomLib.ExtendSurfByLength_s(bs, dist, 2, in_u, after)
-    return bs
+    r = _extend_patch(surf, BRepTools.UVBounds_s(face.wrapped), dist, {(True, False), (True, True), (False, False), (False, True)})
+    if r is None:
+        raise ValueError("the surface cannot be extended")
+    return BRep_Tool.Surface_s(r.wrapped)
 
 
 def _refit_extended_surface(face, dist, tol):
@@ -2272,3 +2990,749 @@ def fillet(shape, bodies, f, find_edges, find_faces=None):
     res = _sew(ka + kb + faces + others, max(1e-4, r * 1e-3))
     res._kind = "fillet between the surfaces, trimmed and sewn (%d faces)" % len(res.faces())
     return res
+
+
+def close_gaps(bodies, f):
+    """Close gaps: slits between faces of the surface body "source" closed. A slit is a free edge of one face with
+    free edges of another face running beside it, at most "max_gap" (mm) apart over its whole length (a V-shaped
+    split between two faces, or a narrow gap along a seam). One of the two faces is rebuilt on its surface (extended
+    beyond the face when it is not analytic) with its edge replaced by the edges of the other face, with short
+    lines where the ends do not meet; the faces then share those edges and are sewn into one shell."""
+    from OCP.BRep import BRep_Tool, BRep_Builder
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy, BRepBuilderAPI_MakeVertex, BRepBuilderAPI_Sewing
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+    from OCP.TopoDS import TopoDS, TopoDS_Compound
+    from OCP.gp import gp_Pnt
+    from build123d import Shape
+    to_edge = getattr(TopoDS, "Edge_s", None) or TopoDS.Edge
+    src = bodies.get(f.get("source"))
+    if src is None:
+        raise ValueError("choose the surface body")
+    max_gap = float(f.get("max_gap") or 0.5)
+    if max_gap <= 0:
+        raise ValueError("the maximum gap must be > 0")
+    # a copy: the edges get curves on the rebuilt faces (the source body is cached)
+    body = Shape.cast(BRepBuilderAPI_Copy(src.wrapped, True, False).Shape())
+    faces = list(body.faces())
+    if len(faces) < 2:
+        raise ValueError("the surface body has one face")
+    seen = {}
+    for i, fc in enumerate(faces):
+        for e in fc.edges():
+            if BRep_Tool.Degenerated_s(to_edge(e.wrapped)):
+                continue
+            lst = seen.setdefault(hash(e.wrapped), [])
+            for item in lst:
+                if item[0].wrapped.IsSame(e.wrapped):
+                    item[1].add(i)
+                    break
+            else:
+                lst.append((e, {i}))
+    free = [(e, next(iter(s))) for lst in seen.values() for e, s in lst if len(s) == 1]
+    by_face = {}
+    for e, i in free:
+        by_face.setdefault(i, []).append(e)
+    boxes = {}
+
+    def box(e):
+        k = id(e)
+        if k not in boxes:
+            bb = e.bounding_box()
+            boxes[k] = (bb.min.X - max_gap, bb.min.Y - max_gap, bb.min.Z - max_gap, bb.max.X + max_gap, bb.max.Y + max_gap, bb.max.Z + max_gap)
+        return boxes[k]
+
+    def overlap(a, b):
+        p, q = box(a), box(b)
+        return all(p[k] <= q[k + 3] and q[k] <= p[k + 3] for k in range(3))
+
+    def pts(e, n=9):
+        return [e.position_at(k / (n - 1)) for k in range(n)]
+
+    def dist(p, shp):
+        v = BRepBuilderAPI_MakeVertex(gp_Pnt(p.X, p.Y, p.Z)).Vertex()
+        return BRepExtrema_DistShapeShape(v, shp).Value()
+
+    def comp(edges):
+        c = TopoDS_Compound()
+        b = BRep_Builder()
+        b.MakeCompound(c)
+        for e in edges:
+            b.Add(c, e.wrapped)
+        return c
+    cands = []
+    for ea, i in free:
+        for j, ebs in by_face.items():
+            if j == i:
+                continue
+            near = [eb for eb in ebs if overlap(ea, eb) and all(dist(q, ea.wrapped) <= max_gap for q in pts(eb))]
+            if not near:
+                continue
+            gap = max(dist(q, comp(near)) for q in pts(ea))
+            if gap > max_gap or gap < 1e-7:
+                continue
+            cands.append((not _is_analytic(faces[i]), -faces[i].area, i, ea, j, near))
+    # the analytic face (extended on its own surface), else the larger face, takes the slit
+    cands.sort(key=lambda c: (c[0], c[1]))
+    used, slits = [], []
+    isused = lambda e: any(e.wrapped.IsSame(u.wrapped) for u in used)
+    for _, _, i, ea, j, near in cands:
+        if isused(ea) or any(isused(x) for x in near):
+            continue
+        used += [ea] + near
+        slits.append((i, [ea], j, near))
+    if not slits:
+        raise ValueError("no gaps up to %g mm between faces of the body" % max_gap)
+    out = list(faces)
+    plan = {}
+    for i, old, j, new in slits:
+        plan.setdefault(i, []).append((old, new, j))
+    closed, failed = 0, 0
+    tried = set()
+    while plan:
+        i = next(iter(plan))
+        reps = plan.pop(i)
+        tried.add(i)
+        try:
+            out[i] = _replaced_edges_face(out[i], [(o, n) for o, n, _ in reps], max_gap)
+            closed += len(reps)
+            continue
+        except ValueError:
+            pass
+        # the other face of each slit takes it
+        for o, n, j in reps:
+            if j in tried:
+                failed += 1
+            else:
+                plan.setdefault(j, []).append((n, o, i))
+    sew = BRepBuilderAPI_Sewing(max(1e-5, min(1e-3, max_gap * 0.05)))
+    for fc in out:
+        sew.Add(fc.wrapped)
+    sew.Perform()
+    res = Shape.cast(sew.SewedShape())
+    res._kind = "%d gap(s) closed" % closed + (", %d could not be closed" % failed if failed else "")
+    return res
+
+
+def _is_analytic(fc):
+    from OCP.BRep import BRep_Tool
+    return BRep_Tool.Surface_s(fc.wrapped).DynamicType().Name() in (
+        "Geom_Plane", "Geom_CylindricalSurface", "Geom_ConicalSurface", "Geom_SphericalSurface", "Geom_ToroidalSurface")
+
+
+def _replaced_edges_face(fc, reps, max_gap):
+    """The face rebuilt with each run of its edges old of reps [(old edges, new edges)] replaced by the chain of
+    new edges (with short lines at the ends where the chain does not meet the neighbouring edges), on its surface
+    (extended by 4 x max_gap + 1 mm when it is not analytic). Raises ValueError."""
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeWire, BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeFace
+    from OCP.BRepTools import BRepTools, BRepTools_WireExplorer
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    from OCP.BRepLib import BRepLib
+    from OCP.ShapeFix import ShapeFix_Face
+    from OCP.TopoDS import TopoDS
+    from OCP.gp import gp_Pnt
+    from build123d import Shape
+    to_face = getattr(TopoDS, "Face_s", None) or TopoDS.Face
+    to_wire = getattr(TopoDS, "Wire_s", None) or TopoDS.Wire
+    to_edge = getattr(TopoDS, "Edge_s", None) or TopoDS.Edge
+    F = to_face(fc.wrapped)
+    surf = BRep_Tool.Surface_s(F)
+    if not _is_analytic(fc):
+        surf = _extended_surface(fc, 4 * max_gap + 1.0, 0.01)
+    outer = BRepTools.OuterWire_s(F)
+
+    def rep_of(e):
+        for k, (old, _new) in enumerate(reps):
+            if any(e.wrapped.IsSame(o.wrapped) for o in old):
+                return k
+        return None
+
+    def line(p, q):
+        return Shape.cast(BRepBuilderAPI_MakeEdge(gp_Pnt(p.X, p.Y, p.Z), gp_Pnt(q.X, q.Y, q.Z)).Edge())
+    done = 0
+    wires = []
+    for w in fc.wires():
+        ex = BRepTools_WireExplorer(to_wire(w.wrapped), F)
+        seq = []
+        while ex.More():
+            seq.append(Shape.cast(ex.Current()))
+            ex.Next()
+        # start at an edge that stays, so that a replaced run is not split at the start of the list
+        keep = [k for k, e in enumerate(seq) if rep_of(e) is None]
+        if keep:
+            seq = seq[keep[0]:] + seq[:keep[0]]
+        edges = []
+        k = 0
+        while k < len(seq):
+            r = rep_of(seq[k])
+            if r is None:
+                edges.append(seq[k])
+                k += 1
+                continue
+            run = [seq[k]]
+            while k + len(run) < len(seq) and rep_of(seq[k + len(run)]) == r:
+                run.append(seq[k + len(run)])
+            k += len(run)
+            done += 1
+            # (position_at follows the orientation of the edge in the wire)
+            s, t = run[0].position_at(0), run[-1].position_at(1)
+            chain = _ordered_chain(reps[r][1], s)
+            cs, ct = chain[0][1], chain[-1][2]
+            if (cs - s).length > 1e-6:
+                edges.append(line(s, cs))
+            edges += [c[0] for c in chain]
+            if (ct - t).length > 1e-6:
+                edges.append(line(ct, t))
+        mw = BRepBuilderAPI_MakeWire()
+        for e in edges:
+            mw.Add(to_edge(e.wrapped))
+            if not mw.IsDone():
+                raise ValueError("the boundary is not one wire")
+        wires.append((w.wrapped.IsSame(outer), mw.Wire()))
+    if not done:
+        raise ValueError("no edge replaced")
+    ow = [x for o, x in wires if o]
+    if not ow:
+        raise ValueError("no outer wire")
+    inner = [x for o, x in wires if not o]
+    grow = max_gap * sum(sum(e.length for e in old) for old, _ in reps) + 1e-6
+    for wr in (ow[0], to_wire(ow[0].Reversed())):
+        mk = BRepBuilderAPI_MakeFace(surf, wr, True)
+        if not mk.IsDone():
+            continue
+        for w in inner:
+            mk.Add(w)
+        fx = ShapeFix_Face(mk.Face())
+        fx.Perform()
+        cand = fx.Face()
+        BRepLib.SameParameter_s(cand, 1e-5, True)
+        c = Shape.cast(cand)
+        if c.area > 0 and BRepCheck_Analyzer(cand).IsValid() and abs(c.area - fc.area) <= grow:
+            pc = _point_on(fc)
+            try:
+                if fc.normal_at(pc).dot(c.normal_at(pc)) < 0:
+                    c = Shape.cast(c.wrapped.Reversed())
+            except Exception:  # noqa: BLE001
+                pass
+            return c
+    raise ValueError("the face could not be rebuilt")
+
+
+def _ordered_chain(edges, start):
+    """The edges as a chain from the end nearest to start: [(edge, first point, last point)] along the chain."""
+    rest = list(edges)
+
+    def ends(e):
+        return e.position_at(0), e.position_at(1)
+    first = min(rest, key=lambda e: min((p - start).length for p in ends(e)))
+    rest.remove(first)
+    a, b = ends(first)
+    out = [(first, a, b) if (a - start).length <= (b - start).length else (first, b, a)]
+    while rest:
+        cur = out[-1][2]
+        nxt = min(rest, key=lambda e: min((p - cur).length for p in ends(e)))
+        rest.remove(nxt)
+        a, b = ends(nxt)
+        out.append((nxt, a, b) if (a - cur).length <= (b - cur).length else (nxt, b, a))
+    return out
+
+
+def sweep_surface(bodies, f):
+    """Sweep surface: the profile ("profile": a curve body or a sketch feature; each separate chain of it swept on
+    its own) swept along the path ("path": a curve body or a sketch feature; one connected chain), the profile
+    turning with the path ("orient": "corrected" (corrected Frenet, default; the discrete frame when it fails) |
+    "frenet" | "discrete" (discrete frame) | "fixed" (moved without turning)), joined at the path corners by
+    extended and intersected sections; "smooth" (mm, default 0.02, 0: off): the path replaced by one C2 B-spline
+    within that tolerance. Open profiles give open surfaces; a closed profile gives a tube."""
+    from OCP.BRepOffsetAPI import BRepOffsetAPI_MakePipeShell
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_RightCorner
+    from build123d import Shape, Wire, Compound
+
+    def edges_of(ref, what):
+        if not ref:
+            raise ValueError("choose the %s (a curve body or a sketch)" % what)
+        body = (bodies or {}).get(ref)
+        if body is not None:
+            es = list(body.edges())
+        else:
+            fn = f.get("_sketch_curves")
+            if fn is None:
+                raise ValueError("the %s was not found" % what)
+            es = list(fn(ref))
+        if not es:
+            raise ValueError("the %s has no curves" % what)
+        return es
+    profiles = _chain_wires(edges_of(f.get("profile"), "profile"))
+    pe = edges_of(f.get("path"), "path")
+    smooth = float(f.get("smooth", 0.02) or 0)
+    note = []
+    if smooth > 0:
+        # the path as one smooth curve (C2 B-spline through points along the chain, within the tolerance): the
+        # kinks, short edges and small breaks of an extracted curve do not twist the swept profile
+        path = Wire([_smooth_chain(pe, smooth)])
+        note.append("path smoothed within %g mm" % smooth)
+    else:
+        chains = list(Wire.combine(pe, tol=1e-4))
+        if len(chains) > 1:
+            chains, n = _join_gaps(chains, 0.5)
+            if n:
+                note.append("%d path gap(s) bridged" % n)
+        if len(chains) != 1:
+            raise ValueError("the path has %d separate chains: one connected chain is needed (Smooth the path "
+                             "joins small breaks)" % len(chains))
+        path = chains[0]
+    from OCP.gp import gp_Ax2
+    orient = f.get("orient") or "corrected"
+
+    def pipe(w, mode):
+        ps = BRepOffsetAPI_MakePipeShell(path.wrapped)
+        if mode == "frenet":
+            ps.SetMode(True)
+        elif mode == "discrete":
+            ps.SetDiscreteMode()
+        elif mode == "fixed":
+            ps.SetMode(gp_Ax2())
+        else:
+            ps.SetMode(False)
+        ps.SetTransitionMode(BRepBuilderAPI_RightCorner)
+        ps.Add(w.wrapped, False, False)
+        try:
+            ps.Build()
+        except Exception:  # noqa: BLE001
+            return None
+        return Shape.cast(ps.Shape()) if ps.IsDone() else None
+    out = []
+    for w in profiles:
+        r = pipe(w, orient)
+        if r is None and orient == "corrected":
+            # the corrected Frenet frame fails on paths with tight bends: the discrete frame
+            r = pipe(w, "discrete")
+            if r is not None and "discrete frame used (corrected Frenet failed)" not in note:
+                note.append("discrete frame used (corrected Frenet failed)")
+        if r is None:
+            raise ValueError("the sweep failed (a path corner tighter than the profile, or a profile far from the "
+                             "path start); try another Profile orientation")
+        out.append(r)
+    if len(out) == 1:
+        res = out[0]
+    else:
+        res = Compound(children=out)
+    if not res.faces():
+        raise ValueError("the sweep gave no surface")
+    if len(out) > 1:
+        note.append("%d profile chain(s) swept" % len(out))
+    res._kind = ", ".join(note) or None
+    return res
+
+
+def _smooth_chain(edges, tol, step=0.1):
+    """One C2 B-spline edge through the edges taken as one chain (ordered end to nearest end, gaps up to 1 mm
+    allowed), points every step (mm, at least 4 per edge), within tol (mm). Raises ValueError."""
+    from OCP.GeomAPI import GeomAPI_PointsToBSpline
+    try:
+        from OCP.TColgp import TColgp_Array1OfPnt
+    except ImportError:
+        from OCP.collections import Array1_gp_Pnt as TColgp_Array1OfPnt
+    from OCP.GeomAbs import GeomAbs_C2
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+    from OCP.gp import gp_Pnt
+    from build123d import Edge
+    rest = [e for e in edges if e.length > 1e-9]
+    if not rest:
+        raise ValueError("the path has no length")
+    ends = lambda e: (e.position_at(0), e.position_at(1))
+    # start at a chain end: the edge end farthest from every other edge
+    def lonely(e, p):
+        return min([min((p - q).length for q in ends(o)) for o in rest if o is not e] or [0.0])
+    first, rev = max(((e, k) for e in rest for k in (0, 1)), key=lambda x: lonely(x[0], ends(x[0])[x[1]]))
+    order = [(first, rev == 1)]
+    rest.remove(first)
+    cur = ends(first)[0] if rev == 1 else ends(first)[1]
+    while rest:
+        nxt, d, back = min(((o, min((cur - q).length for q in ends(o)), (cur - ends(o)[1]).length < (cur - ends(o)[0]).length)
+                            for o in rest), key=lambda x: x[1])
+        if d > 1.0:
+            raise ValueError("the path has breaks over 1 mm: one connected chain is needed")
+        order.append((nxt, back))
+        rest.remove(nxt)
+        cur = ends(nxt)[0] if back else ends(nxt)[1]
+    pts = []
+    for e, back in order:
+        n = max(4, int(e.length / step) + 1)
+        ts = [k / n for k in range(n + 1)]
+        if back:
+            ts = ts[::-1]
+        for t in ts:
+            q = e.position_at(t)
+            if not pts or (q - pts[-1]).length > max(step * 0.25, 1e-4):
+                pts.append(q)
+    if len(pts) < 2:
+        raise ValueError("the path has no length")
+    arr = TColgp_Array1OfPnt(1, len(pts))
+    for i, q in enumerate(pts):
+        arr.SetValue(i + 1, gp_Pnt(q.X, q.Y, q.Z))
+    fit = GeomAPI_PointsToBSpline(arr, 3, 8, GeomAbs_C2, tol)
+    if not fit.IsDone():
+        raise ValueError("the path could not be smoothed")
+    return Edge(BRepBuilderAPI_MakeEdge(fit.Curve()).Edge())
+
+
+def curve_project(shape, bodies, f):
+    """Project curve: the curves of "source" (a curve body or a sketch feature) projected onto "target" (a surface
+    body; empty: the solid). "method": "normal" (default; each point to the nearest point of the surface, along
+    the surface normal) | "direction" ("direction" [x, y, z]; a sketch without a direction: its plane normal),
+    "keep": "nearest" (default; of the projections along the direction, the one nearest to the curve) | "all".
+    Returns a curve body."""
+    from OCP.BRepProj import BRepProj_Projection
+    from OCP.BRepOffsetAPI import BRepOffsetAPI_NormalProjection
+    from OCP.GeomAbs import GeomAbs_C2
+    from OCP.gp import gp_Dir
+    from build123d import Shape, Compound, Vector
+    ref = f.get("source")
+    if not ref:
+        raise ValueError("choose the curve to project (a curve body or a sketch)")
+    body = (bodies or {}).get(ref)
+    if body is not None:
+        edges = list(body.edges())
+    else:
+        fn = f.get("_sketch_curves")
+        if fn is None:
+            raise ValueError("the curve was not found")
+        edges = list(fn(ref))
+    if not edges:
+        raise ValueError("the curve has no edges")
+    target = (bodies or {}).get(f.get("target")) if f.get("target") else shape
+    if target is None or not target.faces():
+        raise ValueError("choose the surface to project onto")
+    wires = _chain_wires(edges)
+    out = []
+    if (f.get("method") or "normal") == "direction":
+        d = f.get("direction")
+        if not d or Vector(*d).length < 1e-12:
+            # the normal of the plane of the curve (a sketch)
+            pts = [e.position_at(k / 8.0) for e in edges for k in range(9)]
+            n = Vector(0, 0, 0)
+            for i in range(1, len(pts) - 1):
+                n = n + (pts[i] - pts[0]).cross(pts[i + 1] - pts[0])
+            if n.length < 1e-9:
+                raise ValueError("the curve is straight: give the projection direction")
+            d = [n.X, n.Y, n.Z]
+        dv = Vector(*d).normalized()
+        keep_all = f.get("keep") == "all"
+        for w in wires:
+            pr = BRepProj_Projection(w.wrapped, target.wrapped, gp_Dir(dv.X, dv.Y, dv.Z))
+            cands = []
+            while pr.More():
+                cands.append(Shape.cast(pr.Current()))
+                pr.Next()
+            if not cands:
+                continue
+            if keep_all:
+                out += cands
+            else:
+                c = w.center()
+                out.append(min(cands, key=lambda x: (x.center() - c).length))
+    else:
+        for w in wires:
+            op = BRepOffsetAPI_NormalProjection(target.wrapped)
+            op.Add(w.wrapped)
+            op.SetParams(1e-4, 1e-3, GeomAbs_C2, 14, 16)
+            try:
+                op.Build()
+            except Exception:  # noqa: BLE001
+                continue
+            if not op.IsDone():
+                continue
+            es = list(Shape.cast(op.Projection()).edges())
+            if es:
+                out += _chain_wires(es)
+    if not out:
+        raise ValueError("the projection misses the surface")
+    res = out[0] if len(out) == 1 else Compound(children=out)
+    res._kind = "%d chain(s)" % len(out) if len(out) > 1 else None
+    return res
+
+
+# --------------------------------------------------------------------------- curves with end conditions
+
+def _end_data(shape, bodies, end, find_edges, datums=None):
+    """Point, outward unit tangent and curvature vector at one end of a curve: end {"kind": "edge", "ref": edge key,
+    "at": [x, y, z] (the end of the edge nearer this point)} | {"kind": "curve", "body": curve body id, "at"} |
+    {"kind": "point", "point": [x, y, z] or point feature id}. The tangent points away from the curve at its end
+    (None for a point). Returns (p, t, k, edge) as build123d Vectors (k: curvature vector d2r/ds2)."""
+    from build123d import Vector
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.BRepLProp import BRepLProp_CLProps
+    kind = (end or {}).get("kind")
+    if kind == "point":
+        from . import part as prt
+        return Vector(*prt.ref_point(datums, end.get("point"))), None, None, None
+    at = Vector(*(end.get("at") or [0, 0, 0]))
+    if kind == "curve":
+        body = (bodies or {}).get(end.get("body"))
+        if body is None:
+            raise ValueError("the curve body of the end was not found")
+        edges = list(body.edges())
+    else:
+        edges = _ref_edges(shape, [end.get("ref") or {}], find_edges, bodies)
+    if not edges:
+        raise ValueError("the edge of the end was not found")
+    # the edge end nearest the click
+    best = None
+    for e in edges:
+        for u in (0.0, 1.0):
+            q = e.position_at(u)
+            d = (q - at).length
+            if best is None or d < best[0]:
+                best = (d, e, u)
+    _, e, u = best
+    ad = BRepAdaptor_Curve(e.wrapped)
+    u0, u1 = ad.FirstParameter(), ad.LastParameter()
+    pr = BRepLProp_CLProps(ad, u0 if u < 0.5 else u1, 2, 1e-7)
+    p = pr.Value()
+    d1 = pr.D1()
+    t = Vector(d1.X(), d1.Y(), d1.Z())
+    if t.length < 1e-12:
+        t = e.tangent_at(u)
+    t = t.normalized()
+    kv = Vector(0, 0, 0)
+    try:
+        from OCP.gp import gp_Dir
+        if pr.IsTangentDefined():
+            c = pr.Curvature()
+            if c > 1e-12:
+                nrm = gp_Dir()
+                pr.Normal(nrm)
+                kv = Vector(nrm.X(), nrm.Y(), nrm.Z()) * c
+    except Exception:
+        kv = Vector(0, 0, 0)
+    # outward: the direction away from the edge at this end (the curve continues the edge)
+    if u < 0.5:
+        t = -t
+    return Vector(p.X(), p.Y(), p.Z()), t, kv, e
+
+
+def _hermite_edge(p0, t0, k0, p1, t1, k1):
+    """Bezier edge from p0 to p1 with the end derivatives: cubic with t0, t1 (None: free end, the control point
+    at the chord third), quintic when a curvature vector k is given (second derivative)."""
+    from OCP.Geom import Geom_BezierCurve
+    from OCP.gp import gp_Pnt
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+    from build123d import Edge
+    try:
+        from OCP.TColgp import TColgp_Array1OfPnt as Arr
+    except ImportError:
+        from OCP.collections import Array1_gp_Pnt as Arr
+    chord = p1 - p0
+    if t0 is None:
+        t0 = chord
+    if t1 is None:
+        t1 = chord
+    quintic = k0 is not None or k1 is not None
+    if quintic:
+        a0 = k0 if k0 is not None else (p1 - p0) * 0
+        a1 = k1 if k1 is not None else (p1 - p0) * 0
+        pts = [p0, p0 + t0 / 5, p0 + t0 * (2 / 5) + a0 / 20, p1 - t1 * (2 / 5) + a1 / 20, p1 - t1 / 5, p1]
+    else:
+        pts = [p0, p0 + t0 / 3, p1 - t1 / 3, p1]
+    a = Arr(1, len(pts))
+    for i, q in enumerate(pts):
+        a.SetValue(i + 1, gp_Pnt(q.X, q.Y, q.Z))
+    return Edge(BRepBuilderAPI_MakeEdge(Geom_BezierCurve(a)).Edge())
+
+
+def curve_blend(shape, bodies, f, find_edges, datums=None):
+    """Blend curve: a curve between two ends ("ends": [end A, end B], see _end_data) with the continuity of each
+    end "cont": "position" | "tangent" | "curvature" (an end on a point is position only) and the tangent length
+    "factor" of each end (x the distance between the ends; 1 is a natural blend). The curve leaves each edge in
+    its direction (continues it). Returns a curve body (a wire of one edge)."""
+    from build123d import Wire
+    ends = f.get("ends") or []
+    if len(ends) < 2 or not ends[0] or not ends[1]:
+        raise ValueError("pick the two ends of the curve")
+    data = [_end_data(shape, bodies, e, find_edges, datums) for e in ends[:2]]
+    (p0, t0, k0, _), (p1, t1, k1, _) = data
+    d = (p1 - p0).length
+    if d < 1e-9:
+        raise ValueError("the two ends are at the same point")
+    conts = [(e.get("cont") or "tangent") if dt[1] is not None else "position" for e, dt in zip(ends, data)]
+    facs = [float(e.get("factor") or 1.0) for e in ends]
+    # derivatives of the blend parametrised on [0, 1]: speed = factor x distance; the curvature vector is for the
+    # arc length, so the second derivative is k |speed|^2 (plus nothing along the tangent)
+    def deriv(t, k, cont, fac, into):
+        if cont == "position" or t is None:
+            return None, None
+        s = fac * d
+        tv = (t if not into else -t) * s
+        if cont == "curvature" and k is not None:
+            return tv, k * (s * s)
+        return tv, None
+    T0, K0 = deriv(t0, k0, conts[0], facs[0], False)
+    T1, K1 = deriv(t1, k1, conts[1], facs[1], True)
+    e = _hermite_edge(p0, T0, K0, p1, T1, K1)
+    w = Wire([e])
+    w._kind = "blend " + " / ".join(conts) + ", %.1f mm" % e.length
+    return w
+
+
+def curve_points(f, datums=None):
+    """Curve through points ("points": point feature ids or [x, y, z] vertices) with "method": "polyline" (straight
+    segments) | "spline" (C2 B-spline through the points) | "line" (best-fit straight line over the span of the
+    points) | "arc" (circular arc through three points); "closed" closes a polyline or a spline. Returns a curve
+    body."""
+    from build123d import Wire, Edge, Vector
+    from . import part as prt
+    pts = [Vector(*prt.ref_point(datums, p)) for p in (f.get("points") or [])]
+    # consecutive duplicates dropped
+    clean = []
+    for q in pts:
+        if not clean or (q - clean[-1]).length > 1e-7:
+            clean.append(q)
+    pts = clean
+    m = f.get("method") or "polyline"
+    closed = bool(f.get("closed")) and m in ("polyline", "spline")
+    if m == "arc":
+        if len(pts) != 3:
+            raise ValueError("an arc needs exactly three points (%d picked)" % len(pts))
+        w = Wire([Edge.make_three_point_arc(pts[0], pts[1], pts[2])])
+        w._kind = "arc, radius %.3f mm" % w.edges()[0].radius
+        return w
+    if len(pts) < 2:
+        raise ValueError("pick at least two points (%d picked)" % len(pts))
+    if m == "line":
+        import numpy as np
+        A = np.array([[q.X, q.Y, q.Z] for q in pts])
+        c = A.mean(axis=0)
+        _, _, vt = np.linalg.svd(A - c)
+        dv = vt[0]
+        s = (A - c) @ dv
+        a, b = c + dv * s.min(), c + dv * s.max()
+        if np.linalg.norm(b - a) < 1e-9:
+            raise ValueError("the points are at one place")
+        w = Wire([Edge.make_line(Vector(*a), Vector(*b))])
+        dev = float(np.max(np.linalg.norm((A - c) - np.outer(s, dv), axis=1)))
+        w._kind = "fitted line, %.3f mm, max deviation %.4f mm" % (float(np.linalg.norm(b - a)), dev)
+        return w
+    if m == "spline":
+        from OCP.GeomAPI import GeomAPI_Interpolate
+        from OCP.gp import gp_Pnt
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+        try:
+            from OCP.TColgp import TColgp_HArray1OfPnt as HArr
+        except ImportError:
+            from OCP.collections import HArray1_gp_Pnt as HArr
+        src = pts[:-1] if closed and (pts[0] - pts[-1]).length < 1e-7 else pts
+        if len(src) < 2 or (closed and len(src) < 3):
+            raise ValueError("pick more points")
+        a = HArr(1, len(src))
+        for i, q in enumerate(src):
+            a.SetValue(i + 1, gp_Pnt(q.X, q.Y, q.Z))
+        it = GeomAPI_Interpolate(a, closed, 1e-7)
+        it.Perform()
+        if not it.IsDone():
+            raise ValueError("the spline through the points failed")
+        w = Wire([Edge(BRepBuilderAPI_MakeEdge(it.Curve()).Edge())])
+        w._kind = ("closed " if closed else "") + "spline through %d points, %.3f mm" % (len(src), w.length)
+        return w
+    # polyline
+    seq = list(pts)
+    if closed and (seq[0] - seq[-1]).length > 1e-7:
+        seq.append(seq[0])
+    edges = [Edge.make_line(seq[i], seq[i + 1]) for i in range(len(seq) - 1)]
+    w = Wire(edges)
+    w._kind = ("closed " if closed else "") + "polyline, %d segments, %.3f mm" % (len(edges), w.length)
+    return w
+
+
+# --------------------------------------------------------------------------- tangent bridge
+
+def _owner_faces(shape, bodies):
+    """[(face, [edges])] over the solid and the surface bodies, for the cross-boundary direction at an edge."""
+    out = []
+    shapes = ([shape] if shape is not None else []) + [b for b in (bodies or {}).values() if b is not None and b.faces()]
+    for s in shapes:
+        for fc in s.faces():
+            out.append((fc, list(fc.edges())))
+    return out
+
+
+def _cross_dir(p, e, owners, toward):
+    """Unit direction at point p of edge e across the boundary of the face that owns e (in the face's tangent
+    plane, perpendicular to the edge), pointing to the side of "toward"; None when no face owns the edge."""
+    for fc, edges in owners:
+        if any(e.wrapped.IsSame(x.wrapped) for x in edges):
+            n = fc.normal_at(p)
+            t = e.tangent_at(_param_near(e, p))
+            d = n.cross(t)
+            if d.length < 1e-12:
+                return None
+            d = d.normalized()
+            if d.dot(toward - p) < 0:
+                d = -d
+            return d
+    return None
+
+
+def _param_near(e, p):
+    """Normalised parameter of the point of edge e nearest p (sampled)."""
+    best, bu = None, 0.0
+    for i in range(33):
+        u = i / 32
+        d = (e.position_at(u) - p).length
+        if best is None or d < best:
+            best, bu = d, u
+    return bu
+
+
+def _edge_at(wire, u):
+    """The edge of the wire at the normalised parameter u (the edge nearest the point there)."""
+    p = wire.position_at(u)
+    best, be = None, None
+    for e in wire.edges():
+        d = min((e.position_at(i / 16) - p).length for i in range(17))
+        if best is None or d < best:
+            best, be = d, e
+    return be, p
+
+
+def bridge_tangent(shape, bodies, wa, wb, rev, factor=1.0, nu=32, nv=12):
+    """Surface between the wires A and B that leaves each side tangent to the face owning that side's edges (G1):
+    cubic Hermite blends between corresponding points of the sides (the cross-boundary direction of the owner face
+    as the end tangent, the chord direction where no face owns the edge, e.g. a curve body), fitted with a C2
+    B-spline surface. factor scales the tangent length (x the distance between the sides)."""
+    from OCP.GeomAPI import GeomAPI_PointsToBSplineSurface
+    from OCP.GeomAbs import GeomAbs_C2
+    from OCP.gp import gp_Pnt
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+    from build123d import Face
+    try:
+        from OCP.TColgp import TColgp_Array2OfPnt as Arr2
+    except ImportError:
+        from OCP.collections import Array2_gp_Pnt as Arr2
+    owners = _owner_faces(shape, bodies)
+    pts = Arr2(1, nv + 1, 1, nu + 1)
+    for i in range(nu + 1):
+        u = i / nu
+        ea, pa = _edge_at(wa, u)
+        eb, pb = _edge_at(wb, (1 - u) if rev else u)
+        chord = pb - pa
+        d = chord.length
+        if d < 1e-9:
+            ta = tb = chord
+        else:
+            da = _cross_dir(pa, ea, owners, pb)
+            db = _cross_dir(pb, eb, owners, pa)
+            s = factor * d
+            ta = (da * s) if da is not None else chord
+            tb = (-db * s) if db is not None else chord
+        for j in range(nv + 1):
+            t = j / nv
+            h00 = 2 * t ** 3 - 3 * t ** 2 + 1
+            h10 = t ** 3 - 2 * t ** 2 + t
+            h01 = -2 * t ** 3 + 3 * t ** 2
+            h11 = t ** 3 - t ** 2
+            q = pa * h00 + ta * h10 + pb * h01 + tb * h11
+            pts.SetValue(j + 1, i + 1, gp_Pnt(q.X, q.Y, q.Z))
+    sf = GeomAPI_PointsToBSplineSurface(pts, 3, 8, GeomAbs_C2, 1e-6).Surface()
+    u0, u1, v0, v1 = sf.Bounds()
+    return Face(BRepBuilderAPI_MakeFace(sf, u0, u1, v0, v1, 1e-6).Face())

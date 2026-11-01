@@ -825,6 +825,195 @@ def test_rough_mesh_section_without_projection(tmp_path):
     assert not any(r.get("kind") in ("proj", "hidden") for r in refs)
 
 
+def test_section_refs_cut_at_plane():
+    """Reference geometry with the model cut at the sketch plane: a plate 100 x 50 x 20 with a 20 mm hole, sketched
+    on XZ through the hole centre. Uncut, the hole is four hidden lines. Cut (front or back), the half hole of the
+    kept half is visible, the edges of the cut face are listed once (as the section) and the frame carries the 3D
+    plane. The section is of the whole model either way."""
+    from conftest import plate
+    from drawgen import part
+    p = part.migrate(plate("cut"))
+    bodies, datums = {}, {}
+    shape, st = part.build(p, surfaces=bodies, datums=datums)
+    f = {"id": "s1", "type": "sketch", "plane": "XZ", "offset": -25.0}
+    lines = lambda refs, kind: sorted(tuple(round(r[k], 3) for k in ("x1", "y1", "x2", "y2")) for r in refs if r.get("kind") == kind and r["t"] == "line")
+    plain = part.section_refs(shape, f, datums, bodies)
+    assert len(lines(plain, "hidden")) == 4 and len(lines(plain, "section")) == 8
+    fr = next(r for r in plain if r["t"] == "frame")
+    assert fr["o3"] == [0.0, 25.0, 0.0] and fr["z3"] == [0.0, -1.0, 0.0] and fr["x3"] == [1.0, 0.0, 0.0]
+    for side, seen in (("front", (40.0, 0.0, 60.0, 0.0)), ("back", (0.0, 0.0, 100.0, 0.0))):
+        refs = part.section_refs(shape, f, datums, bodies, cut=side)
+        assert lines(refs, "section") == lines(plain, "section")
+        vis = lines(refs, "proj")
+        # front: the far half of the hole is visible; back: the whole front face is
+        assert seen in vis or (seen[2], seen[3], seen[0], seen[1]) in vis, (side, vis)
+        assert not any(l in lines(refs, "section") for l in vis)
+        assert (40.0, 0.0, 40.0, 20.0) not in lines(refs, "hidden") and (40.0, 20.0, 40.0, 0.0) not in lines(refs, "hidden")
+    assert part.section_refs(None, f, datums, bodies, cut="front")[0]["t"] in ("frame", "point")
+
+
+def test_curve_blend_and_curve_points():
+    """Blend curve: tangent and curvature continuity at an edge end of the solid and at the end of an arc curve
+    body; a point end is position only. Curve through points: polyline (closed), spline, best-fit line and arc."""
+    from conftest import plate
+    from drawgen import part
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.BRepLProp import BRepLProp_CLProps
+
+    def curv(e, end):
+        ad = BRepAdaptor_Curve(e.wrapped)
+        return BRepLProp_CLProps(ad, ad.LastParameter() if end else ad.FirstParameter(), 2, 1e-7).Curvature()
+    p = plate("bl")
+    pts = [[0, 0, 20], [50, 10, 25], [100, 0, 20]]
+    p["features"] += [
+        {"id": "arc", "name": "Arc", "type": "curve_points", "points": pts, "method": "arc"},
+        {"id": "pl", "name": "Poly", "type": "curve_points", "points": pts, "method": "polyline", "closed": True},
+        {"id": "spl", "name": "Spline", "type": "curve_points", "points": pts, "method": "spline"},
+        {"id": "ln", "name": "Line", "type": "curve_points", "points": pts, "method": "line"},
+        {"id": "b1", "name": "Blend 1", "type": "curve_blend", "ends": [
+            {"kind": "edge", "ref": {"mid": [50.0, 0.0, 20.0], "len": 100.0}, "at": [100.0, 0.0, 20.0], "cont": "tangent", "factor": 1},
+            {"kind": "point", "point": [140.0, 30.0, 20.0]}]},
+        {"id": "b2", "name": "Blend 2", "type": "curve_blend", "ends": [
+            {"kind": "edge", "ref": {"mid": [50.0, 0.0, 20.0], "len": 100.0}, "at": [100.0, 0.0, 20.0], "cont": "curvature", "factor": 1},
+            {"kind": "curve", "body": "arc", "at": [0.0, 0.0, 20.0], "cont": "curvature", "factor": 0.5}]}]
+    bodies, datums = {}, {}
+    shape, st = part.build(p, surfaces=bodies, datums=datums)
+    assert not [x for x in st if x.get("error")], [x.get("error") for x in st]
+    arc = bodies["arc"].edges()[0]
+    assert abs(arc.radius - 117.394) < 0.01
+    assert len(bodies["pl"].edges()) == 3 and bodies["pl"].is_closed
+    assert len(bodies["spl"].edges()) == 1 and abs(bodies["spl"].length - 103.24) < 0.05
+    ln = bodies["ln"].edges()[0]
+    assert abs(ln.length - 100) < 1e-3 and abs(ln.position_at(0).Y - 3.333) < 0.01
+    b1 = bodies["b1"].edges()[0]
+    tup = lambda v: tuple(round(c, 6) for c in (v.X, v.Y, v.Z))
+    assert tup(b1.position_at(0)) == (100.0, 0.0, 20.0) and tup(b1.tangent_at(0)) == (1.0, 0.0, 0.0)
+    assert tup(b1.position_at(1)) == (140.0, 30.0, 20.0)
+    b2 = bodies["b2"].edges()[0]
+    assert (b2.position_at(1) - arc.position_at(0)).length < 1e-6
+    assert (b2.tangent_at(1) - arc.tangent_at(0)).length < 1e-6
+    assert abs(curv(b2, True) - curv(arc, False)) < 1e-6 and curv(b2, False) < 1e-9
+    assert [x["note"] for x in st if x.get("id") == "b2"][0].startswith("clean curve: blend curvature / curvature")
+
+
+def test_bridge_tangent():
+    """Bridge surface with continuity tangent between two offset parallel planar faces: the surface leaves both
+    sides with the normal of the faces (an S shape); ruled gives the flat strip."""
+    from conftest import rect
+    from drawgen import part
+    from build123d import Vector, Vertex
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+    feats = [
+        {"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(40, 20)}},
+        {"id": "b", "name": "B", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 10, "sketch": {"entities": rect(40, 20, 0, 30)}}]
+    side = {"edges_a": [{"mid": [20.0, 20.0, 0.0], "len": 40.0}], "edges_b": [{"mid": [20.0, 30.0, 10.0], "len": 40.0}], "curves_a": [], "curves_b": [], "flip": False}
+    out = {}
+    for bid, extra in (("t", {"continuity": "tangent", "factor": 1}), ("r", {})):
+        p = {"name": "br", "version": 2, "features": feats + [dict(side, id=bid, name=bid, type="surf_bridge", **extra)]}
+        bodies, datums = {}, {}
+        shape, st = part.build(p, surfaces=bodies, datums=datums)
+        assert not [x for x in st if x.get("error")], [x.get("error") for x in st]
+        out[bid] = bodies[bid].faces()[0]
+    t, r = out["t"], out["r"]
+    assert abs(r.area - 40 * (10 ** 2 + 10 ** 2) ** 0.5) < 0.01
+    assert t.area > r.area
+    for q in (Vector(20, 20.05, 0), Vector(20, 29.95, 10), Vector(5, 20.05, 0)):
+        d = BRepExtrema_DistShapeShape(t.wrapped, Vertex(q.X, q.Y, q.Z).wrapped)
+        d.Perform()
+        pp = d.PointOnShape1(1)
+        n = t.normal_at(Vector(pp.X(), pp.Y(), pp.Z()))
+        assert d.Value() < 0.01 and abs(abs(n.Z) - 1) < 0.01, (q, d.Value(), n)
+
+
+def test_partition_surface_extended():
+    """Partition with a surface body that stops short of the faces of the cell: no cut as it is, two cells with
+    the surface extended beyond its free edges."""
+    from conftest import plate, rect
+    from drawgen import part
+    for ext, cells in ((0, 1), (10, 2)):
+        p = plate("sp", hole_r=0)
+        p["features"].append({"id": "s", "name": "S", "type": "surf_sketch", "kind": "planar", "plane": "YZ", "offset": 50, "sketch": {"entities": rect(40, 30, 5, -5)}})
+        p["features"].append({"id": "sp", "name": "Partition 1", "type": "split", "method": "surface", "source": "s", "cells": [], "extend": ext})
+        bodies, datums = {}, {}
+        shape, st = part.build(p, surfaces=bodies, datums=datums)
+        assert len(shape.solids()) == cells, (ext, [x.get("error") for x in st])
+
+
+def test_partition_cells_by_solid():
+    """Partition cells picked as solids ({"solid": index}): a plate split into two cells, then only cell 2 split
+    again by a plane through both: three cells."""
+    from conftest import plate
+    from drawgen import part
+    p = plate("pc", hole_r=0)
+    p["features"].append({"id": "s1", "name": "Partition 1", "type": "split", "method": "principal", "plane": "YZ", "offset": 50, "cells": []})
+    p["features"].append({"id": "s2", "name": "Partition 2", "type": "split", "method": "principal", "plane": "XZ", "offset": 25, "cells": [{"solid": 1}]})
+    shape, st = part.build(part.migrate(p))
+    assert not [x for x in st if x.get("error")], [x.get("error") for x in st]
+    assert len(shape.solids()) == 3
+
+
+def test_move_faces_corner_by_plane_offset():
+    """Move faces of two planar faces meeting at a corner by a vector along neither normal: each plane moves by the
+    vector's component along its normal and the corner is rebuilt (a 100 x 50 x 20 plate becomes 105 x 55 x 20
+    with six faces, no wedge)."""
+    from conftest import plate
+    from drawgen import part
+    p = plate("mv", hole_r=0)
+    p["features"].append({"id": "m", "name": "Move faces 1", "type": "move_faces", "vector": [5, 5, 0], "tangent": True,
+                          "faces": [{"c": [100.0, 25.0, 10.0], "n": [1.0, 0.0, 0.0], "area": 1000.0}, {"c": [50.0, 50.0, 10.0], "n": [0.0, 1.0, 0.0], "area": 2000.0}]})
+    shape, st = part.build(part.migrate(p))
+    assert not [x for x in st if x.get("error")], [x.get("error") for x in st]
+    assert abs(shape.volume - 105 * 55 * 20) < 1e-3 and len(shape.faces()) == 6
+    mx = shape.bounding_box().max
+    assert abs(mx.X - 105) < 1e-6 and abs(mx.Y - 55) < 1e-6
+
+
+def test_sketch_on_surface_body_face():
+    """A sketch on a planar face of a surface body (plane "face" with the face key of the body): the frame is
+    the face's centre and normal."""
+    from conftest import rect
+    from drawgen import part
+    p = {"name": "sf", "version": 2, "features": [
+        {"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XZ", "offset": -7, "sketch": {"entities": rect(40, 20)}},
+        {"id": "s", "name": "Sketch 1", "type": "sketch", "plane": "face", "plane_face": {"c": [20.0, 7.0, 10.0], "n": [0.0, -1.0, 0.0], "area": 800.0}, "plane_face_body": "a", "offset": 0, "sketch": {"entities": []}}]}
+    bodies, datums = {}, {}
+    shape, st = part.build(p, surfaces=bodies, datums=datums)
+    assert not [x for x in st if x.get("error")], [x.get("error") for x in st]
+    fr = [x for x in st if x.get("id") == "s"][0]["frame"]
+    assert [round(v, 6) for v in fr["o"]] == [20.0, 7.0, 10.0] and abs(abs(fr["z"][1]) - 1) < 1e-9
+
+
+def test_boolean_fuzzy_value():
+    """Boolean subtract with a tool that stops 0.05 mm short of the faces of the target: exact, one solid with thin
+    lips; with a fuzzy value of 0.1 mm the lips are taken as coincident faces and the target is cut through."""
+    from conftest import plate, rect
+    from drawgen import part
+    for fuzzy, n in ((0, 1), (0.1, 2)):
+        p = plate("bo", hole_r=0)
+        p["features"].append({"id": "t", "name": "Tool", "type": "extrude", "plane": "XY", "offset": -5, "sketch": {"entities": rect(20, 49.9, 40, 0.05)}, "depth": 30, "new_body": True})
+        p["features"].append({"id": "b", "name": "Boolean 1", "type": "boolean", "op": "subtract", "targets": [0], "tools": [1], "fuzzy": fuzzy, "min_thickness": 0.01})
+        shape, st = part.build(part.migrate(p))
+        assert len(shape.solids()) == n, (fuzzy, [x.get("error") for x in st])
+        if fuzzy:
+            assert "fuzzy value 0.1 mm" in [x for x in st if x.get("id") == "b"][0]["note"]
+
+
+def test_offset_surface_join_option():
+    """Offset surface: the join at the edges can be forced: arcs, face by face, simple; each gives a body."""
+    from conftest import rect
+    from drawgen import part
+    for join in ("auto", "intersection", "arcs", "faces", "simple"):
+        p = {"name": "oj", "version": 2, "features": [
+            {"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(40, 20)}},
+            {"id": "b", "name": "B", "type": "surf_sketch", "kind": "planar", "plane": "XZ", "offset": 0, "sketch": {"entities": rect(40, 20)}},
+            {"id": "s", "name": "Sew 1", "type": "surf_sew", "sources": ["a", "b"], "tolerance": 0.001},
+            {"id": "o", "name": "Offset 1", "type": "surf_offset", "source": "s", "distance": 2, "join": join}]}
+        bodies, datums = {}, {}
+        shape, st = part.build(p, surfaces=bodies, datums=datums)
+        assert not [x for x in st if x.get("error")], (join, [x.get("error") for x in st])
+        assert bodies["o"].faces(), join
+
+
 def test_inspect_edges_where_cells_meet():
     """Inspect of a part of 4 cells (two partitions): the edges shared by the cells are listed as edges where cells
     meet, not as non-manifold edges; Boolean union of the cells and Merge faces give one solid of 6 faces."""
@@ -933,7 +1122,8 @@ def test_remove_tiny_face_next_to_extruded_spline():
 
 def test_extend_extruded_spline_surface_across_edges():
     """Extend surface of an extruded sketch spline (extrusion surface): across a straight end edge and across the
-    curved edge, the strip is built on the surface extended as a B-spline surface and sewn to the face."""
+    curved edge: one face (the patch lengthened at that side with curvature continuity), area grown by 5 mm x the
+    edge length."""
     from drawgen import part as P
     sp = {"id": 1, "t": "spline", "layer": "0", "closed": False, "pts": [[0, 0], [10, 4], [20, 0]]}
     base = lambda: [{"id": "s", "name": "Wall", "type": "surf_sketch", "kind": "extrude", "depth": 10, "plane": "XY", "offset": 0,
@@ -951,8 +1141,78 @@ def test_extend_extruded_spline_surface_across_edges():
         assert not st[-1].get("error"), (e.geom_type.name, st[-1])
         b = bodies["x"]
         expect = a0 + 5 * e.length                              # strip of the edge length x 5 mm (curvature: approximately)
-        assert abs(b.area - expect) < 0.02 * expect, (e.geom_type.name, b.area, expect)
-        assert len(b.shells()) == 1
+        assert abs(b.area - expect) < 0.002 * expect, (e.geom_type.name, b.area, expect)
+        assert len(b.faces()) == 1                              # the extension is part of the face
+
+
+def test_extend_surface_merged_upto_and_trim_reach(tmp_path):
+    """Extend surface: across the slanted edge of a trimmed spline wall (one face, area + 5 mm x edge length),
+    across the straight and the arc edge of a cylinder patch (one face each); Up to a surface: a planar strip
+    extended across its end up to a second strip that ends short of it (the second strip extended for the cut);
+    Trim surface with a tool that ends short of the target: the tool is extended and the trim done."""
+    import copy
+    from drawgen import part as P
+
+    def build(feats):
+        b = {}
+        sh, st = P.build(P.migrate({"name": "t", "features": copy.deepcopy(feats)}), surfaces=b)
+        return b, st
+
+    def extend_case(feats, src, pick, **kw):
+        b, st = build(feats)
+        body = b[src]
+        e = pick(body)
+        m = e.position_at(0.5)
+        ext = dict({"id": "x", "name": "Ext", "type": "surf_extend", "source": src, "edges": [{"mid": [m.X, m.Y, m.Z], "len": e.length}],
+                    "mode": "edges", "distance": 5, "tolerance": 0.01}, **kw)
+        b2, st2 = build(feats + [ext])
+        assert st2[-1]["error"] is None, st2[-1]
+        return body, e, b2["x"], st2[-1]
+    sp = {"id": 1, "t": "spline", "layer": "0", "closed": False, "pts": [[0, 0], [10, 4], [20, 0]]}
+    wall = [{"id": "w", "name": "Wall", "type": "surf_sketch", "kind": "extrude", "depth": 10, "plane": "XY", "offset": 0, "sketch": {"entities": [dict(sp)]}},
+            {"id": "c", "name": "Cutter", "type": "surf_sketch", "kind": "extrude", "depth": 20, "plane": "XZ", "offset": -5,
+             "sketch": {"entities": [{"id": 1, "t": "line", "layer": "0", "x1": -5, "y1": 2, "x2": 25, "y2": 9}]}},
+            {"id": "t", "name": "Trim", "type": "surf_trim", "source": "w", "with": "surface", "tool": "c", "keep": "largest", "remove": []}]
+    body, e, x, st = extend_case(wall, "t", lambda bd: max(bd.edges(), key=lambda e: e.position_at(0.5).Z))
+    assert len(x.faces()) == 1 and abs(x.area - (body.area + 5 * e.length)) < 0.002 * x.area
+    cyl = [{"id": "cy", "name": "Cyl", "type": "surf_sketch", "kind": "extrude", "depth": 10, "plane": "XY", "offset": 0,
+            "sketch": {"entities": [{"id": 1, "t": "arc", "layer": "0", "cx": 0, "cy": 0, "r": 10, "a0": 0, "a1": 90}]}}]
+    for kind in ("LINE", "CIRCLE"):
+        body, e, x, st = extend_case(cyl, "cy", lambda bd: [g for g in bd.edges() if g.geom_type.name == kind][0])
+        assert len(x.faces()) == 1 and abs(x.area - (body.area + 5 * e.length)) < 0.002 * x.area, (kind, x.area)
+    # up to a surface that ends short of the extension
+    A = {"id": "a", "name": "A", "type": "surf_sketch", "kind": "extrude", "depth": 4, "plane": "XY", "offset": 0,
+         "sketch": {"entities": [{"id": 1, "t": "line", "layer": "0", "x1": -20, "y1": 20, "x2": -1, "y2": 1}]}}
+    B = {"id": "b", "name": "B", "type": "surf_sketch", "kind": "extrude", "depth": 4, "plane": "XY", "offset": 0,
+         "sketch": {"entities": [{"id": 1, "t": "line", "layer": "0", "x1": 1, "y1": 0, "x2": 30, "y2": 0}]}}
+    body, e, x, st = extend_case([A, B], "b", lambda bd: min(bd.edges(), key=lambda e: e.position_at(0.5).X), mode="upto", target="a")
+    assert len(x.faces()) == 1 and abs(x.bounding_box().min.X) < 1e-4 and abs(x.area - 120) < 1e-3
+    # trim with a tool that ends 0.5 mm short of the target edge
+    C = {"id": "c", "name": "C", "type": "surf_sketch", "kind": "extrude", "depth": 4, "plane": "XY", "offset": 0,
+         "sketch": {"entities": [{"id": 1, "t": "line", "layer": "0", "x1": 15, "y1": 10, "x2": 15, "y2": 0.5}]}}
+    tr = {"id": "tr", "name": "Trim", "type": "surf_trim", "source": "b", "with": "surface", "tool": "c", "keep": "largest", "remove": []}
+    b, st = build([B, C, tr])
+    assert st[-1]["error"] is None and "extended beyond its edges" in st[-1]["note"]
+    assert abs(b["tr"].area - 60) < 1e-6 and abs(b["tr"].bounding_box().min.X - 15) < 1e-6
+
+
+def test_merge_tangent_faces():
+    """Merge tangent faces: a box with a vertical edge rounded R3: the two side faces and the round (tangent, all
+    surface kinds) become one smooth face; the solid stays valid, the volume changes by less than 0.1 %; with spline
+    faces only nothing is merged (the note says 0 groups)."""
+    from drawgen import part as P
+    from conftest import rect
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    feats = lambda: [{"id": "f1", "name": "Extrude 1", "type": "extrude", "plane": "XY", "offset": 0, "sketch": {"entities": rect(20, 10)}, "depth": 5},
+                     {"id": "fl", "name": "Fillet 1", "type": "fillet", "value": 3, "edges": [{"mid": [20, 10, 2.5], "len": 5}]}]
+    s0, _ = P.build(P.migrate({"name": "t", "features": feats()}))
+    mt = {"id": "m", "name": "Merge", "type": "merge_tangent", "faces": [], "angle": 1, "splines_only": False, "points": 8, "max_dev": 0.2}
+    s, st = P.build(P.migrate({"name": "t", "features": feats() + [mt]}))
+    assert st[-1]["error"] is None and "1 group(s)" in st[-1]["note"], st[-1]
+    assert len(s.faces()) == len(s0.faces()) - 2 and BRepCheck_Analyzer(s.wrapped).IsValid()
+    assert abs(s.volume - s0.volume) < 1e-3 * s0.volume
+    s2, st2 = P.build(P.migrate({"name": "t", "features": feats() + [dict(mt, splines_only=True)]}))
+    assert "0 group(s)" in st2[-1]["note"] and len(s2.faces()) == len(s0.faces())
 
 
 def test_fillet_edge_ending_on_round():
@@ -1137,6 +1397,27 @@ def test_boolean_subtract_inside_out_tool():
     assert vols == sorted([round(tool.volume, 3), round(1200 - math.pi * 9 * 2, 3)]), vols
 
 
+def test_boolean_subtract_fallback_fuzzy(monkeypatch):
+    """Boolean subtract whose plain cut loses the wrong volume (a cut that removes nothing, as for nearly coincident
+    faces): the fixed copies are cut again with fuzzy values (and glue) until the result is the target less the
+    common volume; the solids of the part are not changed in place; a failure names the solids that are not valid
+    (none here)."""
+    from build123d import Box, Pos, Compound, Solid
+    from drawgen import part as P
+    base = Box(30, 20, 2)
+    tool = Pos(10, 0, 0) * Box(10, 30, 4)
+    comp = Compound(children=[base, tool])
+    monkeypatch.setattr(Solid, "cut", lambda self, *a, **k: self)          # the plain cut fails
+    f = {"op": "subtract", "targets": [0], "tools": [1], "keep_tools": True}
+    r = P._boolean(comp, f)
+    vols = sorted(round(abs(x.volume), 3) for x in r.solids())
+    assert vols == sorted([round(tool.volume, 3), round(1200 - 10 * 20 * 2, 3)]), vols
+    assert abs(base.volume - 1200) < 1e-9
+    monkeypatch.setattr(P, "_fuzzy_cut", lambda *a, **k: None)              # every fallback fails too
+    with pytest.raises(ValueError, match="the solids are valid"):
+        P._boolean(comp, dict(f))
+
+
 def test_boolean_sliver_removed():
     """Boolean subtract whose tool face lies 0.001 mm inside a target face: no sliver solid is left (fuzzy value of
     the sliver thickness, or the sliver removed) and the note says so; with "keep_slivers" the 0.001 mm slab stays.
@@ -1197,6 +1478,38 @@ def test_fillet_shallow_crease():
     assert st["error"] is None and "tangent" in st["note"] and len(s1.faces()) == len(s0.faces())
     s0, s1, st = prism(3, 1.0, "chamfer")
     assert st["error"] and "3.00 deg" in st["error"] and "5.7 deg" in st["error"], st
+
+
+def test_spline_faces_to_analytic(tmp_path):
+    """to_analytic: the spline faces of two solids (a box and a cylinder written as NURBS) rebuilt as planes (the
+    cylinder side may stay a spline), both solids kept, valid, volume within 0.2 %; Merge faces with "analytic" reports the count; Import
+    geometry with the analytic clean-up option on a STEP of spline solids."""
+    from build123d import Box, Cylinder, Location, Vector, Shape, Compound, export_step
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_NurbsConvert
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    from OCP.GeomAbs import GeomAbs_BSplineSurface, GeomAbs_Plane, GeomAbs_Cylinder
+    from drawgen import part as P
+    nurbs = lambda s: Shape.cast(BRepBuilderAPI_NurbsConvert(s.wrapped, True).Shape()).solids()[0]
+    a = nurbs(Box(10, 10, 5))
+    b = nurbs(Cylinder(3, 8).moved(Location(Vector(30, 0, 0))))
+    both = Compound(children=[a, b])
+    kinds = lambda sh: [BRepAdaptor_Surface(f.wrapped).GetType() for f in sh.faces()]
+    assert all(k == GeomAbs_BSplineSurface for k in kinds(both))
+    res, n = P.to_analytic(both, 1e-3)
+    ks = kinds(res)
+    # every plane converted; the cylinder side (a seam face) may stay a spline
+    assert n >= 8 and len(res.solids()) == 2 and BRepCheck_Analyzer(res.wrapped).IsValid()
+    assert ks.count(GeomAbs_Plane) == 8 and ks.count(GeomAbs_BSplineSurface) == len(ks) - 8 - ks.count(GeomAbs_Cylinder)
+    assert abs(res.volume) == pytest.approx(abs(both.volume), rel=2e-3)
+    f = {"analytic": True, "tolerance": 1e-3, "faces": True, "edges": True, "angle": 0}
+    u = P._unify(both, f)
+    assert len(u.solids()) == 2 and "spline face(s) rebuilt" in f["_note"]
+    path = str(tmp_path / "spl.step")
+    export_step(both, path)
+    sh, st = P.build(P.migrate({"name": "s", "features": [{"id": "f1", "type": "import", "path": path, "clean": {"rebuild": True, "fix": True, "analytic": True}}]}))
+    assert len(sh.solids()) == 2 and st[0]["error"] is None and "rebuilt as planes" in st[0]["note"]
+    assert kinds(sh).count(GeomAbs_Plane) == 8
 
 
 def test_checked_unify_keeps_valid_solid():
@@ -1392,3 +1705,233 @@ def test_find_edges_and_faces_on_cells():
     for cell in (0, 1):
         fs = P.find_faces(sh, [dict(P.face_key(mid[0]), cell=cell)])
         assert len(fs) == 1 and tp.face_index(fs[0]) in tp.solid_faces[cell]
+
+
+def test_trim_plane_regions_join_faces():
+    """Trim surface with a plane: the faces of an extruded 40 x 20 mm rectangle (height 10 mm) cut by the plane
+    x = 5 mm form 2 regions (500 mm^2 and 700 mm^2), not one region per face; a plane that misses the surface
+    is reported."""
+    from build123d import Polyline
+    from drawgen import surfaces as sfm, part as P
+    w = Polyline((-20, 0, 0), (20, 0, 0), (20, 20, 0), (-20, 20, 0), close=True)
+    srf = sfm.surf_from_curve({"c": w}, {"source": "c", "kind": "extrude", "direction": [0, 0, 1], "depth": 10})
+    f = {"source": "s", "with": "plane", "tool": "p", "_datums": {"p": P._frame_of([5, 0, 0], [1, 0, 0], [0, 1, 0])}}
+    pieces, _ = sfm.trim_pieces(None, {"s": srf}, f)
+    assert sorted(round(p.area, 6) for p in pieces) == [500, 700]
+    f["_datums"] = {"p": P._frame_of([50, 0, 0], [1, 0, 0], [0, 1, 0])}
+    with pytest.raises(ValueError, match="does not cut"):
+        sfm.trim_pieces(None, {"s": srf}, f)
+    f["_datums"] = {"p": P._frame_of([5, 0, 0], [1, 0, 0], [0, 1, 0])}
+    res = sfm.trim(None, {"s": srf}, dict(f, keep="largest"))
+    assert res.area == pytest.approx(700) and len(res.faces()) == 3
+
+
+def test_close_gaps_v_split():
+    """Close gaps: two faces with a V-shaped split (0 mm at one end, 0.3 mm at the other) between them, planar and
+    on B-spline surfaces that end at the split: one face is extended to the edge of the other, one shell with
+    7 free edges (the outer boundary); a maximum gap below 0.3 mm finds no gap."""
+    from build123d import Face, Polyline, Spline, Wire, Shape
+    from OCP.BRepOffsetAPI import BRepOffsetAPI_ThruSections
+    from drawgen import surfaces as sfm
+
+    def free_count(sh):
+        n = {}
+        for fc in sh.faces():
+            for e in fc.edges():
+                k = hash(e.wrapped)
+                n[k] = n.get(k, 0) + 1
+        return sum(1 for v in n.values() if v == 1)
+    a = Face(Polyline((0, 0, 0), (10, 0, 0), (10, 10, 0), (0, 10, 0), close=True))
+    b = Face(Polyline((10, 0, 0), (20, 0, 0), (20, 10, 0), (10.3, 10, 0), close=True))
+    body = sfm._sew([a, b])
+    res = sfm.close_gaps({"s": body}, {"source": "s", "max_gap": 0.5})
+    assert len(res.shells()) == 1 and free_count(res) == 7
+    assert res.area == pytest.approx(200, abs=1e-6) and res._kind == "1 gap(s) closed"
+    with pytest.raises(ValueError, match="no gaps"):
+        sfm.close_gaps({"s": body}, {"source": "s", "max_gap": 0.2})
+
+    def crv(x0, x1, n=11):
+        return Spline(*[(x0 + (x1 - x0) * k / (n - 1), 10 * k / (n - 1), 0.1 * (10 * k / (n - 1)) ** 2) for k in range(n)])
+
+    def loft(c1, c2):
+        op = BRepOffsetAPI_ThruSections(False, True, 1e-6)
+        op.AddWire(Wire([c1]).wrapped)
+        op.AddWire(Wire([c2]).wrapped)
+        op.Build()
+        return Shape.cast(op.Shape()).faces()[0]
+    body = sfm._sew([loft(crv(0, 0), crv(10, 10)), loft(crv(10, 10.3), crv(20, 20))])
+    res = sfm.close_gaps({"s": body}, {"source": "s", "max_gap": 0.5})
+    assert len(res.shells()) == 1 and free_count(res) == 7
+    assert res.area > body.area
+
+
+def test_extract_curve_bridges_gaps():
+    """Extract curve with breaks of 0.2 mm and 0.32 mm between three edges: Bridge gaps 0.5 mm gives one wire (two
+    bridging lines, or one smooth spline with Clean smooth); gap 0 keeps three separate chains."""
+    from build123d import Edge
+    from drawgen import surfaces as sfm
+    e1 = Edge.make_line((0, 0, 0), (10, 0, 0))
+    e2 = Edge.make_three_point_arc((10.2, 0, 0), (15, 3, 0), (18, 10, 0))
+    e3 = Edge.make_line((18.1, 10.3, 0), (18, 20, 0))
+    fe = lambda shp, refs: [e1, e3, e2]
+    b = sfm.curve_extract(None, {}, {"edges": [1], "clean": "none", "gap": 0}, fe, None)
+    assert len(b.wires()) == 3
+    b = sfm.curve_extract(None, {}, {"edges": [1], "clean": "none", "gap": 0.5}, fe, None)
+    assert len(b.wires()) == 1 and len(b.edges()) == 5 and b._kind == "2 gap(s) bridged"
+    b = sfm.curve_extract(None, {}, {"edges": [1], "clean": "smooth", "gap": 0.5}, fe, None)
+    assert len(b.wires()) == 1 and len(b.edges()) == 1
+    assert (b.position_at(0) - e1.position_at(0)).length < 1e-6 or (b.position_at(1) - e1.position_at(0)).length < 1e-6
+
+
+def test_trim_plane_split_face_by_face(monkeypatch):
+    """Trim surface with a plane when the split of the whole body fails (forced here): the faces are split one at a
+    time and sewn again; the plane x = 5.5 mm cuts the extruded polyline and arc into 2 regions, note "split face
+    by face"."""
+    import OCP.BRepAlgoAPI as M
+    from build123d import Wire, Edge
+    from drawgen import surfaces as sfm, part as P
+    orig = M.BRepAlgoAPI_Splitter
+
+    class OneFaceOnly:
+        def __init__(self):
+            self.o, self.n = orig(), 0
+
+        def SetArguments(self, a):
+            self.n = a.Size()
+            self.o.SetArguments(a)
+
+        def __getattr__(self, k):
+            return getattr(self.o, k)
+
+        def IsDone(self):
+            return self.o.IsDone() and self.n == 1
+    monkeypatch.setattr(M, "BRepAlgoAPI_Splitter", OneFaceOnly)
+    w = Wire([Edge.make_line((0, 0, 0), (5, 0.5, 0)), Edge.make_line((5, 0.5, 0), (6, 0, 0)), Edge.make_line((6, 0, 0), (8, 1, 0)),
+              Edge.make_three_point_arc((8, 1, 0), (14, 3, 0), (16, 10, 0))])
+    srf = sfm.surf_from_curve({"c": w}, {"source": "c", "kind": "extrude", "direction": [0, 0, 1], "depth": 5})
+    f = {"source": "s", "with": "plane", "tool": "p", "_datums": {"p": P._frame_of([5.5, 0, 0], [1, 0, 0], [0, 1, 0])}}
+    pieces, _ = sfm.trim_pieces(None, {"s": srf}, f)
+    assert len(pieces) == 2 and f["_note"] == "split face by face"
+    assert sum(p.area for p in pieces) == pytest.approx(srf.area, rel=1e-6)
+
+
+def test_surface_from_curve_drops_zero_area_faces():
+    """Surface from curve: a curve edge along the extrude direction gives a face of zero area, which is left out
+    (it made the split of Trim surface fail); the plane x = 5 mm then trims the surface into 2 regions."""
+    from build123d import Wire, Edge
+    from drawgen import surfaces as sfm, part as P
+    w = Wire([Edge.make_line((0, 0, 0), (10, 0, 0)), Edge.make_line((10, 0, 0), (10, 0, 2)), Edge.make_line((10, 0, 2), (20, 0, 2))])
+    srf = sfm.surf_from_curve({"c": w}, {"source": "c", "kind": "extrude", "direction": [0, 0, 1], "depth": 5})
+    assert len(srf.faces()) == 2 and srf.area == pytest.approx(100) and "zero area" in srf._kind
+    f = {"source": "s", "with": "plane", "tool": "p", "_datums": {"p": P._frame_of([5, 0, 0], [1, 0, 0], [0, 1, 0])}}
+    pieces, _ = sfm.trim_pieces(None, {"s": srf}, f)
+    assert sorted(round(p.area, 6) for p in pieces) == [25, 75]
+
+
+def test_sweep_surface_sketches():
+    """Sweep surface: a 6 mm line (sketch on XY) swept along a 20 mm line (sketch on XZ) gives a 120 mm^2 surface;
+    a circle of R2 along the same path gives a tube of 2 pi 2 20 mm^2."""
+    from drawgen import part as P
+    line = lambda i, a, b: {"id": i, "t": "line", "layer": "0", "x1": a[0], "y1": a[1], "x2": b[0], "y2": b[1]}
+    feats = [{"id": "s1", "name": "Sketch 1", "type": "sketch", "plane": "XY", "offset": 0, "sketch": {"entities": [line(1, (-3, 0), (3, 0))]}},
+             {"id": "s2", "name": "Sketch 2", "type": "sketch", "plane": "XZ", "offset": 0, "sketch": {"entities": [line(1, (0, 0), (0, 20))]}},
+             {"id": "s3", "name": "Sketch 3", "type": "sketch", "plane": "XY", "offset": 0, "sketch": {"entities": [{"id": 1, "t": "circle", "layer": "0", "cx": 0, "cy": 0, "r": 2}]}},
+             {"id": "w1", "name": "Sweep surface 1", "type": "surf_sweep", "profile": "s1", "path": "s2"},
+             {"id": "w2", "name": "Sweep surface 2", "type": "surf_sweep", "profile": "s3", "path": "s2"}]
+    p = P.migrate({"name": "t", "features": feats})
+    _, st = P.build(p)
+    by = {s["id"]: s for s in st}
+    assert by["w1"]["error"] is None and by["w1"]["area"] == pytest.approx(120, rel=1e-6)
+    assert by["w2"]["error"] is None and by["w2"]["area"] == pytest.approx(2 * math.pi * 2 * 20, rel=1e-4)
+
+
+def test_reference_curve_nearly_straight_is_a_line():
+    """Sketch reference geometry: points of a nearly straight curve (a curve seen almost edge-on, 0.0005 mm off the
+    chord over 17 mm) give a line, not an arc of a huge radius; points of a real arc still give an arc."""
+    from drawgen import part as P
+    pts = [(17 * k / 32, 0.0005 * math.sin(math.pi * k / 32)) for k in range(33)]
+    r = P._curve_ref(pts, "proj", 1e-3 * 17)
+    assert r["t"] == "line"
+    pts = [(17 * k / 32, 0.003 * math.sin(math.pi * k / 32)) for k in range(33)]
+    r = P._curve_ref(pts, "proj", 1e-4)
+    assert r["t"] != "arc" or r["r"] < 100 * 17
+    pts = [(10 * math.cos(math.pi * k / 64), 10 * math.sin(math.pi * k / 64)) for k in range(33)]
+    r = P._curve_ref(pts, "proj", 1e-4)
+    assert r["t"] == "arc" and r["r"] == pytest.approx(10)
+
+
+def test_sweep_surface_smoothed_path():
+    """Sweep surface along an extracted-style path (three edges with breaks of 0.003 mm and 0.004 mm): with
+    Smooth 0 the breaks are bridged by lines (several faces); smoothed within 0.02 mm the 6 mm line sweeps along it as one face
+    (area 6 mm x path length within 1 %)."""
+    from build123d import Edge
+    from drawgen import surfaces as sfm
+    path = [Edge.make_line((0, 0, 0), (0, 0, 10)), Edge.make_three_point_arc((0.003, 0, 10), (2, 0, 14.5), (6, 0, 16)),
+            Edge.make_line((6, 0, 16.004), (20, 0, 16.004))]
+    bodies = {"p": Edge.make_line((0, -3, 0), (0, 3, 0)), "q": __import__("build123d").Compound(children=path)}
+    raw = sfm.sweep_surface(bodies, {"profile": "p", "path": "q", "smooth": 0})
+    assert "2 path gap(s) bridged" in raw._kind and len(raw.faces()) > 1
+    res = sfm.sweep_surface(bodies, {"profile": "p", "path": "q", "smooth": 0.02})
+    L = sum(e.length for e in path)
+    assert len(res.faces()) == 1 and res.area == pytest.approx(6 * L, rel=0.01)
+    assert "path smoothed" in res._kind
+
+
+def test_project_curve_onto_surface():
+    """Project curve: a 20 mm vertical line at y = -20 mm projected onto an R10 cylinder face (axis Z): normal to the
+    surface and along +Y it lands at y = -10 mm (length 20 mm); along +Y with Keep all both sides (2 chains). A
+    sketch circle of R5 on XY at z = 0 projected along its plane normal onto the top of a box at z = 10 mm keeps R5."""
+    from build123d import Solid, GeomType, Edge, Box, Pos
+    from drawgen import surfaces as sfm, part as P
+    cyl = Solid.make_cylinder(10, 30).faces().filter_by(GeomType.CYLINDER)[0]
+    line = Edge.make_line((0, -20, 5), (0, -20, 25))
+    b = {"c": line, "s": cyl}
+    for extra in ({"method": "normal"}, {"method": "direction", "direction": [0, 1, 0]}):
+        r = sfm.curve_project(None, b, dict({"source": "c", "target": "s"}, **extra))
+        assert len(r.edges()) == 1 and r.edges()[0].length == pytest.approx(20, abs=1e-4)
+        assert r.edges()[0].center().Y == pytest.approx(-10, abs=1e-4)
+    r = sfm.curve_project(None, b, {"source": "c", "target": "s", "method": "direction", "direction": [0, 1, 0], "keep": "all"})
+    assert len(r.edges()) == 2
+    feats = [{"id": "x1", "name": "Extrude 1", "type": "extrude", "plane": "XY", "offset": -10, "depth": 20,
+              "sketch": {"entities": [{"id": i + 1, "t": "line", "layer": "0", "x1": q[0], "y1": q[1], "x2": r_[0], "y2": r_[1]}
+                                      for i, (q, r_) in enumerate(zip([(-20, -20), (20, -20), (20, 20), (-20, 20)], [(20, -20), (20, 20), (-20, 20), (-20, -20)]))]}},
+             {"id": "s1", "name": "Sketch 1", "type": "sketch", "plane": "XY", "offset": 20, "sketch": {"entities": [{"id": 1, "t": "circle", "layer": "0", "cx": 0, "cy": 0, "r": 5}]}},
+             {"id": "p1", "name": "Project curve 1", "type": "curve_project", "source": "s1", "target": None, "method": "direction", "direction": [0, 0, 0]}]
+    _, st = P.build(P.migrate({"name": "t", "features": feats}))
+    s = st[-1]
+    assert s["error"] is None and s["curve"] and s["length"] == pytest.approx(2 * math.pi * 5, rel=1e-4)
+
+
+def test_offset_faces_cylinder_column():
+    """Offset faces fallback for a full cylindrical face (_cyl_offset): a hole R3 through a plate 20 x 20 x 5 mm
+    made smaller (+0.5) and larger (-0.5), a boss R3 x 4 mm made larger (+0.5) and smaller (-0.5);
+    volume change pi (R^2 - r^2) L within 2 %."""
+    from build123d import Box, Cylinder, Pos, Rot, GeomType, Solid
+    from drawgen.part import _cyl_offset
+    plate = Box(20, 20, 5) - Cylinder(3, 10)
+    hole = [fc for fc in plate.faces() if fc.geom_type == GeomType.CYLINDER][0]
+    so = plate.solids()[0]
+    for d in (0.5, -0.5):
+        r = _cyl_offset(so, hole, d)
+        assert r is not None and r.is_valid
+        assert r.volume - so.volume == pytest.approx(math.pi * (3 ** 2 - (3 - d) ** 2) * 5, rel=0.02)
+    boss = (Box(20, 20, 5) + Pos(0, 0, 4.5) * Cylinder(3, 4)).solids()[0]
+    side = [fc for fc in boss.faces() if fc.geom_type == GeomType.CYLINDER][0]
+    for d in (0.5, -0.5):
+        r = _cyl_offset(boss, side, d)
+        assert r is not None and r.is_valid
+        assert r.volume - boss.volume == pytest.approx(math.pi * ((3 + d) ** 2 - 3 ** 2) * 4, rel=0.02)
+
+
+def test_projected_refs_keeps_every_spline_edge():
+    """Sketch reference geometry (projection of the part): a prism on a profile of two splines and two lines seen
+    along its axis gives both splines (each projected polyline kept, not one per part)."""
+    from build123d import Spline, Line, Wire, Face, extrude, Plane
+    from drawgen import part as P
+    s1 = Spline((0, 0), (10, 3), (20, 0))
+    s2 = Spline((20, 10), (10, 14), (0, 10))
+    w = Wire([s1, Line((20, 0), (20, 10)), s2, Line((0, 10), (0, 0))])
+    solid = extrude(Face(w), 5)
+    out = P.projected_refs(solid, Plane.XY.offset(10))
+    curved = [e for e in out if e["kind"] == "proj" and e["t"] in ("poly", "arc")]
+    assert len(curved) >= 2

@@ -244,7 +244,11 @@
       <div id="sk-partbar" class="ann-top sk-partbar" hidden>
         <strong id="sk-parttitle" title="Dashed: section of the part with the sketch plane. Grey: the part seen along the plane normal (dotted: hidden edges). Reference geometry snaps only."></strong>
         <label class="check inline"><input type="checkbox" id="sk-partproj" checked> Model edges</label>
+        <label class="check inline" title="Edges of the model behind other faces (dotted)"><input type="checkbox" id="sk-hidden" checked> Hidden lines</label>
         <label class="check inline" title="Curves of the earlier sketches that no feature uses (grey), projected onto the sketch plane"><input type="checkbox" id="sk-sketchrefs" checked> Earlier sketches</label>
+        <label class="check inline" title="The half of the model in front of the sketch plane (toward the viewer) is removed: the model edges are those of the remaining half, the section outline included"><input type="checkbox" id="sk-cut"> Cut at plane</label>
+        <label class="check inline" title="Remove the half behind the sketch plane instead"><input type="checkbox" id="sk-cutflip"> Flip</label>
+        <label class="check inline" title="The shaded model under the sketch, seen along the sketch plane normal (cut at the plane when Cut at plane is on)"><input type="checkbox" id="sk-shaded" checked> Shaded</label>
         <button type="button" id="sk-include" title="Click reference geometry to copy it into the sketch as fixed entities">Include</button>
         <button type="button" id="sk-includesec" title="Copy the whole section into the sketch">Include section</button>
         <button type="button" id="sk-includeproj" title="Copy all visible model edges into the sketch">Include edges</button>
@@ -418,6 +422,7 @@
           <button type="button" data-add="move_faces" title="Move faces by a vector: planar faces along their normals, or a hole, boss or slot to a new position">Move faces</button>
           <button type="button" data-add="smooth" title="Re-approximate wavy B-spline surfaces with smooth splines">Smooth surfaces</button>
           <button type="button" data-add="replace" title="Rebuild faces on a clean, offset surface: cut outside, fill inside (CAE: replace faces)">Replace faces</button>
+          <button type="button" data-add="merge_tangent" title="Replace groups of tangent faces (the patches of one smooth surface) by one smooth face each">Merge tangent faces</button>
           <button type="button" data-add="combine" title="Mesh several faces as one surface; geometry unchanged (CAE: virtual topology)">Combine faces</button>
           <button type="button" data-add="hole_mesh" title="O-grid partition around holes and element counts for the structured hexahedral mesh">Hole mesh</button>
           <button type="button" data-add="body_delete" title="Remove solids and surface bodies, and solids below a volume or a mean thickness, from the part (a feature in the tree)">Delete body</button>
@@ -434,15 +439,20 @@
           <button type="button" data-add="surf_sketch" data-init='{"kind":"revolve"}' title="Sketch curves revolved about a sketch axis or a construction line">Revolved surface</button>
           <button type="button" data-add="surf_loft" title="Loft through sketch curves">Loft surface</button>
           <button type="button" data-add="surf_fill" title="N-sided patch over a loop of edges">Fill surface</button>
-          <button type="button" data-add="surf_bridge" title="Ruled surface between two chains of edges, corner to corner">Bridge surface</button>
+          <button type="button" data-add="surf_sweep" title="Sweep a profile (curve body or sketch) along a path (curve body or sketch) as a surface body">Sweep surface</button>
+          <button type="button" data-add="surf_bridge" title="Surface between two chains of edges, corner to corner: ruled, or tangent to the faces of both sides">Bridge surface</button>
           <button type="button" data-add="surf_fillet" title="Rolling-ball fillet between two surface bodies (trimmed and sewn), or rounded edges of a surface body">Surface fillet</button>
           <button type="button" data-add="surf_offset" title="Offset a surface body">Offset surface</button>
           <button type="button" data-add="surf_sew" title="Sew surface bodies into one shell">Sew surfaces</button>
+          <button type="button" data-add="surf_gaps" title="Close splits between faces of a surface body: one face extended to the edges of the other, the faces sewn">Close gaps</button>
           <button type="button" data-add="surf_import" title="Faces of a STEP file (one component) as a surface body">Import surface</button>
           <button type="button" data-add="thicken" title="Solid from a surface body">Thicken</button>
           <button type="button" data-add="surf_cut" title="Split the solid with a surface body and keep one side">Cut with surface</button>
           <button type="button" data-add="curve_extract" title="3D curve from edges, joined and cleaned">Extract curve</button>
+          <button type="button" data-add="curve_project" title="Project a curve body or a sketch onto a surface body or the solid (normal to the surface or along a direction)">Project curve</button>
           <button type="button" data-add="curve_section" title="Intersection curve of surfaces or of a surface with the solid">Intersection curve</button>
+          <button type="button" data-add="curve_blend" title="3D curve between two ends (edge ends, curve ends, points) with position, tangent or curvature continuity at each end">Blend curve</button>
+          <button type="button" data-add="curve_points" title="3D curve through picked vertices and point features: polyline, spline, best-fit line or arc">Curve through points</button>
           <button type="button" data-add="surf_from_curve" title="Extrude or revolve a curve body into a surface">Surface from curve</button>
           <button type="button" data-add="surf_trim" title="Split a surface body with the solid, a surface or a projected curve and keep pieces">Trim surface</button>
           <button type="button" data-add="surf_extend" title="Extend a surface body beyond its boundary by a distance">Extend surface</button>

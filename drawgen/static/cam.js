@@ -165,6 +165,7 @@ function opLabel(o) { return (OPS[o.type] || {}).label || (CM.meta && CM.meta.op
 function hasSource() { return !!(CM.doc && CM.doc.source && CM.doc.source.name); }
 /** A change of the document: dirty, the result of the last run is stale, a preview is scheduled. */
 function changed(preview = true) {
+  syncSetup();
   CM.dirty = true;
   if (FM) FM.render();
   if (preview) schedulePreview();
@@ -851,9 +852,16 @@ function renderTree() {
   };
   const ops = d.operations || [], tcs = d.tools || [], pl = d.placement || {}, pcs = pl.constraints || [];
   const hj = !!CM.hidden.job;
-  let h = row("job", 0, ico("cam_job"), d.name || "Job", { kids: true, eye: true, dim: hj, sub: `${(CM.posts.find(p => p.id === d.post) || {}).name || d.post || ""}` });
+  const sus = d.setups || [], multi = sus.length > 1, L = multi ? 1 : 0;
+  let h = row("job", 0, ico("cam_job"), d.name || "Job", { kids: true, eye: true, dim: hj, sub: `${(CM.posts.find(p => p.id === d.post) || {}).name || d.post || ""}${multi ? `, ${sus.length} setups` : ""}` });
   if (!fold.job) {
-    h += row("ops", 1, ico("cam_folder"), "Operations", { kids: ops.length > 0, eye: true, dim: hj || CM.hidden.ops, sub: ops.length ? `${ops.length}` : "" });
+    sus.forEach((su, k) => {
+    if (multi) {
+      const act = k === d.active;
+      h += row("su:" + su.id, 1, ico("cam_sheet"), su.name, { ops: true, del: true, sub: act ? "active" : `${(su.operations || []).length} operation(s)`, cmd: act });
+    }
+    if (k !== d.active) return;
+    h += row("ops", 1 + L, ico("cam_folder"), "Operations", { kids: ops.length > 0, eye: true, dim: hj || CM.hidden.ops, sub: ops.length ? `${ops.length}` : "" });
     if (!fold.ops) ops.forEach(o => {
       const r0 = recOf(o.id), rf = recOf(o.id + ":finish"), ot = OPS[o.type] || {};
       const r = r0 && rf && r0.ok && !rf.ok ? rf : r0;
@@ -862,23 +870,24 @@ function renderTree() {
       const fin = ot.finish && o.finish_mode === "separate" ? `, finish ${o.finish_tc || o.tc}` : "";
       const sub = ot.supplemental ? "" : ot.derived ? `of ${(opOf(o.of) || {}).name || "?"}` : (o.tc || "no tool") + fin + ((ot.base && (o.faces || []).length) ? `, ${o.faces.length} face(s)` : "") + ((o.edges || []).length ? `, ${o.edges.length} edge(s)` : "");
       const drs = o.dressups || [];
-      h += row(o.id, 2, ico(OP_ICON(o.type), "⟲"), o.name, { kids: drs.length > 0, toggle: true, ops: true, del: true, supp: o.active === false, eye: !ot.supplemental, dim: hiddenItem(o.id),
+      h += row(o.id, 2 + L, ico(OP_ICON(o.type), "⟲"), o.name, { kids: drs.length > 0, toggle: true, ops: true, del: true, supp: o.active === false, eye: !ot.supplemental, dim: hiddenItem(o.id),
                                                              sub: `${opLabel(o)}${sub ? ", " + sub : ""}`, state, cmd: CM.cmd && CM.cmd.id === o.id && CM.cmd.dr === undefined, err: r && !r.ok && r.errors && r.errors[0] });
       if (!fold[o.id]) drs.forEach((dr, k) => {
         const id = `dr:${o.id}:${k}`;
-        h += row(id, 3, ico("cam_dr_" + dr.type, "✧"), (DRESSUPS[dr.type] || {}).label || dr.type, { del: true, cmd: CM.cmd && CM.cmd.id === o.id && CM.cmd.dr === k });
+        h += row(id, 3 + L, ico("cam_dr_" + dr.type, "✧"), (DRESSUPS[dr.type] || {}).label || dr.type, { del: true, cmd: CM.cmd && CM.cmd.id === o.id && CM.cmd.dr === k });
       });
     });
     const src = d.source && d.source.name;
-    h += row("model", 1, ico("cam_folder"), "Model", { kids: !!src, eye: true, dim: hj || CM.hidden.model, cmd: CM.cmd && CM.cmd.place });
+    h += row("model", 1 + L, ico("cam_folder"), "Model", { kids: !!src, eye: true, dim: hj || CM.hidden.model, cmd: CM.cmd && CM.cmd.place });
     if (!fold.model && src) {
-      h += row("part", 2, ico("cam_model"), src, { kids: pcs.length > 0, dim: hj || CM.hidden.model, sub: placementText(pl) });
+      h += row("part", 2 + L, ico("cam_model"), src, { kids: pcs.length > 0, dim: hj || CM.hidden.model, sub: placementText(pl) });
       if (!fold.part) pcs.forEach(c => {
         const bad = CM.placeRes && (CM.placeRes.unsatisfied || {})[c.id];
-        h += row("pc:" + c.id, 3, ico(PC_ICON[c.type], "⊥"), pcLabel(c), { del: true, supp: !!c.suppressed, err: bad || "" });
+        h += row("pc:" + c.id, 3 + L, ico(PC_ICON[c.type], "⊥"), pcLabel(c), { del: true, supp: !!c.suppressed, err: bad || "" });
       });
     }
-    h += row("stock", 1, ico("cam_stock"), "Stock", { eye: true, dim: hj || CM.hidden.stock, sub: stockText() });
+    h += row("stock", 1 + L, ico("cam_stock"), "Stock", { eye: true, dim: hj || CM.hidden.stock, sub: d.active > 0 ? `from ${sus[d.active - 1].name}` : stockText() });
+    });
     h += row("setup", 1, ico("cam_sheet"), "SetupSheet");
     const tcm = travelCheck();
     h += row("machine", 1, ico("cam_machine"), "Machine", { eye: true, dim: hj || CM.hidden.machine, sub: CM.machine ? `${fmt(CM.machine.travel_x)} x ${fmt(CM.machine.travel_y)} x ${fmt(CM.machine.travel_z)} mm` : "",
@@ -899,6 +908,14 @@ function renderTree() {
       if (id.startsWith("tc:")) {
         if (k === "del") { deleteTc(id.slice(3)); return; }
         select(id); return;
+      }
+      if (id.startsWith("su:")) {
+        const sid = id.slice(3);
+        if (k === "del") { deleteSetup(sid); return; }
+        if (k === "up" || k === "down") { moveSetup(sid, k === "up" ? -1 : 1); return; }
+        const kk = CM.doc.setups.findIndex(x => x.id === sid);
+        if (kk !== CM.doc.active) activateSetup(kk); else select(id);
+        return;
       }
       if (id.startsWith("pc:")) {
         if (k === "del") { deleteConstraint(id.slice(3)); return; }
@@ -928,6 +945,95 @@ function renderTree() {
   });
 }
 function saveFold() { try { localStorage.setItem("cm-fold", JSON.stringify(CM.fold)); } catch (e) { /* this session */ } }
+
+// ------------------------------------------------------------------ setups
+
+const SETUP_KEYS = ["placement", "origin", "operations", "machine_pos"];
+/** The setups of a job (one made from the top-level fields of an older job); the top-level placement, machine zero,
+ *  operations and table position are the active setup's. */
+function ensureSetups(d) {
+  if (!d) return;
+  if (!Array.isArray(d.setups) || !d.setups.length) d.setups = [{ id: "S1", name: "Setup 1" }];
+  d.active = Math.max(0, Math.min(+d.active || 0, d.setups.length - 1));
+  const su = d.setups[d.active];
+  for (const k of SETUP_KEYS) if (d[k] !== undefined) su[k] = d[k]; else if (su[k] !== undefined) d[k] = su[k];
+}
+/** The top-level fields written back to the active setup (they can be replaced objects after an edit). */
+function syncSetup() {
+  const d = CM.doc;
+  if (!d || !Array.isArray(d.setups) || !d.setups.length) return;
+  const su = d.setups[Math.max(0, Math.min(+d.active || 0, d.setups.length - 1))];
+  for (const k of SETUP_KEYS) su[k] = d[k];
+}
+function setupOf(id) { return (CM.doc.setups || []).find(x => x.id === id); }
+/** Another setup made active: its part placement, machine zero and operations; the stock is the one the setups
+ *  before it leave (the server works it out). */
+function activateSetup(k) {
+  const d = CM.doc;
+  if (!d.setups[k] || k === d.active) return;
+  if (CM.cmd) closeCommand(true);
+  if (CM.measure) setMeasure(false);
+  syncSetup();
+  d.active = k;
+  const su = d.setups[k];
+  d.placement = su.placement || (su.placement = { pos: [0, 0, 0], rot: [0, 0, 0], constraints: [], next: 1 });
+  d.origin = su.origin || (su.origin = { xy: "stock_min", z: "stock_top" });
+  d.operations = su.operations || (su.operations = []);
+  d.machine_pos = su.machine_pos;
+  if (d.machine_pos === undefined) delete d.machine_pos;
+  dropPreview();                       // a preview of the setup before is discarded
+  CM.placeRes = null;
+  CM.sel = "su:" + su.id;
+  changed(false);
+  if (CM.three) CM.three.zoomed = false;
+  status(`${su.name} active`);
+  loadGeometry();
+  renderAll();
+}
+/** A new setup after the active one: the part placement and machine zero of the active setup, no operations. */
+function addSetup() {
+  const d = CM.doc;
+  syncSetup();
+  let n = d.setups.length + 1;
+  while (d.setups.some(x => x.id === "S" + n)) n++;
+  const cur = d.setups[d.active];
+  const su = { id: "S" + n, name: "Setup " + n, placement: JSON.parse(JSON.stringify(cur.placement || {})), origin: JSON.parse(JSON.stringify(cur.origin || {})), operations: [] };
+  d.setups.splice(d.active + 1, 0, su);
+  activateSetup(d.active + 1);
+}
+function deleteSetup(id) {
+  const d = CM.doc, k = d.setups.findIndex(x => x.id === id);
+  if (k < 0 || d.setups.length < 2) return;
+  if ((d.setups[k].operations || []).length && !confirm(`Delete ${d.setups[k].name} with its ${d.setups[k].operations.length} operation(s)?`)) return;
+  syncSetup();
+  const wasActive = k === d.active;
+  d.setups.splice(k, 1);
+  if (wasActive) { d.active = -1; activateSetup(Math.min(k, d.setups.length - 1)); return; }
+  if (k < d.active) d.active--;
+  dropPreview(); changed(); loadGeometry(); renderAll();
+}
+function moveSetup(id, dir) {
+  const d = CM.doc, k = d.setups.findIndex(x => x.id === id), j = k + dir;
+  if (k < 0 || j < 0 || j >= d.setups.length) return;
+  syncSetup();
+  const act = d.setups[d.active];
+  [d.setups[k], d.setups[j]] = [d.setups[j], d.setups[k]];
+  d.active = d.setups.indexOf(act);
+  dropPreview(); changed(); loadGeometry(); renderAll();
+}
+function renderSetupItemProps(box, id) {
+  const d = CM.doc, su = setupOf(id), k = d.setups.indexOf(su);
+  if (!su) { CM.sel = "job"; return renderProps(); }
+  const out = (d.output && d.output.name) || d.name || "cam";
+  box.innerHTML = `<div class="row">${numField("Name", "name", su.name, "", "cm-name")}</div>
+    <div class="hint">${k === d.active ? "Active setup" : "Not active"}; ${(su.operations || []).length} operation(s); part ${esc(placementText(su.placement))}. ${k === 0 ? "The stock of the job." : `The stock left by ${esc(d.setups[k - 1].name)} (and the setups before it), moved with the part to this placement.`}</div>
+    <div class="hint">G-code: ${d.setups.length > 1 ? esc(out.replace(/\.(nc|ngc|tap|gcode)$/i, "") + "_" + su.name.replace(/[^A-Za-z0-9_\-.]+/g, "_") + ".nc") : esc(out)} with its own machine zero.</div>
+    <div class="row">${k !== d.active ? `<button type="button" class="small primary" id="cm-su-act">Activate</button>` : ""}<button type="button" class="small" id="cm-su-add">Add setup</button></div>`;
+  box.querySelector("input[data-k=name]").onchange = e => { su.name = e.target.value.trim() || su.name; changed(false); renderTree(); renderProps(); };
+  const a = $("#cm-su-act");
+  if (a) a.onclick = () => activateSetup(k);
+  $("#cm-su-add").onclick = addSetup;
+}
 function placementText(pl) {
   const p = (pl && pl.pos) || [0, 0, 0], r = (pl && pl.rot) || [0, 0, 0];
   if (![...p, ...r].some(v => Math.abs(v) > 1e-9)) return "not moved";
@@ -995,6 +1101,7 @@ function renderProps() {
   if (!id) { box.innerHTML = `<p class="hint">Select an item of the job tree. Double-click an operation to edit it in the command window.</p>`; return; }
   if (id === "model" || id === "part") return renderModelProps(box);
   if (id === "job" || id === "output") return renderJobProps(box);
+  if (id.startsWith("su:")) return renderSetupItemProps(box, id.slice(3));
   if (id === "ops") return renderOpsProps(box);
   if (id === "machine") return renderMachineProps(box);
   if (id.startsWith("pc:")) return renderPcProps(box, id.slice(3));
@@ -1031,12 +1138,18 @@ function renderPcProps(box, id) {
 }
 function renderStockProps(box) {
   const d = CM.doc, st = d.stock || (d.stock = { kind: "offsets" }), og = d.origin || (d.origin = { xy: "stock_min", z: "stock_top" });
-  let h = `<div class="row">${selField("Stock", "kind", st.kind || "offsets", [["offsets", "Part bounding box with offsets"], ["box", "Box (coordinates)"], ["part_filled", "Part with the undercuts filled"], ["step", "STEP file"]], "Part with the undercuts filled: the stock an earlier program with an end mill leaves. STEP file: a solid in the coordinates of the part, moved with the model placement")}${materialField(st.material)}</div>`;
-  if (st.kind === "step") h += `<div class="row"><label class="cm-f">STEP file<input type="text" class="cm-path" data-k="path" value="${esc(st.path || "")}" placeholder="file path, or a name in the STEP folder of the project"></label><button type="button" class="small" id="cm-stock-browse" title="Choose the STEP file of the stock">…</button></div><div class="row">${numField("X offset", "dx", st.dx, "mm, part coordinates")}${numField("Y offset", "dy", st.dy, "mm, part coordinates")}${numField("Z offset", "dz", st.dz, "mm, part coordinates")}</div>` +
-    `<div class="row">${numField("Rot X", "rx", st.rx, "deg about the X axis of the part")}${numField("Rot Y", "ry", st.ry, "deg about the Y axis of the part")}${numField("Rot Z", "rz", st.rz, "deg about the Z axis of the part")}</div>` +
-    `<div class="hint">The solid is in the coordinates of the part: turned about the part origin (X, then Y, then Z), moved by the offset (mm, deg), then moved with the model placement.</div>`;
-  else if (st.kind === "box") h += `<div class="row">${numField("X min", "xmin", st.xmin)}${numField("X max", "xmax", st.xmax)}${numField("Y min", "ymin", st.ymin)}${numField("Y max", "ymax", st.ymax)}${numField("Z min", "zmin", st.zmin)}${numField("Z max", "zmax", st.zmax)}</div><div class="hint">mm, part coordinates; empty: the part bounding box</div>`;
-  else if (st.kind !== "part_filled") h += `<div class="row">${numField("X neg", "xneg", st.xneg)}${numField("X pos", "xpos", st.xpos)}${numField("Y neg", "yneg", st.yneg)}${numField("Y pos", "ypos", st.ypos)}${numField("Z neg", "zneg", st.zneg)}${numField("Z pos", "zpos", st.zpos)}</div><div class="hint">mm beyond the part bounding box</div>`;
+  let h;
+  if ((d.active || 0) > 0) {
+    // a later setup: the stock the setups before it leave
+    h = `<div class="row">${materialField(st.material)}</div><div class="hint">The stock left by ${esc(d.setups[d.active - 1].name)} (and the setups before it), moved with the part to the placement of this setup. The stock record of the job (${esc(stockText())}) is the stock of ${esc(d.setups[0].name)}.</div>`;
+  } else {
+    h = `<div class="row">${selField("Stock", "kind", st.kind || "offsets", [["offsets", "Part bounding box with offsets"], ["box", "Box (coordinates)"], ["part_filled", "Part with the undercuts filled"], ["step", "STEP file"]], "Part with the undercuts filled: the stock an earlier program with an end mill leaves. STEP file: a solid in the coordinates of the part, moved with the model placement")}${materialField(st.material)}</div>`;
+    if (st.kind === "step") h += `<div class="row"><label class="cm-f">STEP file<input type="text" class="cm-path" data-k="path" value="${esc(st.path || "")}" placeholder="file path, or a name in the STEP folder of the project"></label><button type="button" class="small" id="cm-stock-browse" title="Choose the STEP file of the stock">…</button></div><div class="row">${numField("X offset", "dx", st.dx, "mm, part coordinates")}${numField("Y offset", "dy", st.dy, "mm, part coordinates")}${numField("Z offset", "dz", st.dz, "mm, part coordinates")}</div>` +
+      `<div class="row">${numField("Rot X", "rx", st.rx, "deg about the X axis of the part")}${numField("Rot Y", "ry", st.ry, "deg about the Y axis of the part")}${numField("Rot Z", "rz", st.rz, "deg about the Z axis of the part")}</div>` +
+      `<div class="hint">The solid is in the coordinates of the part: turned about the part origin (X, then Y, then Z), moved by the offset (mm, deg), then moved with the model placement.</div>`;
+    else if (st.kind === "box") h += `<div class="row">${numField("X min", "xmin", st.xmin)}${numField("X max", "xmax", st.xmax)}${numField("Y min", "ymin", st.ymin)}${numField("Y max", "ymax", st.ymax)}${numField("Z min", "zmin", st.zmin)}${numField("Z max", "zmax", st.zmax)}</div><div class="hint">mm, part coordinates; empty: the part bounding box</div>`;
+    else if (st.kind !== "part_filled") h += `<div class="row">${numField("X neg", "xneg", st.xneg)}${numField("X pos", "xpos", st.xpos)}${numField("Y neg", "yneg", st.yneg)}${numField("Y pos", "ypos", st.ypos)}${numField("Z neg", "zneg", st.zneg)}${numField("Z pos", "zpos", st.zpos)}</div><div class="hint">mm beyond the part bounding box</div>`;
+  }
   h += `<div class="row">${selField("Machine zero X Y", "oxy", og.xy, ORIGIN_XY, "Work offset in X and Y")}${selField("Machine zero Z", "oz", og.z, ORIGIN_Z)}` +
     `<button type="button" id="cm-zero-pick" class="small${CM.zeroPick ? " primary" : ""}" title="Click a vertex of the part in the view: the machine zero X, Y and Z at that vertex (Esc: cancel)">Pick vertex</button></div>` +
     (og.point ? `<div class="hint">Picked vertex X ${fmt(og.point[0])} Y ${fmt(og.point[1])} Z ${fmt(og.point[2])} mm (job coordinates)</div>` : "") + `<div class="hint" id="cm-setup-hint"></div>`;
@@ -1236,8 +1349,11 @@ function renderJobProps(box) {
     <div class="row">${selField("Post-processor", "post", d.post || "estlcam", CM.posts.map(p => [p.id, p.name]))}</div>
     <div class="row">${numField("File name", "name", out.name, "Empty: <job name>.nc", "cm-name")}</div>
     <div class="row">${numField("Folder", "folder", out.folder, "Empty: the cam folder of the project", "cm-path")}</div>
-    <div class="row"><button type="button" id="cm-out-post" class="primary">Post process</button><button type="button" id="cm-out-dl">Download</button></div>`;
+    <div class="row"><button type="button" id="cm-out-post" class="primary">Post process</button><button type="button" id="cm-out-dl">Download</button></div>
+    <div class="pt-sec">Setups</div><div class="hint">${(d.setups || []).length} setup(s), active: ${esc(((d.setups || [])[d.active] || {}).name || "")}. Each setup has its own part placement, machine zero and operations and gives its own G-code file; a later setup starts from the stock the setups before it leave.</div>
+    <div class="row"><button type="button" id="cm-su-add2" class="small">Add setup</button></div>`;
   bindFields(box, out, () => { changed(false); renderTree(); }, false);
+  $("#cm-su-add2").onclick = addSetup;
   box.querySelector("select[data-k=post]").onchange = e => { d.post = e.target.value; changed(false); renderPost(); renderTree(); };
   $("#cm-out-post").onclick = () => writeGcode(false);
   $("#cm-out-dl").onclick = () => writeGcode(true);
@@ -2231,7 +2347,8 @@ async function writeGcode(download) {
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
       const nm = (CM.doc.output || {}).name || CM.doc.name || "cam";
-      a.download = nm.replace(/[^A-Za-z0-9_\-.]+/g, "_") + (/\.(nc|gcode|tap|ngc)$/i.test(nm) ? "" : ".nc");
+      const zip = ct.includes("zip");
+      a.download = zip ? nm.replace(/\.(nc|gcode|tap|ngc)$/i, "").replace(/[^A-Za-z0-9_\-.]+/g, "_") + ".zip" : nm.replace(/[^A-Za-z0-9_\-.]+/g, "_") + (/\.(nc|gcode|tap|ngc)$/i.test(nm) ? "" : ".nc");
       a.click();
       status("G-code downloaded");
     }
@@ -2270,6 +2387,7 @@ async function importTemplate(file) {
     if (CM.cmd) { CM.cmd = null; $("#cm-cmdwin").hidden = true; }
     d.name = CM.doc.name;
     CM.doc = d; CM.sel = null;
+    ensureSetups(d);
     changed(); renderAll(); draw();
     status("Template applied");
   } catch (e) { showErr(e); }
@@ -2455,6 +2573,7 @@ async function loadDoc(d) {
   for (const k of Object.keys(b)) if (d[k] === undefined) d[k] = b[k];
   if (CM.cmd) { CM.cmd = null; $("#cm-cmdwin").hidden = true; }
   CM.doc = d;
+  ensureSetups(d);
   CM.sel = null; CM.res = null; CM.hidden = {}; CM.placeRes = null;
   CM.dirty = false;
   if (CM.three) CM.three.zoomed = false;

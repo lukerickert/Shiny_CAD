@@ -50,7 +50,8 @@ Job
 
 | Item | Properties |
 |---|---|
-| **Job** (the job name) | **Post-processor**, **File name**, **Folder**, **Post process**, **Download** |
+| **Job** (the job name) | **Post-processor**, **File name**, **Folder**, **Post process**, **Download**; **Setups**: the number of setups and the active one, **Add setup** |
+| `<setup>` (with two setups or more) | **Name**; the active setup, its operations, the part placement and where its stock comes from; the G-code file name; **Activate** (or a click on the row), **Add setup**; **▲** **▼** move it, **×** deletes it with its operations |
 | **Operations** | Number of operations and the cycle time of the last run |
 | `<operation>` | The checkbox sets it active (inactive: no moves, the stock unchanged), the icon of the type, the name, the type, the tool controller, the number of faces and edges, the state after a run (✓, ⚠ gouge, ✗ error with the message), **▲** and **▼** change the order, **×** deletes it. Properties: the summary and the results of the last run; **Edit** opens the command window. A dressup is a row under its operation |
 | **Model** | **Part**, its face count, volume and bounding box in job coordinates, the picks not found after the last **Refresh**, the placement and the number of constraints; **Edit** opens the **Model placement** window |
@@ -60,6 +61,24 @@ Job
 | **Machine** | The router model ([Machine and playback](#machine-and-playback)); ✗ when moves are outside the travel |
 | **Tools** | The list of the controllers; **Add from bit** and **Add controller** make a controller from a bit of the library; **Feeds and speeds for all** sets **Feed (mm/min)**, **Plunge feed (mm/min)**, **Ramp feed (mm/min)** and **Spindle (rpm)** of every controller from the calculator with the **ae (mm)** and **ap (mm)** of each controller |
 | `TC1`, `TC2`, … | A tool controller ([section 16.2](#162-tool-bits-and-tool-controllers)); **×** deletes it |
+
+### Setups
+
+A job holds one setup or more. A setup is one clamping of the part on the machine: it has its own part placement (**Model**, the constraints), machine zero (**Machine zero X Y**, **Machine zero Z**), operations and table position of the machine model. The stock, the setup sheet, the tool controllers and the post-processor belong to the job.
+
+```
+Job
+  Setup 1
+  Setup 2          (active)
+    Operations
+    Model
+    Stock          from Setup 1
+  SetupSheet
+  Machine
+  Tools
+```
+
+With one setup the tree has no setup rows. **Add setup** (in the **Job** or setup properties) adds a setup after the active one with the part placement and machine zero of the active setup and no operations, and makes it active. A click on a setup row makes it active: the view, **Operations**, **Model** and **Stock** show that setup. The first setup starts from the stock of the job (**Stock**). A later setup starts from the stock the setups before it leave: each setup before it is computed on the stock of the one before, and the stock it leaves is moved with the part from its placement to the placement of the next setup. The **Stock** of a later setup shows **Material** and the machine zero; the stock kind and its fields are those of the first setup. An operation of an earlier setup that fails stops the computation of a later setup with a message naming the setup. **Post process** writes one G-code file per setup, `<file name>_<setup name>.nc`, each with its own machine zero (**Download**: a zip file of them); with one setup the file is `<file name>.nc`. **Inspect** shows the operations of the active setup. The sanity check of a later setup leaves out the check of the stock covering the part.
 
 ### Model placement
 
@@ -234,7 +253,7 @@ The material above the picked floor faces cleared in levels. A floor face is a h
 | **Extra offset (mm)** | Material left on the walls by the pattern |
 | **Entry** | **Helix**: arcs down to the level about a point with the tool inside the region, quarter turns, a flat turn at the level, then a move to the first pass. **Plunge**: straight down at the first pass. When the region of a level reaches past the stock (an open side, a stock edge), the tool goes down there beside the stock (no stock within R + 0.5 mm in the level) and moves in at the level; **Entry** applies only when the stock covers the whole region |
 | **Helix pitch (mm)** | Depth per turn of the helix. The helix radius is 0.5 x R, 0.35 x R or 0.25 x R, the largest with room in the region; without room the level starts with a plunge (message) |
-| **Keep tool down** | A link between passes is a feed move at the level when its line lies in the region; else the tool lifts to the safe height and plunges again (message with the count) |
+| **Keep tool down** | A link between passes is a feed move at the level when its line lies in the region or in the air beside it (no stock and no part within R + 0.1 mm); else a feed along the boundary of the region when that path is at most 3 times the straight distance + 10 mm; else the tool lifts and plunges again (message with the count). The next level starts from the end of the level above: a feed at that level to the entry of the next level, then down (beside the stock, or the helix), when the line stays in the region and air of the level above. Line lifts after every pass |
 | **Use outline** | Islands ignored: the outline of the floor |
 
 Region of a level: the floor polygon, with the holes that go down (a pocket or a hole in the floor) filled in and the islands (faces rising from the floor) kept; an edge of the outer boundary whose other face does not rise above the floor is open, and the region extends beyond it by 2 x R + extra offset + 1 mm; the section of the part between the level and the reach of the tool above it (the cutting height), offset by the extra offset, is taken away (walls, islands and overhangs); the result is offset inward by the tool radius. The levels start at the top of the stock over the floor polygon. After the levels the material left above the floor within the floor polygon is reported.
