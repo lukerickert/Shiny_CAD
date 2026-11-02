@@ -39,10 +39,10 @@ function annKeyTitles() {
   setKeyTitle($("#ann-fitview"), annFitKey());
 }
 window.SHORTCUTS.push({ tab: "Drawings", rows: () =>
-  Object.keys(TOOL_NAMES).map(t => [annToolKey(t), TOOL_NAMES[t]]).concat([[annFitKey(), "Fit sheet"], ["Ctrl+Z", "Undo"], ["Delete", "Delete selection"], ["Esc", "Cancel / deselect"]]) });
+  Object.keys(TOOL_NAMES).map(t => [annToolKey(t), TOOL_NAMES[t]]).concat([[annFitKey(), "Fit sheet"], ["T", "Dimension text along the line / horizontal"], ["Ctrl+Z", "Undo"], ["Delete", "Delete selection"], ["Esc", "Cancel / deselect"], ["Right click", "Back to Select"]]) });
 const HINTS = {
   sketch: "Sketch: click a view to sketch on it (view coordinates in mm, the sketch moves with the view), or the sheet outside the views (sheet coordinates in mm).",
-  select: "Drag a view to move it. Drag a dimension or note to move it, click it to edit. Shift+drag or middle button pans, wheel zooms.",
+  select: "Drag a view to move it. Drag a dimension or note to move it, click it to edit. Shift+drag or middle button pans, wheel zooms. Right click ends a tool.",
   h: ["Horizontal: pick the first point.", "Pick the second point.", "Click to place the dimension line."],
   v: ["Vertical: pick the first point.", "Pick the second point.", "Click to place the dimension line."],
   a: ["Aligned: pick the first point.", "Pick the second point.", "Click to place the dimension line."],
@@ -78,10 +78,11 @@ function viewAt(X, Y) {
   return null;
 }
 function svgEl() { return $("#ann-canvas svg"); }
-function eventSheet(e) {
+function eventSheet(e) { return eventSheetXY(e.clientX, e.clientY); }
+function eventSheetXY(cx, cy) {
   const svg = svgEl();
   const pt = svg.createSVGPoint();
-  pt.x = e.clientX; pt.y = e.clientY;
+  pt.x = cx; pt.y = cy;
   const p = pt.matrixTransform(svg.getScreenCTM().inverse());
   return [p.x, ED.d.size[1] - p.y];
 }
@@ -250,6 +251,8 @@ function drawCanvas(keepVB) {
   svg.addEventListener("mouseup", onUp);
   svg.addEventListener("wheel", onWheel, { passive: false });
   svg.addEventListener("dblclick", e => e.preventDefault());
+  // right click: the picks of the running tool are dropped and the Select tool is active again
+  svg.addEventListener("contextmenu", e => { e.preventDefault(); if (ED.tool !== "select") setTool("select"); else if (ED.pick.length) { ED.pick = []; updateHint(); drawOverlay(); } });
   box.classList.toggle("select", ED.tool === "select");
   updateHint();
 }
@@ -387,7 +390,7 @@ function drawOverlay() {
     const p = ED.pick[0], C = toSheet(p.view, p.x, p.y);
     ovCircle(g, { X: C[0], Y: C[1], R: Math.hypot(X - C[0], Y - C[1]) });
   }
-  if (ED.drag && ED.drag.moved) ovMark(g, X, Y, "end");
+  if (ED.drag && ED.drag.moved && false) ovMark(g, X, Y, "end");
   if (ED.vdrag && ED.vdrag.moved) {
     const [dX, dY] = viewDelta(ED.vdrag, X, Y);
     const moving = ED.vdrag.view === "front" ? ["front", "top", "right"] : [ED.vdrag.view];
@@ -460,6 +463,15 @@ function onMove(e) {
   }
   ED.mouse = eventSheet(e);
   if (ED.drag && Math.hypot(e.clientX - ED.drag.x, e.clientY - ED.drag.y) > 3) ED.drag.moved = true;
+  if (ED.drag && ED.drag.moved) {
+    // the annotation follows the mouse (its group translated); the final placement is drawn on the drop
+    const g = svgEl().querySelector(`g.ann[data-ann="${ED.drag.id}"]`);
+    if (g) {
+      if (!ED.drag.X0) { const s0 = eventSheetXY(ED.drag.x, ED.drag.y); ED.drag.X0 = s0[0]; ED.drag.Y0 = s0[1]; }
+      const dX = ED.mouse[0] - ED.drag.X0, dY = ED.mouse[1] - ED.drag.Y0;
+      g.setAttribute("transform", `translate(${dX} ${-dY})`);
+    }
+  }
   if (ED.vdrag && Math.hypot(e.clientX - ED.vdrag.x, e.clientY - ED.vdrag.y) > 3) ED.vdrag.moved = true;
   if (ED.tool === "select" && !ED.vdrag) {
     const onAnn = e.target.closest && e.target.closest("g.ann");
@@ -621,8 +633,11 @@ function onUp(e) {
     if (dr.moved) {
       const a = ED.anns.find(x => x.id === dr.id);
       if (a) {
+        // the annotation is moved by the drag distance (its text or position point follows the mouse)
         const [X, Y] = eventSheet(e);
-        commit(() => { a.pos = toModel(a.view, X, Y); if (a.type === "linear") a.text_free = true; });
+        const [X0, Y0] = dr.X0 !== undefined ? [dr.X0, dr.Y0] : eventSheetXY(dr.x, dr.y);
+        const P = toSheet(a.view, a.pos[0], a.pos[1]);
+        commit(() => { a.pos = toModel(a.view, P[0] + X - X0, P[1] + Y - Y0); if (a.type === "linear") a.text_free = true; });
       }
     }
     drawOverlay();
@@ -864,6 +879,9 @@ function annShowProps() {
   $("#ann-text").value = a.text || "";
   $("#ann-centred-row").hidden = a.type !== "linear";
   $("#ann-centred").checked = !a.text_free;
+  $("#ann-horiz-row").hidden = !(a.type === "linear" && a.orient !== "h");
+  $("#ann-horiz").checked = !!a.text_horizontal;
+  $("#ann-decimals").value = a.decimals === undefined || a.decimals === null || a.decimals === "" ? "" : String(a.decimals);
   $("#ann-tolmode").value = tol.mode || "none";
   $("#ann-fit").value = tol.fit || "";
   $("#ann-showdev").checked = tol.show_dev !== false;
@@ -893,7 +911,9 @@ function propsChanged() {
     if (a.type === "note" || a.type === "balloon") { a.text = $("#ann-notetext").value.trim(); return; }
     a.prefix = $("#ann-prefix").value;
     a.text = $("#ann-text").value;
-    if (a.type === "linear") a.text_free = !$("#ann-centred").checked;
+    if (a.type === "linear") { a.text_free = !$("#ann-centred").checked; a.text_horizontal = $("#ann-horiz").checked; }
+    const dec = $("#ann-decimals").value;
+    if (dec === "") delete a.decimals; else a.decimals = parseInt(dec, 10);
     const mode = $("#ann-tolmode").value;
     a.tol = { mode };
     if (mode === "fit") { a.tol.fit = $("#ann-fit").value.trim(); a.tol.show_dev = $("#ann-showdev").checked; }
@@ -914,6 +934,12 @@ function deleteSelected() {
   document.querySelectorAll("#ann-tools button").forEach(b => b.onclick = () => setTool(b.dataset.tool));
   $("#ann-undo").onclick = undo;
   $("#ann-resetviews").onclick = resetViews;
+  $("#ann-clearall").onclick = () => {
+    if (!ED.d || !ED.anns.length) return;
+    if (!confirm("Remove all " + ED.anns.length + " dimensions, notes and balloons of this drawing? (Ctrl+Z undoes)")) return;
+    commit(() => { ED.anns = []; ED.sel = null; });
+  };
+
   $("#ann-autoballoons").onclick = autoBalloons;
   $("#ann-plist").onchange = () => { if (ED.d) saveLayout(Object.assign({}, ED.d.layout || {}, { parts_list: $("#ann-plist").checked })); };
   $("#ann-holecallouts").onclick = holeCallouts;
@@ -929,7 +955,7 @@ function deleteSelected() {
     const d = (state.drawings || []).find(x => x.name === $("#ann-drawing").value);
     if (d) loadDrawing(d, false);
   };
-  ["#ann-prefix", "#ann-text", "#ann-centred", "#ann-tolmode", "#ann-fit", "#ann-showdev", "#ann-plus", "#ann-minus", "#ann-notetext", "#ann-height"]
+  ["#ann-prefix", "#ann-text", "#ann-centred", "#ann-horiz", "#ann-decimals", "#ann-tolmode", "#ann-fit", "#ann-showdev", "#ann-plus", "#ann-minus", "#ann-notetext", "#ann-height"]
     .forEach(s => $(s).addEventListener("change", propsChanged));
   document.addEventListener("keydown", e => {
     if ($("#tab-annotate").hidden || document.querySelector(".modal:not([hidden])")) return;   // keys of an open window
@@ -940,6 +966,12 @@ function deleteSelected() {
     if (e.key === "Delete" || e.key === "Backspace") { deleteSelected(); return; }
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     if (leftKeys() ? e.code === FIT_KEY.left : e.key.toLowerCase() === "f") { fitView(); return; }
+    if (e.key.toLowerCase() === "t") {
+      // T: the text of the selected vertical or sloped dimension turned between along the line and horizontal
+      const a = current();
+      if (a && a.type === "linear" && a.orient !== "h") commit(() => { a.text_horizontal = !a.text_horizontal; }, a.id);
+      return;
+    }
     const t = leftKeys() ? TOOL_CODES_LEFT[e.code] : TOOL_KEYS[e.key.toLowerCase()];
     if (t) setTool(t);
   });

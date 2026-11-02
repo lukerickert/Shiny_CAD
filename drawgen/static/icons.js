@@ -53,6 +53,8 @@
     thicken: `<path ${S} d="M3 12 Q8 4 12 9 T21 6"/><path ${S} d="M3 18 Q8 10 12 15 T21 12"/><path ${S} d="M3 12 V18 M21 6 V12"/><path ${S} d="M12 9 V15"/>`,
     surf_cut: `${box(3, 8, 14, 10, 4)}<path ${S} stroke-width="1.8" d="M2 14 Q10 6 22 12"/>`,
     curve_extract: `${box(3, 8, 14, 10, 4)}<path ${S} stroke-width="2.2" d="M3 12 H17 L21 8"/>`,
+    surf_separate: `<path ${S} d="M3 16 L9 13 L9 6 L3 9 Z"/><path ${S} d="M12 12 L20 8 L20 15 L12 19 Z"/><path ${S} d="M9 9.5 L12 12.5"/>`,
+    surf_clean: `<path ${S} d="M4 18 L8 17.5 L12 18.5 L16 17.5 L20 18"/><path ${S} stroke-width="2.2" d="M4 9 H20"/><path ${S} d="M12 11 V15 M10.5 13.5 L12 15 L13.5 13.5"/>`,
     curve_section: `<path ${S} d="M3 16 Q8 8 12 13 T21 10"/><path ${S} d="M6 4 L18 20"/><circle cx="10" cy="10.5" r="1.6" ${F}/><circle cx="14.5" cy="15.5" r="1.6" ${F}/>`,
     surf_from_curve: `<path ${S} stroke-width="2" d="M3 19 Q8 11 12 16 T21 13"/><path ${S} d="M3 11 Q8 3 12 8 T21 5"/><path ${D} d="M3 19 V11 M21 13 V5"/>`,
     surf_trim: `<path ${S} d="M3 16 Q8 6 12 11 T21 8"/><path ${D} d="M3 16 V21 M12 11 V21 M3 21 H12"/><path ${S} d="M15 14 L20 20 M20 14 L15 20"/>`,

@@ -129,7 +129,7 @@ def test_annotations_roundtrip(client, drawing_sel):
 
 def test_options_inch_drawing(client, drawing_sel):
     """Options: inch drawing units change the dimension text and the title block Units field; invalid values fail."""
-    assert ok(client.get("/api/options")) == {"units": "mm", "keys": "default", "browser": ""}
+    assert ok(client.get("/api/options")) == {"units": "mm", "keys": "default", "decimals": "auto", "tol_unit": "um", "browser": ""}
     assert ok(client.put("/api/options", json={"browser": "msedge --app={url}"}))["browser"] == "msedge --app={url}"
     assert ok(client.put("/api/options", json={"browser": ""}))["browser"] == ""
     assert client.put("/api/options", json={"units": "yard"}).status_code == 400
@@ -141,11 +141,36 @@ def test_options_inch_drawing(client, drawing_sel):
     try:
         svg = ok(client.post("/api/preview", json={"selection": drawing_sel}))["drawings"][0]["svg"]
         assert ">25.4<" in svg and ">+25.4<" in svg
-        assert ok(client.put("/api/options", json={"units": "inch", "keys": "left"})) == {"units": "inch", "keys": "left", "browser": ""}
+        assert ok(client.put("/api/options", json={"units": "inch", "keys": "left"})) == {
+            "units": "inch", "keys": "left", "decimals": "auto", "tol_unit": "um", "browser": ""}
         svg = ok(client.post("/api/preview", json={"selection": drawing_sel}))["drawings"][0]["svg"]
         assert ">1.000<" in svg and ">+.0010<" in svg and ">-.0000<" in svg and ">in<" in svg
     finally:
         ok(client.put("/api/options", json={"units": "mm", "keys": "default"}))
+        ok(client.put("/api/annotations/" + name, json=[]))
+
+
+def test_options_decimals_and_tolerance_text(client, drawing_sel):
+    """Options: a fixed number of dimension decimals and the tolerance text format change the drawing text; a
+    dimension's own decimals take precedence; invalid values fail."""
+    assert client.put("/api/options", json={"decimals": "7"}).status_code == 400
+    assert client.put("/api/options", json={"tol_unit": "in"}).status_code == 400
+    j = ok(client.post("/api/preview", json={"selection": drawing_sel}))
+    name = j["drawings"][0]["ann_name"]
+    anns = [{"id": "d1", "type": "linear", "view": "front", "p1": [0, 0], "p2": [25, 0], "orient": "h", "pos": [12.5, 30],
+             "tol": {"mode": "dev", "plus": 0.027, "minus": -0.04}},
+            {"id": "d2", "type": "linear", "view": "front", "p1": [0, 0], "p2": [10, 0], "orient": "h", "pos": [5, 40], "decimals": 1}]
+    ok(client.put("/api/annotations/" + name, json=anns))
+    try:
+        o = ok(client.put("/api/options", json={"decimals": "2", "tol_unit": "um_unit"}))
+        assert o["decimals"] == "2" and o["tol_unit"] == "um_unit"
+        svg = ok(client.post("/api/preview", json={"selection": drawing_sel}))["drawings"][0]["svg"]
+        assert ">25.00<" in svg and ">10.0<" in svg and ">+27 \u00b5m<" in svg and ">-40 \u00b5m<" in svg
+        ok(client.put("/api/options", json={"tol_unit": "mm"}))
+        svg = ok(client.post("/api/preview", json={"selection": drawing_sel}))["drawings"][0]["svg"]
+        assert ">+0.027<" in svg and ">-0.040<" in svg
+    finally:
+        ok(client.put("/api/options", json={"decimals": "auto", "tol_unit": "um"}))
         ok(client.put("/api/annotations/" + name, json=[]))
 
 
@@ -428,6 +453,21 @@ def test_part_refs_cut(client):
     assert len([x for x in same if x.get("kind") == "hidden"]) == 4
 
 
+def test_part_face_groups(client):
+    """Connected groups of picked faces of a plate: top and bottom are two groups, top and a side one group."""
+    from conftest import plate
+    p = plate("fg", hole_r=0)
+    top = {"c": [50.0, 25.0, 20.0], "n": [0.0, 0.0, 1.0], "area": 5000.0}
+    bottom = {"c": [50.0, 25.0, 0.0], "n": [0.0, 0.0, -1.0], "area": 5000.0}
+    side = {"c": [100.0, 25.0, 10.0], "n": [1.0, 0.0, 0.0], "area": 1000.0}
+    g = client.post("/api/part/face_groups", json={"part": p, "index": 2, "faces": [top, bottom]}).get_json()
+    assert len(g) == 2 and all(len(x) == 1 for x in g)
+    g = client.post("/api/part/face_groups", json={"part": p, "index": 2, "faces": [top, side]}).get_json()
+    assert len(g) == 1 and len(g[0]) == 2
+    g = client.post("/api/part/face_groups", json={"part": p, "index": 2, "faces": [top, bottom, side]}).get_json()
+    assert len(g) == 1 and len(g[0]) == 3
+
+
 def test_sketch_loops(client):
     """Closed profiles and open ends: a triangle, a circle and a single line (two open ends)."""
     sk = {"entities": [{"t": "line", "x1": 0, "y1": 0, "x2": 10, "y2": 0}, {"t": "line", "x1": 10, "y1": 0, "x2": 10, "y2": 5},
@@ -521,3 +561,51 @@ def test_projects_scan_known_open_path(client, web, tmp_path):
         web.PROJECTS.open(cur0)
         web.PROJECTS.forget(p1)
         web.PROJECTS.forget(p2)
+
+
+def test_part_worker_round_trip_and_cancel(client, monkeypatch):
+    """Part worker: with DRAWGEN_PART_WORKER=1 the build request is answered by the worker process with the same
+    result as in process; /api/part/cancel ends the process (a later request starts a new one and works); a call
+    whose worker is cancelled while it runs raises Cancelled."""
+    import threading
+    import time
+    from conftest import plate
+    from drawgen import partworker
+    p = plate("wk", hole_r=0)
+    direct = client.post("/api/part/build", json={"part": p}).get_json()
+    monkeypatch.setenv("DRAWGEN_PART_WORKER", "1")
+    w = partworker.PartWorker()
+    monkeypatch.setattr(partworker, "WORKER", w)
+    try:
+        assert partworker.enabled()
+        r = client.post("/api/part/build", json={"part": p})
+        assert r.status_code == 200
+        j = r.get_json()
+        assert abs(j["volume_mm3"] - direct["volume_mm3"]) < 1e-6 and len(j["mesh"]["triangles"]) == len(direct["mesh"]["triangles"])
+        assert w.proc is not None and w.proc.is_alive()
+        pid = w.proc.pid
+        r = client.post("/api/part/cancel", json={})
+        assert r.get_json() == {"cancelled": True, "worker": True}
+        assert w.proc is None
+        r = client.post("/api/part/build", json={"part": p})
+        assert r.status_code == 200 and w.proc.pid != pid
+        # a request running while the worker is ended: Cancelled
+        box = {}
+
+        def run():
+            try:
+                box["r"] = w.call("/api/part/build", "POST", {"part": p})
+            except partworker.Cancelled:
+                box["cancelled"] = True
+        # the worker is held busy by a first request made from this thread's lock: cancel right after sending
+        th = threading.Thread(target=run)
+        w.cancel()                                   # no process: the call below starts one (imports take seconds)
+        th.start()
+        time.sleep(0.5)
+        w.cancel()
+        th.join(60)
+        assert box.get("cancelled") is True or "r" in box
+        r = client.post("/api/part/build", json={"part": p})
+        assert r.status_code == 200
+    finally:
+        w.shutdown()

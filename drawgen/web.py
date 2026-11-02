@@ -20,7 +20,7 @@ import numpy as np
 
 from flask import Flask, jsonify, request, send_file, send_from_directory
 
-from . import analysis, assembly, cam, dialogs, drawing, fcstd, fea, fits, measure, model, part, render, sketch, sketchimage, units
+from . import analysis, assembly, cam, dialogs, drawing, fcstd, fea, fits, measure, model, part, partworker, render, sketch, sketchimage, units
 from . import titleblock as tbk
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -129,6 +129,29 @@ PROJECTS = _projects.Projects(APP_DIR, load_config, save_config)
 
 def error(msg, code=400):
     return jsonify({"error": msg}), code
+
+
+def in_part_worker(view):
+    """The view runs in the part worker process when the worker is on (partworker.enabled()): a Cancel in the
+    Part tab ends that process and the request answers with "build cancelled" (status 409)."""
+    import functools
+    from flask import Response
+
+    @functools.wraps(view)
+    def wrapper(*a, **k):
+        if not partworker.enabled():
+            return view(*a, **k)
+        payload = request.get_json(force=True, silent=True)
+        try:
+            code, body, mimetype, headers = partworker.WORKER.call(request.path, request.method, payload)
+        except partworker.Cancelled:
+            return error("build cancelled", 409)
+        resp = Response(body, status=code, mimetype=mimetype)
+        for key, val in headers:
+            if key.lower() == "content-disposition":
+                resp.headers[key] = val
+        return resp
+    return wrapper
 
 
 def _register(path, source=None):
@@ -874,8 +897,9 @@ def get_options():
 
 @app.route("/api/options", methods=["PUT"])
 def put_options():
-    """Program options (units.py): {"units": "mm" | "inch", "keys": "default" | "left"}; "browser": the browser
-    command of run.py (config.json "browser", empty: the system default)."""
+    """Program options (units.py): {"units": "mm" | "inch", "keys": "default" | "left", "decimals": "auto" | "0".."4",
+    "tol_unit": "um" | "um_unit" | "mm"}; "browser": the browser command of run.py (config.json "browser", empty:
+    the system default)."""
     req = request.get_json(force=True) or {}
     browser = req.pop("browser", None)
     for k, v in req.items():
@@ -1530,6 +1554,7 @@ def put_part_last():
 
 
 @app.route("/api/part/build", methods=["POST"])
+@in_part_worker
 def part_build():
     req = request.get_json(force=True)
     try:
@@ -1559,7 +1584,38 @@ def part_build():
                     "cells": len(shape.solids()) if shape is not None else 0})
 
 
+def _with_timeout(fn, seconds, message):
+    """fn() run in a worker thread; its result, or ValueError(message) when it has not returned after seconds
+    (the worker keeps running to its end)."""
+    import threading
+    box = {}
+
+    def run():
+        try:
+            box["value"] = fn()
+        except BaseException as e:  # noqa: BLE001
+            box["error"] = e
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    th.join(seconds)
+    if th.is_alive():
+        raise ValueError(message)
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
+@app.route("/api/part/cancel", methods=["POST"])
+def part_cancel():
+    """Ends the part worker process: the running build or region computation stops; the next request starts a new
+    worker with an empty build cache."""
+    if not partworker.enabled():
+        return jsonify({"cancelled": False, "worker": False})
+    return jsonify({"cancelled": bool(partworker.WORKER.cancel()), "worker": True})
+
+
 @app.route("/api/part/regions", methods=["POST"])
+@in_part_worker
 def part_regions():
     """Pieces of a surface trim for graphical region selection: {"part", "index"} -> [{"point", "area", "mesh"}]."""
     req = request.get_json(force=True)
@@ -1577,7 +1633,12 @@ def part_regions():
         if f.get("with") == "sketch":
             frames = {x.get("id"): x["frame"] for x in st if x.get("frame")}
             f["_tool_edges"] = part.sketch_tool_edges(feats, frames, datums, f.get("tool"))
-        pieces, _tool = sfm.trim_pieces(shape, bodies, f)
+        pieces, _tool = _with_timeout(lambda: sfm.trim_pieces_all(shape, bodies, f), 180,
+                                      "the regions took more than 180 s: use a part of the tool (Pick single faces) or a smaller extension")
+        # slivers (a tool touching the target along an edge) and pieces below "min_area" are dropped by the trim: not offered
+        total = sum(pc.area for pc in pieces)
+        min_area = float(f.get("min_area") if f.get("min_area") is not None else 0.5)
+        pieces = [pc for pc in pieces if pc.area > max(1e-6, 1e-4 * total, min_area)] or pieces
         out = []
         for pc in pieces:
             q = sfm._point_on(pc)
@@ -1593,6 +1654,7 @@ def part_regions():
 
 
 @app.route("/api/part/inspect", methods=["POST"])
+@in_part_worker
 def part_inspect():
     """Topology report of a body: {"part", "body": feature id of a surface body or null for the solid, "gap_tol",
     "min_area", "min_edge"} -> {"summary", "issues"}."""
@@ -1614,6 +1676,7 @@ def part_inspect():
 
 
 @app.route("/api/part/section", methods=["POST"])
+@in_part_worker
 def part_section():
     """Cap faces of the solid on a plane: {"part", "origin": [x, y, z], "normal": [x, y, z], "upto": feature index
     or null} -> mesh of the section faces ({"vertices", "triangles", "edges"}) for the section view (of the part
@@ -1643,6 +1706,7 @@ def part_section():
 
 
 @app.route("/api/part/profile_regions", methods=["POST"])
+@in_part_worker
 def part_profile_regions():
     """Regions of the sketch of a sketch feature for picking: {"part", "index"} -> [{"point", "uv", "area", "mesh"}]."""
     req = request.get_json(force=True)
@@ -1672,7 +1736,36 @@ def part_profile_regions():
         return error("regions failed: %s" % e, 400)
 
 
+@app.route("/api/part/face_groups", methods=["POST"])
+@in_part_worker
+def part_face_groups():
+    """Connected groups of picked faces: {"part", "index", "faces": [face keys]} -> [[face keys], ...], the faces
+    of the solid and of the surface bodies before the feature at index grouped through their shared edges (Extract
+    surface, Separate bodies). A reference that matches no face is left out."""
+    req = request.get_json(force=True)
+    p = part.migrate(req.get("part") or {})
+    i = int(req.get("index", 0))
+    refs = [r for r in (req.get("faces") or []) if isinstance(r, dict)]
+    try:
+        bodies = {}
+        shape, st = part.build(p, upto=i, surfaces=bodies)
+        found = []
+        for r in refs:
+            fcs = part.find_faces_any(shape, bodies, [r])
+            if fcs and not any(fcs[0].wrapped.IsSame(x.wrapped) for x, _ in found):
+                found.append((fcs[0], r))
+        groups = part._connected_face_groups([fc for fc, _ in found])
+        out = []
+        for g in groups:
+            out.append([r for fc, r in found if any(fc.wrapped.IsSame(x.wrapped) for x in g)])
+        return jsonify(out)
+    except Exception as e:
+        traceback.print_exc()
+        return error("face groups failed: %s" % e, 500)
+
+
 @app.route("/api/part/refs", methods=["POST"])
+@in_part_worker
 def part_refs():
     """Reference geometry of a feature sketch: {"part", "index", "path", "section", "cut": null | "front" |
     "back"} -> list of reference entities in sketch coordinates. "cut" removes the half of the model on the
@@ -1708,6 +1801,7 @@ def part_refs():
 
 
 @app.route("/api/part/expand", methods=["POST"])
+@in_part_worker
 def part_expand():
     """Edge references extended from picked edges or faces: {"part", "index", "mode": tangent | face | faces,
     "refs": [edge keys] or [face keys]} -> [edge keys]."""
@@ -1725,6 +1819,7 @@ def part_expand():
 
 
 @app.route("/api/part/expand_faces", methods=["POST"])
+@in_part_worker
 def part_expand_faces():
     """Face references grown from a picked face: {"part", "index", "mode": tangent | connected, "ref": face key,
     "surface": surface body id (none: the solid)} -> [face keys]."""
@@ -1779,6 +1874,7 @@ def part_put(name):
 
 
 @app.route("/api/part/export", methods=["POST"])
+@in_part_worker
 def part_export():
     req = request.get_json(force=True)
     p = req.get("part") or {}
@@ -1925,6 +2021,7 @@ _PART_SHAPES = {}       # sha1 of the part json -> (shape, datums), the last few
 
 
 @app.route("/api/part/measure", methods=["POST"])
+@in_part_worker
 def part_measure():
     """Measurement of one or two items of the posted part: {"part", "items": [{"face": index} | {"plane": feature
     id} | {"axis": feature id} | {"base": "XY" | "XZ" | "YZ"}]} -> measure.measure (rows, closest points)."""
@@ -2150,6 +2247,10 @@ def _asm_to_drawings(req):
 
 def cleanup():
     shutil.rmtree(WORK_DIR, ignore_errors=True)
+    try:
+        partworker.WORKER.shutdown()
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- analysis (CalculiX)

@@ -19,8 +19,8 @@ const TYPE_NAMES = { sketch: "Sketch", plane: "Plane", point: "Point", axis: "Ax
                      import: "Import geometry", body_delete: "Delete body", body_copy: "Copy body", body_scale: "Scale body", place: "Place", split: "Partition", unify: "Merge faces", heal: "Heal", defeature: "Remove faces", offset_faces: "Offset faces", move_faces: "Move faces", combine: "Combine faces", hole_mesh: "Hole mesh", smooth: "Smooth surfaces", replace: "Replace faces", merge_tangent: "Merge tangent faces",
                      surf_extract: "Extract surface", surf_fit: "Fit surface", surf_sketch: "Extruded surface", surf_loft: "Loft surface",
                      surf_fill: "Fill surface", surf_offset: "Offset surface", surf_sew: "Sew surfaces", surf_import: "Import surface", thicken: "Thicken", surf_cut: "Cut with surface",
-                     curve_extract: "Extract curve", curve_section: "Intersection curve", surf_from_curve: "Surface from curve", surf_trim: "Trim surface", surf_extend: "Extend surface", surf_bridge: "Bridge surface", surf_fillet: "Surface fillet", surf_gaps: "Close gaps", surf_sweep: "Sweep surface", curve_project: "Project curve", curve_blend: "Blend curve", curve_points: "Curve through points" };
-const SURFACE_TYPES = new Set(["surf_extract", "surf_fit", "surf_sketch", "surf_loft", "surf_fill", "surf_offset", "surf_sew", "surf_import", "curve_extract", "curve_section", "surf_from_curve", "surf_trim", "surf_extend", "surf_bridge", "surf_fillet", "surf_gaps", "surf_sweep", "curve_project", "curve_blend", "curve_points"]);
+                     curve_extract: "Extract curve", curve_section: "Intersection curve", surf_from_curve: "Surface from curve", surf_trim: "Trim surface", surf_extend: "Extend surface", surf_bridge: "Bridge surface", surf_fillet: "Surface fillet", surf_gaps: "Close gaps", surf_sweep: "Sweep surface", curve_project: "Project curve", curve_blend: "Blend curve", curve_points: "Curve through points", surf_connect: "Connect surfaces", surf_clean: "Clean edges", surf_separate: "Separate faces" };
+const SURFACE_TYPES = new Set(["surf_extract", "surf_fit", "surf_sketch", "surf_loft", "surf_fill", "surf_offset", "surf_sew", "surf_import", "curve_extract", "curve_section", "surf_from_curve", "surf_trim", "surf_extend", "surf_bridge", "surf_fillet", "surf_gaps", "surf_sweep", "curve_project", "curve_blend", "curve_points", "surf_connect", "surf_clean", "surf_separate"]);
 const CURVE_TYPES = new Set(["curve_extract", "curve_section", "curve_project", "curve_blend", "curve_points"]);
 const SOLID_TYPES = new Set(["extrude", "cut", "revolve", "hole", "sweep", "fillet", "chamfer", "shell", "pattern", "mirror", "boolean", "import", "place", "split", "unify", "heal", "defeature", "smooth", "replace", "merge_tangent", "thicken", "surf_cut", "hole_mesh", "offset_faces", "move_faces"]);
 const SPLIT_METHODS = { principal: "Principal plane + offset", datum: "Plane feature + offset", face: "Extend a face (planar or curved)", sketch: "Sketch extruded through the part",
@@ -33,7 +33,8 @@ const PLANE_METHODS = { principal: "Principal plane + offset", datum: "Parallel 
 const SKETCH_TYPES = new Set(["extrude", "cut", "revolve", "hole", "sweep"]);
 const BASE_PLANES = { XY: "Top (XY)", XZ: "Front (XZ)", YZ: "Right (YZ)" };
 const PLANE_TXT = { XY: "Top (XY), normal +Z", XZ: "Front (XZ), normal -Y", YZ: "Right (YZ), normal +X", normal: "Normal to an edge or curve" };
-const COL = { mesh: 0xc9b48a, hover: 0x7ad17a, sel: 0x2bb24c, surf: 0x5b7fb5, curve: 0x6a1b9a, solid: 0xb8c2cf, edge: 0x1d2125, sketch: 0x7a4a9a, plane: 0x6c7a89, region: 0x3aa6d8, datum: 0x6a3fa0 };
+const COL = { mesh: 0xc9b48a, hover: 0x7ad17a, sel: 0x2bb24c, surf: 0x5b7fb5, curve: 0x6a1b9a, solid: 0xb8c2cf, edge: 0x1d2125, sketch: 0x7a4a9a, plane: 0x6c7a89, region: 0x3aa6d8, datum: 0x6a3fa0,
+              ref: 0xe8590c, refEdge: 0xff00e6 };   // references of the active command: faces and bodies orange, edges and curves magenta
 
 function msgPart(text, isError) { status(text, isError); }
 const pesc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -101,7 +102,7 @@ function initThree() {
   tip.hidden = true;
   box.appendChild(tip);
   PT.three = { renderer, scene, camera, controls, group, overlay, box, tip, zoomed: false };
-  controls.addEventListener("change", render3);
+  controls.addEventListener("change", () => { rescaleMarkers(); render3(); });
   camera.userData.target = controls.target;
   PT.three.cube = createNavCube(box, camera, viewDir);
   let down = null;
@@ -290,7 +291,7 @@ function drawSurfaces() {
     if (PT.hidden[id] && !used.has(id)) continue;
     const f = feat(id);
     if (!f || f.suppressed) continue;
-    if (trimming && trimming.source === id) continue;
+    if (trimming && (trimming.source === id || (trimming.mutual && trimming.tool === id && (trimming.with || "surface") === "surface"))) continue;
     const isCurve = !sm.triangles.length;
     const isMesh = !!(PT.status[id] && PT.status[id].mesh);
     if (!isCurve) {
@@ -299,8 +300,9 @@ function drawSurfaces() {
       g.setIndex(sm.triangles.flat());
       g.computeVertexNormals();
       // a rough mesh body (STL) is drawn opaque like a solid, the other surface bodies translucent
-      const mesh = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: bodyColor(id, isMesh ? COL.mesh : COL.surf), transparent: !isMesh, opacity: isMesh ? 1 : 0.45,
-                                                                     side: THREE.DoubleSide, depthWrite: isMesh, flatShading: isMesh, metalness: isMesh ? 0.1 : 0, roughness: isMesh ? 0.7 : 1,
+      const op = isMesh ? 1 : surfOpacity();
+      const mesh = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: bodyColor(id, isMesh ? COL.mesh : COL.surf), transparent: op < 1, opacity: op,
+                                                                     side: THREE.DoubleSide, depthWrite: op >= 1, flatShading: isMesh, metalness: isMesh ? 0.1 : 0, roughness: isMesh ? 0.7 : 1,
                                                                      polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }));
       mesh.renderOrder = 2;
       mesh.userData = { kind: "surface", id };
@@ -483,6 +485,32 @@ function planeSize() {
   const bb = PT.mesh && PT.mesh.bbox;
   return bb ? Math.max(bb[3] - bb[0], bb[4] - bb[1], bb[5] - bb[2]) * 0.45 + 5 : 40;
 }
+/** World units per screen pixel of the 3D view (orthographic camera). */
+function worldPerPixel() {
+  const t = PT.three;
+  if (!t) return 0.1;
+  const w = t.renderer.domElement.clientWidth || 1;
+  return (t.camera.right - t.camera.left) / (t.camera.zoom || 1) / w;
+}
+/** A point marker of a fixed size on screen (px: radius in pixels) in the overlay; the markers are rescaled when
+ *  the view zooms (see initThree). */
+function addMarker(point, color, px, order, segments) {
+  const t = PT.three;
+  const sp = new THREE.Mesh(new THREE.SphereGeometry(1, segments || 12, segments || 12), new THREE.MeshBasicMaterial({ color, depthTest: false }));
+  sp.position.set(point[0], point[1], point[2]);
+  sp.scale.setScalar(worldPerPixel() * px);
+  sp.renderOrder = order || 12;
+  sp.userData.markerPx = px;
+  t.overlay.add(sp);
+  return sp;
+}
+/** Markers of the overlay rescaled to their pixel size after a zoom. */
+function rescaleMarkers() {
+  const t = PT.three;
+  if (!t) return;
+  const k = worldPerPixel();
+  t.overlay.traverse(o => { if (o.userData && o.userData.markerPx) o.scale.setScalar(k * o.userData.markerPx); });
+}
 
 /** Reference planes (XY, XZ, YZ when visible) and plane features as translucent squares. */
 function drawPlanes() {
@@ -535,10 +563,10 @@ function drawRegions() {
     g.setAttribute("position", new THREE.Float32BufferAttribute(rg.mesh.vertices.flat(), 3));
     g.setIndex(rg.mesh.triangles.flat());
     g.computeVertexNormals();
-    // trim: kept green, removed red; profile regions: picked green, the others grey (none picked: all grey-green)
+    // trim: kept green (translucent), removed strong red; profile regions: picked green, the others grey (none picked: all grey-green)
     let color, opacity;
     if (selectMode) { const on = selected.has((rg.uv || []).join(",")); color = on ? COL.region : 0x9aa5b1; opacity = on ? 0.7 : (selected.size ? 0.25 : 0.4); }
-    else { const isRemoved = removed.has(rg.point.join(",")); color = isRemoved ? 0xd9534f : COL.region; opacity = isRemoved ? 0.25 : 0.7; }
+    else { const isRemoved = removed.has(rg.point.join(",")); color = isRemoved ? 0xff2020 : COL.region; opacity = isRemoved ? 0.75 : 0.55; }
     const mesh = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color, transparent: true, opacity, side: THREE.DoubleSide,
                                                                    polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }));
     mesh.renderOrder = 4;
@@ -548,7 +576,7 @@ function drawRegions() {
   });
 }
 
-/** Highlights: the selected tree item (green) and the references of the active command step (orange). */
+/** Highlights: the selected tree item (green) and the references of the active command step (faces, bodies, planes and sketches orange; edges and curve bodies magenta). */
 function drawSelection() {
   if (PT.quiet) return;
   const t = PT.three;
@@ -602,10 +630,10 @@ function drawSelection() {
       for (const [sid, sm] of Object.entries(PT.surfaces || {})) { const si = (sm.face_keys || []).findIndex(k => k && keyOfFace(k) === keyOfFace(r)); if (si >= 0) { paintSurface(sid, 0xe8590c, 0.5, si); break; } }
     }
     paint(faces, 0xe8590c, 0.55, 4);
-    paintEdges(new Set(refs.edges.map(keyOfEdge)), 0xe8590c);
+    paintEdges(new Set(refs.edges.map(keyOfEdge)), COL.refEdge);
     const bad = (PT.status[c.id] || {}).bad_edges;                 // edges where a fillet or chamfer fails
     if (bad && bad.length) paintEdges(new Set(bad.map(keyOfEdge)), 0xd0021b);
-    for (const sid of refs.surfaces) if (PT.surfaces[sid]) paintSurface(sid, 0xe8590c, 0.5);
+    for (const sid of refs.surfaces) if (PT.surfaces[sid]) paintSurface(sid, PT.surfaces[sid].triangles.length ? COL.ref : COL.refEdge, 0.5);
     for (const pid of refs.planes) paintPlane(pid, 0xe8590c);
     for (const sid of refs.sketches) paintSketch(sid, 0xe8590c);
     for (const did of refs.datums || []) paintDatum(did, 0xe8590c);
@@ -613,13 +641,13 @@ function drawSelection() {
     // the solids the command acts on (Bodies section): tinted in the view
     const bsel = new Set((c.bodies || []).map(b => (typeof b === "object" ? b.solid : b)).concat(c.type === "split" ? (c.cells || []).filter(r => r && r.solid !== undefined).map(r => r.solid) : []));
     if (bsel.size && m && m.face_solid) { const bf = new Set(); m.face_solid.forEach((s, fi) => { if (bsel.has(s)) bf.add(fi); }); paint(bf, 0xe8590c, 0.3, 4); }
-    for (const q of refs.points || []) { const sg = new THREE.SphereGeometry(planeSize() * 0.02, 12, 12); const sp = new THREE.Mesh(sg, new THREE.MeshBasicMaterial({ color: 0xe8590c, depthTest: false })); sp.position.set(...q); sp.renderOrder = 11; t.overlay.add(sp); }
+    for (const q of refs.points || []) addMarker(q, COL.ref, 7, 11);
     // the face or edge under the mouse in the selection chips of the command window
     // (hover, and the chip clicked to stay highlighted)
     for (const hv of [PT.chipPin, PT.chipHover]) {
       if (!hv) continue;
       if (hv.mid) { paintEdges(new Set([keyOfEdge(hv)]), 0x0a84ff); continue; }
-      if (hv.point) { const sg = new THREE.SphereGeometry(planeSize() * 0.018, 12, 12); const sp = new THREE.Mesh(sg, new THREE.MeshBasicMaterial({ color: 0x0a84ff, depthTest: false })); sp.position.set(...hv.point); sp.renderOrder = 12; t.overlay.add(sp); continue; }
+      if (hv.point) { addMarker(hv.point, 0x0a84ff, 7, 12); continue; }
       if (!hv.c) continue;
       const fi = m && m.face_keys ? m.face_keys.findIndex(k => k && keyOfFace(k) === keyOfFace(hv)) : -1;
       if (fi >= 0) { paint(new Set([fi]), 0x0a84ff, 0.7, 5); continue; }
@@ -644,14 +672,13 @@ function drawSelection() {
       const color = active ? 0xd0021b : x.kind === "free" ? 0xe8a04c : 0xe8590c;
       seg(x.pts || [], color, active ? 3 : 1, active ? 13 : 12);
       if (active || x.kind === "pointgap" || x.kind === "smalledge" || x.kind === "smallface") {
-        const sg = new THREE.SphereGeometry(planeSize() * (active ? 0.015 : 0.01), 10, 10);
-        const sp = new THREE.Mesh(sg, new THREE.MeshBasicMaterial({ color, depthTest: false })); sp.position.set(...x.p); sp.renderOrder = 13; t.overlay.add(sp);
+        addMarker(x.p, color, active ? 6 : 4, 13, 10);
       }
     });
   }
   if (PT.section) t.overlay.traverse(o => { if (o.material && !o.userData.noclip) o.material.clippingPlanes = [PT.section.plane]; });
   // centre of rotation
-  if (PT.pivot) { const sg = new THREE.SphereGeometry(planeSize() * 0.012, 10, 10); const sp = new THREE.Mesh(sg, new THREE.MeshBasicMaterial({ color: 0x2f74d0, depthTest: false })); sp.position.set(...PT.pivot); sp.renderOrder = 12; t.overlay.add(sp); }
+  if (PT.pivot) addMarker(PT.pivot, 0x2f74d0, 5, 12, 10);
   // hover
   if (PT.hover) {
     const h = PT.hover;
@@ -666,7 +693,7 @@ function drawSelection() {
       const near = ax && h.id === ax.f.sketch_ref && h.point ? nearestSketchLine(feat(h.id), axisLines(ax.f, ax.constrOnly), h.point) : null;
       if (near && near.dist <= planeSize() * 0.02) paintLine3(near.a, near.b, COL.hover); else paintSketch(h.id, COL.hover);
     }
-    else if (h.kind === "point" && h.vertex) { const sg = new THREE.SphereGeometry(planeSize() * 0.015, 10, 10); const sp = new THREE.Mesh(sg, new THREE.MeshBasicMaterial({ color: COL.hover, depthTest: false })); sp.position.set(...h.point); sp.renderOrder = 12; t.overlay.add(sp); }
+    else if (h.kind === "point" && h.vertex) addMarker(h.point, COL.hover, 6, 12, 10);
     else if (h.kind === "point" || h.kind === "axis") paintDatum(h.id, COL.hover);
     else if (h.kind === "region") { const o = PT.regionObjs[h.index]; if (o) { const mm = o.clone(); mm.material = new THREE.MeshBasicMaterial({ color: COL.hover, transparent: true, opacity: 0.7, side: THREE.DoubleSide, depthWrite: false }); mm.renderOrder = 6; t.overlay.add(mm); } }
   }
@@ -711,7 +738,7 @@ function paintPlane(id, color) {
 function paintDatum(id, color) {
   const t = PT.three;
   const p = PT.pointObjs.find(o => o.userData.id === id);
-  if (p) { const sg = new THREE.SphereGeometry(planeSize() * 0.03, 12, 12); const sp = new THREE.Mesh(sg, new THREE.MeshBasicMaterial({ color, depthTest: false })); sp.position.set(...p.userData.point); sp.renderOrder = 11; t.overlay.add(sp); }
+  if (p) addMarker(p.userData.point, color, 8, 11);
   const a = PT.axisObjs.find(o => o.userData.id === id);
   if (a) { const l = new THREE.Line(a.geometry, new THREE.LineBasicMaterial({ color, depthTest: false })); l.renderOrder = 10; t.overlay.add(l); }
 }
@@ -732,7 +759,7 @@ function paintLine3(a, b, color) {
   const l = new THREE.Line(g, new THREE.LineBasicMaterial({ color, depthTest: false }));
   l.renderOrder = 12;
   t.overlay.add(l);
-  for (const q of [a, b]) { const sg = new THREE.SphereGeometry(planeSize() * 0.01, 8, 8); const sp = new THREE.Mesh(sg, new THREE.MeshBasicMaterial({ color, depthTest: false })); sp.position.set(...q); sp.renderOrder = 12; t.overlay.add(sp); }
+  for (const q of [a, b]) addMarker(q, color, 4, 12, 8);
 }
 
 /** Lines of the profile sketch of f that can be its axis (constrOnly: construction lines only, as Revolve lists). */
@@ -1596,9 +1623,26 @@ async function build() {
     if (PT.buildAgain) { PT.buildAgain = false; build(); }
   }
 }
+/** Cancel: ends the geometry process on the server; the running build (or region computation) answers with
+ *  "build cancelled" and the next request starts a new process (its build cache is empty). */
+async function cancelBuild() {
+  PT.cancelled = true;
+  $("#pt-cancel").disabled = true;
+  try { await postJSON("/api/part/cancel", {}); } catch (e) { showErr(e); }
+  finally { $("#pt-cancel").disabled = false; }
+}
+function showBuilding(on) {
+  const b = $("#pt-cancel");
+  if (!b) return;
+  clearTimeout(PT.cancelTimer);
+  if (on) PT.cancelTimer = setTimeout(() => { b.hidden = false; }, 1500);     // after 1.5 s of building
+  else b.hidden = true;
+}
 async function buildNow() {
   const seq = ++PT.buildSeq;
   $("#pt-info").textContent = "Building...";
+  PT.cancelled = false;
+  showBuilding(true);
   try {
     const upto = buildUpto();
     const uptoName = upto !== null && PT.cmd && feat(PT.cmd.id) ? feat(PT.cmd.id).name : "";
@@ -1622,7 +1666,13 @@ async function buildNow() {
       : (errs ? `${errs} feature(s) failed` : "No solid"));
     renderTree();
     if (PT.cmd) renderCommand(); else renderProps();
-  } catch (e) { if (seq === PT.buildSeq) { $("#pt-info").textContent = ""; showErr(e); } }
+  } catch (e) {
+    if (seq === PT.buildSeq) {
+      $("#pt-info").textContent = PT.cancelled || /cancelled/.test(e.message || "") ? "Build cancelled" : "";
+      if (PT.cancelled || /cancelled/.test(e.message || "")) { PT.buildAgain = false; msgPart("Build cancelled: change or suppress the feature, then the part is built again", true); }
+      else showErr(e);
+    }
+  } finally { if (seq === PT.buildSeq) showBuilding(false); }
 }
 
 function changedPart(rebuild) {
@@ -1669,6 +1719,35 @@ function showOnlyBody(id) {
 function showAllBodies() {
   for (const k of bodyIds()) delete PT.hidden[k];
   renderTree(); renderProps(); setMesh(PT.mesh);
+}
+/** Show menu: "all" / "none" / "invert" (the hidden bodies shown, the shown ones hidden) / "solids" / "surfaces"
+ *  (that group shown, the other hidden) over the solids, surface and curve bodies. */
+/** Opacity of the surface bodies (0.1 to 1; localStorage "pt-surf-opacity", default 0.45). */
+function surfOpacity() {
+  if (PT.surfOpacity === undefined) { let v = NaN; try { v = parseFloat(localStorage.getItem("pt-surf-opacity")); } catch (e) { /* default */ } PT.surfOpacity = isFinite(v) && v >= 0.1 && v <= 1 ? v : 0.45; }
+  return PT.surfOpacity;
+}
+/** Sets the opacity of the surface bodies and applies it to the drawn ones (mesh bodies stay opaque). */
+function setSurfOpacity(v) {
+  v = Math.min(1, Math.max(0.1, +v || 0.45));
+  PT.surfOpacity = v;
+  try { localStorage.setItem("pt-surf-opacity", String(v)); } catch (e) { /* kept for this session */ }
+  for (const o of PT.surfObjs || []) {
+    if (!o.material || !(o.material instanceof THREE.MeshStandardMaterial)) continue;
+    if (PT.status[o.userData.id] && PT.status[o.userData.id].mesh) continue;
+    o.material.opacity = v; o.material.transparent = v < 1; o.material.depthWrite = v >= 1; o.material.needsUpdate = true;
+  }
+  const lbl = $("#pt-surfop-val"); if (lbl) lbl.textContent = Math.round(v * 100) + " %";
+  render3();
+}
+function showBodies(mode) {
+  const ids = bodyIds(), solids = new Set(bodyGroupIds("solid"));
+  for (const k of ids) {
+    const show = mode === "all" ? true : mode === "none" ? false : mode === "invert" ? !!PT.hidden[k] : mode === "solids" ? solids.has(k) : !solids.has(k);
+    if (show) delete PT.hidden[k]; else PT.hidden[k] = true;
+  }
+  renderTree(); renderProps(); setMesh(PT.mesh);
+  msgPart({ all: "All bodies shown", none: "All bodies hidden", invert: "Shown and hidden bodies swapped", solids: "Solids shown, surfaces hidden", surfaces: "Surfaces shown, solids hidden" }[mode]);
 }
 /** Tree keys of one group of bodies: "solid" (solids), "surface" (surface bodies), "curve" (curve bodies). */
 function bodyGroupIds(grp) {
@@ -1818,7 +1897,7 @@ function deleteFeature(id) {
 }
 /** Whether feature x references the feature id (sketch, plane, source bodies, curves, points, axes, ...). */
 function usesFeature(x, id) {
-  const one = ["sketch_ref", "path_ref", "plane_ref", "source", "tool", "point_ref", "axis_ref", "plane_axis", "plane_point", "plane_origin_ref", "plane_xdir_ref", "source_a", "source_b", "target", "other", "profile", "path", "project", "plane_face_body"];
+  const one = ["sketch_ref", "path_ref", "plane_ref", "source", "tool", "point_ref", "axis_ref", "plane_axis", "plane_point", "plane_origin_ref", "plane_xdir_ref", "source_a", "source_b", "target", "other", "profile", "path", "project", "plane_face_body", "plane"];
   const many = ["sources", "curves", "features", "points_ref", "planes_ref", "sketch_refs", "curves_a", "curves_b", "surfaces"];
   return one.some(k => x[k] === id) || many.some(k => (x[k] || []).includes(id)) || !!(x.plane_sketch_curve && x.plane_sketch_curve.sketch === id) ||
     (x.ends || []).some(e => e && (e.body === id || e.point === id));
@@ -2105,7 +2184,8 @@ function createSketchUnderlay(model, frame, upto) {
       g.setIndex(sm.triangles.flat());
       g.computeVertexNormals();
       const isMesh = !!(PT.status[id] && PT.status[id].mesh);
-      const mat = new THREE.MeshStandardMaterial({ color: bodyColor(id, isMesh ? COL.mesh : COL.surf), transparent: !isMesh, opacity: isMesh ? 1 : 0.45, side: THREE.DoubleSide, depthWrite: isMesh, flatShading: isMesh, metalness: 0, roughness: isMesh ? 0.7 : 1 });
+      const op = isMesh ? 1 : surfOpacity();
+      const mat = new THREE.MeshStandardMaterial({ color: bodyColor(id, isMesh ? COL.mesh : COL.surf), transparent: op < 1, opacity: op, side: THREE.DoubleSide, depthWrite: op >= 1, flatShading: isMesh, metalness: 0, roughness: isMesh ? 0.7 : 1 });
       mats.push(mat);
       const mesh = new THREE.Mesh(g, mat);
       mesh.renderOrder = 2;
@@ -2862,20 +2942,45 @@ const COMMANDS = {
   },
   surf_trim: {
     title: "Trim surface",
-    defaults: () => ({ source: null, with: "surface", tool: null, keep: "pick", remove: [] }),
+    defaults: () => ({ source: null, faces: [], with: "surface", tool: null, tool_faces: [], keep: "pick", remove: [], extend: 3, extend_far: false, min_area: 0.5, grouping: "connected" }),
     steps: f => [
-      Object.assign(sourceStep("Target", "source", false, "Click the surface body to trim."), { kinds: ["surface"] }),
-      { key: "tool", label: "Tool", kinds: ["surface", "curve", "sketch", "body", "plane"], single: true, before: false, hint: "Click the tool: a surface body, a curve body or a sketch (projected onto the target), the solid, or a plane.",
-        accept: (f, h) => { if (h.id && h.id === f.source) { msgPart("The tool must differ from the target", true); return; }
-          if (h.kind === "body") { f.with = "solid"; f.tool = null; } else if (h.kind === "plane") { f.with = "plane"; f.tool = h.id; } else { f.with = h.kind === "curve" ? "curve" : h.kind === "sketch" ? "sketch" : "surface"; f.tool = h.id; } f.remove = []; PT.cmd.regions = null; PT.dirty = true; },
-        html: f => `<p class="hint">${f.with === "solid" ? "The solid." : f.with === "plane" ? "Plane " + planeName(f.tool) + "." : f.tool ? itemName(f.tool) + "." : "No tool yet."}</p>`,
-        done: f => f.with === "solid" || !!f.tool, summary: f => f.with === "solid" ? "the solid" : f.with === "plane" ? planeName(f.tool) : f.tool ? itemName(f.tool) : "none" },
+      { key: "source", label: "Target", multiFace: true, get kinds() { return PT.cmd && PT.cmd.sface ? ["sface", "face"] : ["surface"]; }, before: false,
+        hint: "Click the surface body to trim, or choose it. To trim a part of a body, tick Pick single faces and click its faces (click again to deselect); faces of the solid are trimmed as a new surface.",
+        accept: (f, h) => {
+          if (h.kind === "surface") { f.source = h.id; f.faces = []; }
+          else if (h.kind === "face" && h.surface) { if (f.source !== h.surface) f.faces = []; f.source = h.surface; f.faces = f.faces || []; const ref = refOf(h), i = f.faces.findIndex(x => sameRef(x, ref)); if (i >= 0) f.faces.splice(i, 1); else f.faces.push(ref); }
+          else if (h.kind === "face") { if (f.source) f.faces = []; f.source = null; f.faces = f.faces || []; const ref = refOf(h), i = f.faces.findIndex(x => sameRef(x, ref)); if (i >= 0) f.faces.splice(i, 1); else f.faces.push(ref); }
+          f.remove = []; PT.cmd.regions = null; PT.dirty = true;
+        },
+        html: f => sourceSelect("pf-source", f, "source", false, false) + check("pf-sface", "Pick single faces of surface bodies (a part of a body as target or tool)", PT.cmd && PT.cmd.sface) +
+          ((f.faces || []).length ? `<p class="hint">${f.faces.length} face(s) of ${f.source ? pesc(itemName(f.source)) : "the solid"}.</p><div class="buttons"><button type="button" data-clear="faces">Whole body</button></div>` : ""),
+        bind: (f, box) => { bindAll(box, { "#pf-source": el => { f.source = el.value || null; f.faces = []; f.remove = []; PT.cmd.regions = null; } }); const sf = box.querySelector("#pf-sface"); if (sf) sf.onchange = () => { PT.cmd.sface = sf.checked; renderCommand(); };
+          box.querySelectorAll("button[data-clear]").forEach(b => b.onclick = () => { f.faces = []; f.remove = []; PT.cmd.regions = null; changedPart(); }); },
+        done: f => !!f.source || (f.faces || []).length > 0,
+        summary: f => (f.source ? itemName(f.source) : (f.faces || []).length ? "the solid" : "none") + ((f.faces || []).length ? `, ${f.faces.length} face(s)` : "") },
+      { key: "tool", label: "Tool", get kinds() { return (PT.cmd && PT.cmd.sface ? ["sface", "face"] : ["surface"]).concat(["curve", "sketch", "body", "plane"]); }, single: true, before: false,
+        hint: "Click the tool: a surface body, a curve body or a sketch (projected onto the target), the solid, or a plane. With Pick single faces ticked (Target step), click faces of a surface body to use only those as the tool.",
+        accept: (f, h) => { if (h.id && h.id === f.source && !(h.kind === "face" && h.surface)) { msgPart("The tool must differ from the target", true); return; }
+          if (h.kind === "face" && h.surface) { if (f.tool !== h.surface || f.with !== "surface") f.tool_faces = []; f.with = "surface"; f.tool = h.surface; f.tool_faces = f.tool_faces || []; const ref = refOf(h), i = f.tool_faces.findIndex(x => sameRef(x, ref)); if (i >= 0) f.tool_faces.splice(i, 1); else f.tool_faces.push(ref); }
+          else if (h.kind === "face") { msgPart("Click a face of a surface body, or the solid as a whole", true); return; }
+          else if (h.kind === "body") { f.with = "solid"; f.tool = null; f.tool_faces = []; } else if (h.kind === "plane") { f.with = "plane"; f.tool = h.id; f.tool_faces = []; } else { f.with = h.kind === "curve" ? "curve" : h.kind === "sketch" ? "sketch" : "surface"; f.tool = h.id; f.tool_faces = []; } f.remove = []; PT.cmd.regions = null; PT.dirty = true; },
+        html: f => `<p class="hint">${f.with === "solid" ? "The solid." : f.with === "plane" ? "Plane " + planeName(f.tool) + "." : f.tool ? itemName(f.tool) + ((f.tool_faces || []).length ? `, ${f.tool_faces.length} face(s)` : "") + "." : "No tool yet."}</p>` +
+          ((f.tool_faces || []).length ? `<div class="buttons"><button type="button" data-clear="tool_faces">Whole body</button></div>` : "") +
+          (f.with === "surface" && f.tool && !CURVE_TYPES.has((feat(f.tool) || {}).type) ? check("pf-tmutual", "Mutual: the tool is trimmed by the target too; the kept pieces of both are sewn into one body", !!f.mutual) +
+            `<div class="grid2">` + num("pf-text", "Extend the tool (mm, 0: off)", f.extend === undefined ? 3 : f.extend) + `<label class="check bottom"><input type="checkbox" id="pf-textfar"${f.extend_far ? " checked" : ""}> Extend across the whole target if that does not cut</label></div>` +
+            `<p class="hint">A tool that does not reach across the target is extended beyond its edges by this distance before the cut.</p>` : ""),
+        bind: (f, box) => { bindAll(box, { "#pf-tmutual": el => { f.mutual = el.checked; f.remove = []; PT.cmd.regions = null; }, "#pf-text": el => { const v = numv(el.value); if (v >= 0) { f.extend = v; f.remove = []; PT.cmd.regions = null; } }, "#pf-textfar": el => { f.extend_far = el.checked; f.remove = []; PT.cmd.regions = null; } });
+          box.querySelectorAll("button[data-clear]").forEach(b => b.onclick = () => { f.tool_faces = []; f.remove = []; PT.cmd.regions = null; changedPart(); }); },
+        done: f => f.with === "solid" || !!f.tool, summary: f => (f.with === "solid" ? "the solid" : f.with === "plane" ? planeName(f.tool) : f.tool ? itemName(f.tool) + ((f.tool_faces || []).length ? `, ${f.tool_faces.length} face(s)` : "") : "none") + (f.mutual && f.with === "surface" ? ", mutual" : "") },
       { key: "regions", label: "Regions", multi: true, kinds: ["region"], before: true, hint: "Click the regions to remove (click again to keep them). Invert swaps kept and removed.",
         enter: f => { if (f.source && (f.with === "solid" || f.tool)) loadRegions(f); },
         accept: (f, h) => { f.keep = "pick"; f.remove = f.remove || []; const i = f.remove.findIndex(p => p.join(",") === h.point.join(",")); if (i >= 0) f.remove.splice(i, 1); else f.remove.push(h.point); PT.dirty = true; drawRegions(); },
-        html: f => { const n = (PT.cmd.regions || []).length; return `<p class="hint${PT.cmd.regionError ? " err" : ""}">${PT.cmd.regionError ? pesc(PT.cmd.regionError) : n ? n + " region(s), " + (f.remove || []).length + " removed." : "Computing the regions..."}</p><div class="buttons"><button type="button" id="pf-invert">Invert</button><button type="button" id="pf-keepall">Keep all</button></div>`; },
+        html: f => { const n = (PT.cmd.regions || []).length; return `<p class="hint${PT.cmd.regionError ? " err" : ""}">${PT.cmd.regionError ? pesc(PT.cmd.regionError) : n ? n + " region(s), " + (f.remove || []).length + " removed." : "Computing the regions..."}</p><div class="buttons"><button type="button" id="pf-invert">Invert</button><button type="button" id="pf-keepall">Keep all</button></div>` +
+          `<div class="grid2">` + select("pf-tregs", "Regions", [["connected", "Connected pieces (joined across edges off the cut)"], ["faces", "Faces: every piece of the cut on its own"]], f.grouping || "connected") +
+          num("pf-tmina", "Drop pieces smaller than (mm^2)", f.min_area === undefined ? 0.5 : f.min_area) + `</div><p class="hint">Faces: a section of the body joined to its neighbour through an edge can be removed alone. Pieces below the area (whiskers and slivers at the ends of a cut) are removed and not offered as regions.</p>`; },
         bind: (f, box) => { const b = box.querySelector("#pf-invert"); if (b) b.onclick = () => { const all = (PT.cmd.regions || []).map(r => r.point); const rem = new Set((f.remove || []).map(p => p.join(","))); f.remove = all.filter(p => !rem.has(p.join(","))); f.keep = "pick"; changedPart(); };
-          const k = box.querySelector("#pf-keepall"); if (k) k.onclick = () => { f.remove = []; changedPart(); }; },
+          const k = box.querySelector("#pf-keepall"); if (k) k.onclick = () => { f.remove = []; changedPart(); };
+          bindAll(box, { "#pf-tmina": el => { const v = numv(el.value); if (v >= 0) { f.min_area = v; PT.cmd.regions = null; } }, "#pf-tregs": el => { f.grouping = el.value; f.remove = []; PT.cmd.regions = null; } }); },
         done: f => true, summary: f => (f.remove || []).length + " region(s) removed" },
     ],
   },
@@ -2948,6 +3053,46 @@ const COMMANDS = {
           `<p class="hint">The profile is swept from where it lies along the path; the path corners are joined by extended and intersected sections. Open profiles give open surfaces; a closed profile gives a tube. Smooth: the path is replaced by one smooth spline within the tolerance (short edges, kinks and breaks up to 1 mm of an extracted curve removed).</p>` + resultLine(f),
         bind: (f, box) => bindAll(box, { "#pf-sworient": el => { f.orient = el.value; }, "#pf-swsmooth": el => { const v = numv(el.value); if (v >= 0) f.smooth = v; } }),
         summary: f => ({ frenet: "Frenet", discrete: "discrete frame", fixed: "fixed" }[f.orient] || "corrected Frenet") + ((f.smooth === undefined ? 0.02 : f.smooth) ? ", smoothed" : "") }]) },
+  surf_separate: { title: "Separate faces", needsSolid: false, defaults: () => ({ source: null, faces: [], keep: "picked", rest: true }),
+    steps: f => [{ key: "faces", label: "Faces", multiFace: true, kinds: ["sface", "face"], before: false,
+        hint: "Click the faces of a surface body to separate (click again to deselect; Tangent faces and Connected faces pick groups). All picked faces must belong to one body.",
+        accept: (f, h) => {
+          if (h.kind === "face" && !h.surface) { msgPart("Click a face of a surface body", true); return; }
+          if (h.kind !== "face") return;
+          if (f.source !== h.surface) f.faces = [];
+          f.source = h.surface; f.faces = f.faces || [];
+          if (faceMode() !== "face" && h.key) { pickFaces(f, "faces", h, faceMode()); return; }
+          const ref = refOf(h), i = f.faces.findIndex(x => sameRef(x, ref)); if (i >= 0) f.faces.splice(i, 1); else f.faces.push(ref);
+          PT.dirty = true;
+        },
+        html: f => `<p class="hint">${(f.faces || []).length ? (f.faces || []).length + " face(s) of " + pesc(itemName(f.source)) + "." : "Nothing selected."}</p>` +
+          ((f.faces || []).length ? `<div class="buttons"><button type="button" data-clear="faces">Clear</button></div>` : ""),
+        bind: (f, box) => { box.querySelectorAll("button[data-clear]").forEach(b => b.onclick = () => { f.faces = []; changedPart(); }); },
+        done: f => !!f.source && (f.faces || []).length > 0,
+        summary: f => (f.faces || []).length ? (f.faces || []).length + " face(s) of " + itemName(f.source) : "none" },
+      { key: "opts", label: "Result", html: f => (f.keep === "rest" ? `<p class="hint">The faces of the body other than the picked ones.</p>` : check("pf-sprest", "Also a body of the remaining faces (a second Separate faces feature)", f.rest !== false)) +
+          `<p class="hint">The picked faces become one surface body. The source body is hidden.</p>` + resultLine(f),
+        bind: (f, box) => bindAll(box, { "#pf-sprest": el => { f.rest = el.checked; } }),
+        summary: f => f.keep === "rest" ? "the remaining faces" : "the picked faces" + (f.rest !== false ? " and the rest" : "") }],
+    // on OK: a second feature with the remaining faces of the same body
+    finish: async (f, isNew, resume) => {
+      if (f.keep !== "rest" && f.rest !== false && f.source && (f.faces || []).length && isNew) {
+        checkpointPart();
+        const n = PT.part.features.filter(x => x.type === "surf_separate").length;
+        PT.part.features.splice(featIndex(f.id) + 1, 0, { id: newId(), name: "Separate faces " + (n + 1) + " (rest)", type: "surf_separate", suppressed: false, source: f.source, faces: f.faces.map(x => Object.assign({}, x)), keep: "rest", rest: false });
+      }
+      changedPart();
+      if (resume) resumeCommand(resume);
+    } },
+  surf_clean: { title: "Clean edges", defaults: () => ({ source: null, faces: [], clean: "analytic", tolerance: 0.05, angle: 15, min_edge: 0, min_face: 0 }),
+    steps: f => [surfaceOrFacesStep("Surface", "Click the surface body whose edges to clean, or faces of the solid (extracted and cleaned in one step)."),
+      { key: "opts", label: "Options", html: f => select("pf-clm", "Edges", [["analytic", "Lines and circular arcs within the tolerance, else smooth splines"], ["smooth", "Smooth splines"]], f.clean || "analytic") +
+          `<div class="grid2">` + num("pf-cltol", "Tolerance (mm)", f.tolerance === undefined ? 0.05 : f.tolerance) + num("pf-clang", "Corner angle (deg)", f.angle === undefined ? 15 : f.angle) +
+          num("pf-clmin", "Remove edges shorter than (mm, 0: off)", f.min_edge || 0) + num("pf-clface", "Remove faces smaller than (mm^2, 0: off)", f.min_face || 0) + `</div>` +
+          `<p class="hint">On each face, every run of boundary edges that meet within the corner angle is replaced by one edge, and the face is rebuilt on its own surface. A run shorter than the given length in a corner (a notch, a small chamfer) is removed and the two edges beside it are extended to their corner. A face whose rebuild fails or changes its area is kept as it is. The source body is hidden.</p>` + resultLine(f),
+        bind: (f, box) => bindAll(box, { "#pf-clm": el => { f.clean = el.value; }, "#pf-cltol": el => { const v = numv(el.value); if (v > 0) f.tolerance = v; }, "#pf-clang": el => { const v = numv(el.value); if (v >= 0) f.angle = v; },
+          "#pf-clmin": el => { const v = numv(el.value); if (v >= 0) f.min_edge = v; }, "#pf-clface": el => { const v = numv(el.value); if (v >= 0) f.min_face = v; } }),
+        summary: f => (f.clean === "smooth" ? "smooth" : "analytic") + ", " + pfmt(f.tolerance === undefined ? 0.05 : f.tolerance) + " mm, " + pfmt(f.angle === undefined ? 15 : f.angle) + " deg" + (f.min_edge ? ", edges < " + pfmt(f.min_edge) + " mm removed" : "") + (f.min_face ? ", faces < " + pfmt(f.min_face) + " mm^2 removed" : "") }] },
   surf_gaps: { title: "Close gaps", defaults: () => ({ source: null, max_gap: 0.5 }),
     steps: f => [sourceStep("Surface", "source", false, "Click the surface body whose gaps to close, or choose it."),
       { key: "opts", label: "Gap", html: f => `<div class="grid2">` + num("pf-gmax", "Maximum gap (mm)", f.max_gap || 0.5) + `<span></span></div>` +
@@ -2957,13 +3102,41 @@ const COMMANDS = {
     steps: f => [surfaceOrFacesStep("Surface", "Click a surface body or faces of the solid to thicken.", true), { key: "thickness", label: "Thickness", html: f => `<div class="grid2">` + num("pf-tth", "Thickness (mm)", f.thickness || 1) + select("pf-tside", "Side", [["+", "Along the normal"], ["-", "Against the normal"], ["both", "Both (half each)"]], f.side || "+") + `</div>` +
         select("pf-tmode", "Result", [["add", "Add to the part"], ["cut", "Remove from the part"], ["new", "New cell"]], f.mode || "add") + resultLine(f),
       bind: (f, box) => bindAll(box, { "#pf-tth": el => { const v = numv(el.value); if (v > 0) f.thickness = v; }, "#pf-tside": el => { f.side = el.value; }, "#pf-tmode": el => { f.mode = el.value; } }), summary: f => pfmt(f.thickness || 1) + " mm, " + (f.mode || "add") }] },
-  curve_section: { title: "Intersection curve", defaults: () => ({ source: null, faces: [], other: null }),
-    steps: f => [surfaceOrFacesStep("Surface", "Click a surface body or faces of the solid."), { key: "other", label: "With", kinds: ["surface", "body"], single: true, before: false, hint: "Click the second surface body, or the solid.",
-      accept: (f, h) => { f.other = h.kind === "surface" ? h.id : null; PT.dirty = true; },
-      html: f => sourceSelect("pf-other", f, "other", false, false).replace("Surface<", "With surface (none: the solid)<") + resultLine(f), bind: (f, box) => bindAll(box, { "#pf-other": el => { f.other = el.value || null; } }),
-      done: f => true, summary: f => f.other ? itemName(f.other) : "the solid" }] },
-  surf_extract: { title: "Extract surface", needsSolid: false, defaults: () => ({ faces: [], offset: 0 }),
-    steps: f => [facesStep("Faces", "faces", "Click the faces to copy as a surface body: faces of the solid or of surface bodies.", false, true), { key: "offset", label: "Offset", html: f => `<div class="grid2">` + num("pf-xoff", "Offset along the normals (mm)", f.offset || 0) + `<span></span></div>` + resultLine(f), bind: (f, box) => bindAll(box, { "#pf-xoff": el => { f.offset = numv(el.value) || 0; } }), summary: f => pfmt(f.offset || 0) + " mm" }] },
+  curve_section: { title: "Intersection curve", defaults: () => ({ source: null, faces: [], other: null, with: "shape", plane: "XY", gap: 0.5 }),
+    steps: f => [surfaceOrFacesStep("Surface", "Click a surface body or faces of the solid."), { key: "other", label: "With", kinds: ["surface", "body", "plane"], single: true, before: false, hint: "Click the second surface body, the solid, or a plane.",
+      accept: (f, h) => { if (h.kind === "plane") { f.with = "plane"; f.plane = h.id; } else { f.with = "shape"; f.other = h.kind === "surface" ? h.id : null; } PT.dirty = true; },
+      html: f => { const i = featIndex(f.id); const opts = [["", "(none: the solid)"]].concat(surfaceItems(i, false).filter(x => x.id !== f.source).map(x => [x.id, x.name]))
+          .concat(Object.entries(BASE_PLANES).map(([k, n]) => ["plane:" + k, "Plane " + n])).concat(planeItems(i).map(p => ["plane:" + p.id, "Plane " + p.name]));
+        return select("pf-other", "With", opts, f.with === "plane" ? "plane:" + (f.plane || "XY") : (f.other || "")) +
+          `<div class="grid2">` + num("pf-isgap", "Bridge gaps up to (mm, 0: off)", f.gap === undefined ? 0.5 : f.gap) + `<span></span></div>` +
+          `<p class="hint">Pieces of the intersection whose ends are at most this far apart are joined into one curve by straight lines.</p>` + resultLine(f); },
+      bind: (f, box) => bindAll(box, { "#pf-other": el => { if (el.value.startsWith("plane:")) { f.with = "plane"; f.plane = el.value.slice(6); } else { f.with = "shape"; f.other = el.value || null; } }, "#pf-isgap": el => { const v = numv(el.value); if (v >= 0) f.gap = v; } }),
+      done: f => true, summary: f => f.with === "plane" ? "plane " + planeName(f.plane) : f.other ? itemName(f.other) : "the solid" }] },
+  surf_extract: { title: "Extract surface", needsSolid: false, defaults: () => ({ faces: [], offset: 0, separate: false }),
+    steps: f => [facesStep("Faces", "faces", "Click the faces to copy as a surface body: faces of the solid or of surface bodies.", false, true), { key: "offset", label: "Offset", html: f => `<div class="grid2">` + num("pf-xoff", "Offset along the normals (mm)", f.offset || 0) + `<span></span></div>` +
+          check("pf-xsep", "Separate bodies: one Extract surface feature per connected group of the picked faces", !!f.separate) + resultLine(f),
+        bind: (f, box) => bindAll(box, { "#pf-xoff": el => { f.offset = numv(el.value) || 0; }, "#pf-xsep": el => { f.separate = el.checked; } }), summary: f => pfmt(f.offset || 0) + " mm" + (f.separate ? ", separate bodies" : "") }],
+    // Separate bodies: on OK the picked faces are grouped through their shared edges on the server and the feature is
+    // split into one Extract surface per group (the first group stays in this feature)
+    finish: async (f, isNew, resume) => {
+      if (f.separate && (f.faces || []).length > 1) {
+        try {
+          const r = await postJSON("/api/part/face_groups", { part: PT.part, index: featIndex(f.id), faces: f.faces });
+          const groups = await r.json();
+          if (Array.isArray(groups) && groups.length > 1) {
+            checkpointPart();
+            f.faces = groups[0];
+            let at = featIndex(f.id) + 1, n = PT.part.features.filter(x => x.type === "surf_extract").length;
+            for (const g of groups.slice(1)) {
+              PT.part.features.splice(at++, 0, { id: newId(), name: "Extract surface " + (++n), type: "surf_extract", suppressed: false, faces: g, offset: f.offset || 0, separate: true });
+            }
+            msgPart(groups.length + " connected groups of faces: " + groups.length + " surface bodies");
+          } else if (Array.isArray(groups)) msgPart("The picked faces are one connected group: one surface body");
+        } catch (e) { showErr(e); }
+      }
+      changedPart();
+      if (resume) resumeCommand(resume);
+    } },
   surf_fillet: { title: "Surface fillet", defaults: () => ({ mode: "bodies", source_a: null, source_b: null, source: null, edges: [], radius: 2, flip_a: false, flip_b: false, trim: true }),
     steps: f => {
       const modeSel = select("pf-sfmode", "Fillet", [["bodies", "Between two surface bodies"], ["edges", "Edges of a surface body"]], f.mode || "bodies");
@@ -3010,6 +3183,23 @@ const COMMANDS = {
           `<p class="hint">The ends of side A are joined to the nearer ends of side B (corner to corner) and the points between; the result is a surface body. Tangent: the surface leaves each side in the plane of the face that owns the side's edges (a side on a curve body: position only). Sew surfaces joins it to the neighbouring surfaces.</p>` + resultLine(f),
         bind: (f, box) => bindAll(box, { "#pf-bcont": el => { f.continuity = el.value; }, "#pf-bfac": el => { const v = numv(el.value); if (v > 0) f.factor = v; }, "#pf-bflip": el => { f.flip = el.checked; } }),
         summary: f => (f.continuity === "tangent" ? "tangent" : "ruled") + (f.flip ? ", flipped" : "") }]) },
+  surf_connect: { title: "Connect surfaces", needsSolid: false, defaults: () => ({ source_a: null, edges_a: [], source_b: null, edges_b: [], tolerance: 0.01 }),
+    steps: f => ["a", "b"].map(k => ({ key: "side_" + k, label: "Side " + k.toUpperCase(), multi: true, kinds: ["sedge", "edge"], before: false,
+        hint: `Click the edges of surface body ${k.toUpperCase()} at the corner (one body per side; click again to deselect). A click on an edge of another body starts the side again with that body.`,
+        accept(f, h) {
+          if (!h.surface) { msgPart("Click an edge of a surface body", true); return; }
+          const other = k === "a" ? f.source_b : f.source_a;
+          if (h.surface === other) { msgPart("Side " + k.toUpperCase() + " must be another surface body than side " + (k === "a" ? "B" : "A"), true); return; }
+          if (h.surface !== f["source_" + k]) { f["source_" + k] = h.surface; f["edges_" + k] = []; }
+          applyPick(f, { prop: "edges_" + k, kinds: ["edge"], single: false }, h);
+        },
+        html: f => `<p class="hint">${f["source_" + k] ? itemName(f["source_" + k]) + ": " : ""}${(f["edges_" + k] || []).length} edge(s).</p><div class="buttons"><button type="button" data-cclear="${k}">Clear</button></div>`,
+        bind: (f, box) => box.querySelectorAll("button[data-cclear]").forEach(b => b.onclick = () => { f["source_" + k] = null; f["edges_" + k] = []; changedPart(); }),
+        done: f => !!f["source_" + k] && (f["edges_" + k] || []).length > 0,
+        summary: f => f["source_" + k] ? itemName(f["source_" + k]) + ", " + (f["edges_" + k] || []).length + " edge(s)" : "none" }))
+      .concat([{ key: "opts", label: "Options", html: f => `<div class="grid2">` + num("pf-ctol", "Tolerance (mm)", f.tolerance || 0.01) + `<span></span></div>` +
+          `<p class="hint">Side A is extended across its edges up to side B (B extended beyond its own edges when it is too short), then side B across its edges up to the extended A. Both end at their intersection and are sewn into one body; a gap or an overlap at the corner is closed. The two bodies are hidden.</p>` + resultLine(f),
+        bind: (f, box) => bindAll(box, { "#pf-ctol": el => { const v = numv(el.value); if (v > 0) f.tolerance = v; } }), summary: f => "" }]) },
   curve_blend: { title: "Blend curve", needsSolid: false, defaults: () => ({ ends: [null, null] }),
     steps: f => [0, 1].map(i => ({ key: "end_" + i, label: "End " + "AB"[i], kinds: ["edge", "sedge", "curve", "point"], before: false,
         hint: `Click the end of an edge (of the solid or of a surface body) or of a curve body near end ${"AB"[i]}, or a vertex or point feature. The curve continues the edge from the end nearer the click.`,
@@ -3045,7 +3235,7 @@ const COMMANDS = {
           (f.method === "polyline" || f.method === "spline" || !f.method ? check("pf-cpclosed", "Closed", !!f.closed) : "") + resultLine(f),
         bind: (f, box) => bindAll(box, { "#pf-cpm": el => { f.method = el.value; }, "#pf-cpclosed": el => { f.closed = el.checked; } }),
         summary: f => (f.method || "polyline") + (f.closed && (f.method === "polyline" || f.method === "spline" || !f.method) ? ", closed" : "") }] },
-  surf_fill: { title: "Fill surface", defaults: () => ({ edges: [], tangent: true, curves: [], sketch_refs: [] }),
+  surf_fill: { title: "Fill surface", defaults: () => ({ edges: [], tangent: true, curves: [], sketch_refs: [], gap: 0.5 }),
     steps: f => [{ key: "edges", label: "Boundary", multi: true, kinds: ["edge", "sedge", "face", "sketch", "curve"], before: false,
         hint: "Click the edges of the closed loop: edges of the solid or of surface bodies, sketch curves (the whole sketch), curve bodies. Click again to deselect.",
         accept(f, h) {
@@ -3064,7 +3254,9 @@ const COMMANDS = {
           box.querySelectorAll("input[data-src]").forEach(cb => cb.onchange = () => { f.curves = [...box.querySelectorAll("input[data-src]:checked")].map(x => x.dataset.src); changedPart(); }); },
         done: f => (f.edges || []).length > 0 || (f.curves || []).length > 0 || (f.sketch_refs || []).length > 0,
         summary: f => [(f.edges || []).length ? (f.edges || []).length + " edge(s)" : "", (f.sketch_refs || []).length ? (f.sketch_refs || []).map(itemName).join(", ") : "", (f.curves || []).length ? (f.curves || []).length + " curve(s)" : ""].filter(Boolean).join(", ") || "none" },
-      { key: "opts", label: "Options", html: f => check("pf-ftan", "Tangent to the adjacent faces", f.tangent !== false) + resultLine(f), bind: (f, box) => bindAll(box, { "#pf-ftan": el => { f.tangent = el.checked; } }), summary: f => f.tangent !== false ? "tangent" : "position only" }] },
+      { key: "opts", label: "Options", html: f => check("pf-ftan", "Tangent to the adjacent faces", f.tangent !== false) + `<div class="grid2">` + num("pf-fgap", "Close gaps up to (mm, 0: off)", f.gap === undefined ? 0.5 : f.gap) + `<span></span></div>` +
+          `<p class="hint">Edges whose ends are at most this far apart are joined by straight lines so the loop closes.</p>` + resultLine(f),
+        bind: (f, box) => bindAll(box, { "#pf-ftan": el => { f.tangent = el.checked; }, "#pf-fgap": el => { const v = numv(el.value); if (v >= 0) f.gap = v; } }), summary: f => (f.tangent !== false ? "tangent" : "position only") + ((f.gap === undefined ? 0.5 : f.gap) ? ", gaps to " + pfmt(f.gap === undefined ? 0.5 : f.gap) + " mm" : "") }] },
   curve_extract: { title: "Extract curve", needsSolid: false, defaults: () => ({ edges: [], tangent_chain: false, clean: "none", tolerance: 0.05, gap: 0.5, project: "" }),
     steps: f => [Object.assign(edgesStep("Edges", "edges", "Click the edges of the curve: edges of the solid or of surface bodies."), { kinds: ["edge", "sedge", "face"] }), { key: "opts", label: "Clean", html: f => select("pf-cclean", "Clean", [["none", "None (edges as they are)"], ["smooth", "Join into one smooth spline within tolerance"], ["analytic", "Line or circular arc within tolerance, else smooth spline"]], f.clean || "none") +
         `<div class="grid2">` + num("pf-ctol", "Tolerance (mm)", f.tolerance || 0.05) + num("pf-cgap", "Bridge gaps up to (mm, 0: off)", f.gap || 0) + `</div>` +
@@ -3099,13 +3291,13 @@ function commandRefs(f) {
   for (const st of commandSteps(f)) if (st.prop) add(f[st.prop]);
   if (f.type === "plane" || f.type === "split") { add(f.face); add(f.faces); add(f.edge); add(f.curve); add(f.plane_ref); add(f.sketch_ref); add(f.source); }
   if (f.type === "sweep") { add(f.path_ref); add(f.path_source); }
-  if (f.type === "surf_trim") { add(f.source); if (f.with !== "solid") add(f.tool); }
+  if (f.type === "surf_trim") { if (!(f.faces || []).length) add(f.source); if (f.with !== "solid") { if ((f.tool_faces || []).length) add(f.tool_faces); else add(f.tool); } }
   if (f.type === "sketch") { if (f.plane === "datum") add(f.plane_ref); else if (BASE_PLANES[f.plane]) add(f.plane); add(f.plane_edge); add(f.plane_curve); add(f.plane_face); add(f.plane_axis); add(f.plane_point); add(f.plane_origin_ref); add(f.plane_xdir_ref); if (f.plane_sketch_curve) add(f.plane_sketch_curve.sketch); }
   if (f.type === "point" || f.type === "axis" || f.type === "plane") { add(f.point_ref); add(f.axis_ref); add(f.points_ref); add(f.planes_ref); add(f.plane_ref); add(f.edge); add(f.curve); add(f.face); if (f.sketch_curve) add(f.sketch_curve.sketch); }
   if (f.type === "revolve" || f.type === "pattern") add(f.axis_ref);
   if (f.type === "sketch" && f.plane_origin) out.points.push(f.plane_origin);
   if (f.type === "place") { add(f.face1); add(f.face2); add(f.face3); }
-  for (const k of ["faces", "edges", "source", "sources", "curves", "tool", "other", "project", "sketch_refs", "edges_a", "edges_b", "curves_a", "curves_b"]) if (!(f.type === "surf_trim" && k === "tool")) add(f[k]);
+  for (const k of ["faces", "edges", "source", "sources", "curves", "tool", "other", "project", "sketch_refs", "edges_a", "edges_b", "curves_a", "curves_b"]) if (!(f.type === "surf_trim" && (k === "tool" || k === "source"))) add(f[k]);
   return out;
 }
 
@@ -3163,10 +3355,7 @@ function drawMeasure(paint) {
     ln.renderOrder = 12;
     t.overlay.add(ln);
     for (const q of [a, b]) {
-      const sp = new THREE.Mesh(new THREE.SphereGeometry(planeSize() * 0.015, 12, 8), new THREE.MeshBasicMaterial({ color: MEAS_COL, depthTest: false }));
-      sp.position.set(...q);
-      sp.renderOrder = 12;
-      t.overlay.add(sp);
+      addMarker(q, MEAS_COL, 6, 12);
     }
   }
 }
@@ -3186,8 +3375,8 @@ const STICKY = {
   replace: ["method", "tolerance", "offset", "pad", "min_area"], surf_fit: ["method", "tolerance", "extend", "offset"],
   surf_sketch: ["depth", "symmetric", "angle"], surf_extend: ["distance", "sides", "tolerance"],
   surf_offset: ["distance"], thicken: ["thickness", "side", "mode"], surf_extract: ["offset"],
-  surf_fillet: ["radius", "trim"], surf_fill: ["tangent"], surf_sew: ["tolerance"], surf_gaps: ["max_gap"], surf_sweep: ["orient", "smooth"], curve_project: ["method", "keep"],
-  curve_extract: ["tangent_chain", "clean", "tolerance", "gap"], surf_from_curve: ["depth", "symmetric", "angle"], sweep: ["kind", "mode", "tool_at"],
+  surf_fillet: ["radius", "trim"], surf_trim: ["extend", "extend_far", "min_area", "grouping"], surf_fill: ["tangent", "gap"], surf_sew: ["tolerance"], surf_gaps: ["max_gap"], surf_sweep: ["orient", "smooth"], curve_project: ["method", "keep"],
+  curve_extract: ["tangent_chain", "clean", "tolerance", "gap"], curve_section: ["gap"], surf_clean: ["clean", "tolerance", "angle", "min_edge", "min_face"], surf_from_curve: ["depth", "symmetric", "angle"], sweep: ["kind", "mode", "tool_at"],
 };
 async function loadLast() {
   try { const r = await fetch("/api/part/last"); if (r.ok) PT.last = await r.json(); } catch (e) { /* defaults */ }
@@ -3570,7 +3759,7 @@ const LEGACY_DEFAULTS = {
   surf_loft: () => ({ sections: [{ plane: "XY", offset: 0, sketch: emptySketch() }, { plane: "XY", offset: 20, sketch: emptySketch() }], ruled: false, curves: [] }),
   surf_sew: () => ({ sources: [], tolerance: 0.001 }),
   surf_import: () => ({ path: "", label: "" }),
-  surf_cut: () => ({ source: null, keep: "-" }),
+  surf_cut: () => ({ source: null, with: "surface", plane: "XY", keep: "-" }),
   surf_from_curve: () => ({ source: null, kind: "extrude", direction: [0, 0, 1], depth: 10, symmetric: false, axis_point: [0, 0, 0], axis_dir: [0, 0, 1], angle: 360 }),
 };
 
@@ -3775,9 +3964,13 @@ const LEGACY_PANELS = {
     box.querySelector("#pf-sbrowse").onclick = async () => { try { const p = await window.browse("open", "step", "", "STEP file to import"); if (p) { f.path = p; changedPart(); } } catch (e) { showErr(e); } };
   },
   surf_cut(f, box) {
-    box.innerHTML = sourceSelect("pf-src", f, "source", false, false) + select("pf-keep", "Keep", [["-", "The side against the surface normal"], ["+", "The side along the surface normal"]], f.keep || "-") + resultText(PT.status[f.id] || {}) +
-      `<p class="hint">The solid is split by the surface and the cells on one side are kept. The surface must pass through the solid completely.</p>`;
-    bindAll(box, { "#pf-src": el => { f.source = el.value; }, "#pf-keep": el => { f.keep = el.value; } });
+    const i = featIndex(f.id);
+    const opts = [["", "(none)"]].concat(surfaceItems(i, false).map(x => [x.id, x.name]))
+      .concat(Object.entries(BASE_PLANES).map(([k, n]) => ["plane:" + k, "Plane " + n])).concat(planeItems(i).map(p => ["plane:" + p.id, "Plane " + p.name]));
+    box.innerHTML = select("pf-src", "Surface or plane", opts, f.with === "plane" ? "plane:" + (f.plane || "XY") : (f.source || "")) +
+      select("pf-keep", "Keep", [["-", "The side against the surface normal"], ["+", "The side along the surface normal"]], f.keep || "-") + resultText(PT.status[f.id] || {}) +
+      `<p class="hint">The solid is split by the surface or plane and the cells on one side are kept. A surface must pass through the solid completely. The normal of a reference plane is its axis (Top: +Z, Front: -Y, Right: +X); of a plane feature, its normal.</p>`;
+    bindAll(box, { "#pf-src": el => { if (el.value.startsWith("plane:")) { f.with = "plane"; f.plane = el.value.slice(6); f.source = null; } else { f.with = "surface"; f.source = el.value || null; } }, "#pf-keep": el => { f.keep = el.value; } });
   },
 };
 
@@ -3971,9 +4164,11 @@ function consumedSources(f) {
 /** The bodies a feature of these types consumes, suppressed or not. */
 function sourcesOf(f) {
   if (!f) return [];
-  if (f.type === "surf_trim" || f.type === "surf_extend" || f.type === "thicken" || f.type === "surf_gaps") return f.source ? [f.source] : [];
+  if (f.type === "surf_trim") return ((f.faces || []).length ? [] : [f.source]).concat(f.mutual && (f.with || "surface") === "surface" && f.tool && !(f.tool_faces || []).length ? [f.tool] : []).filter(Boolean);
+  if (f.type === "surf_extend" || f.type === "thicken" || f.type === "surf_gaps" || f.type === "surf_clean" || f.type === "surf_separate") return f.source ? [f.source] : [];
   if (f.type === "surf_sew") return f.sources || [];
   if (f.type === "surf_fillet") return f.mode === "edges" ? (f.source ? [f.source] : []) : f.trim === false ? [] : [f.source_a, f.source_b].filter(Boolean);
+  if (f.type === "surf_connect") return [f.source_a, f.source_b].filter(Boolean);
   return [];
 }
 
@@ -4067,6 +4262,9 @@ window.partShown = function () {
   $("#pt-planes").onchange = () => setMesh(PT.mesh);
   $("#pt-axes").onchange = () => setMesh(PT.mesh);
   $("#pt-showsketch").onchange = () => setMesh(PT.mesh);
+  for (const [id, mode] of [["#pt-show-all", "all"], ["#pt-hide-all", "none"], ["#pt-show-invert", "invert"], ["#pt-show-solids", "solids"], ["#pt-show-surfaces", "surfaces"]]) if ($(id)) $(id).onclick = () => showBodies(mode);
+  if ($("#pt-cancel")) $("#pt-cancel").onclick = cancelBuild;
+  if ($("#pt-surfop")) { $("#pt-surfop").value = String(Math.round(surfOpacity() * 100)); const lbl = $("#pt-surfop-val"); if (lbl) lbl.textContent = Math.round(surfOpacity() * 100) + " %"; $("#pt-surfop").oninput = () => setSurfOpacity(+$("#pt-surfop").value / 100); }
   $("#pt-cmdbody").addEventListener("focusout", () => setTimeout(() => { const box = $("#pt-cmdbody"); if (PT.pendingRender && !(document.activeElement && box.contains(document.activeElement))) { PT.pendingRender = false; if (PT.cmd) renderCommand(); } }, 0));
   bindCmdWin();
   bindConfigFold();
@@ -4106,7 +4304,7 @@ window.partShown = function () {
   window.addEventListener("beforeunload", e => { if (PT.dirty) { e.preventDefault(); e.returnValue = ""; } });
 })();
 // exposed for tests
-window.__part = { PT, feat, feedCommand, showOnlyBody, showAllBodies, toggleBodyGroup, bodyGroupIds, boxHits, selectShown, addHits, activePick, THREE, loadPart, setMesh, viewXdir, setMeasure, measureClick, startCommand, finishCommand, cancelCommand, gotoStep, nextStep, selectItem, pickAt, commandSteps, changedPart, viewDir, hoverText };
+window.__part = { PT, feat, feedCommand, showOnlyBody, showAllBodies, showBodies, toggleBodyGroup, bodyGroupIds, surfOpacity, setSurfOpacity, cancelBuild, boxHits, selectShown, addHits, activePick, THREE, loadPart, setMesh, viewXdir, setMeasure, measureClick, startCommand, finishCommand, cancelCommand, gotoStep, nextStep, selectItem, pickAt, commandSteps, changedPart, viewDir, hoverText };
 
 // ------------------------------------------------------------------ mesh preview
 

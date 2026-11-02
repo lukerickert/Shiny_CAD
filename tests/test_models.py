@@ -968,6 +968,90 @@ def test_move_faces_corner_by_plane_offset():
     assert abs(mx.X - 105) < 1e-6 and abs(mx.Y - 55) < 1e-6
 
 
+def test_extend_surface_mitred_corners():
+    """Extend surface across edges: two picked edges meeting at a convex corner share a mitred corner (a 40 x 20 face
+    becomes 45 x 25, one face); a single picked edge continues the neighbouring edges (40 x 25); all four edges give
+    50 x 30 with four edges; at a concave corner of an L-shaped face the strips meet at the mitre without overlap."""
+    from conftest import rect
+    from drawgen import part
+
+    def ext(ents, edges):
+        p = {"name": "ex", "version": 2, "features": [
+            {"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": ents}},
+            {"id": "x", "name": "Extend 1", "type": "surf_extend", "source": "a", "edges": edges, "mode": "edges", "distance": 5, "sides": "all", "tolerance": 0.01, "target": None}]}
+        bodies, datums = {}, {}
+        shape, st = part.build(p, surfaces=bodies, datums=datums)
+        assert not [x for x in st if x.get("error")], [x.get("error") for x in st]
+        return bodies["x"]
+    right, top, left, bottom = {"mid": [40.0, 10.0, 0.0], "len": 20.0}, {"mid": [20.0, 20.0, 0.0], "len": 40.0}, {"mid": [0.0, 10.0, 0.0], "len": 20.0}, {"mid": [20.0, 0.0, 0.0], "len": 40.0}
+    b = ext(rect(40, 20), [right, top])
+    assert len(b.faces()) == 1 and abs(b.area - 45 * 25) < 1e-6 and b.is_valid
+    b = ext(rect(40, 20), [bottom])
+    assert len(b.faces()) == 1 and abs(b.area - 40 * 25) < 1e-6
+    b = ext(rect(40, 20), [right, top, left, bottom])
+    assert len(b.faces()) == 1 and abs(b.area - 50 * 30) < 1e-6 and len(b.edges()) == 4
+    pts = [(0, 0), (40, 0), (40, 10), (20, 10), (20, 20), (0, 20)]
+    ents = [{"id": i + 1, "t": "line", "x1": pts[i][0], "y1": pts[i][1], "x2": pts[(i + 1) % 6][0], "y2": pts[(i + 1) % 6][1], "layer": "0"} for i in range(6)]
+    b = ext(ents, [{"mid": [30.0, 10.0, 0.0], "len": 20.0}, {"mid": [20.0, 15.0, 0.0], "len": 10.0}])
+    assert len(b.faces()) == 1 and abs(b.area - 725) < 1e-6 and b.is_valid
+    assert any((v.X - 25) ** 2 + (v.Y - 15) ** 2 < 1e-8 for v in b.vertices())
+
+
+def test_trim_surface_mutual():
+    """Trim surface with Mutual: two crossing planar faces (40 x 20 each) are both split; one piece of each
+    removed by its point; the two kept halves are sewn into one shell (800 mm^2). The regions endpoint lists the
+    pieces of both bodies (four), two without Mutual."""
+    from conftest import rect
+    from drawgen import part, web
+    feats = [
+        {"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(40, 20)}},
+        {"id": "b", "name": "B", "type": "surf_sketch", "kind": "planar", "plane": "XZ", "offset": -10, "sketch": {"entities": rect(40, 20, 0, -10)}},
+        {"id": "t", "name": "Trim 1", "type": "surf_trim", "source": "a", "with": "surface", "tool": "b", "keep": "pick", "mutual": True, "remove": [[20.0, 15.0, 0.0], [20.0, 10.0, -5.0]]}]
+    p = part.migrate({"name": "mt", "version": 2, "features": feats})
+    bodies, datums = {}, {}
+    shape, st = part.build(p, surfaces=bodies, datums=datums)
+    assert not [x for x in st if x.get("error")], [x.get("error") for x in st]
+    t = bodies["t"]
+    assert len(t.faces()) == 2 and len(t.shells()) == 1 and abs(t.area - 800) < 1e-6
+    mx = t.bounding_box().max
+    assert abs(mx.Y - 10) < 1e-6 and abs(mx.Z - 10) < 1e-6
+    i = next(k for k, f in enumerate(p["features"]) if f["id"] == "t")
+    c = web.app.test_client()
+    assert len(c.post("/api/part/regions", json={"part": p, "index": i}).get_json()) == 4
+    p["features"][i]["mutual"] = False
+    assert len(c.post("/api/part/regions", json={"part": p, "index": i}).get_json()) == 2
+
+
+def test_connect_surfaces_closes_corner():
+    """Connect surfaces: a horizontal 40 x 20 face and a vertical face 3 mm beyond its edge and 2 mm above it are
+    extended up to each other and sewn into one shell (40 x 23 + 40 x 22); an overlapping pair is trimmed to the
+    corner (40 x 23 + 40 x 20); a plane and a cylinder meet along the cylinder's intersection with the plane."""
+    from conftest import rect
+    from drawgen import part
+
+    def run(feats, ea, eb):
+        f = {"id": "c", "name": "Connect 1", "type": "surf_connect", "source_a": "a", "edges_a": [ea], "source_b": "b", "edges_b": [eb], "tolerance": 0.01}
+        bodies, datums = {}, {}
+        shape, st = part.build({"name": "cn", "version": 2, "features": feats + [f]}, surfaces=bodies, datums=datums)
+        assert not [x for x in st if x.get("error")], [x.get("error") for x in st]
+        return bodies["c"]
+    a = {"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(40, 20)}}
+    b = {"id": "b", "name": "B", "type": "surf_sketch", "kind": "planar", "plane": "XZ", "offset": -23, "sketch": {"entities": rect(40, 20, 0, 2)}}
+    c = run([a, b], {"mid": [20.0, 20.0, 0.0], "len": 40.0}, {"mid": [20.0, 23.0, 2.0], "len": 40.0})
+    assert len(c.faces()) == 2 and len(c.shells()) == 1 and abs(c.area - (40 * 23 + 40 * 22)) < 1e-6
+    a2 = dict(a, sketch={"entities": rect(40, 26)})
+    b2 = dict(b, sketch={"entities": rect(40, 24, 0, -4)})
+    c = run([a2, b2], {"mid": [20.0, 26.0, 0.0], "len": 40.0}, {"mid": [20.0, 23.0, -4.0], "len": 40.0})
+    assert len(c.shells()) == 1 and abs(c.area - (40 * 23 + 40 * 20)) < 1e-6
+    a3 = dict(a, sketch={"entities": rect(40, 15)})
+    cyl = {"id": "b", "name": "B", "type": "surf_sketch", "kind": "extrude", "depth": 40, "plane": "YZ", "offset": 0,
+           "sketch": {"entities": [{"id": 1, "t": "arc", "layer": "0", "cx": 23, "cy": 8, "r": 10, "a0": 180, "a1": 270}]}}
+    c = run([a3, cyl], {"mid": [20.0, 15.0, 0.0], "len": 40.0}, {"mid": [20.0, 23.0, -2.0], "len": 40.0})
+    assert len(c.shells()) == 1 and abs(c.area - (40 * 17 + 40 * 9.2730)) < 0.05
+    mx, mn = c.bounding_box().max, c.bounding_box().min
+    assert abs(mx.Y - 17) < 1e-4 and abs(mn.Z) < 1e-4
+
+
 def test_sketch_on_surface_body_face():
     """A sketch on a planar face of a surface body (plane "face" with the face key of the body): the frame is
     the face's centre and normal."""
@@ -1192,7 +1276,7 @@ def test_extend_surface_merged_upto_and_trim_reach(tmp_path):
          "sketch": {"entities": [{"id": 1, "t": "line", "layer": "0", "x1": 15, "y1": 10, "x2": 15, "y2": 0.5}]}}
     tr = {"id": "tr", "name": "Trim", "type": "surf_trim", "source": "b", "with": "surface", "tool": "c", "keep": "largest", "remove": []}
     b, st = build([B, C, tr])
-    assert st[-1]["error"] is None and "extended beyond its edges" in st[-1]["note"]
+    assert st[-1]["error"] is None and "beyond its edges" in st[-1]["note"]
     assert abs(b["tr"].area - 60) < 1e-6 and abs(b["tr"].bounding_box().min.X - 15) < 1e-6
 
 
@@ -1935,3 +2019,450 @@ def test_projected_refs_keeps_every_spline_edge():
     out = P.projected_refs(solid, Plane.XY.offset(10))
     curved = [e for e in out if e["kind"] == "proj" and e["t"] in ("poly", "arc")]
     assert len(curved) >= 2
+
+
+def test_clean_surface_edges():
+    """Clean edges: a planar 100 x 50 face whose bottom edge is two collinear lines and whose top edge is a
+    polyline of 8 segments bending 10 deg each, with a hole of two half circles: analytic cleaning gives one line
+    for the bottom, one edge for the top (14 edges -> 6, the hole's two arcs kept), the area unchanged.
+    A junction turning more than the angle stays a corner."""
+    import math
+    from drawgen import part
+
+    def line(i, a, b):
+        return {"id": i, "t": "line", "x1": a[0], "y1": a[1], "x2": b[0], "y2": b[1], "layer": "0"}
+    ents = [line(1, (0, 0), (50, 0)), line(2, (50, 0), (100, 0)), line(3, (100, 0), (100, 50))]
+    # top edge: points on a circle through (100, 50) and (0, 50), 8 chords of 10 deg each (bulging up)
+    r = 50.0 / math.sin(math.radians(40))
+    cy = 50 - r * math.cos(math.radians(40))
+    pts = [(50 + r * math.sin(math.radians(40 - 10 * k)), cy + r * math.cos(math.radians(40 - 10 * k))) for k in range(9)]
+    for k in range(8):
+        ents.append(line(4 + k, pts[k], pts[k + 1]))
+    ents.append(line(12, (0, 50), (0, 0)))
+    ents.append({"id": 13, "t": "arc", "layer": "0", "cx": 50, "cy": 25, "r": 5, "a0": 0, "a1": 180})
+    ents.append({"id": 14, "t": "arc", "layer": "0", "cx": 50, "cy": 25, "r": 5, "a0": 180, "a1": 360})
+    a = {"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": ents}}
+    c = {"id": "c", "name": "Clean 1", "type": "surf_clean", "source": "a", "clean": "analytic", "tolerance": 0.05, "angle": 15}
+    bodies = {}
+    shape, st = part.build({"name": "cl", "version": 2, "features": [a, c]}, surfaces=bodies)
+    assert not [x for x in st if x.get("error")], [x.get("error") for x in st]
+    src, out = bodies["a"], bodies["c"]
+    assert len(src.edges()) == 14 and len(out.faces()) == 1
+    assert len(out.edges()) == 6, len(out.edges())
+    assert abs(out.area - src.area) < 0.05 * 400
+    def kinds(b):
+        return sorted(str(getattr(e.geom_type, "name", e.geom_type)).upper() for e in b.edges())
+    # the chords deviate 0.3 mm from their circle: a spline within 0.05 mm, a circular arc within 0.5 mm
+    assert kinds(out) == ["BSPLINE", "CIRCLE", "CIRCLE", "LINE", "LINE", "LINE"], kinds(out)
+    bodies = {}
+    shape, st = part.build({"name": "cl", "version": 2, "features": [a, dict(c, tolerance=0.5)]}, surfaces=bodies)
+    assert kinds(bodies["c"]) == ["CIRCLE", "CIRCLE", "CIRCLE", "LINE", "LINE", "LINE"], kinds(bodies["c"])
+    note = [x for x in st if x.get("id") == "c"][0].get("note") or ""
+    assert "14 edge(s) joined into 6" in note, note
+    # the same with the smooth option: a spline over the top chain, lines kept
+    c2 = dict(c, clean="smooth")
+    bodies = {}
+    shape, st = part.build({"name": "cl", "version": 2, "features": [a, c2]}, surfaces=bodies)
+    assert not [x for x in st if x.get("error")], [x.get("error") for x in st]
+    assert len(bodies["c"].edges()) == 6
+    # corner angle 5 deg: the 10 deg junctions of the top edge stay
+    c3 = dict(c, angle=5)
+    bodies = {}
+    shape, st = part.build({"name": "cl", "version": 2, "features": [a, c3]}, surfaces=bodies)
+    assert len(bodies["c"].edges()) == 13  # the two collinear bottom lines still joined
+
+
+def test_clean_surface_edges_on_cylinder():
+    """Clean edges on a cylindrical patch (radius 20 mm, 90 deg, 30 mm long) whose two straight edges are each split
+    in two collinear lines: 6 edges -> 4, the face stays on the cylinder with the same area."""
+    import math
+    from OCP.gp import gp_Ax3, gp_Pnt, gp_Dir
+    from OCP.Geom import Geom_CylindricalSurface
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace, BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeWire
+    from OCP.GC import GC_MakeArcOfCircle
+    from build123d import Face
+    from drawgen import surfaces as sfm
+    r, L = 20.0, 30.0
+    surf = Geom_CylindricalSurface(gp_Ax3(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1), gp_Dir(1, 0, 0)), r)
+    P = lambda a, z: gp_Pnt(r * math.cos(math.radians(a)), r * math.sin(math.radians(a)), z)
+    mw = BRepBuilderAPI_MakeWire()
+    mw.Add(BRepBuilderAPI_MakeEdge(GC_MakeArcOfCircle(P(0, 0), P(45, 0), P(90, 0)).Value()).Edge())
+    mw.Add(BRepBuilderAPI_MakeEdge(P(90, 0), P(90, 12)).Edge())
+    mw.Add(BRepBuilderAPI_MakeEdge(P(90, 12), P(90, L)).Edge())
+    mw.Add(BRepBuilderAPI_MakeEdge(GC_MakeArcOfCircle(P(90, L), P(45, L), P(0, L)).Value()).Edge())
+    mw.Add(BRepBuilderAPI_MakeEdge(P(0, L), P(0, 7)).Edge())
+    mw.Add(BRepBuilderAPI_MakeEdge(P(0, 7), P(0, 0)).Edge())
+    from OCP.ShapeFix import ShapeFix_Face
+    w = mw.Wire()
+    w.Reverse()
+    fx = ShapeFix_Face(BRepBuilderAPI_MakeFace(surf, w, True).Face())
+    fx.Perform()
+    face = Face(fx.Face())
+    assert len(face.edges()) == 6 and abs(face.area - math.pi / 2 * r * L) < 1e-6
+    out = sfm.clean_edges(None, {"a": face}, {"source": "a", "clean": "analytic", "tolerance": 0.05, "angle": 15}, None)
+    assert len(out.faces()) == 1 and len(out.edges()) == 4, len(out.edges())
+    assert abs(out.area - face.area) < 1e-3 * face.area
+    assert "6 edge(s) joined into 4" in out._kind
+    assert "CYLINDER" in str(getattr(out.faces()[0].geom_type, "name", out.faces()[0].geom_type)).upper()
+    assert all(abs(math.hypot(p.X, p.Y) - r) < 1e-6 for e in out.edges() for p in (e.position_at(0.25), e.position_at(0.75)))
+
+
+def test_trim_surface_tool_extended_a_little():
+    """Trim surface with a short tool: a vertical 10 x 20 strip across a 100 x 50 target that stops 2 mm short of the
+    target's far edge (Y 2 to 48). With extend 3 mm the strip is extended just across and the target splits in two
+    (40 x 50 kept); with extend 1 mm and no far extension the tool does not cut; with the far extension on it does."""
+    from conftest import rect
+    from drawgen import part
+
+    def run(extra):
+        feats = [
+            {"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(100, 50)}},
+            {"id": "b", "name": "B", "type": "surf_sketch", "kind": "planar", "plane": "YZ", "offset": 40, "sketch": {"entities": rect(46, 20, 2, -10)}},
+            dict({"id": "t", "name": "Trim 1", "type": "surf_trim", "source": "a", "with": "surface", "tool": "b", "keep": "pick", "remove": [[70.0, 25.0, 0.0]]}, **extra)]
+        bodies = {}
+        shape, st = part.build(part.migrate({"name": "te", "version": 2, "features": feats}), surfaces=bodies)
+        return bodies.get("t"), [x for x in st if x.get("id") == "t"][0]
+    t, st = run({"extend": 3, "extend_far": False})
+    assert not st.get("error"), st.get("error")
+    assert abs(t.area - 40 * 50) < 1e-6 and abs(t.bounding_box().max.X - 40) < 1e-6
+    assert "extended by 3 mm" in (st.get("note") or ""), st.get("note")
+    t, st = run({"extend": 1, "extend_far": False})
+    assert st.get("error") and "does not cut" in st["error"]
+    t, st = run({"extend": 1, "extend_far": True})
+    assert not st.get("error"), st.get("error")
+    assert abs(t.area - 40 * 50) < 1e-6
+    t, st = run({"extend": 0, "extend_far": False})
+    assert st.get("error") and "does not cut" in st["error"]
+
+
+def test_clean_surface_edges_short_edges_and_small_faces():
+    """Clean edges with Remove edges shorter than 2 mm: a 100 x 50 planar face with a 1 mm chamfer at one corner and
+    a 1 x 1 mm notch at another becomes the full rectangle (4 edges, 5000 mm^2); a sewn 0.5 x 0.5 mm face on its
+    edge is dropped with Remove faces smaller than 1 mm^2."""
+    from drawgen import part, surfaces as sfm
+
+    def line(i, a, b):
+        return {"id": i, "t": "line", "x1": a[0], "y1": a[1], "x2": b[0], "y2": b[1], "layer": "0"}
+    pts = [(0, 0), (99, 0), (100, 1), (100, 50), (1, 50), (1, 49), (0, 49)]
+    ents = [line(i + 1, pts[i], pts[(i + 1) % len(pts)]) for i in range(len(pts))]
+    a = {"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": ents}}
+    c = {"id": "c", "name": "Clean 1", "type": "surf_clean", "source": "a", "clean": "analytic", "tolerance": 0.05, "angle": 15, "min_edge": 2}
+    bodies = {}
+    shape, st = part.build({"name": "cl", "version": 2, "features": [a, c]}, surfaces=bodies)
+    assert not [x for x in st if x.get("error")], [x.get("error") for x in st]
+    out = bodies["c"]
+    assert len(out.edges()) == 4 and abs(out.area - 5000) < 1e-6, (len(out.edges()), out.area)
+    bb = out.bounding_box()
+    assert abs(bb.min.X) < 1e-6 and abs(bb.max.X - 100) < 1e-6 and abs(bb.max.Y - 50) < 1e-6
+    note = [x for x in st if x.get("id") == "c"][0].get("note") or ""
+    assert "3 short edge(s) removed at corners" in note, note
+    # without min_edge the chamfer and the notch stay
+    bodies = {}
+    shape, st = part.build({"name": "cl", "version": 2, "features": [a, dict(c, min_edge=0)]}, surfaces=bodies)
+    assert len(bodies["c"].edges()) == 7
+    # a small face sewn to the big one is dropped by min_face
+    from build123d import Face, Vector
+    big = bodies["c"]
+    small = Face.make_rect(0.5, 0.5).moved(__import__("build123d").Location(Vector(50, -0.25, 0)))
+    body = sfm._sew([big, small])
+    assert len(body.faces()) == 2
+    out = sfm.clean_edges(None, {"b": body}, {"source": "b", "min_face": 1.0}, None)
+    assert len(out.faces()) == 1 and "1 small face(s) dropped" in out._kind
+
+
+def test_curve_section_with_plane():
+    """Intersection curve with a plane: a cylindrical surface (radius 10 mm about Y, 40 mm long) cut by plane XZ
+    gives one arc of 10 mm radius at Y 0; by a datum plane 5 mm along Y, the same arc at Y 5."""
+    import copy
+    from drawgen import part
+    cyl = {"id": "s", "name": "S", "type": "surf_sketch", "kind": "extrude", "depth": 40, "plane": "XZ", "offset": 0,
+           "sketch": {"entities": [{"id": 1, "t": "arc", "layer": "0", "cx": 0, "cy": 0, "r": 10, "a0": 0, "a1": 180}]}}
+    pl = {"id": "pl", "name": "Plane 1", "type": "plane", "method": "principal", "plane": "XZ", "offset": 5}
+    c = {"id": "c", "name": "Intersection curve 1", "type": "curve_section", "source": "s", "with": "plane", "plane": "XZ"}
+    bodies = {}
+    shape, st = part.build(part.migrate(copy.deepcopy({"name": "cs", "version": 2, "features": [cyl, pl, c]})), surfaces=bodies)
+    assert not [x for x in st if x.get("error")], [x.get("error") for x in st]
+    cv = bodies["c"]
+    assert len(cv.edges()) == 1 and abs(cv.length - math.pi * 10) < 1e-3
+    bb = cv.bounding_box()
+    assert abs(bb.min.Y) < 1e-6 and abs(bb.max.Y) < 1e-6
+    bodies = {}
+    shape, st = part.build(part.migrate(copy.deepcopy({"name": "cs", "version": 2, "features": [cyl, pl, dict(c, plane="pl")]})), surfaces=bodies)
+    assert not [x for x in st if x.get("error")], [x.get("error") for x in st]
+    cv = bodies["c"]
+    assert abs(cv.length - math.pi * 10) < 1e-3 and abs(abs(cv.bounding_box().min.Y) - 5) < 1e-6
+
+
+def test_fill_surface_bridges_gaps_and_dedupes_edges():
+    """Fill surface: a triangle of three curve bodies whose corners miss each other by 0.2 mm is filled (gaps
+    bridged, note says so); with gap 0 the error names the open distance; the same edge found on two bodies (an
+    Extract surface and its Clean edges) is counted once, so the loop still closes."""
+    from drawgen import part
+
+    def pts(i, a, b):
+        return {"id": i, "name": "C" + i, "type": "curve_points", "points": [list(a), list(b)], "method": "line"}
+    feats = [pts("c1", (0, 0, 0), (30, 0, 0)), pts("c2", (30.2, 0, 0), (15, 20, 0)), pts("c3", (15, 20.2, 0), (0, 0.2, 0)),
+             {"id": "f", "name": "Fill 1", "type": "surf_fill", "edges": [], "curves": ["c1", "c2", "c3"], "tangent": False}]
+    bodies = {}
+    shape, st = part.build({"name": "fg", "version": 2, "features": feats}, surfaces=bodies)
+    assert not [x for x in st if x.get("error")], [x.get("error") for x in st]
+    assert abs(bodies["f"].area - 300) < 5 and "3 gap(s) bridged" in ([x for x in st if x["id"] == "f"][0].get("note") or "")
+    feats[3] = dict(feats[3], gap=0)
+    bodies = {}
+    shape, st = part.build({"name": "fg", "version": 2, "features": feats}, surfaces=bodies)
+    err = [x for x in st if x["id"] == "f"][0].get("error") or ""
+    assert "separate chain" in err and "0.200 mm" in err, err
+    # edges of a planar surface body and of its cleaned copy: picked once each, found on both bodies
+    from conftest import rect
+    feats = [{"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(40, 20)}},
+             {"id": "c", "name": "Clean 1", "type": "surf_clean", "source": "a"},
+             {"id": "f", "name": "Fill 1", "type": "surf_fill", "tangent": False, "curves": [],
+              "edges": [{"mid": [20.0, 0.0, 0.0], "len": 40.0}, {"mid": [40.0, 10.0, 0.0], "len": 20.0}, {"mid": [20.0, 20.0, 0.0], "len": 40.0}, {"mid": [0.0, 10.0, 0.0], "len": 20.0}]}]
+    bodies = {}
+    shape, st = part.build({"name": "fg", "version": 2, "features": feats}, surfaces=bodies)
+    assert not [x for x in st if x.get("error")], [x.get("error") for x in st]
+    assert abs(bodies["f"].area - 800) < 1e-3
+
+
+def test_trim_surface_face_subsets():
+    """Trim surface with parts of bodies: the tool body has two vertical faces (x 40 and x 70) across a 100 x 50
+    target; with tool_faces naming the x 40 face only, the target splits in two (40 x 50 kept); the whole tool gives
+    three pieces. A target of two rectangles with "faces" naming one of them: only that one is trimmed."""
+    from conftest import rect
+    from drawgen import part
+
+    def line(i, a, b):
+        return {"id": i, "t": "line", "x1": a[0], "y1": a[1], "x2": b[0], "y2": b[1], "layer": "0"}
+    target = {"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(100, 50)}}
+    # two vertical faces: lines x = 40 and x = 70 in plane XY (y from -5 to 55) extruded 20 mm along +Z, then moved down... simpler: extrude symmetric
+    tool = {"id": "b", "name": "B", "type": "surf_sketch", "kind": "extrude", "depth": 20, "symmetric": True, "plane": "XY", "offset": 0,
+            "sketch": {"entities": [line(1, (40, -5), (40, 55)), line(2, (70, -5), (70, 55))]}}
+
+    def run(extra, feats=None):
+        t = dict({"id": "t", "name": "Trim 1", "type": "surf_trim", "source": "a", "with": "surface", "tool": "b", "keep": "pick", "remove": [], "extend": 0, "extend_far": False}, **extra)
+        bodies = {}
+        import copy
+        shape, st = part.build(part.migrate(copy.deepcopy({"name": "ts", "version": 2, "features": (feats or [target, tool]) + [t]})), surfaces=bodies)
+        return bodies.get("t"), [x for x in st if x.get("id") == "t"][0], bodies
+    _, st, bodies = run({})
+    assert not st.get("error"), st.get("error")
+    assert len(bodies["b"].faces()) == 2
+    f40 = {"c": [40.0, 25.0, 0.0], "n": [1.0, 0.0, 0.0], "area": 1200.0}
+    from drawgen import surfaces as sfm
+    pieces, _ = sfm.trim_pieces_all(None, bodies, {"source": "a", "with": "surface", "tool": "b", "extend": 0, "extend_far": False})
+    assert len(pieces) == 3
+    pieces, _ = sfm.trim_pieces_all(None, bodies, {"source": "a", "with": "surface", "tool": "b", "tool_faces": [f40], "extend": 0, "extend_far": False})
+    assert len(pieces) == 2 and sorted(round(p.area) for p in pieces) == [2000, 3000]
+    t, st, _ = run({"tool_faces": [f40], "remove": [[70.0, 25.0, 0.0]]})
+    assert not st.get("error"), st.get("error")
+    assert abs(t.area - 2000) < 1e-6 and abs(t.bounding_box().max.X - 40) < 1e-6
+    # a target of two rectangles (x 0..100 and x 120..220): only the second is trimmed by the x 70 face... use x 150
+    target2 = dict(target, sketch={"entities": rect(100, 50) + rect(100, 50, 120, 0, start=5)})
+    tool2 = dict(tool, sketch={"entities": [line(1, (40, -5), (40, 55)), line(2, (150, -5), (150, 55))]})
+    _, st, bodies = run({}, [target2, tool2])
+    assert len(bodies["a"].faces()) == 2
+    second = {"c": [170.0, 25.0, 0.0], "n": [0.0, 0.0, 1.0], "area": 5000.0}
+    pieces, _ = sfm.trim_pieces_all(None, bodies, {"source": "a", "faces": [second], "with": "surface", "tool": "b", "extend": 0, "extend_far": False})
+    assert len(pieces) == 2 and sorted(round(p.area) for p in pieces) == [1500, 3500]
+    t, st, _ = run({"faces": [second], "remove": [[130.0, 25.0, 0.0]]}, [target2, tool2])
+    assert not st.get("error"), st.get("error")
+    assert abs(t.area - 3500) < 1e-6 and abs(t.bounding_box().min.X - 150) < 1e-6
+
+
+def test_separate_faces_of_surface_body():
+    """Separate faces: of a 4-face extruded rectangle body, the two faces at x = 0 and x = 40 picked give a body of
+    2 faces (keep picked) and the other two faces another body (keep rest); nothing picked or every face picked
+    with keep rest is an error."""
+    import copy
+    from conftest import rect
+    from drawgen import part
+    feats = [{"id": "a", "name": "A", "type": "surf_sketch", "kind": "extrude", "depth": 10, "plane": "XY", "offset": 0, "sketch": {"entities": rect(40, 20)}}]
+    picked = [{"c": [0.0, 10.0, 5.0], "n": [-1.0, 0.0, 0.0], "area": 200.0}, {"c": [40.0, 10.0, 5.0], "n": [1.0, 0.0, 0.0], "area": 200.0}]
+
+    def run(extra):
+        f = dict({"id": "s", "name": "Separate 1", "type": "surf_separate", "source": "a", "faces": picked, "keep": "picked"}, **extra)
+        bodies = {}
+        shape, st = part.build(part.migrate(copy.deepcopy({"name": "sp", "version": 2, "features": feats + [f]})), surfaces=bodies)
+        return bodies.get("s"), [x for x in st if x.get("id") == "s"][0], bodies
+    b, st, bodies = run({})
+    assert not st.get("error"), st.get("error")
+    assert len(bodies["a"].faces()) == 4 and len(b.faces()) == 2 and abs(b.area - 400) < 1e-6
+    assert all(abs(abs(fc.center().X - 20) - 20) < 1e-6 for fc in b.faces())
+    assert "2 of 4 face(s)" in (st.get("note") or ""), st.get("note")
+    b, st, _ = run({"keep": "rest"})
+    assert not st.get("error"), st.get("error")
+    assert len(b.faces()) == 2 and abs(b.area - 800) < 1e-6 and all(abs(fc.center().X - 20) < 1e-6 for fc in b.faces())
+    _, st, _ = run({"faces": []})
+    assert "pick the faces" in (st.get("error") or "")
+    allf = picked + [{"c": [20.0, 0.0, 5.0], "n": [0.0, -1.0, 0.0], "area": 400.0}, {"c": [20.0, 20.0, 5.0], "n": [0.0, 1.0, 0.0], "area": 400.0}]
+    _, st, _ = run({"faces": allf, "keep": "rest"})
+    assert "nothing remains" in (st.get("error") or "")
+
+
+def test_trim_surface_kept_pieces_merged():
+    """Trim surface: a 100 x 50 target cut by two crossing faces with nothing removed comes back as one face
+    (the pieces on the same surface are merged again); with one piece removed the cut edges that bound removed
+    pieces stay."""
+    import copy
+    from conftest import rect
+    from drawgen import part
+
+    def line(i, a, b):
+        return {"id": i, "t": "line", "x1": a[0], "y1": a[1], "x2": b[0], "y2": b[1], "layer": "0"}
+    feats = [{"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(100, 50)}},
+             {"id": "b", "name": "B", "type": "surf_sketch", "kind": "extrude", "depth": 20, "symmetric": True, "plane": "XY", "offset": 0,
+              "sketch": {"entities": [line(1, (40, -5), (40, 55)), line(2, (-5, 25), (105, 25))]}}]
+
+    def run(remove):
+        t = {"id": "t", "name": "Trim 1", "type": "surf_trim", "source": "a", "with": "surface", "tool": "b", "keep": "pick", "remove": remove, "extend": 0, "extend_far": False}
+        bodies = {}
+        shape, st = part.build(part.migrate(copy.deepcopy({"name": "tm", "version": 2, "features": feats + [t]})), surfaces=bodies)
+        assert not [x for x in st if x.get("error")], [x.get("error") for x in st]
+        return bodies["t"]
+    b = run([])
+    assert len(b.faces()) == 1 and abs(b.area - 5000) < 1e-6 and len(b.edges()) == 4
+    b = run([[20.0, 10.0, 0.0]])
+    assert abs(b.area - 5000 + 40 * 25) < 1e-6 and len(b.faces()) == 1 and len(b.edges()) == 6
+
+
+def test_trim_regions_separated_by_side_at_a_discontinuous_cut():
+    """Trim surface: a target of two sewn rectangles (x 0..50 and 50..100) cut by a tool of two vertical faces whose
+    cut lines are offset by 1 mm at the junction (y 25 on the first, y 26 on the second). The pieces on the two sides
+    share a 1 mm edge at the junction; they are still two regions (2550 and 2450 mm^2), one per side of the tool."""
+    import copy
+    from conftest import rect
+    from drawgen import part, surfaces as sfm
+
+    def line(i, a, b):
+        return {"id": i, "t": "line", "x1": a[0], "y1": a[1], "x2": b[0], "y2": b[1], "layer": "0"}
+    feats = [
+        {"id": "a1", "name": "A1", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(50, 50)}},
+        {"id": "a2", "name": "A2", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(50, 50, 50, 0)}},
+        {"id": "a", "name": "Sew", "type": "surf_sew", "sources": ["a1", "a2"], "tolerance": 0.001},
+        {"id": "b", "name": "B", "type": "surf_sketch", "kind": "extrude", "depth": 20, "symmetric": True, "plane": "XY", "offset": 0,
+         "sketch": {"entities": [line(1, (-5, 25), (50.2, 25)), line(2, (49.8, 26), (105, 26))]}}]
+    bodies = {}
+    shape, st = part.build(part.migrate(copy.deepcopy({"name": "rs", "version": 2, "features": feats})), surfaces=bodies)
+    assert not [x for x in st if x.get("error")], [x.get("error") for x in st]
+    assert len(bodies["a"].faces()) == 2 and len(bodies["b"].faces()) == 2
+    pieces, _ = sfm.trim_pieces_all(None, bodies, {"source": "a", "with": "surface", "tool": "b", "extend": 0, "extend_far": False})
+    assert sorted(round(p.area) for p in pieces) == [2450, 2550], [round(p.area) for p in pieces]
+
+
+def test_trim_regions_by_face():
+    """Trim surface with grouping "faces": a target of two sewn rectangles cut across by one vertical face gives
+    4 pieces (each face of the split on its own) instead of 2 connected regions; removing one piece keeps the
+    other three (7500 mm^2 of 10000)."""
+    import copy
+    from conftest import rect
+    from drawgen import part, surfaces as sfm
+
+    def line(i, a, b):
+        return {"id": i, "t": "line", "x1": a[0], "y1": a[1], "x2": b[0], "y2": b[1], "layer": "0"}
+    feats = [
+        {"id": "a1", "name": "A1", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(100, 50)}},
+        {"id": "a2", "name": "A2", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(100, 50, 0, 50)}},
+        {"id": "a", "name": "Sew", "type": "surf_sew", "sources": ["a1", "a2"], "tolerance": 0.001},
+        {"id": "b", "name": "B", "type": "surf_sketch", "kind": "extrude", "depth": 20, "symmetric": True, "plane": "XY", "offset": 0,
+         "sketch": {"entities": [line(1, (50, -5), (50, 105))]}}]
+    bodies = {}
+    shape, st = part.build(part.migrate(copy.deepcopy({"name": "rf", "version": 2, "features": feats})), surfaces=bodies)
+    assert not [x for x in st if x.get("error")], [x.get("error") for x in st]
+    base = {"source": "a", "with": "surface", "tool": "b", "extend": 0, "extend_far": False}
+    pieces, _ = sfm.trim_pieces_all(None, bodies, dict(base))
+    assert len(pieces) == 2
+    pieces, _ = sfm.trim_pieces_all(None, bodies, dict(base, grouping="faces"))
+    assert len(pieces) == 4 and all(abs(p.area - 2500) < 1e-6 for p in pieces)
+    out = sfm.trim(None, bodies, dict(base, grouping="faces", keep="pick", remove=[[25.0, 25.0, 0.0]]))
+    assert abs(out.area - 7500) < 1e-6 and abs(out.bounding_box().min.X) < 1e-6 and abs(out.bounding_box().min.Y) < 1e-6
+
+
+def test_cut_with_surface_by_plane():
+    """Cut with surface by a plane: the 100 x 50 x 20 plate cut by plane YZ offset 60 mm keeps the side against the
+    plane normal (x < 60: 60000 mm^3) and with keep "+" the other side (40000 mm^3); by the reference plane XZ at
+    z = 0 (on the bottom face) with keep "+" cuts nothing: the feature reports that the plane does not cut the solid."""
+    import copy
+    from conftest import plate
+    from drawgen import part
+    p = plate("cp", hole_r=0)
+    p["features"].append({"id": "pl", "name": "Plane 1", "type": "plane", "method": "principal", "plane": "YZ", "offset": 60})
+    p["features"].append({"id": "c", "name": "Cut with surface 1", "type": "surf_cut", "with": "plane", "plane": "pl", "keep": "-"})
+    shape, st = part.build(part.migrate(copy.deepcopy(p)))
+    assert not [x for x in st if x.get("error")], [x.get("error") for x in st]
+    assert abs(shape.volume - 60000) < 1e-6 and abs(shape.bounding_box().max.X - 60) < 1e-6
+    p["features"][-1]["keep"] = "+"
+    shape, st = part.build(part.migrate(copy.deepcopy(p)))
+    assert abs(shape.volume - 40000) < 1e-6 and abs(shape.bounding_box().min.X - 60) < 1e-6
+    p["features"][-1] = {"id": "c", "name": "Cut 1", "type": "surf_cut", "with": "plane", "plane": "XY", "keep": "+"}
+    p["features"].pop(-2)
+    shape, st = part.build(part.migrate(copy.deepcopy(p)))
+    err = [x for x in st if x.get("error")]
+    assert err and "does not cut" in err[0]["error"]
+
+
+def test_clean_edges_short_edge_in_a_smooth_chain_and_extend_across_it():
+    """A 100 x 50 face whose corner is cut by a 0.3 mm edge at a shallow angle to the top edge (so that the chain
+    joining would swallow it): Clean edges with Remove edges shorter than 1 mm removes it (4 edges, 5000 mm^2).
+    Extend surface across the top edge and the right edge of the uncleaned face: the two strips meet in one mitre
+    across the short edge (one face, no overlap: area = face + strips + corner)."""
+    import copy
+    from drawgen import part
+
+    def line(i, a, b):
+        return {"id": i, "t": "line", "x1": a[0], "y1": a[1], "x2": b[0], "y2": b[1], "layer": "0"}
+    pts = [(0, 0), (100, 0), (100, 49.7), (99.7, 50), (0, 50)]
+    ents = [line(i + 1, pts[i], pts[(i + 1) % len(pts)]) for i in range(len(pts))]
+    a = {"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": ents}}
+    c = {"id": "c", "name": "Clean 1", "type": "surf_clean", "source": "a", "clean": "analytic", "tolerance": 0.05, "angle": 15, "min_edge": 1}
+    bodies = {}
+    shape, st = part.build(copy.deepcopy({"name": "cs", "version": 2, "features": [a, c]}), surfaces=bodies)
+    assert not [x for x in st if x.get("error")], [x.get("error") for x in st]
+    assert len(bodies["c"].edges()) == 4 and abs(bodies["c"].area - 5000) < 1e-6
+    e = {"id": "e", "name": "Extend 1", "type": "surf_extend", "source": "a", "mode": "edges", "distance": 5, "sides": "all", "tolerance": 0.01,
+         "edges": [{"mid": [49.85, 50.0, 0.0], "len": 99.7}, {"mid": [100.0, 24.85, 0.0], "len": 49.7}]}
+    bodies = {}
+    shape, st = part.build(copy.deepcopy({"name": "cs", "version": 2, "features": [a, e]}), surfaces=bodies)
+    assert not [x for x in st if x.get("error")], [x.get("error") for x in st]
+    out = bodies["e"]
+    expect = 5000 - 0.045 + 99.7 * 5 + 49.7 * 5 + 25
+    assert abs(out.area - expect) < 2.0, (out.area, expect)
+    assert out.bounding_box().max.X < 105.01 and out.bounding_box().max.Y < 55.01
+
+
+def test_fill_surface_loop_with_separate_end_vertices():
+    """Fill surface: a loop of two curve bodies (a line and a semicircle through the same end points) whose end
+    vertices are separate objects at the same place: the loop is closed by merging them and the fill is made."""
+    from drawgen import part
+    feats = [{"id": "c1", "name": "C1", "type": "curve_points", "points": [[0, 0, 0], [40, 0, 0]], "method": "line"},
+             {"id": "c2", "name": "C2", "type": "curve_points", "points": [[40, 0, 0], [20, 20, 0], [0, 0, 0]], "method": "arc"},
+             {"id": "f", "name": "Fill 1", "type": "surf_fill", "edges": [], "curves": ["c1", "c2"], "tangent": False, "gap": 0.1}]
+    bodies = {}
+    shape, st = part.build({"name": "fl", "version": 2, "features": feats}, surfaces=bodies)
+    assert not [x for x in st if x.get("error")], [x.get("error") for x in st]
+    import math
+    assert abs(bodies["f"].area - math.pi * 400 / 2) < 1.0
+
+
+def test_dimension_decimals_and_tolerance_text():
+    """Dimension text: the decimals option fixes the number of decimals (trailing zeros kept), a dimension's own
+    decimals take precedence (also on angles); tol_unit "um_unit" adds µm to the deviations and symmetric
+    tolerances, "mm" writes them in mm with 3 decimals; inch drawings are not affected by tol_unit."""
+    from drawgen import annotate, units
+    a = {"type": "linear", "p1": [0, 0], "p2": [25, 0], "tol": {"mode": "dev", "plus": 0.027, "minus": -0.04}}
+    assert annotate.label(a) == ("25", "+27", "-40")
+    assert annotate.label(a, {"units": "mm", "decimals": "2", "tol_unit": "um_unit"}) == ("25.00", "+27 µm", "-40 µm")
+    assert annotate.label(dict(a, decimals=1), {"units": "mm", "decimals": "3", "tol_unit": "mm"}) == ("25.0", "+0.027", "-0.040")
+    assert annotate.label(dict(a, decimals=0), "mm", {"tol_unit": "mm"})[0] == "25"
+    assert annotate.label(dict(a, tol={"mode": "sym", "plus": 0.05}), "mm", {"tol_unit": "um_unit"}) == ("25 ±50 µm", None, None)
+    assert annotate.label(dict(a, tol={"mode": "sym", "plus": 0.05}), "mm", {"tol_unit": "mm"}) == ("25 ±0.050", None, None)
+    assert annotate.label(dict(a, tol={"mode": "dev", "plus": 0.0005, "minus": 0}), "mm", {"tol_unit": "mm"}) == ("25", "+0.0005", "0")
+    assert annotate.label(a, "inch", {"decimals": "2", "tol_unit": "mm"}) == (".98", "+.0011", "-.0016")
+    ang = {"type": "angle", "c": [0, 0], "p1": [10, 0], "p2": [0, 10], "pos": [5, 5]}
+    assert annotate.label(ang)[0] == "90°"
+    assert annotate.label(ang, {"units": "mm", "decimals": "2"})[0] == "90°"
+    assert annotate.label(dict(ang, decimals=1))[0] == "90.0°"
+    assert units.length_text(-0.0001, "mm", 2, fixed=True) == "0.00"
+    assert units.fixed_decimals({"decimals": "auto"}) is None and units.fixed_decimals({"decimals": "4"}) == 4
+    assert units.fixed_decimals({"decimals": "auto"}, {"decimals": "x"}) is None
+    o = units.options({"options": {"decimals": "7", "tol_unit": "um_unit"}})
+    assert o["decimals"] == "auto" and o["tol_unit"] == "um_unit"

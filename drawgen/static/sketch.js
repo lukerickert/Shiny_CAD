@@ -1332,7 +1332,7 @@ function dimLabel(a) {
   if (a.type === "angle") main = a.text || ((a.prefix || "") + fmtN(v, 2) + "°");
   else {
     const sym = a.type === "diameter" || a.dia ? "Ø" : a.type === "radius" ? "R" : "";
-    main = a.text || ((a.prefix || "") + sym + dimLenText(v, x => fmtN(x)));
+    main = a.text || ((a.prefix || "") + sym + dimLenText(v, x => fmtN(x), a));
   }
   const tol = a.tol || {};
   let up = null, lo = null;

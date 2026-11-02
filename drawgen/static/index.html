@@ -83,7 +83,7 @@
       <label class="check"><input type="checkbox" id="next-to-source"> Write to a drawings folder next to each opened STEP file</label>
       <div class="buttons">
         <button id="btn-preview" type="button" class="primary">Preview</button>
-        <label class="check inline" title="Preview again after every change to the settings, views, title block fields or line widths"><input type="checkbox" id="auto-preview"> Auto</label>
+        <label class="check inline" title="Preview again after every change to the settings, views, title block fields or line widths"><input type="checkbox" id="auto-preview" checked> Auto</label>
         <button id="btn-export" type="button">Export</button>
         <button id="btn-save" type="button" class="quiet">Save as defaults</button>
       </div>
@@ -181,6 +181,7 @@
           <button type="button" id="ann-undo" title="Undo (Ctrl+Z)">Undo</button>
           <button type="button" id="ann-fitview" title="Fit sheet (F)">Fit</button>
           <button type="button" id="ann-resetviews" title="Return all views to the automatic layout">Reset views</button>
+          <button type="button" id="ann-clearall" title="Remove every dimension, note and balloon of this drawing (Ctrl+Z undoes)">Clear annotations</button>
           <label class="check inline" id="ann-plist-box" title="Parts list above the title block of this assembly drawing" hidden><input type="checkbox" id="ann-plist"> Parts list</label>
           <button type="button" id="ann-autoballoons" title="One balloon per component of an assembly drawing, numbered as the parts list">Auto balloons</button>
           <button type="button" id="ann-holecallouts" title="One note per hole and thread feature of a part drawing: thread or diameter, counterbore, countersink, depth; external threads with length; metric threads with the size before threading and the thread depth">Thread &amp; hole callouts</button>
@@ -207,6 +208,17 @@
               <label>Prefix<input type="text" id="ann-prefix" placeholder="e.g. 4x "></label>
               <label>Text override<input type="text" id="ann-text" placeholder="measured value"></label>
               <label class="check" id="ann-centred-row"><input type="checkbox" id="ann-centred"> Text centred between extension lines</label>
+              <label class="check" id="ann-horiz-row" title="The text of a vertical or sloped dimension drawn horizontally beside the dimension line (key T)"><input type="checkbox" id="ann-horiz"> Horizontal text (T)</label>
+              <label title="Number of decimals of this dimension's value; Default: the Decimals option (Options window)">Decimals
+                <select id="ann-decimals">
+                  <option value="">Default</option>
+                  <option value="0">0</option>
+                  <option value="1">1</option>
+                  <option value="2">2</option>
+                  <option value="3">3</option>
+                  <option value="4">4</option>
+                </select>
+              </label>
               <label>Tolerance
                 <select id="ann-tolmode">
                   <option value="none">None (general tolerance)</option>
@@ -222,8 +234,8 @@
               <div class="buttons"><button type="button" id="ann-fitcalc" class="small" title="ISO 286 fits: limits, clearance or interference of a hole and shaft pair, IT grades">Fit calculator</button></div>
               <p id="ann-fit-result" class="hint"></p>
               <div id="ann-dev-row" class="grid2">
-                <label>Upper (<span class="dev-unit">&#181;m</span>)<input type="text" inputmode="decimal" class="numf" id="ann-plus"></label>
-                <label>Lower (<span class="dev-unit">&#181;m</span>)<input type="text" inputmode="decimal" class="numf" id="ann-minus"></label>
+                <label><span>Upper (<span class="dev-unit">&#181;m</span>)</span><input type="text" inputmode="decimal" class="numf" id="ann-plus"></label>
+                <label><span>Lower (<span class="dev-unit">&#181;m</span>)</span><input type="text" inputmode="decimal" class="numf" id="ann-minus"></label>
               </div>
             </div>
             <div id="ann-note-fields">
@@ -441,6 +453,7 @@
           <button type="button" data-add="surf_fill" title="N-sided patch over a loop of edges">Fill surface</button>
           <button type="button" data-add="surf_sweep" title="Sweep a profile (curve body or sketch) along a path (curve body or sketch) as a surface body">Sweep surface</button>
           <button type="button" data-add="surf_bridge" title="Surface between two chains of edges, corner to corner: ruled, or tangent to the faces of both sides">Bridge surface</button>
+          <button type="button" data-add="surf_connect" title="Close a corner: two surface bodies extended across the picked edges up to each other, trimmed at the intersection and sewn">Connect surfaces</button>
           <button type="button" data-add="surf_fillet" title="Rolling-ball fillet between two surface bodies (trimmed and sewn), or rounded edges of a surface body">Surface fillet</button>
           <button type="button" data-add="surf_offset" title="Offset a surface body">Offset surface</button>
           <button type="button" data-add="surf_sew" title="Sew surface bodies into one shell">Sew surfaces</button>
@@ -449,6 +462,8 @@
           <button type="button" data-add="thicken" title="Solid from a surface body">Thicken</button>
           <button type="button" data-add="surf_cut" title="Split the solid with a surface body and keep one side">Cut with surface</button>
           <button type="button" data-add="curve_extract" title="3D curve from edges, joined and cleaned">Extract curve</button>
+          <button type="button" data-add="surf_clean" title="Boundary edges of a surface body joined into one edge per smooth chain">Clean edges</button>
+          <button type="button" data-add="surf_separate" title="Picked faces of a surface body as a body of their own (and the rest as another)">Separate faces</button>
           <button type="button" data-add="curve_project" title="Project a curve body or a sketch onto a surface body or the solid (normal to the surface or along a direction)">Project curve</button>
           <button type="button" data-add="curve_section" title="Intersection curve of surfaces or of a surface with the solid">Intersection curve</button>
           <button type="button" data-add="curve_blend" title="3D curve between two ends (edge ends, curve ends, points) with position, tangent or curvature continuity at each end">Blend curve</button>
@@ -477,9 +492,15 @@
             <label class="check inline"><input type="checkbox" id="pt-planes" checked> Planes</label>
             <label class="check inline"><input type="checkbox" id="pt-showsketch" checked> Sketches</label>
             <label class="check inline" title="Cut the view with a plane; the cut faces are capped"><input type="checkbox" id="pt-sectionchk"> Section view</label>
+            <div class="show-sep">Bodies (solids, surfaces, curves)</div>
+            <div class="show-row"><button type="button" id="pt-show-all" title="Show every solid, surface and curve body">Show all</button><button type="button" id="pt-hide-all" title="Hide every solid, surface and curve body">Hide all</button><button type="button" id="pt-show-invert" title="Show the hidden bodies, hide the shown ones">Invert</button></div>
+            <div class="show-row"><button type="button" id="pt-show-solids" title="Show the solids only">Solids only</button><button type="button" id="pt-show-surfaces" title="Show the surface and curve bodies only">Surfaces only</button></div>
+            <div class="show-sep">Surface opacity</div>
+            <div class="show-row"><input type="range" id="pt-surfop" min="10" max="100" step="5" value="45" title="Opacity of the surface bodies (%)"><span id="pt-surfop-val" class="hint">45 %</span></div>
           </div>
         </div>
         <span id="pt-info" class="hint"></span>
+        <button type="button" id="pt-cancel" class="danger" hidden title="Stop the running build (the geometry process is ended and started again; the next build starts from the file)">Cancel</button>
         <button type="button" class="panel-toggle" data-panel="#tab-part .ann-props" title="Hide or show the side panel (Ctrl+B)" style="margin-left:auto">Panel</button>
       </div>
       <div class="ann-body">
@@ -987,6 +1008,25 @@
       </select>
     </label>
     <p class="hint">Applies to dimension text, tolerances, hole callouts, the title block <b>Units</b> field and the deviation fields of the dimension properties. The model, the other input fields and the exports of the Part, Assembly and Analysis tabs are in mm.</p>
+    <label>Dimension decimals
+      <select id="opt-decimals">
+        <option value="auto">Automatic (mm: up to 3, trailing zeros removed; inch: 3)</option>
+        <option value="0">0</option>
+        <option value="1">1</option>
+        <option value="2">2</option>
+        <option value="3">3</option>
+        <option value="4">4</option>
+      </select>
+    </label>
+    <p class="hint">Number of decimals of the dimension values. A dimension's own <b>Decimals</b> field (dimension properties) takes precedence.</p>
+    <label>Tolerance text (mm drawings)
+      <select id="opt-tolunit">
+        <option value="um">&#181;m without unit (+27 / -40)</option>
+        <option value="um_unit">&#181;m with unit (+27 &#181;m / -40 &#181;m)</option>
+        <option value="mm">mm (+0.027 / -0.040)</option>
+      </select>
+    </label>
+    <p class="hint">Format of the deviations and symmetric tolerances. The <b>Upper</b> and <b>Lower</b> fields of the dimension properties use the same unit. Inch drawings show deviations in inch with 4 decimals.</p>
     <label>Keyboard shortcuts
       <select id="opt-keys">
         <option value="default">Default</option>

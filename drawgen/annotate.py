@@ -5,7 +5,8 @@ Annotation records (JSON). Coordinates are view coordinates (model mm) of the
 named view, or sheet mm when "view" is null (notes only):
 
   linear    {"type": "linear", "view", "p1": [x, y], "p2": [x, y], "orient": "h" | "v" | "a",
-             "pos": [x, y], "text", "prefix", "tol"}
+             "pos": [x, y], "text", "prefix", "tol", "text_horizontal": bool (the text of a vertical or sloped
+             dimension drawn horizontally beside the line instead of along it)}
   diameter  {"type": "diameter", "view", "c": [x, y], "r", "pos": [x, y], "text", "prefix", "tol"}
   radius    {"type": "radius", "view", "c": [x, y], "r", "pos": [x, y], "text", "prefix", "tol"}
   angle     {"type": "angle", "view", "c": [x, y] (vertex), "p1": [x, y], "p2": [x, y] (points on the
@@ -97,18 +98,30 @@ def angle_sector(c, p1, p2, q):
     return best or (t1 % tw, (t2 - t1) % tw)
 
 
-def label(a, units="mm"):
+def label(a, units="mm", opts=None):
     """(main text, upper deviation, lower deviation); deviations are None when not stacked. units: "mm" or
-    "inch" (drawing units option)."""
+    "inch" (drawing units option), or the options dict (units.options); opts: the options dict (decimals,
+    tol_unit)."""
+    if isinstance(units, dict):
+        opts, units = units, units.get("units", "mm")
+    opts = dict(_units.DEFAULTS, **(opts or {}))
+    opts["units"] = units
+    tu = opts.get("tol_unit", "um")
+    dec = _units.fixed_decimals(opts, a)
     v = value_of(a)
     t = a["type"]
-    sym = {"diameter": "Ø", "radius": "R"}.get(t, "")
+    sym = {"diameter": "\u00d8", "radius": "R"}.get(t, "")
     if t == "linear" and a.get("dia"):
         sym = "\u00d8"
     if t == "angle":
-        main = a.get("text") or (a.get("prefix", "") + fmt(v, 2) + "°")
+        num = fmt(v, 2) if a.get("decimals") in (None, "") else _units.length_text(v, "mm", dec, fixed=True)
+        main = a.get("text") or (a.get("prefix", "") + num + "\u00b0")
     else:
-        main = a.get("text") or (a.get("prefix", "") + sym + (_units.length_text(v, "inch") if units == "inch" else fmt(v)))
+        if dec is None:
+            num = _units.length_text(v, "inch") if units == "inch" else fmt(v)
+        else:
+            num = _units.length_text(v, units, dec, fixed=True)
+        main = a.get("text") or (a.get("prefix", "") + sym + num)
     tol = a.get("tol") or {}
     mode = tol.get("mode", "none")
     up = lo = None
@@ -117,14 +130,14 @@ def label(a, units="mm"):
         if tol.get("show_dev", True):
             try:
                 u, l = fits.limits(v, tol["fit"])
-                up, lo = _units.dev_text(u, units), _units.dev_text(l, units, lower=True)
+                up, lo = _units.dev_text(u, units, tol_unit=tu), _units.dev_text(l, units, lower=True, tol_unit=tu)
             except ValueError:
                 pass
     elif mode == "sym":
-        main += " ±" + _units.sym_text(float(tol.get("plus", 0) or 0), units)
+        main += " \u00b1" + _units.sym_text(float(tol.get("plus", 0) or 0), units, tu)
     elif mode == "dev":
-        up = _units.dev_text(float(tol.get("plus", 0) or 0), units)
-        lo = _units.dev_text(float(tol.get("minus", 0) or 0), units, lower=True)
+        up = _units.dev_text(float(tol.get("plus", 0) or 0), units, tol_unit=tu)
+        lo = _units.dev_text(float(tol.get("minus", 0) or 0), units, lower=True, tol_unit=tu)
     return main, up, lo
 
 
@@ -218,6 +231,11 @@ def _linear(a, M, h, U="mm"):
     ar = math.radians(ang)
     up_dir = (-math.sin(ar), math.cos(ar))
     mid = (A[0] + dab[0] * t, A[1] + dab[1] * t)
+    if a.get("text_horizontal") and abs(ang) > 1e-6:
+        # horizontal text beside a sloped or vertical dimension line, on the side the rotated text would be on
+        base = (mid[0] + up_dir[0] * (TEXT_GAP + tw / 2.0), mid[1] + up_dir[1] * (TEXT_GAP + tw / 2.0))
+        out += _text_block(base, 0.0, h, main, up, lo, "middle")
+        return out
     base = (mid[0] + up_dir[0] * TEXT_GAP, mid[1] + up_dir[1] * TEXT_GAP)
     out += _text_block(base, ang, h, main, up, lo, "middle")
     return out
@@ -340,7 +358,7 @@ def _note(a, M, h):
 def render(anns, maps, cfg):
     """Sheet primitives for annotations; one ("group", id, prims) per annotation."""
     h = float(cfg.get("dim_text_height_mm", 3.5))
-    U = _units.units_of(cfg)
+    U = _units.options(cfg)          # units, decimals, tol_unit
     out = []
     for a in anns or []:
         view = a.get("view")

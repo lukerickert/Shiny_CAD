@@ -245,7 +245,9 @@
   "dim_text_height_mm": 3.5,
   "options": {
     "units": "mm",
-    "keys": "default"
+    "keys": "default",
+    "decimals": "auto",
+    "tol_unit": "um_unit"
   },
   "cam_machine": {
     "travel_x": 500.0,
@@ -264,15 +266,15 @@
   "cam_tools": [
     {
       "id": "T6",
-      "name": "test_slot",
-      "shape": "tslot",
-      "d": 15.0,
-      "height": 4.0,
-      "neck": 6.0,
+      "name": "12mm",
+      "shape": "endmill",
+      "d": 12.0,
+      "height": 20.0,
+      "neck": 12.0,
       "neck_length": 8.0,
       "shank": 12.0,
       "shank_length": 30.0,
-      "flutes": 6,
+      "flutes": 4,
       "feed": 800.0,
       "plunge": 200.0,
       "rpm": 12000.0
@@ -349,6 +351,22 @@
       "height": 4.0,
       "neck": 6.0,
       "neck_length": 8.0,
+      "shank": 12.0,
+      "shank_length": 30.0,
+      "flutes": 2,
+      "tool_material": "carbide",
+      "feed": 800.0,
+      "plunge": 200.0,
+      "rpm": 12000.0
+    },
+    {
+      "id": "T8",
+      "name": "",
+      "shape": "endmill",
+      "d": 12.0,
+      "height": 18.0,
+      "neck": 12.0,
+      "neck_length": 0.0,
       "shank": 12.0,
       "shank_length": 30.0,
       "flutes": 2,

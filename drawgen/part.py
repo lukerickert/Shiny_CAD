@@ -1087,6 +1087,7 @@ def profile_regions(sketch, plane):
         op.SetArguments(args)
         op.SetTools(tl)
         op.SetRunParallel(True)
+        op.SetUseOBB(True)
         op.Build()
         if op.IsDone():
             got = list(Shape.cast(op.Shape()).faces())
@@ -1172,6 +1173,42 @@ def _solid_of(f, faces, size):
     else:
         raise ValueError("unknown feature type %s" % f["type"])
     return out
+
+
+class _CutFailed(ValueError):
+    """A cut whose Boolean gave an invalid solid, a larger volume or no solid at all."""
+
+
+def _checked_cut(t, sols):
+    """t cut by the solids sols, checked: the result must be valid solids with a volume between 0 and that of t.
+    An invalid result is made again with a fuzzy value (the edge tolerances of t); when that fails too,
+    _CutFailed is raised."""
+    v0 = t.volume
+
+    def ok(r):
+        if r is None or r.wrapped.IsNull():
+            return False
+        rs = list(r.solids())
+        if not rs:
+            return False
+        v = sum(x.volume for x in rs)
+        # a result below 0.1 % of the part is a failed Boolean (fragments left over), not a cut that removed everything
+        if not (1e-3 * v0 < v <= v0 * (1 + 1e-6)):
+            return False
+        try:
+            return all((x.is_valid() if callable(x.is_valid) else x.is_valid) for x in rs)
+        except Exception:
+            return False
+    # the raw Boolean first (no face merging: merging an invalid result can run for minutes), then the clean-up
+    for fuzzy in (0.0, max(2 * _edge_tolerance(t), 1e-4)):
+        r = _bool_fuzzy(t, sols, False, fuzzy)
+        if ok(r):
+            try:
+                rc = _cleaned(r)
+                return rc if ok(rc) else r
+            except Exception:  # noqa: BLE001
+                return r
+    raise _CutFailed("the cut gives an invalid solid")
 
 
 def _cleaned(x):
@@ -1564,6 +1601,7 @@ def _split_cells(cells, tools, chosen=None):
     op.SetArguments(args)
     op.SetTools(tl)
     op.SetRunParallel(True)
+    op.SetUseOBB(True)
     op.Build()
     if not op.IsDone():
         raise ValueError("the partition failed")
@@ -1934,6 +1972,7 @@ def _split(shape, f):
     op.SetArguments(args)
     op.SetTools(tools)
     op.SetRunParallel(True)
+    op.SetUseOBB(True)
     op.Build()
     if not op.IsDone():
         raise ValueError("the partition failed")
@@ -2008,6 +2047,7 @@ def _fuzzy_cut(t, tools, fuzzy=1e-5, glue=False):
         if glue:
             from OCP.BOPAlgo import BOPAlgo_GlueShift
             op.SetGlue(BOPAlgo_GlueShift)
+        op.SetUseOBB(True)
         op.Build()
         if not op.IsDone():
             return None
@@ -2045,6 +2085,7 @@ def _fuzzy_op(op, args, tools, fuzzy):
         bo.SetArguments(a)
         bo.SetTools(b)
         bo.SetFuzzyValue(fuzzy)
+        bo.SetUseOBB(True)
         bo.Build()
         if not bo.IsDone():
             return None
@@ -2470,6 +2511,11 @@ def _merge_tangent(shape, f):
                 dev = max((BRepExtrema_DistShapeShape(BRepBuilderAPI_MakeVertex(q).Vertex(), nf).Value() for q in pts), default=0.0)
                 if dev > max_dev:
                     raise ValueError("deviation %.3f mm" % dev)
+                # a plate surface over a narrow curved strip (fillet pieces) can bulge far beyond the strip while the
+                # sample points stay close to it: the area of the new face must match the group's
+                a0, a1 = sum(fc.area for fc in sel), abs(Shape.cast(nf).area)
+                if a1 < 0.7 * a0 or a1 > 1.3 * a0:
+                    raise ValueError("area %.3f mm^2 instead of %.3f mm^2" % (a1, a0))
                 r = resew([fc.wrapped for fc in fcs if not any(fc.wrapped.IsSame(x.wrapped) for x in sel)] + [nf])
                 if r is None:
                     raise ValueError("not a valid solid")
@@ -2484,7 +2530,7 @@ def _merge_tangent(shape, f):
             dv += _precise_volume(cur) - v0
         out.append(cur)
     f["_note"] = "%d group(s) of tangent faces (%d faces) merged into one face each%s%s; volume change %.3f mm^3" % (
-        groups_done, merged, ", largest deviation %.4f mm" % max(devs) if devs else "", ", %d group(s) left (no single boundary loop, deviation or an invalid result)" % skipped if skipped else "", dv)
+        groups_done, merged, ", largest deviation %.4f mm" % max(devs) if devs else "", ", %d group(s) left (no single boundary loop, deviation, a bulging fit or an invalid result)" % skipped if skipped else "", dv)
     if not groups_done:
         return shape
     return out[0] if len(out) == 1 else Compound(children=out)
@@ -2648,6 +2694,11 @@ def _extended_fit(surf, tol, ext_frac=0.3, n=25):
     return GeomAPI_PointsToBSplineSurface(pts, 3, 3, GeomAbs_C2, tol).Surface()
 
 
+def _shape_list():
+    from .surfaces import _shape_list as sl
+    return sl()
+
+
 def _replace_faces(shape, f):
     """Replace faces: the picked faces (and the small faces touching them) are rebuilt on one clean surface.
     The clean surface is offset by "offset" (mm, + outward); a thick pad of the old faces ("pad", mm, outward)
@@ -2755,6 +2806,20 @@ def _replace_faces(shape, f):
             continue
         v0 = so.volume
         from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+
+        def boolean(cls, a, b):
+            # oriented bounding boxes: without them the booleans of the pad with a part of many sliver faces run for
+            # minutes (10 s against 9 min on an imported jaw)
+            la, lb = _shape_list(), _shape_list()
+            la.Append(a)
+            lb.Append(b)
+            op = cls()
+            op.SetArguments(la)
+            op.SetTools(lb)
+            op.SetRunParallel(True)
+            op.SetUseOBB(True)
+            op.Build()
+            return op
         body = so.wrapped
         pad_out = pad_of(mine, True)
         if pad_out is None:
@@ -2763,22 +2828,18 @@ def _replace_faces(shape, f):
             # material inside the old faces is cut away down to the offset surface: the pad reaches inward too
             pad_in = pad_of(mine, False)
             if pad_in is not None:
-                fu = BRepAlgoAPI_Fuse(pad_out.wrapped, pad_in.wrapped)
-                fu.Build()
+                fu = boolean(BRepAlgoAPI_Fuse, pad_out.wrapped, pad_in.wrapped)
                 if fu.IsDone():
                     pad_out = Shape.cast(fu.Shape())
         # local operation: within the pad footprint, material outside the clean surface is removed and material
         # up to the clean surface is added; the rest of the cell is untouched
-        cut = BRepAlgoAPI_Cut(body, pad_out.wrapped)
-        cut.Build()
+        cut = boolean(BRepAlgoAPI_Cut, body, pad_out.wrapped)
         if not cut.IsDone():
             raise ValueError("the cut of the pad region failed")
         body = cut.Shape()
-        fill = BRepAlgoAPI_Common(pad_out.wrapped, half)
-        fill.Build()
+        fill = boolean(BRepAlgoAPI_Common, pad_out.wrapped, half)
         if fill.IsDone() and Shape.cast(fill.Shape()).solids():
-            fu = BRepAlgoAPI_Fuse(body, fill.Shape())
-            fu.Build()
+            fu = boolean(BRepAlgoAPI_Fuse, body, fill.Shape())
             if not fu.IsDone():
                 raise ValueError("adding material up to the clean surface failed")
             body = fu.Shape()
@@ -2936,9 +2997,41 @@ def _prism(fc, vec):
     return Shape.cast(r)
 
 
-def _slab(fc, d):
-    """Solid between a face and its offset by d along the outward normal (d < 0: inside the part)."""
+def _plane_deviation(fc, n=12):
+    """Largest distance of points sampled inside the face from the plane fitted through them (0 for a plane)."""
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepClass import BRepClass_FaceClassifier
+    from OCP.BRepTools import BRepTools
+    from OCP.TopAbs import TopAbs_IN
+    from OCP.gp import gp_Pnt2d
     if _is_planar(fc):
+        return 0.0
+    try:
+        import numpy as np
+        F = fc.wrapped
+        u1, u2, v1, v2 = BRepTools.UVBounds_s(F)
+        surf = BRep_Tool.Surface_s(F)
+        pts = []
+        for i in range(1, n):
+            for j in range(1, n):
+                u, v = u1 + (u2 - u1) * i / n, v1 + (v2 - v1) * j / n
+                if BRepClass_FaceClassifier(F, gp_Pnt2d(u, v), 1e-7).State() == TopAbs_IN:
+                    q = surf.Value(u, v)
+                    pts.append((q.X(), q.Y(), q.Z()))
+        if len(pts) < 6:
+            return float("inf")
+        A = np.array(pts)
+        c = A.mean(axis=0)
+        _, _, vt = np.linalg.svd(A - c)
+        return float(np.abs((A - c) @ vt[2]).max())
+    except Exception:  # noqa: BLE001
+        return float("inf")
+
+
+def _slab(fc, d):
+    """Solid between a face and its offset by d along the outward normal (d < 0: inside the part). A planar face,
+    or a spline face within 0.25 mm of a plane (imported geometry), is swept along its mean normal."""
+    if _is_planar(fc) or _plane_deviation(fc) <= 0.25:
         n = fc.normal_at(0.5, 0.5)
         return _prism(fc, (n.X * d, n.Y * d, n.Z * d))
     from OCP.BRepOffset import BRepOffset_MakeOffset, BRepOffset_Skin
@@ -2984,11 +3077,13 @@ def _bool_fuzzy(a, tools, fuse, fuzzy):
         tl.Append(t.wrapped)
     op.SetArguments(args)
     op.SetTools(tl)
-    op.SetFuzzyValue(fuzzy)
-    op.SetRunParallel(False)
+    if fuzzy:
+        op.SetFuzzyValue(fuzzy)
+    op.SetRunParallel(True)
+    op.SetUseOBB(True)
     try:
         op.Build()
-        if not op.IsDone() or op.HasErrors() or op.Shape().IsNull():
+        if not op.IsDone() or op.Shape().IsNull():
             return None
         return Shape.cast(op.Shape())
     except Exception:  # noqa: BLE001
@@ -3119,6 +3214,7 @@ def _cyl_offset(so, fc, d):
         op = BRepAlgoAPI_Splitter()
         op.SetArguments(args)
         op.SetTools(tl)
+        op.SetUseOBB(True)
         op.Build()
         if not op.IsDone():
             return None
@@ -3560,6 +3656,22 @@ def _defeature_bspline(so, faces):
         return None
 
 
+def _connected_face_groups(faces):
+    """Groups of faces connected through shared edges."""
+    rest, out = list(faces), []
+    while rest:
+        g, k = [rest.pop()], 0
+        while k < len(g):
+            es = list(g[k].edges())
+            k += 1
+            for fc in list(rest):
+                if any(e.wrapped.IsSame(x.wrapped) for e in es for x in fc.edges()):
+                    rest.remove(fc)
+                    g.append(fc)
+        out.append(g)
+    return out
+
+
 def _patch_faces(so, faces):
     """Fallback: the faces are removed from the shell and the opening is closed with a smooth patch (G1 to the
     neighbouring faces where possible), then the solid is rebuilt. The face count does not drop below the number
@@ -3573,26 +3685,30 @@ def _patch_faces(so, faces):
     from build123d import Shape, Face
     try:
         keep = [fc for fc in so.faces() if not any(fc.wrapped.IsSame(r.wrapped) for r in faces)]
-        removed = Face.fuse(*faces) if len(faces) > 1 else faces[0]
-        # outer boundary edges of the removed region: edges of removed faces that belong to a kept face
+        # one patch per connected group of removed faces, over the group's outer boundary (the edges shared with
+        # kept faces)
         patches = []
-        for region in (removed.faces() if hasattr(removed, "faces") else [removed]):
+        for region in _connected_face_groups(list(faces)):
             fill = BRepOffsetAPI_MakeFilling()
             n = 0
-            for e in region.edges():
-                owner = next((k for k in keep if any(e.wrapped.IsSame(x.wrapped) for x in k.edges())), None)
-                if owner is None:
-                    continue
-                try:
-                    fill.Add(e.wrapped, owner.wrapped, GeomAbs_G1, True)
-                except Exception:
-                    fill.Add(e.wrapped, GeomAbs_C0, True)
-                n += 1
+            for fc in region:
+                for e in fc.edges():
+                    owner = next((k for k in keep if any(e.wrapped.IsSame(x.wrapped) for x in k.edges())), None)
+                    if owner is None:
+                        continue
+                    try:
+                        fill.Add(e.wrapped, owner.wrapped, GeomAbs_G1, True)
+                    except Exception:
+                        fill.Add(e.wrapped, GeomAbs_C0, True)
+                    n += 1
             if n < 3:
                 return None
             fill.Build()
             if not fill.IsDone():
                 return None
+            a0, a1 = sum(fc.area for fc in region), abs(Shape.cast(fill.Shape()).area)
+            if a1 < 0.5 * a0 or a1 > 1.5 * a0:
+                return None                       # the patch bulges beyond the removed faces
             patches.append(fill.Shape())
         sew = BRepBuilderAPI_Sewing(1e-4)
         for k in keep:
@@ -3621,7 +3737,7 @@ def _patch_faces(so, faces):
 
 SURFACE_TYPES = ("surf_extract", "surf_fit", "surf_sketch", "surf_loft", "surf_fill", "surf_offset", "surf_sew", "surf_import",
                  "curve_extract", "curve_section", "surf_from_curve", "surf_trim", "surf_extend", "surf_bridge", "surf_fillet", "surf_gaps", "surf_sweep", "curve_project",
-                 "curve_blend", "curve_points")
+                 "curve_blend", "curve_points", "surf_connect", "surf_clean", "surf_separate")
 
 
 SKETCH_PLANE_KEYS = ("plane", "offset", "plane_edge", "plane_curve", "plane_sketch_curve", "plane_t", "plane_flip", "plane_ref", "plane_face", "plane_origin", "plane_xdir", "plane_axis", "plane_point", "plane_origin_ref", "plane_xdir_ref")
@@ -3988,12 +4104,18 @@ def build(part, upto=None, surfaces=None, datums=None, owners=None):
                     body = sfm.sweep_surface(bodies, f)
                 elif t == "surf_gaps":
                     body = sfm.close_gaps(bodies, f)
+                elif t == "surf_clean":
+                    body = sfm.clean_edges(shape, bodies, f, ffa)
+                elif t == "surf_separate":
+                    body = sfm.separate(shape, bodies, f, find_faces)
                 elif t == "curve_extract":
                     body = sfm.curve_extract(shape, bodies, f, fea, expand_edges)
                 elif t == "curve_section":
                     body = sfm.curve_section(shape, bodies, f, ffa)
                 elif t == "curve_blend":
                     body = sfm.curve_blend(shape, bodies, f, find_edges, planes)
+                elif t == "surf_connect":
+                    body = sfm.connect(shape, bodies, f, fea, ffa)
                 elif t == "curve_points":
                     body = sfm.curve_points(f, planes)
                 elif t == "surf_from_curve":
@@ -4309,13 +4431,35 @@ def build(part, upto=None, surfaces=None, datums=None, owners=None):
             v0 = shape.volume if shape is not None else 0.0
             def cut_with(sols):
                 def op(t):
-                    return _cleaned(t.cut(*sols)) if sols else t
+                    return _checked_cut(t, sols) if sols else t
                 return op
             if cut:
                 if shape is None:
                     raise ValueError("nothing to cut")
                 shape0 = shape
-                shape = _in_bodies(shape, f, cut_with(solids))
+                try:
+                    shape = _in_bodies(shape, f, cut_with(solids))
+                except _CutFailed:
+                    # the Boolean at the sketch plane gives an invalid solid (a seam, pole or degenerate face of the
+                    # imported geometry in that plane): the tool is moved a little along the sketch normal
+                    nrm = faces[0].normal_at(faces[0].center())
+                    shape, moved = None, None
+                    for d in (0.3, -0.3, 1.0, -1.0):
+                        shifted = [_apply_trsf(sx, ("t", nrm * d)) for sx in solids]
+                        try:
+                            shape = _in_bodies(shape0, f, cut_with(shifted))
+                        except _CutFailed:
+                            continue
+                        if abs(shape.volume - v0) >= 1e-6 * max(v0, 1.0):
+                            solids, moved = shifted, d
+                            tools[f.get("id")] = (solids, cut)
+                            break
+                        shape = None
+                    if shape is None:
+                        raise ValueError("the cut gives an invalid solid at the sketch plane (a seam, pole or degenerate face of the "
+                                         "part lies in it); move the sketch plane a little or heal the part")
+                    notes.append("the Boolean at the sketch plane failed on this geometry: the cut was moved %g mm along the sketch normal" % moved)
+                    info["note"] = "; ".join(notes)
                 if abs(shape.volume - v0) < 1e-6 * max(v0, 1.0) and f["type"] == "cut" and not (f.get("symmetric") or f.get("through")):
                     # nothing removed in this direction: the cut is tried in the opposite direction
                     g = dict(f)
@@ -6086,6 +6230,7 @@ def _tool_sweep(f, faces, path, normal):
     op.SetArguments(args)
     op.SetTools(tls)
     op.SetFuzzyValue(1e-6)
+    op.SetUseOBB(True)
     op.Build()
     if not op.IsDone():
         raise ValueError("the tool sweep could not be fused")

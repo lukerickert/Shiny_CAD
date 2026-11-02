@@ -3303,6 +3303,12 @@ def test_part_body_groups(page, client):
     assert page.evaluate("[!!window.__part.PT.hidden['solid:0'], !!window.__part.PT.hidden['x1']]") == [False, True]
     page.click("#pt-showall")
     assert page.evaluate("Object.values(window.__part.PT.hidden).filter(Boolean).length") == 0
+    # Show menu: Hide all, Invert, Solids only, Surfaces only, Show all
+    hidden = lambda: page.evaluate("[!!window.__part.PT.hidden['solid:0'], !!window.__part.PT.hidden['x1']]")
+    for btn, want in (("#pt-hide-all", [True, True]), ("#pt-show-invert", [False, False]), ("#pt-show-solids", [False, True]), ("#pt-show-surfaces", [True, False]), ("#pt-show-all", [False, False])):
+        page.click("#tab-part .dd-btn:has-text('Show')")
+        page.click(btn)
+        assert hidden() == want, (btn, hidden())
 
 
 def test_part_pick_panel_chips(page, client):
@@ -3561,6 +3567,56 @@ def test_part_blend_curve_and_curve_through_points(page, client):
     page.wait_for_selector("#pf-sext")
     assert page.input_value("#pf-sext") == "1"
     page.evaluate("window.__part.cancelCommand()")
+
+
+def test_part_connect_surfaces_command(page, client):
+    """Connect surfaces: edges of two surface bodies fed to side A and side B (a side switches body on an edge of
+    another body), the feature builds one shell, the two bodies are hidden."""
+    from conftest import part_rec, rect
+    p = part_rec("ui_conn", [
+        {"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(40, 20)}},
+        {"id": "b", "name": "B", "type": "surf_sketch", "kind": "planar", "plane": "XZ", "offset": -23, "sketch": {"entities": rect(40, 20, 0, 2)}}])
+    client.put("/api/part/file/ui_conn", json=p)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_conn')")
+    page.wait_for_function("window.__part.PT.surfaces && window.__part.PT.surfaces.a && window.__part.PT.surfaces.b")
+    page.evaluate("window.__part.startCommand('surf_connect')")
+    page.wait_for_selector("#pt-cmdwin:not([hidden])")
+    assert page.inner_text("#pt-cmdwin-title") == "Connect surfaces"
+    feed = "([sid, mid, len]) => { const sm = window.__part.PT.surfaces[sid]; const i = sm.edge_keys.findIndex(k => k && Math.abs(k.mid[0] - mid[0]) < 1e-4 && Math.abs(k.mid[1] - mid[1]) < 1e-4 && Math.abs(k.mid[2] - mid[2]) < 1e-4); window.__part.feedCommand({ kind: 'edge', key: sm.edge_keys[i], surface: sid, point: mid }); }"
+    page.evaluate(feed, ["a", [20, 20, 0], 40])
+    page.wait_for_function("(() => { const f = window.__part.feat(window.__part.PT.cmd.id); return f.source_a === 'a' && f.edges_a.length === 1; })()")
+    page.evaluate("window.__part.gotoStep(1)")
+    page.evaluate(feed, ["b", [20, 23, 2], 40])
+    page.wait_for_function("(() => { const f = window.__part.feat(window.__part.PT.cmd.id); return f.source_b === 'b' && f.edges_b.length === 1; })()")
+    cid = page.evaluate("window.__part.PT.cmd.id")
+    page.wait_for_function("id => window.__part.PT.status[id] && !window.__part.PT.status[id].pending && window.__part.PT.surfaces[id]", arg=cid, timeout=60000)
+    assert "1 shell" in page.evaluate("id => window.__part.PT.status[id].note || ''", cid)
+    page.click("#cmd-finish")
+    page.wait_for_function("!window.__part.PT.cmd")
+    assert page.evaluate("[!!window.__part.PT.hidden.a, !!window.__part.PT.hidden.b]") == [True, True]
+
+
+def test_part_extract_surface_separate_bodies(page, client):
+    """Extract surface with Separate bodies: the top and the bottom face of a plate (not connected) give two
+    Extract surface features, one face each; two surface bodies in the tree."""
+    client.put("/api/part/file/ui_sep", json=plate("ui_sep", hole_r=0))
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_sep')")
+    page.wait_for_function("window.__part.PT.mesh && window.__part.PT.mesh.face_keys && window.__part.PT.mesh.face_keys.length > 0", timeout=60000)
+    page.evaluate("window.__part.startCommand('surf_extract')")
+    page.wait_for_selector("#pt-cmdwin:not([hidden])")
+    for z in (20, 0):
+        page.evaluate("z => { const m = window.__part.PT.mesh; const i = m.face_keys.findIndex(k => k && Math.abs(k.c[2] - z) < 1e-6 && Math.abs(Math.abs(k.n[2]) - 1) < 1e-6); window.__part.feedCommand({ kind: 'face', fi: i, key: m.face_keys[i], solid: 0, point: m.face_keys[i].c }); }", z)
+    page.wait_for_function("window.__part.feat(window.__part.PT.cmd.id).faces.length === 2")
+    page.evaluate("window.__part.gotoStep(1)")
+    page.wait_for_selector("#pf-xsep")
+    page.check("#pf-xsep")
+    page.wait_for_function("window.__part.feat(window.__part.PT.cmd.id).separate === true")
+    page.click("#cmd-finish")
+    page.wait_for_function("!window.__part.PT.cmd && window.__part.PT.part.features.filter(f => f.type === 'surf_extract').length === 2", timeout=60000)
+    assert page.evaluate("window.__part.PT.part.features.filter(f => f.type === 'surf_extract').map(f => f.faces.length)") == [1, 1]
+    page.wait_for_function("window.__part.bodyGroupIds('surface').length === 2", timeout=60000)
 
 
 def test_part_surface_fillet_faces_of_one_body_by_click(page, client):
@@ -4599,3 +4655,212 @@ def test_part_extend_surface_reopen_edges_pickable(page, client):
     assert xy, "edge not pickable after the deselection"
     page.mouse.click(*xy)
     page.wait_for_function("(window.__part.feat('x').edges || []).length === 1")
+
+
+def test_part_clean_edges_command(page, client):
+    """Clean edges: a planar surface body whose bottom edge is two collinear lines, chosen as the source of the
+    command; the feature builds a face with 4 edges, the note says so, the source body is hidden."""
+    from conftest import part_rec
+    def line(i, a, b):
+        return {"id": i, "t": "line", "x1": a[0], "y1": a[1], "x2": b[0], "y2": b[1], "layer": "0"}
+    ents = [line(1, (0, 0), (50, 0)), line(2, (50, 0), (100, 0)), line(3, (100, 0), (100, 50)), line(4, (100, 50), (0, 50)), line(5, (0, 50), (0, 0))]
+    p = part_rec("ui_clean", [{"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": ents}}])
+    client.put("/api/part/file/ui_clean", json=p)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_clean')")
+    page.wait_for_function("window.__part.PT.surfaces && window.__part.PT.surfaces.a")
+    assert page.evaluate("window.__part.PT.surfaces.a.edge_keys.filter(Boolean).length") == 5
+    page.evaluate("window.__part.startCommand('surf_clean')")
+    page.wait_for_selector("#pt-cmdwin:not([hidden])")
+    assert page.inner_text("#pt-cmdwin-title") == "Clean edges"
+    page.select_option("#pf-source", "a")
+    page.wait_for_function("window.__part.feat(window.__part.PT.cmd.id).source === 'a'")
+    page.evaluate("window.__part.gotoStep(1)")
+    page.wait_for_selector("#pf-clm")
+    assert page.input_value("#pf-cltol") == "0.05" and page.input_value("#pf-clang") == "15"
+    cid = page.evaluate("window.__part.PT.cmd.id")
+    page.wait_for_function("id => window.__part.PT.status[id] && !window.__part.PT.status[id].pending && window.__part.PT.surfaces[id]", arg=cid, timeout=60000)
+    assert "5 edge(s) joined into 4" in page.evaluate("id => window.__part.PT.status[id].note || ''", cid)
+    assert page.evaluate("id => window.__part.PT.surfaces[id].edge_keys.filter(Boolean).length", cid) == 4
+    page.click("#cmd-finish")
+    page.wait_for_function("!window.__part.PT.cmd")
+    assert page.evaluate("!!window.__part.PT.hidden.a") is True
+
+
+def test_part_surface_opacity_slider(page, client):
+    """Show menu, Surface opacity: the slider sets the opacity of the surface bodies (material opacity, opaque at
+    100 %), the value is kept in localStorage and applied to a reloaded part."""
+    from conftest import part_rec, rect
+    p = part_rec("ui_op", [{"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(40, 20)}}])
+    client.put("/api/part/file/ui_op", json=p)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_op')")
+    page.wait_for_function("window.__part.PT.surfObjs && window.__part.PT.surfObjs.length > 0")
+    assert abs(page.evaluate("window.__part.PT.surfObjs[0].material.opacity") - 0.45) < 1e-6
+    assert page.input_value("#pt-surfop") == "45"
+    page.evaluate("const s = document.querySelector('#pt-surfop'); s.value = '80'; s.dispatchEvent(new Event('input'))")
+    assert abs(page.evaluate("window.__part.PT.surfObjs[0].material.opacity") - 0.8) < 1e-6
+    assert page.evaluate("window.__part.PT.surfObjs[0].material.transparent") is True
+    assert page.inner_text("#pt-surfop-val") == "80 %"
+    page.evaluate("window.__part.setSurfOpacity(1)")
+    assert page.evaluate("[window.__part.PT.surfObjs[0].material.transparent, window.__part.PT.surfObjs[0].material.depthWrite]") == [False, True]
+    assert page.evaluate("localStorage.getItem('pt-surf-opacity')") == "1"
+    page.evaluate("window.__part.setSurfOpacity(0.3)")
+    page.evaluate("window.__partLoadNamed('ui_op')")
+    page.wait_for_function("window.__part.PT.surfObjs && window.__part.PT.surfObjs.length > 0 && Math.abs(window.__part.PT.surfObjs[0].material.opacity - 0.3) < 1e-6")
+    page.evaluate("window.__part.setSurfOpacity(0.45)")
+
+
+def test_part_trim_surface_tool_faces(page, client):
+    """Trim surface with faces of the tool: the tool body has two vertical faces across a 100 x 50 target; with
+    Pick single faces ticked, one face of the tool fed as the tool gives 2 regions (the whole tool 3); the tool body
+    stays shown (not consumed) and the chip summary names the face count."""
+    from conftest import part_rec, rect
+    def line(i, a, b):
+        return {"id": i, "t": "line", "x1": a[0], "y1": a[1], "x2": b[0], "y2": b[1], "layer": "0"}
+    p = part_rec("ui_trf", [
+        {"id": "a", "name": "A", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(100, 50)}},
+        {"id": "b", "name": "B", "type": "surf_sketch", "kind": "extrude", "depth": 20, "symmetric": True, "plane": "XY", "offset": 0,
+         "sketch": {"entities": [line(1, (40, -5), (40, 55)), line(2, (70, -5), (70, 55))]}}])
+    client.put("/api/part/file/ui_trf", json=p)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_trf')")
+    page.wait_for_function("window.__part.PT.surfaces && window.__part.PT.surfaces.a && window.__part.PT.surfaces.b")
+    page.evaluate("window.__part.startCommand('surf_trim')")
+    page.wait_for_selector("#pf-source")
+    page.select_option("#pf-source", "a")
+    page.evaluate("window.__part.gotoStep(1)")
+    page.evaluate("window.__part.feedCommand({ kind: 'surface', id: 'b' })")
+    page.wait_for_function("window.__part.PT.cmd.step === 2 && (window.__part.PT.cmd.regions || []).length === 3")
+    # one face of the tool: the pick of a surface body face comes as kind "face" with .surface
+    page.evaluate("window.__part.gotoStep(1)")
+    page.evaluate("window.__part.PT.cmd.sface = true")
+    page.evaluate("() => { const sm = window.__part.PT.surfaces.b; const i = sm.face_keys.findIndex(k => k && Math.abs(k.c[0] - 40) < 1e-6); window.__part.feedCommand({ kind: 'face', fi: i, key: sm.face_keys[i], surface: 'b', point: sm.face_keys[i].c }); }")
+    page.wait_for_function("(() => { const f = window.__part.feat(window.__part.PT.cmd.id); return f.tool === 'b' && (f.tool_faces || []).length === 1; })()")
+    page.wait_for_function("window.__part.PT.cmd.step === 2 && (window.__part.PT.cmd.regions || []).length === 2")
+    page.evaluate("window.__part.feedCommand({ kind: 'region', point: window.__part.PT.cmd.regions.find(r => r.point[0] > 40).point })")
+    cid = page.evaluate("window.__part.PT.cmd.id")
+    page.click("#cmd-finish")
+    page.wait_for_function("!window.__part.PT.cmd")
+    page.wait_for_function("id => window.__part.PT.status[id] && !window.__part.PT.status[id].pending && !window.__part.PT.status[id].error && window.__part.PT.surfaces[id]", arg=cid, timeout=60000)
+    assert page.evaluate("[!!window.__part.PT.hidden.a, !!window.__part.PT.hidden.b]") == [True, False]
+    assert page.evaluate("id => window.__part.PT.surfaces[id].face_keys.filter(Boolean).length", cid) == 1
+    assert page.evaluate("id => window.__part.feat(id).remove.length", cid) == 1
+
+
+def test_part_separate_faces_command(page, client):
+    """Separate faces from the Surfaces menu: a face of a 4-face surface body fed to the command; OK creates the
+    feature with the picked face and a second feature with the remaining faces; the source body is hidden and
+    both new bodies exist (1 and 3 faces)."""
+    from conftest import part_rec, rect
+    p = part_rec("ui_sepf", [{"id": "a", "name": "A", "type": "surf_sketch", "kind": "extrude", "depth": 10, "plane": "XY", "offset": 0, "sketch": {"entities": rect(40, 20)}}])
+    client.put("/api/part/file/ui_sepf", json=p)
+    tab(page, "part")
+    page.evaluate("window.__partLoadNamed('ui_sepf')")
+    page.wait_for_function("window.__part.PT.surfaces && window.__part.PT.surfaces.a && window.__part.PT.surfaces.a.face_keys")
+    page.evaluate("document.querySelector('[data-add=surf_separate]').click()")
+    page.wait_for_selector("#pt-cmdwin:not([hidden])")
+    assert page.inner_text("#pt-cmdwin-title") == "Separate faces"
+    page.evaluate("() => { const sm = window.__part.PT.surfaces.a; const i = sm.face_keys.findIndex(k => k && Math.abs(k.c[0] - 40) < 1e-6); window.__part.feedCommand({ kind: 'face', fi: i, key: sm.face_keys[i], surface: 'a', point: sm.face_keys[i].c }); }")
+    page.wait_for_function("(() => { const f = window.__part.feat(window.__part.PT.cmd.id); return f.source === 'a' && (f.faces || []).length === 1; })()")
+    cid = page.evaluate("window.__part.PT.cmd.id")
+    page.evaluate("window.__part.gotoStep(1)")
+    page.wait_for_selector("#pf-sprest")
+    assert page.is_checked("#pf-sprest")
+    page.click("#cmd-finish")
+    page.wait_for_function("!window.__part.PT.cmd")
+    ids = page.evaluate("window.__part.PT.part.features.filter(x => x.type === 'surf_separate').map(x => [x.id, x.keep, x.faces.length])")
+    assert len(ids) == 2 and ids[0][0] == cid and ids[0][1] == "picked" and ids[1][1] == "rest" and ids[1][2] == 1
+    rid = ids[1][0]
+    page.wait_for_function("([a, b]) => window.__part.PT.surfaces[a] && window.__part.PT.surfaces[b] && !window.__part.PT.status[a].pending && !window.__part.PT.status[b].pending", arg=[cid, rid], timeout=60000)
+    assert page.evaluate("([a, b]) => [window.__part.PT.surfaces[a].face_keys.filter(Boolean).length, window.__part.PT.surfaces[b].face_keys.filter(Boolean).length]", [cid, rid]) == [1, 3]
+    assert page.evaluate("!!window.__part.PT.hidden.a") is True
+
+
+def test_dimension_horizontal_text_drag_and_clear(page, client):
+    """Drawings: a vertical dimension's text turns horizontal with the Horizontal text checkbox (the text element
+    loses its rotation) and back with key T; dragging a note moves it by the drag distance (the group follows the
+    mouse during the drag); Clear annotations removes every annotation and Ctrl+Z brings them back."""
+    client.put("/api/part/file/ui_htx", json=plate("ui_htx"))
+    tab(page, "part")
+    file_menu(page, "#tab-part")
+    page.select_option("#pt-list", "ui_htx")
+    wait_text(page, "#pt-info", "Volume")
+    file_menu(page, "#tab-part")
+    page.click("#pt-draw")
+    page.wait_for_selector("#ann-canvas svg", timeout=120000)
+    page.wait_for_function("typeof ED !== 'undefined' && ED.d && ED.d.maps && ED.snapPts.length")
+    page.evaluate("""() => { setTool('v'); const P = ED.snapPts.filter(p => p.view === 'front');
+        const a = P[0], b = P.find(p => Math.abs(p.X - a.X) < 1e-6 && Math.abs(p.Y - a.Y) > 5);
+        toolClick(a.X, a.Y); toolClick(b.X, b.Y); toolClick(a.X - 15, (a.Y + b.Y) / 2); setTool('select'); }""")
+    page.wait_for_function("ED.anns.length === 1 && document.querySelector('g.ann')")
+    page.evaluate("select(ED.anns[0].id)")
+    assert page.is_visible("#ann-horiz-row")
+    rotated = page.evaluate("[...document.querySelectorAll('g.ann text')].some(t => /rotate\\(\\s*-?90/.test(t.getAttribute('transform') || ''))")
+    assert rotated
+    page.check("#ann-horiz")
+    page.dispatch_event("#ann-horiz", "change")
+    page.wait_for_function("ED.anns[0].text_horizontal === true")
+    page.wait_for_function("![...document.querySelectorAll('g.ann text')].some(t => /rotate\\(\\s*-?90/.test(t.getAttribute('transform') || ''))")
+    page.evaluate("document.activeElement && document.activeElement.blur()")
+    page.keyboard.press("t")
+    page.wait_for_function("ED.anns[0].text_horizontal === false")
+    # a note, dragged 20 mm to the right on the sheet
+    page.evaluate("() => { setTool('note'); toolClick(60, 60); }")
+    page.wait_for_selector("#text-dialog:not([hidden]) textarea")
+    page.fill("#text-dialog textarea", "NOTE")
+    page.click("#text-dialog-ok")
+    page.wait_for_function("ED.anns.length === 2 && ED.anns[1].type === 'note' && document.querySelector('g.ann[data-ann=\"' + ED.anns[1].id + '\"]')")
+    page.evaluate("setTool('select')")
+    box = page.evaluate("""() => { const g = document.querySelector('g.ann[data-ann="' + ED.anns[1].id + '"]'); const r = g.getBoundingClientRect();
+        const svg = document.querySelector('#ann-canvas svg'); const k = ED.vb[2] / svg.clientWidth; return [r.x + r.width / 2, r.y + r.height / 2, k]; }""")
+    x0, y0, k = box
+    px = 20 / k                                   # 20 mm on the sheet in screen pixels
+    page.mouse.move(x0, y0)
+    page.mouse.down()
+    page.mouse.move(x0 + px / 2, y0, steps=4)
+    page.mouse.move(x0 + px, y0, steps=4)
+    assert page.evaluate("!!ED.drag && ED.drag.moved")
+    tr = page.evaluate("document.querySelector('g.ann[data-ann=\"' + ED.anns[1].id + '\"]').getAttribute('transform') || ''")
+    assert "translate(" in tr
+    before = page.evaluate("ED.anns[1].pos[0]")
+    page.mouse.up()
+    page.wait_for_function("x0 => Math.abs(ED.anns[1].pos[0] - x0 - 20) < 1", arg=before)
+    page.click("#ann-clearall")
+    page.wait_for_function("ED.anns.length === 0")
+    page.keyboard.press("Control+z")
+    page.wait_for_function("ED.anns.length === 2")
+    # Decimals of the dimension: the select writes the dimension's decimals and the text shows them
+    page.evaluate("select(ED.anns[0].id)")
+    page.select_option("#ann-decimals", "2")
+    page.dispatch_event("#ann-decimals", "change")
+    page.wait_for_function("ED.anns[0].decimals === 2")
+    page.wait_for_function("[...document.querySelectorAll('g.ann text')].some(t => /^\\d+\\.\\d\\d$/.test(t.textContent.trim()))")
+    page.select_option("#ann-decimals", "")
+    page.dispatch_event("#ann-decimals", "change")
+    page.wait_for_function("ED.anns[0].decimals === undefined")
+    # the tolerance text option: deviations with the µm unit in the drawing and the mm unit in the fields
+    page.evaluate("setOption('tol_unit', 'mm')")
+    page.wait_for_function("OPT.tol_unit === 'mm' && document.querySelector('.dev-unit').textContent === 'mm'")
+    page.evaluate("setOption('tol_unit', 'um')")
+    page.wait_for_function("OPT.tol_unit === 'um' && document.querySelector('.dev-unit').textContent === '\u00b5m'")
+
+
+def test_drawing_right_click_returns_to_select(page, client):
+    """Drawings: a right click on the sheet while a dimension tool is active returns to the Select tool and drops
+    the picks of the tool."""
+    client.put("/api/part/file/ui_rc", json=plate("ui_rc"))
+    tab(page, "part")
+    file_menu(page, "#tab-part")
+    page.select_option("#pt-list", "ui_rc")
+    wait_text(page, "#pt-info", "Volume")
+    file_menu(page, "#tab-part")
+    page.click("#pt-draw")
+    page.wait_for_selector("#ann-canvas svg", timeout=120000)
+    page.wait_for_function("typeof ED !== 'undefined' && ED.d && ED.d.maps && ED.snapPts.length")
+    page.evaluate("() => { setTool('h'); const a = ED.snapPts.filter(p => p.view === 'front')[0]; toolClick(a.X, a.Y); }")
+    assert page.evaluate("ED.tool === 'h' && ED.pick.length === 1")
+    box = page.evaluate("() => { const r = document.querySelector('#ann-canvas svg').getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; }")
+    page.mouse.click(box[0], box[1], button="right")
+    page.wait_for_function("ED.tool === 'select' && ED.pick.length === 0")
+    assert page.evaluate("document.querySelector('#ann-tools button[data-tool=select]').classList.contains('active')")

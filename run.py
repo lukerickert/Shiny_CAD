@@ -63,10 +63,15 @@ def main():
     finally:
         probe.close()
 
-    from drawgen import web, pool
+    # the geometry requests of the Part tab run in a separate process (drawgen/partworker.py): Cancel in the Part
+    # tab ends a build that does not return. DRAWGEN_PART_WORKER=0 in the environment keeps them in this process.
+    os.environ.setdefault("DRAWGEN_PART_WORKER", "1")
+    from drawgen import web, pool, partworker
     atexit.register(web.cleanup)
     atexit.register(pool.shutdown)
     threading.Thread(target=pool.warm, daemon=True).start()   # start the worker processes in the background
+    if partworker.enabled():
+        threading.Thread(target=partworker.WORKER.warm, daemon=True).start()
     threading.Thread(target=web.sync_loop, daemon=True).start()   # document files of the open project
     try:
         from drawgen import fileassoc

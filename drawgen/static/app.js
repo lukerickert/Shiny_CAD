@@ -210,7 +210,7 @@ function renderFiles() {
 
 // ------------------------------------------------------------------ options (drawing units, keyboard shortcuts)
 // config.json "options" (units.py): units "mm" | "inch" for the drawing text; keys "default" | "left".
-window.OPT = { units: "mm", keys: "default" };
+window.OPT = { units: "mm", keys: "default", decimals: "auto", tol_unit: "um" };
 const MM_PER_IN = 25.4;
 window.isInch = () => OPT.units === "inch";
 window.leftKeys = () => OPT.keys === "left";
@@ -222,21 +222,44 @@ window.inchText = function (vmm, d, sign) {
   const neg = v < 0 && +s !== 0;
   return (neg ? "-" : sign ? "+" : "") + s;
 };
-/** Deviation text on the drawing (mm in): µm (+27, -40, 0) or inch (+.0011, -.0000); mirrors units.dev_text. */
+/** Tolerance text option of mm drawings: "um" (+27), "um_unit" (+27 µm), "mm" (+0.027); mirrors units.tol_unit. */
+window.tolUnit = () => isInch() ? "in" : (OPT.tol_unit || "um");
+/** Deviation in mm with 3 decimals (4 when the value has a fourth): +0.027, -0.040; zero: 0; mirrors units.mm_dev_text. */
+window.mmDevText = function (v, sign = true) {
+  if (Math.abs(v) < 0.5e-4) return "0";
+  const d = Math.abs(Math.round(v * 1e4) / 1e4 - Math.round(v * 1e3) / 1e3) < 0.5e-4 ? 3 : 4;
+  return (v < 0 ? "-" : sign ? "+" : "") + Math.abs(v).toFixed(d);
+};
+/** Deviation text on the drawing (mm in): µm (+27, -40, 0), µm with the unit, mm, or inch (+.0011, -.0000);
+ *  mirrors units.dev_text. */
 window.devText = function (v, lower) {
   if (isInch()) return Math.abs(v) < 0.5e-4 * MM_PER_IN ? (lower ? "-" : "+") + ".0000" : inchText(v, 4, true);
+  if (tolUnit() === "mm") return mmDevText(v);
   const um = Math.round(v * 10000) / 10;
-  if (Math.abs(um) < 0.05) return "0";
-  return (um > 0 ? "+" : "-") + String(+Math.abs(um).toFixed(1));
+  const s = Math.abs(um) < 0.05 ? "0" : (um > 0 ? "+" : "-") + String(+Math.abs(um).toFixed(1));
+  return s + (tolUnit() === "um_unit" ? " \u00b5m" : "");
 };
 /** Value after ± of a symmetric tolerance (mm in). */
-window.symText = v => isInch() ? inchText(Math.abs(v), 4) : devText(Math.abs(v)).replace("+", "");
-/** Length text of a dimension on the drawing; fmtMm formats the mm value. */
-window.dimLenText = (v, fmtMm) => isInch() ? inchText(v, 3) : fmtMm(v);
-/** Deviation fields of the dimension properties: µm, or inch with the inch option. */
-window.devUnit = () => isInch() ? "in" : "\u00b5m";
-window.devToField = v => v === undefined || v === null || v === "" ? "" : isInch() ? String(+(v / MM_PER_IN).toFixed(5)) : String(+(v * 1000).toFixed(3));
-window.devFromField = s => { const v = numv(s); return isFinite(v) ? (isInch() ? v * MM_PER_IN : v / 1000) : 0; };
+window.symText = v => isInch() ? inchText(Math.abs(v), 4) : tolUnit() === "mm" ? mmDevText(Math.abs(v), false) : devText(Math.abs(v)).replace("+", "");
+/** Fixed number of decimals of the dimension values (decimals option, or the dimension's own), null: automatic. */
+window.fixedDecimals = function (a) {
+  const d = a && a.decimals;
+  if (d !== undefined && d !== null && d !== "") return Math.max(0, Math.min(6, parseInt(d, 10) || 0));
+  return OPT.decimals && OPT.decimals !== "auto" ? parseInt(OPT.decimals, 10) : null;
+};
+/** mm value with a fixed number of decimals; -0.00 becomes 0.00. */
+window.fixedMm = function (v, d) { const s = Number(v).toFixed(d); return +s === 0 ? Math.abs(+s).toFixed(d) : s; };
+/** Length text of a dimension on the drawing; fmtMm formats the mm value in the automatic format; a: the
+ *  dimension (its decimals). */
+window.dimLenText = function (v, fmtMm, a) {
+  const d = fixedDecimals(a);
+  if (d !== null) return isInch() ? inchText(v, d) : fixedMm(v, d);
+  return isInch() ? inchText(v, 3) : fmtMm(v);
+};
+/** Deviation fields of the dimension properties: µm (mm with the mm tolerance text), or inch with the inch option. */
+window.devUnit = () => isInch() ? "in" : tolUnit() === "mm" ? "mm" : "\u00b5m";
+window.devToField = v => v === undefined || v === null || v === "" ? "" : isInch() ? String(+(v / MM_PER_IN).toFixed(5)) : tolUnit() === "mm" ? String(+(+v).toFixed(5)) : String(+(v * 1000).toFixed(3));
+window.devFromField = s => { const v = numv(s); return isFinite(v) ? (isInch() ? v * MM_PER_IN : tolUnit() === "mm" ? v : v / 1000) : 0; };
 
 /** Label of a physical key (KeyboardEvent.code) on this keyboard layout. */
 let KEY_LAYOUT = null;
@@ -270,14 +293,19 @@ async function setOption(key, value) {
     if (state.cfg) state.cfg.options = Object.assign({}, OPT);
     optionsChanged();
     renderKeyList();
-    if (key === "units" && (state.drawings || []).length) preview(false, true);
+    if (["units", "decimals", "tol_unit"].includes(key) && (state.drawings || []).length) preview(false, true);
+    const TOL = { um: "\u00b5m without unit", um_unit: "\u00b5m with unit", mm: "mm" };
     status(key === "units" ? "Drawing units: " + (isInch() ? "inch" : "mm") : key === "keys" ? "Keyboard shortcuts: " + (leftKeys() ? "left-handed" : "default")
+      : key === "decimals" ? "Dimension decimals: " + (OPT.decimals === "auto" ? "automatic" : OPT.decimals)
+      : key === "tol_unit" ? "Tolerance text: " + (TOL[OPT.tol_unit] || OPT.tol_unit)
       : "Browser: " + (OPT.browser || "system default") + " (used at the next start)");
   } catch (e) { showErr(e); }
 }
 function openOptions() {
   $("#opt-units").value = OPT.units;
   $("#opt-keys").value = OPT.keys;
+  $("#opt-decimals").value = OPT.decimals || "auto";
+  $("#opt-tolunit").value = OPT.tol_unit || "um";
   $("#opt-browser").value = OPT.browser || "";
   renderKeyList();
   $("#opt-dialog").hidden = false;
@@ -660,7 +688,8 @@ function bind() {
   $("#path-open").onclick = openPath;
   $("#path-input").addEventListener("keydown", e => { if (e.key === "Enter") openPath(); });
   $("#btn-preview").onclick = () => preview(false);
-  try { $("#auto-preview").checked = localStorage.getItem("drawgen.autoPreview") === "1"; } catch (e) { /* storage optional */ }
+  // on unless switched off (localStorage "drawgen.autoPreview": "0")
+  try { $("#auto-preview").checked = localStorage.getItem("drawgen.autoPreview") !== "0"; } catch (e) { $("#auto-preview").checked = true; }
   $("#auto-preview").onchange = () => { try { localStorage.setItem("drawgen.autoPreview", $("#auto-preview").checked ? "1" : "0"); } catch (e) { /* optional */ } if ($("#auto-preview").checked) schedulePreview(); };
   document.querySelector("aside").addEventListener("change", e => {
     const t = e.target;
@@ -687,6 +716,8 @@ function bind() {
   $("#opt-close").onclick = () => { $("#opt-dialog").hidden = true; };
   $("#opt-units").onchange = e => setOption("units", e.target.value);
   $("#opt-keys").onchange = e => setOption("keys", e.target.value);
+  $("#opt-decimals").onchange = e => setOption("decimals", e.target.value);
+  $("#opt-tolunit").onchange = e => setOption("tol_unit", e.target.value);
   $("#opt-browser").onchange = e => setOption("browser", e.target.value.trim());
   document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("#opt-dialog").hidden) $("#opt-dialog").hidden = true; });
   loadOptions();
