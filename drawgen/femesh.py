@@ -8,8 +8,9 @@ job:
    "mesh": {"size_min": mm, "curvature": elements per 360 deg (0: off), "algorithm": "delaunay" | "frontal" | "hxt",
             "optimize": bool, "strategy": "tet" | "hex" | "hexsub" (default of the solid bodies),
             "tet_type": "C3D10" | "C3D4", "hex_type": "C3D8I" | "C3D8" | "C3D8R" | "C3D20" | "C3D20R"},
-   "bodies": [{"id", "brep": path, "mode": "solid" | "plate", "size": mm or null, "layers": n (plate),
-               "strategy": null (job default) | "tet" | "hex" | "hexsub"}]}
+   "bodies": [{"id", "brep": path, "mode": "solid" | "plate" | "shell", "size": mm or null, "layers": n (plate),
+               "strategy": null (job default) | "tet" | "hex" | "hexsub", "t": mm (shell)}]}
+   "mesh" also: "shell_type": "S4" | "S4R" | "S8R" | "S3", "shell_algorithm": "quasi" | "frontal" | "delaunay" | "tri"
 
 out:
   {"nodes": {"ids": [...], "xyz": [x0, y0, z0, x1, ...]},
@@ -28,6 +29,11 @@ The bodies of one strategy share their nodes at touching faces ("bonded": the so
 different strategies and plates are tied (analysis.Model._ties).
 Plates: the largest planar face is meshed with quadrangles and the mesh is extruded through the thickness
 (C3D8I, C3D6 for the triangles left), "layers" elements through the thickness; the plate must be a prism of that face.
+Shells: the faces of all shell bodies are meshed together in a model of their own; with "bonded" they are
+fragmented, so shells that touch or cross share their nodes on the common lines. Quadrangles (S4, S4R; S8R second
+order) with triangles (S3; S6 with S8R) where the quadrangle mesh leaves them, or triangles only ("tri"). The surfaces
+of a shell body are its faces; their facets are the shell elements. A face shared by two shell bodies (coincident
+faces) belongs to the body listed first.
 Facets of the surfaces carry the corner nodes first, then the mid-side nodes.
 """
 import json
@@ -79,6 +85,8 @@ GMSH_ELEMS = {
     18: (15, lambda n: n[:6] + [n[6], n[9], n[7], n[12], n[14], n[13], n[8], n[10], n[11]]),
 }
 ALGO3D = {"delaunay": 1, "frontal": 4, "hxt": 10}
+SHELL_TYPES = ("S4", "S4R", "S8R", "S3")
+SHELL_ALGOS = {"quasi": 11, "frontal": 8, "delaunay": 6, "tri": 6}
 HEX_TYPES = ("C3D8I", "C3D8", "C3D8R", "C3D20", "C3D20R")
 TET_TYPES = ("C3D10", "C3D4")
 
@@ -120,10 +128,12 @@ def _mesh(job):
         size = float(job.get("size") or 0)
         opts = job.get("mesh") or {}
         warnings = []
-        solids, plates, hexes = [], [], {}
+        solids, plates, hexes, shells = [], [], {}, []
         for b in job["bodies"]:
             if b.get("mode") == "plate":
                 plates.append(b)
+            elif b.get("mode") == "shell":
+                shells.append(b)
             elif _strategy(b, opts) == "tet":
                 solids.append(b)
             else:
@@ -157,6 +167,8 @@ def _mesh(job):
                     eid = max(eid, e[0])
         for st, group in sorted(hexes.items()):
             nid, eid = _hex_group(gmsh, st, group, job, opts, size or diag / 20.0, nid, eid, out_nodes, bodies, warnings)
+        if shells:
+            nid, eid = _shell_group(gmsh, shells, job, opts, size or diag / 20.0, nid, eid, out_nodes, bodies, warnings)
         for b in plates:
             nid, eid, res = _plate(gmsh, b, size, nid, eid, out_nodes)
             res["group"] = "plate:%s" % b["id"]
@@ -288,6 +300,95 @@ def _hex_group(gmsh, st, group, job, opts, h, nid, eid, out_nodes, bodies, warni
     finally:
         gmsh.model.remove()
         gmsh.option.setNumber("Mesh.SubdivisionAlgorithm", 0)
+
+
+def _shell_type(gtype, opts):
+    """Abaqus shell element type of a gmsh surface element type (3: quadrangle 4, 2: triangle 3, 16: quadrangle 8,
+    9: triangle 6)."""
+    st = opts.get("shell_type") if opts.get("shell_type") in SHELL_TYPES else "S4"
+    if gtype == 3:
+        return st if st in ("S4", "S4R") else "S4"
+    return {2: "S3", 16: "S8R", 9: "S6"}.get(gtype)
+
+
+def _shell_group(gmsh, group, job, opts, h, nid, eid, out_nodes, bodies, warnings):
+    """Shell mesh of the shell bodies in a model of their own; nodes and elements renumbered after nid / eid."""
+    gmsh.model.add("shells")
+    occ = gmsh.model.occ
+    try:
+        surf_of = {}
+        for b in group:
+            ents = occ.importShapes(b["brep"])
+            surf_of[b["id"]] = [t for d, t in ents if d == 2]
+            if not surf_of[b["id"]]:
+                raise RuntimeError("shell %s has no faces" % b["id"])
+        occ.synchronize()
+        if job.get("bonded") and sum(len(v) for v in surf_of.values()) > 1:
+            inp = [(2, t) for b in group for t in surf_of[b["id"]]]
+            _, omap = occ.fragment(inp, [])
+            k = 0
+            for b in group:
+                new = []
+                for _ in surf_of[b["id"]]:
+                    new += [t for d, t in omap[k] if d == 2]
+                    k += 1
+                surf_of[b["id"]] = sorted(set(new))
+            occ.synchronize()
+        seen = set()
+        for b in group:                                  # a face shared by two bodies: the body listed first
+            surf_of[b["id"]] = [t for t in surf_of[b["id"]] if t not in seen]
+            seen.update(surf_of[b["id"]])
+        algo = str(opts.get("shell_algorithm") or "quasi")
+        tri = algo == "tri" or opts.get("shell_type") == "S3"
+        # the quasi-structured quadrangle algorithm makes elements of about half the size it reads
+        f = 2.0 if algo == "quasi" and not tri else 1.0
+        gmsh.option.setNumber("Mesh.MeshSizeMax", h * f)
+        gmsh.option.setNumber("Mesh.MeshSizeMin", (float(opts.get("size_min") or 0) or h / 5.0) * f)
+        gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 1)
+        curv = opts.get("curvature")
+        gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 12 if curv is None else float(curv))
+        gmsh.option.setNumber("Mesh.Algorithm", SHELL_ALGOS.get("delaunay" if tri else algo, 11))
+        gmsh.option.setNumber("Mesh.RecombineAll", 0 if tri else 1)
+        gmsh.option.setNumber("Mesh.RecombinationAlgorithm", 1)
+        gmsh.option.setNumber("Mesh.ElementOrder", 1)
+        gmsh.option.setNumber("Mesh.SecondOrderIncomplete", 1)
+        for b in group:
+            if b.get("size") and surf_of[b["id"]]:
+                pts = gmsh.model.getBoundary([(2, t) for t in surf_of[b["id"]]], combined=False, recursive=True)
+                gmsh.model.mesh.setSize([p for p in pts if p[0] == 0], float(b["size"]) * f)
+        gmsh.model.mesh.generate(2)
+        if opts.get("shell_type") == "S8R" and not tri:
+            gmsh.model.mesh.setOrder(2)
+        ntags, coords, _ = gmsh.model.mesh.getNodes()
+        nmap = {}
+        for i, t in enumerate(ntags):
+            nid += 1
+            nmap[int(t)] = nid
+            out_nodes[nid] = (coords[3 * i], coords[3 * i + 1], coords[3 * i + 2])
+        for b in group:
+            blocks = {}
+            surfs = []
+            for st in surf_of[b["id"]]:
+                et, eg, en = gmsh.model.mesh.getElements(2, st)
+                for typ, tags, nds in zip(et, eg, en):
+                    typ = int(typ)
+                    at = _shell_type(typ, opts)
+                    if at is None:
+                        warnings.append("shell %s: %d elements of gmsh type %d left out" % (b["id"], len(tags), typ))
+                        continue
+                    nn = gmsh.model.mesh.getElementProperties(typ)[3]
+                    lst = blocks.setdefault(at, [])
+                    for i in range(len(tags)):
+                        eid += 1
+                        lst.append([eid] + [nmap[int(v)] for v in nds[nn * i:nn * i + nn]])
+                surfs.append(_surface(gmsh, st, out_nodes, nmap=lambda n: nmap[n]))
+            if not blocks:
+                raise RuntimeError("shell %s: no elements (the faces are covered by another shell)" % b["id"])
+            bodies[b["id"]] = {"blocks": [{"type": t, "elements": els} for t, els in blocks.items()], "surfaces": surfs,
+                               "group": "shell", "thickness": float(b.get("t") or 0)}
+        return nid, eid
+    finally:
+        gmsh.model.remove()
 
 
 def _surface(gmsh, st, nodes, nsample=25, nmap=lambda n: n):

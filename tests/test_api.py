@@ -253,6 +253,56 @@ def test_assembly_build_mass_and_view_cache(client):
     assert all("mesh" not in c for c in j2["components"])                              # client holds the mesh
 
 
+def _surf(fid, name, plane, w, h, x=0.0, y=0.0):
+    return {"id": fid, "name": name, "type": "surf_sketch", "kind": "planar", "plane": plane, "offset": 0,
+            "sketch": {"entities": rect(w, h, x, y)}}
+
+
+def test_assembly_build_surface_bodies(client, web):
+    """The component shape of a part holds the solid and the shown surface bodies (hidden and curve bodies left out):
+    the faces of the solid first, then those of the surface bodies (mesh face_body), one face index space for picking;
+    volume of the solid only. A part with surface bodies and no solid builds without an error."""
+    p = plate("surf_plate", 100.0, 50.0, 10.0, 0.0)
+    p["features"] += [_surf("s1", "Wall", "XZ", 100, 60), _surf("s2", "Hidden wall", "YZ", 50, 60),
+                      {"id": "k1", "name": "Curve", "type": "curve_points", "method": "polyline", "points": [[0, 0, 0], [10, 20, 30]]}]
+    p["hidden"] = ["s2"]
+    p["body_colors"] = {"s1": "#aa3366"}
+    save_part(client, p)
+    a = asm([dict(comp("c1", "A"), source={"type": "part", "name": "surf_plate"})])
+    j = ok(client.post("/api/assembly/build", json={"assembly": a, "have": [], "density": 7850}))
+    c = j["components"][0]
+    assert not c["error"]
+    assert c["surfaces"] == [{"id": "s1", "name": "Wall", "color": "#aa3366"}]
+    assert c["mesh"]["face_body"] == [None] * 6 + [0] and len(c["refs"]) == 7
+    assert c["refs"][6]["kind"] == "plane" and c["refs"][6]["area"] == pytest.approx(6000)
+    fb, fot = c["mesh"]["face_body"], c["mesh"]["face_of_tri"]
+    assert [fb[f] for f in fot] == sorted([fb[f] for f in fot], key=lambda v: -1 if v is None else v)   # solid first
+    assert j["mass"]["total"]["volume_mm3"] == pytest.approx(50000)
+    j2 = ok(client.post("/api/assembly/build", json={"assembly": a, "have": [c["mkey"]]}))
+    assert "surfaces" not in j2["components"][0]                                       # client holds the view data
+    from drawgen import assembly as am
+    am._SRC_CACHE.clear()
+    e = web._asm_sources().info({"type": "part", "name": "surf_plate"})               # from the view cache on disk
+    assert e["surfaces"][0]["id"] == "s1" and "shape" not in e
+    src = web._asm_sources()
+    solid, err = src.solid({"type": "part", "name": "surf_plate"})
+    assert err is None and len(solid.faces()) == 6
+    assert len(src.load({"type": "part", "name": "surf_plate"})[0].faces()) == 7
+    # surface bodies only
+    q = {"name": "surf_only", "version": 2, "features": [_surf("s1", "A", "XY", 40, 20), _surf("s2", "B", "XZ", 40, 30)], "next": 3}
+    save_part(client, q)
+    a2 = asm([dict(comp("c1", "S"), source={"type": "part", "name": "surf_only"})])
+    j = ok(client.post("/api/assembly/build", json={"assembly": a2, "have": [], "density": 7850}))
+    c = j["components"][0]
+    assert not c["error"] and c["mesh"]["face_body"] == [0, 1] and len(c["refs"]) == 2
+    assert c["mesh"]["bbox"] == pytest.approx([0, 0, 0, 40, 20, 30], abs=1e-6)
+    assert j["mass"]["total"]["volume_mm3"] == 0
+    # the analysis geometry: one shell body per surface body
+    from drawgen import analysis
+    bodies = analysis.geometry({"bodies": {}, "shells": {"c1:s2": {"mode": "off"}}}, a2, web._asm_sources())
+    assert [(b["id"], b["mode"], b["t"], sorted(b["faces"])) for b in bodies] == [("c1:s1", "shell", analysis.DEFAULT_SHELL_T, [0])]
+
+
 def test_assembly_solve_datums_and_interference(client):
     a = asm([comp("c1", "A", fixed=True), comp("c2", "B", (13, 7, 55))],
             [{"id": "m1", "type": "coincident", "a": {"comp": "c2", "datum": "plane:XY"}, "b": {"comp": "c1", "datum": "plane:XY"},

@@ -162,6 +162,20 @@ def compute_views(shape, cfg, cache=None, key=None, workdir=None):
     return result
 
 
+def _axes(shape, cache=None, key=None):
+    """project.axes_of of the shape, kept in the view cache."""
+    ck = (key, "axes")
+    if cache is not None and key is not None and ck in cache:
+        return cache[ck]
+    try:
+        axes = pj.axes_of(shape)
+    except Exception:
+        axes = []
+    if cache is not None and key is not None:
+        cache[ck] = axes
+    return axes
+
+
 # --------------------------------------------------------------------------- layout
 
 def candidate_layouts(views):
@@ -341,6 +355,111 @@ def thread_prims(holes, views, centres, s, hidden_lines):
                     q0 = m(u0[0] + sg * perp[0] * r, u0[1] + sg * perp[1] * r)
                     q1 = m(u1[0] + sg * perp[0] * r, u1[1] + sg * perp[1] * r)
                     prims.append(("line", q0[0], q0[1], q1[0], q1[1], "hidden"))
+    return prims
+
+
+CENTRE_EXT_MM = 2.0            # centre lines extend this far beyond the outline (sheet mm)
+CENTRE_CHAIN_MIN_MM = 5.0      # centre marks of circles below this radius on the sheet are thin continuous lines
+
+
+def _drawn_circle(view, c, radii, tol):
+    """Largest radius of radii that is drawn as a circle or arc about c in the view (model mm), or None."""
+    best = None
+    for p in list(view.visible) + list(view.hidden):
+        if p[0] in ("C", "A") and abs(p[1] - c[0]) <= tol and abs(p[2] - c[1]) <= tol:
+            for r in radii:
+                if abs(p[3] - r) <= tol and (best is None or r > best):
+                    best = r
+    return best
+
+
+def _drawn_along(view, u0, u1, radii, tol):
+    """True when a line of the view runs along the axis u0-u1 at the distance of one of radii from it (the
+    silhouette of a cylinder or cone, or the edge of a hole in a section)."""
+    ax, ay = u1[0] - u0[0], u1[1] - u0[1]
+    L = math.hypot(ax, ay)
+    if L < tol:
+        return False
+    ax, ay = ax / L, ay / L
+    for p in list(view.visible) + list(view.hidden):
+        if p[0] != "L":
+            continue
+        ok = True
+        for x, y in ((p[1], p[2]), (p[3], p[4])):
+            dx, dy = x - u0[0], y - u0[1]
+            t = dx * ax + dy * ay
+            dist = abs(-dx * ay + dy * ax)
+            if t < -tol or t > L + tol or not any(abs(dist - r) <= tol for r in radii):
+                ok = False
+                break
+        if ok and math.hypot(p[3] - p[1], p[4] - p[2]) > tol:
+            return True
+    return False
+
+
+def centre_prims(axes, views, centres, s, vcfg):
+    """Centre marks and centre lines (ISO 128-24) of the axes of project.axes_of: in a view along the axis a
+    cross of two lines through the centre, extending CENTRE_EXT_MM beyond the largest drawn circle; in a view
+    across the axis a chain line along the axis from end to end of the faces, extended by CENTRE_EXT_MM. Drawn
+    only where the circle or the silhouette is drawn in the view, so hidden holes get them when hidden lines are
+    on."""
+    prims = []
+    sec = section_setup(vcfg)
+    for n, view in views.items():
+        if n == "iso":
+            continue
+        if n in pj.VIEWS:
+            d, xd = pj.VIEWS[n]
+        elif n == "section":
+            d, xd = sec[3], sec[4]
+        else:
+            continue
+        cx, cy = centres[n]
+        _, m = _place([], view, cx, cy, s, "chain")
+        f = s * view.factor
+        tol = 0.02
+        ext = CENTRE_EXT_MM / f
+        along = {}                       # collinear axis lines of the view merged: (direction, offset) -> [t0, t1]
+        for a in axes:
+            dot = a["d"][0] * d[0] + a["d"][1] * d[1] + a["d"][2] * d[2]
+            if abs(dot) > 0.99:
+                c = pj.project_point(a["p"], d, xd)
+                r = _drawn_circle(view, c, a["radii"], tol)
+                if r is None:
+                    continue
+                layer = "chain" if r * f >= CENTRE_CHAIN_MIN_MM else "dim"
+                e = r + ext
+                for (x0, y0, x1, y1) in ((c[0] - e, c[1], c[0] + e, c[1]), (c[0], c[1] - e, c[0], c[1] + e)):
+                    p0, p1 = m(x0, y0), m(x1, y1)
+                    prims.append(("line", p0[0], p0[1], p1[0], p1[1], layer))
+            elif abs(dot) < 0.01:
+                q0 = [a["p"][i] + a["d"][i] * a["t0"] for i in range(3)]
+                q1 = [a["p"][i] + a["d"][i] * a["t1"] for i in range(3)]
+                u0, u1 = pj.project_point(q0, d, xd), pj.project_point(q1, d, xd)
+                if not _drawn_along(view, u0, u1, a["radii"], tol):
+                    continue
+                L = math.hypot(u1[0] - u0[0], u1[1] - u0[1]) or 1.0
+                ux, uy = (u1[0] - u0[0]) / L, (u1[1] - u0[1]) / L
+                if ux < -1e-9 or (abs(ux) <= 1e-9 and uy < 0):
+                    ux, uy = -ux, -uy
+                off = -u0[0] * uy + u0[1] * ux                     # signed distance of the line from the origin
+                t0, t1 = sorted((u0[0] * ux + u0[1] * uy, u1[0] * ux + u1[1] * uy))
+                k = (round(ux, 4), round(uy, 4), round(off, 2))
+                spans = along.setdefault(k, [])
+                merged = [t0 - ext, t1 + ext]
+                keep = []
+                for sp in spans:
+                    if sp[1] >= merged[0] and sp[0] <= merged[1]:
+                        merged = [min(sp[0], merged[0]), max(sp[1], merged[1])]
+                    else:
+                        keep.append(sp)
+                keep.append(merged)
+                along[k] = keep
+        for (ux, uy, off), spans in along.items():
+            for t0, t1 in spans:
+                p0 = m(ux * t0 - uy * off, uy * t0 + ux * off)
+                p1 = m(ux * t1 - uy * off, uy * t1 + ux * off)
+                prims.append(("line", p0[0], p0[1], p1[0], p1[1], "chain"))
     return prims
 
 
@@ -641,6 +760,13 @@ def compose(name, shape, volume, cfg, sheet=None, scale=None, fields=None, cache
     if holes:
         for n, view in views.items():
             p = thread_prims(holes, {n: view}, centres, s, bool(vcfg.get("hidden_lines", False)))
+            view_prims[n] += p
+            prims += p
+
+    if vcfg.get("centre_lines", True):
+        axes = _axes(shape, cache, key)
+        for n, view in views.items():
+            p = centre_prims(axes, {n: view}, centres, s, vcfg)
             view_prims[n] += p
             prims += p
 

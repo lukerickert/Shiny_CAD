@@ -1328,7 +1328,7 @@ def _fea_geometry(req, tmpd):
     from . import project as pj
     if req.get("assembly"):
         asm = req["assembly"]
-        items = assembly.build(asm, _asm_sources(), explode=False)
+        items = assembly.build(asm, _asm_sources(), explode=False, solid_only=True)
         if not any(sh is not None for _, sh, _ in items):
             raise ValueError("the assembly has no solids")
         base = safe_name(asm.get("name") or "assembly")
@@ -1928,7 +1928,7 @@ def asm_build():
         if req.get("interference"):
             res["interference"] = assembly.interference_parallel(asm, src, explode=bool(req.get("explode")))
             if res["interference"] is None:
-                res["interference"] = assembly.interference(assembly.build(asm, src, explode=bool(req.get("explode"))))
+                res["interference"] = assembly.interference(assembly.build(asm, src, explode=bool(req.get("explode")), solid_only=True))
         return jsonify(res)
     except Exception as e:
         traceback.print_exc()
@@ -2196,7 +2196,7 @@ def asm_to_drawings():
 
 def _asm_to_drawings(req):
     asm = req.get("assembly") or {}
-    items = assembly.build(asm, _asm_sources(), explode=bool(req.get("explode")))
+    items = assembly.build(asm, _asm_sources(), explode=bool(req.get("explode")), solid_only=True)
     aname = asm.get("name") or "assembly"
     fid = "asm_" + safe_name(aname)
     parts = []
@@ -2226,7 +2226,7 @@ def _asm_to_drawings(req):
                    "mass": ("%.3f kg" % g["mass_kg"]) if g["mass_kg"] > 0 else ""})
     trails = None
     if req.get("explode"):
-        base_items = assembly.build(asm, _asm_sources(), explode=False)
+        base_items = assembly.build(asm, _asm_sources(), explode=False, solid_only=True)
         trails = []
         for (c, s, err), (c0, s0, err0) in zip(items, base_items):
             if s is None or s0 is None or c.get("visible") is False:

@@ -38,19 +38,25 @@ def load_step(path):
 def named_solids(path):
     """Read a STEP file. Returns [(name, TopoDS solid)], one per solid, named from the STEP labels (without the
     bounding box and volume of Part)."""
+    return _read_named(path)[0]
+
+
+def _read_named(path):
+    """([(name, TopoDS solid)], [(name, TopoDS faces)]) of a STEP file: the solids named from the STEP labels, and
+    per STEP component without solids its faces (one shell, or a compound of the faces), named from its label."""
     from build123d import import_step
     comp = import_step(path)
     stem = os.path.splitext(os.path.basename(path))[0]
-    parts = []
-    names = {}
+    parts, surfs = [], []
+    names, snames = {}, {}
 
-    def add(name, shape):
+    def add(name, shape, lst=parts, used=names):
         name = name or stem
-        n = names.get(name, 0)
-        names[name] = n + 1
+        n = used.get(name, 0)
+        used[name] = n + 1
         if n:
             name = "%s_%d" % (name, n + 1)
-        parts.append((name, shape))
+        lst.append((name, shape))
 
     def walk(obj, inherited):
         label = getattr(obj, "label", "") or inherited
@@ -62,25 +68,29 @@ def named_solids(path):
         solids = obj.solids() if hasattr(obj, "solids") else []
         if len(solids) == 1:
             add(label, solids[0].wrapped)
-        else:
+        elif solids:
             for i, s in enumerate(solids):
                 add("%s_%d" % (label, i + 1) if label else "", s.wrapped)
+        else:
+            faces = obj.faces() if hasattr(obj, "faces") else []
+            if faces:
+                shells = obj.shells()
+                if len(shells) == 1 and len(shells[0].faces()) == len(faces):
+                    add(label, shells[0].wrapped, surfs, snames)
+                else:
+                    add(label, compound([f.wrapped for f in faces], always=True), surfs, snames)
 
     walk(comp, "")
-    if not parts:
+    if not parts and not surfs:
         for s in comp.solids():
             add("", s.wrapped)
-    return parts
+    return parts, surfs
 
 
-_STEP_SOLIDS = {}   # (path, mtime, size) -> (compound, [(name, solid)])
+_STEP_SOLIDS = {}   # (path, mtime, size) -> (compound, [(name, solid)], [(name, faces)])
 
 
-def step_solids(path):
-    """Solids of a STEP file as (name, build123d Shape), indexed and named as load_step lists them, and the compound
-    of all solids. The file is read once per path, modification time and size; used by the assembly components and
-    the Import geometry feature of parts, so a solid index means the same solid everywhere."""
-    from build123d import Shape
+def _step_read(path):
     st = os.stat(path)
     key = (os.path.normcase(os.path.abspath(path)), st.st_mtime, st.st_size)
     if key not in _STEP_SOLIDS:
@@ -88,15 +98,30 @@ def step_solids(path):
             _STEP_SOLIDS.pop(k, None)
         while len(_STEP_SOLIDS) >= 8:
             _STEP_SOLIDS.pop(next(iter(_STEP_SOLIDS)))
-        named = named_solids(path)
-        _STEP_SOLIDS[key] = (compound([sh for _, sh in named]) if named else None, named)
-    comp, named = _STEP_SOLIDS[key]
+        named, surfs = _read_named(path)
+        _STEP_SOLIDS[key] = (compound([sh for _, sh in named]) if named else None, named, surfs)
+    return _STEP_SOLIDS[key]
+
+
+def step_solids(path):
+    """Solids of a STEP file as (name, build123d Shape), indexed and named as load_step lists them, and the compound
+    of all solids. The file is read once per path, modification time and size; used by the assembly components and
+    the Import geometry feature of parts, so a solid index means the same solid everywhere."""
+    from build123d import Shape
+    comp, named, _s = _step_read(path)
     # new build123d wrappers on every call: callers may set labels or parents on them
     return (Shape.cast(comp) if comp is not None else None), [(n, Shape.cast(s)) for n, s in named]
 
 
-def compound(shapes):
-    if len(shapes) == 1:
+def step_surfaces(path):
+    """Faces of the STEP components without solids: [(name, build123d Shape)] (a shell, or a compound of faces)."""
+    from build123d import Shape
+    return [(n, Shape.cast(s)) for n, s in _step_read(path)[2]]
+
+
+def compound(shapes, always=False):
+    """TopoDS compound of the shapes (one shape alone is returned as it is unless always)."""
+    if len(shapes) == 1 and not always:
         return shapes[0]
     b = BRep_Builder()
     c = TopoDS_Compound()

@@ -5,10 +5,11 @@ import * as THREE from "three";
 import { TumbleControls } from "/static/vendor/TumbleControls.js";
 import { updateAxes } from "/static/axes.js";
 import { createNavCube } from "/static/navcube.js";
+import { addBodyGroups, bodyMaterials, edgeAt as edgeAtScreen, edgeSegments, edgeLabel } from "/static/bodyview.js";
 
 const XP = { doc: null, dirty: false, meta: null, env: null, envInfo: null, three: null, geo: null, asm: null,
              bbox: null, size: 100, pick: null, sel: null,
-             mesh: null, meshSummary: null,                    // view data of the model .inp (Write .inp, Show mesh)
+             mesh: null, meshSummary: null,                    // view data of the model .inp (Mesh, Show mesh)
              runs: [], runsDir: "",
              res: { folder: "", job: "", data: null, geo: null, frame: null, k: 0, playing: false },
              logSeq: 0, logLines: [], status: null, lastBuild: null, offerSeq: 0, prevRows: {}, seq: 0, timer: null };
@@ -26,6 +27,9 @@ const fnum = v => { const x = window.numv ? window.numv(String(v)) : parseFloat(
 const ROLE_COLOR = { deformable: 0x9aa7b5, rigid: 0xd08c3a, off: 0xced4da };
 const PART_COLORS = [0x9aa7b5, 0xd08c3a, 0x74a9cf, 0x8fbc8f, 0xc994c7, 0xe0c068, 0x80b1d3, 0xbc80bd, 0xa6cee3, 0xfdb462];
 const SEL = 0xf08c00, SUP = 0x1c7ed6;
+const DOF6 = ["ux", "uy", "uz", "rx", "ry", "rz"];
+const SUP_PRESETS = [["", "chosen"], ["fixed", "fixed"], ["pinned", "pinned"], ["xsymm", "symmetry X"], ["ysymm", "symmetry Y"], ["zsymm", "symmetry Z"]];
+const PRESET_DOFS = { fixed: [1, 1, 1, 1, 1, 1], pinned: [1, 1, 1, 0, 0, 0], xsymm: [1, 0, 0, 0, 1, 1], ysymm: [0, 1, 0, 1, 0, 1], zsymm: [0, 0, 1, 1, 1, 0] };
 
 function blankDoc(name) {
   return { name: name || "explicit", source: { kind: "shinycad", type: "assembly", name: "", inp: "" },
@@ -42,7 +46,7 @@ function E(k) { return XP.env ? XP.env[k] : ""; }
 function srcKind() { return (XP.doc.source || {}).kind || "shinycad"; }
 function isShiny() { return srcKind() === "shinycad"; }
 function isDeck() { return srcKind() === "deck"; }
-/** The model .inp of the document is written by Write .inp (ShinyCAD geometry or deck generator). */
+/** The model .inp of the document is written by Mesh (ShinyCAD geometry or deck generator). */
 function isModel() { return srcKind() !== "inp"; }
 /** Request body of the server operations: the document and its settings. */
 function req(extra) { return Object.assign({ name: XP.doc.name, doc: XP.doc, settings: Object.assign({}, XP.doc.settings || {}) }, extra || {}); }
@@ -168,6 +172,21 @@ function hoverView(e) {
   if (!t || !XP.doc) return;
   clearHover();
   if (!XP.pick || $("#xp-show").value !== "model") { render3(); return; }
+  const eg = edgeUnder(e);
+  if (eg) {
+    const c = compOf(eg.comp);
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.Float32BufferAttribute(edgeSegments(c.mesh, eg.edge), 3));
+    const ls = new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: SEL, depthTest: false }));
+    ls.matrixAutoUpdate = false;
+    ls.matrix.copy(matOf(c));
+    ls.renderOrder = 10;
+    t.hover = ls;
+    t.scene.add(ls);
+    t.renderer.domElement.style.cursor = "crosshair";
+    render3();
+    return;
+  }
   const h = rayAt(e).intersectObjects(t.pickables, false).find(x => x.object.userData && x.object.userData.comp !== undefined);
   const c = h && compOf(h.object.userData.comp);
   const fi = c && c.mesh ? c.mesh.face_of_tri[h.faceIndex] : null;
@@ -192,6 +211,14 @@ function clickView(e) {
     if (JSON.stringify(XP.sel) !== prev) { renderModel(); draw(); }
     return;
   }
+  const eg = edgeUnder(e);
+  if (eg) {
+    const cb = XP.pick.cb;
+    XP.pick = null;
+    cb(eg);
+    changed(); renderModel(); draw();
+    return;
+  }
   const h = rayAt(e).intersectObjects(XP.three.pickables, false).find(x => x.object.userData && x.object.userData.comp !== undefined);
   if (!h) return;
   const cid = h.object.userData.comp, c = compOf(cid);
@@ -209,6 +236,12 @@ function startPick(text, cb) {
   renderModel();
 }
 function endPick() { XP.pick = null; renderModel(); draw(); }
+/** The edge of a component within 8 px of the cursor: {comp, edge}, or null. */
+function edgeUnder(e) {
+  const comps = ((XP.geo && XP.geo.components) || []).filter(c => c.mesh).map(c => ({ id: c.id, mesh: c.mesh, matrix: matOf(c) }));
+  const h = edgeAtScreen(comps, XP.three.camera, XP.three.renderer.domElement.getBoundingClientRect(), e.clientX, e.clientY, 8);
+  return h ? { comp: h.comp, edge: h.edge } : null;
+}
 
 function clearView() {
   const t = XP.three;
@@ -236,6 +269,7 @@ function faceRef(ref) {
 function faceText(ref) {
   if (!ref) return "(none)";
   const comp = ((XP.asm && XP.asm.components) || []).find(x => x.id === ref.comp);
+  if (ref.edge !== undefined) { const c = compOf(ref.comp); return (comp ? comp.name : ref.comp) + " : " + edgeLabel(c && c.erefs, ref.edge, v => fmt(v, 4)); }
   const r = faceRef(ref);
   return (comp ? comp.name : ref.comp) + " : " + (r ? r.kind + (r.r ? " Ø" + fmt(2 * r.r, 4) : "") + " face " + ref.face : "face " + ref.face);
 }
@@ -260,8 +294,8 @@ async function loadGeometry() {
     const r = await postJSON("/api/assembly/build", { assembly: asm, have: [...MESHES.keys()] });
     const j = await r.json();
     if (seq !== XP.seq) return;
-    for (const c of j.components) if (c.mkey && c.mesh) MESHES.set(c.mkey, { mesh: c.mesh, refs: c.refs || [] });
-    for (const c of j.components) if (c.mkey && MESHES.has(c.mkey)) { const e = MESHES.get(c.mkey); c.mesh = e.mesh; c.refs = e.refs; }
+    for (const c of j.components) if (c.mkey && c.mesh) MESHES.set(c.mkey, { mesh: c.mesh, refs: c.refs || [], erefs: c.erefs || [], surfaces: c.surfaces || [] });
+    for (const c of j.components) if (c.mkey && MESHES.has(c.mkey)) { const e = MESHES.get(c.mkey); c.mesh = e.mesh; c.refs = e.refs; c.erefs = e.erefs; c.surfaces = e.surfaces; }
     XP.geo = j;
     const errs = j.components.filter(c => c.error && c.mesh).map(c => c.error);
     info(`${j.components.length} component(s)` + (errs.length ? ": " + errs.join("; ") : ""));
@@ -283,9 +317,12 @@ function meshGeo(mkey) {
     for (const pl of m.edges) for (let k = 0; k + 1 < pl.length; k++) pos.push(...pl[k], ...pl[k + 1]);
     e.edgeGeo = new THREE.BufferGeometry();
     e.edgeGeo.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+    e.groups = addBodyGroups(e.geo, m);
   }
   return e;
 }
+/** Shell settings of a surface body of a component (doc.shells["<component>:<surface>"]). */
+function shellCfg(cid, sid) { return (XP.doc.shells || {})[cid + ":" + sid] || {}; }
 
 // ------------------------------------------------------------------ drawing
 
@@ -323,13 +360,30 @@ function drawModel(box) {
     const mat = new THREE.MeshStandardMaterial({ color: sel ? SEL : ROLE_COLOR[role], metalness: 0.1, roughness: 0.7, side: THREE.DoubleSide,
                                                  transparent: role === "off", opacity: role === "off" ? 0.15 : 1,
                                                  polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });
-    const mesh = new THREE.Mesh(e.geo, mat);
-    mesh.userData = { comp: c.id };
-    inner.add(mesh);
-    t.pickables.push(mesh);
-    if ($("#xp-edges").checked) inner.add(new THREE.LineSegments(e.edgeGeo, new THREE.LineBasicMaterial({ color: 0x1d2125 })));
+    if (c.mesh.vertices.length) {
+      const sm = { shell: undefined, rigid: ROLE_COLOR.rigid, off: undefined };
+      const mats = e.groups ? bodyMaterials(mat, c.surfaces, (k, sf) => { const md = shellCfg(c.id, sf.id).mode || "shell"; return { color: sel ? SEL : sm[md], opacity: md === "off" ? 0.12 : 0.6 }; }) : mat;
+      const mesh = new THREE.Mesh(e.geo, mats);
+      mesh.userData = { comp: c.id };
+      inner.add(mesh);
+      t.pickables.push(mesh);
+      if ($("#xp-edges").checked) inner.add(new THREE.LineSegments(e.edgeGeo, new THREE.LineBasicMaterial({ color: 0x1d2125 })));
+      box.union(e.geo.boundingBox.clone().applyMatrix4(inner.matrix));
+    }
     for (const s of sups) {
       if (s.target.comp !== c.id) continue;
+      const strongE = XP.sel && XP.sel.sup === s.id;
+      if (s.target.edge !== undefined) {
+        const g = track(new THREE.BufferGeometry());
+        g.setAttribute("position", new THREE.Float32BufferAttribute(edgeSegments(c.mesh, s.target.edge), 3));
+        const ls = new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: strongE ? SEL : SUP, depthTest: false }));
+        ls.renderOrder = 8;
+        inner.add(ls);
+        const pm = new THREE.Points(g, new THREE.PointsMaterial({ color: strongE ? SEL : SUP, size: 5, sizeAttenuation: false, depthTest: false }));
+        pm.renderOrder = 8;
+        inner.add(pm);
+        continue;
+      }
       const pos = faceTris(c, s.target.face);
       if (!pos.length) continue;
       const g = track(new THREE.BufferGeometry());
@@ -338,7 +392,6 @@ function drawModel(box) {
       inner.add(new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: strong ? SEL : SUP, transparent: true, opacity: strong ? 0.75 : 0.5, side: THREE.DoubleSide,
                                                                polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 })));
     }
-    box.union(e.geo.boundingBox.clone().applyMatrix4(inner.matrix));
   }
 }
 
@@ -539,8 +592,11 @@ function renderModel() {
   const comps = (XP.asm && XP.asm.components) || [];
   h += `<h3 class="xp-h">Bodies</h3>`;
   if (!comps.length) h += `<p class="hint">Choose the geometry in the toolbar.</p>`;
-  else h += `<table class="fa-tbl xp-bodies"><tr><th>Component</th><th>Role</th><th>Material</th><th>Size (mm)</th><th>Mesh</th></tr>` +
-    comps.map(c => {
+  const hasSolid = c => { const g = compOf(c.id); const m = g && g.mesh; return !m || (m.triangles.length > 0 && (!m.face_body || m.face_body.some(v => v === null || v === undefined))); };
+  const shells = [];
+  for (const c of comps) { const g = compOf(c.id); for (const sf of (g && g.surfaces) || []) shells.push([c, sf]); }
+  if (comps.length && comps.some(hasSolid)) h += `<table class="fa-tbl xp-bodies"><tr><th>Component</th><th>Role</th><th>Material</th><th>Size (mm)</th><th>Mesh</th></tr>` +
+    comps.filter(hasSolid).map(c => {
       const b = (XP.doc.bodies || {})[c.id] || {};
       const sel = XP.sel && XP.sel.comp === c.id;
       return `<tr data-b="${esc(c.id)}"${sel ? ' class="sel"' : ""}><td title="${esc(c.name)}">${esc(c.name)}</td>` +
@@ -549,6 +605,16 @@ function renderModel() {
         `<td><input type="text" data-bk="size" value="${esc(b.size || "")}" style="width:46px" placeholder="auto"></td>` +
         `<td><select data-bk="strategy"><option value="">(default)</option>${optList(MESH_STRATEGIES, b.strategy || "")}</select></td></tr>`;
     }).join("") + `</table><p class="hint">Rigid: *RIGID BODY over the nodes of the body, REF NODE at its centre of mass (the /RBODY main node driven by the Build loading). Rigid bodies are meshed apart from the deformable bodies.</p>`;
+  if (shells.length) h += `<table class="fa-tbl xp-shells"><tr><th>Shell</th><th>Role</th><th>t (mm)</th><th>Position</th><th>Material</th><th>Size (mm)</th></tr>` +
+    shells.map(([c, sf]) => {
+      const key = c.id + ":" + sf.id, b = (XP.doc.shells || {})[key] || {};
+      return `<tr data-shell="${esc(key)}"><td title="${esc(c.name)} / ${esc(sf.name)}">${esc(c.name)} / ${esc(sf.name)}</td>` +
+        `<td><select data-hk="mode">${optList([["shell", "deformable"], ["rigid", "rigid (impactor)"], ["off", "off"]], b.mode || "shell")}</select></td>` +
+        `<td><input type="text" data-hk="t" value="${esc(b.t || "")}" style="width:46px" placeholder="10"></td>` +
+        `<td><select data-hk="offset">${optList([["mid", "mid"], ["positive", "positive (SPOS)"], ["negative", "negative (SNEG)"]], b.offset || "mid")}</select></td>` +
+        `<td><select data-hk="material"><option value="">(default)</option>${optList(Object.keys(mats), b.material || "")}</select></td>` +
+        `<td><input type="text" data-hk="size" value="${esc(b.size || "")}" style="width:46px" placeholder="auto"></td></tr>`;
+    }).join("") + `</table><p class="hint">Shells: the surface bodies of the parts, meshed with shell elements (Shell elements in Mesh) of thickness t (empty: 10 mm), *SHELL SECTION per shell. Position: OFFSET=SPOS / SNEG (inp2rad does not read the offset). Touching shells share their nodes (Bonded).</p>`;
   const m = XP.doc.mesh || {};
   h += `<h3 class="xp-h">Mesh</h3><div class="row wrap">` +
     `<label class="inline xp-f">Element size (mm)<input type="text" data-mesh="size" value="${esc(m.size || "")}" placeholder="auto" style="width:60px"></label>` +
@@ -557,14 +623,19 @@ function renderModel() {
     `<label class="inline xp-f">Tetrahedra<select data-mesh="tet_type">${optList([["C3D4", "C3D4 (first order)"], ["C3D10", "C3D10 (second order)"]], m.tet_type || "C3D4")}</select></label>` +
     `<label class="inline xp-f">Hexahedra<select data-mesh="hex_type">${optList([["C3D8R", "C3D8R (reduced integration)"], ["C3D8", "C3D8 (full integration)"]], m.hex_type || "C3D8R")}</select></label>` +
     `<label class="inline xp-f">Elements per 360 deg<input type="text" data-mesh="curvature" value="${esc(m.curvature === undefined ? "" : m.curvature)}" placeholder="12" style="width:40px"></label>` +
+    `<label class="inline xp-f">Shell elements<select data-mesh="shell_type">${optList([["S4R", "S4R"], ["S4", "S4"], ["S3", "S3 (triangles)"]], m.shell_type || "S4R")}</select></label>` +
+    `<label class="inline xp-f">Shell mesh<select data-mesh="shell_algorithm">${optList([["quasi", "Quasi-structured quadrangles"], ["frontal", "Frontal-Delaunay for quadrangles"], ["delaunay", "Delaunay, recombined"], ["tri", "Triangles only"]], m.shell_algorithm || "quasi")}</select></label>` +
     `<label class="check inline"><input type="checkbox" id="xp-bonded"${XP.doc.bonded !== false ? " checked" : ""}> Bonded: touching deformable bodies share nodes</label></div>`;
-  h += `<h3 class="xp-h">Supports</h3>` + ((XP.doc.supports || []).length ? `<table class="fa-tbl xp-sups"><tr><th>Name</th><th>Face</th><th>ux</th><th>uy</th><th>uz</th><th></th></tr>` +
-    XP.doc.supports.map(s => `<tr data-sup="${esc(s.id)}"${XP.sel && XP.sel.sup === s.id ? ' class="sel"' : ""}><td><input type="text" data-sk="name" value="${esc(s.name)}" style="width:80px"></td><td class="xp-face">${esc(faceText(s.target))}</td>` +
-      [0, 1, 2].map(i => `<td><input type="checkbox" data-sd="${i}"${(s.dofs || [1, 1, 1])[i] ? " checked" : ""}></td>`).join("") +
-      `<td><button type="button" class="small" data-spick="${esc(s.id)}" title="Pick the face again">Pick</button><button type="button" class="small" data-sdel="${esc(s.id)}" title="Delete">×</button></td></tr>`).join("") + `</table>`
-    : `<p class="hint">Support in the toolbar: click a face of a deformable body. The checked displacements of its nodes are held (*BOUNDARY).</p>`);
+  h += `<h3 class="xp-h">Supports</h3>` + ((XP.doc.supports || []).length ? `<table class="fa-tbl xp-sups"><tr><th>Name</th><th>Face or edge</th><th>Preset</th>${DOF6.map(n => `<th>${n}</th>`).join("")}<th></th></tr>` +
+    XP.doc.supports.map(s => { const dofs = (s.dofs || [1, 1, 1]).concat([0, 0, 0]).slice(0, 6); const pre = (SUP_PRESETS.find(([v]) => v && PRESET_DOFS[v].every((x, i) => x === dofs[i])) || [""])[0];
+      return `<tr data-sup="${esc(s.id)}"${XP.sel && XP.sel.sup === s.id ? ' class="sel"' : ""}><td><input type="text" data-sk="name" value="${esc(s.name)}" style="width:80px"></td><td class="xp-face">${esc(faceText(s.target))}</td>` +
+      `<td><select data-spre>${optList(SUP_PRESETS, pre)}</select></td>` +
+      DOF6.map((n, i) => `<td><input type="checkbox" data-sd="${i}"${dofs[i] ? " checked" : ""}></td>`).join("") +
+      `<td><button type="button" class="small" data-spick="${esc(s.id)}" title="Pick the face or edge again">Pick</button><button type="button" class="small" data-sdel="${esc(s.id)}" title="Delete">×</button></td></tr>`; }).join("") + `</table>` +
+      `<p class="hint">The checked components of the nodes of the face or edge are held (*BOUNDARY); rx, ry, rz act on the shell nodes only.</p>`
+    : `<p class="hint">Support in the toolbar: click a face or an edge of a deformable body or shell. The checked components of its nodes are held (*BOUNDARY).</p>`);
   if (XP.pick) h += `<p class="fa-pick">${esc(XP.pick.text)}</p>`;
-  h += XP.meshSummary ? summaryHtml(XP.meshSummary) : `<p class="hint">Write .inp meshes the bodies and writes the model .inp.</p>`;
+  h += XP.meshSummary ? summaryHtml(XP.meshSummary) : `<p class="hint">Mesh (toolbar) meshes the bodies and shells, writes the model .inp and shows the mesh.</p>`;
   box.innerHTML = h;
   $("#xp-kind").onchange = setKind;
   bindMaterials(box);
@@ -580,6 +651,18 @@ function renderModel() {
     });
     tr.onclick = e => { if (e.target.closest("select, input")) return; XP.sel = { comp: cid }; renderModel(); draw(); };
   });
+  box.querySelectorAll("tr[data-shell]").forEach(tr => {
+    const key = tr.dataset.shell;
+    tr.querySelectorAll("[data-hk]").forEach(el => el.onchange = () => {
+      XP.doc.shells = XP.doc.shells || {};
+      const b = XP.doc.shells[key] = XP.doc.shells[key] || {};
+      const k = el.dataset.hk, v = el.value;
+      if (k === "t" || k === "size") { const x = fnum(v); if (isFinite(x) && x > 0) b[k] = x; else delete b[k]; }
+      else if (v && !(k === "mode" && v === "shell") && !(k === "offset" && v === "mid")) b[k] = v; else delete b[k];
+      if (!Object.keys(b).length) delete XP.doc.shells[key];
+      changed(); draw();
+    });
+  });
   box.querySelectorAll("[data-mesh]").forEach(el => el.onchange = () => {
     const k = el.dataset.mesh, v = el.value.trim();
     XP.doc.mesh = XP.doc.mesh || {};
@@ -591,13 +674,14 @@ function renderModel() {
   box.querySelectorAll("tr[data-sup]").forEach(tr => {
     const s = XP.doc.supports.find(x => x.id === tr.dataset.sup);
     tr.querySelector("[data-sk=name]").onchange = e => { s.name = e.target.value; changed(); };
-    tr.querySelectorAll("[data-sd]").forEach(el => el.onchange = () => { s.dofs = s.dofs || [1, 1, 1]; s.dofs[+el.dataset.sd] = el.checked ? 1 : 0; changed(); });
+    tr.querySelectorAll("[data-sd]").forEach(el => el.onchange = () => { s.dofs = (s.dofs || [1, 1, 1]).concat([0, 0, 0]).slice(0, 6); s.dofs[+el.dataset.sd] = el.checked ? 1 : 0; changed(); renderModel(); });
+    tr.querySelector("[data-spre]").onchange = e => { if (e.target.value) { s.dofs = PRESET_DOFS[e.target.value].slice(); changed(); renderModel(); } };
     tr.onclick = e => { if (e.target.closest("input, button")) return; XP.sel = { sup: s.id }; renderModel(); draw(); };
   });
   box.querySelectorAll("[data-sdel]").forEach(b => b.onclick = () => { XP.doc.supports = XP.doc.supports.filter(x => x.id !== b.dataset.sdel); changed(); renderModel(); draw(); });
   box.querySelectorAll("[data-spick]").forEach(b => b.onclick = () => {
     const s = XP.doc.supports.find(x => x.id === b.dataset.spick);
-    startPick("Click the face of support " + s.name, ref => { s.target = ref; });
+    startPick("Click the face or edge of support " + s.name, ref => { s.target = ref; });
   });
 }
 /** Materials table of the document (ShinyCAD and deck generator sources). */
@@ -630,6 +714,7 @@ function bindMaterials(box) {
         for (const [a, b] of Object.entries(mm)) o[a === n ? nn : a] = b;
         XP.doc.materials = o;
         for (const b of Object.values(XP.doc.bodies || {})) if (b.material === n) b.material = nn;
+        for (const b of Object.values(XP.doc.shells || {})) if (b.material === n) b.material = nn;
         if (XP.doc.deck && XP.doc.deck.material === n) XP.doc.deck.material = nn;
         if (XP.doc.default_material === n) XP.doc.default_material = nn;
       } else if (k === "library") mm[n].library = el.value;
@@ -681,7 +766,7 @@ async function writeInp() {
   if (isShiny() && !(XP.doc.source || {}).name) { status("Choose the geometry first", true); return; }
   busy(true, "Writing the model .inp ...");
   try {
-    const j = await pollJob((await (await postJSON("/api/explicit/model", req())).json()).job, "Write .inp");
+    const j = await pollJob((await (await postJSON("/api/explicit/model", req())).json()).job, "Mesh");
     if (j.state === "error") throw new Error(j.error);
     XP.mesh = j.result.payload; XP.meshSummary = j.result.summary;
     $("#xp-show").value = "mesh";
@@ -708,7 +793,7 @@ async function showInpMesh() {
 }
 function addSupport() {
   if (!isShiny()) { status(isDeck() ? "Deck generator: Edge supports in Model" : "Supports are defined for the ShinyCAD geometry; an external .inp carries its own *BOUNDARY", true); return; }
-  startPick("Click the face of the support", ref => {
+  startPick("Click the face or edge of the support", ref => {
     const id = "s" + (XP.doc.next++);
     XP.doc.supports.push({ id, name: "Support " + (XP.doc.supports.length + 1), target: ref, dofs: [1, 1, 1] });
     XP.sel = { sup: id };
@@ -762,7 +847,7 @@ function deckHtml() {
     (st ? `<button type="button" class="small" id="xp-dk-openpart">Open part ${esc(st.part)}</button>` : "") + `</div>` +
     `<p class="hint">Writes &lt;name&gt;_deck.step (one named component per element set) and &lt;name&gt;_deck_model.json to the step folder of the project, and the part &lt;name&gt;_deck with one Import surface feature per component.</p>` +
     (st ? `<p class="hint">${esc(st.step)}: ${esc(st.components.join(", "))}</p>` : "");
-  h += XP.meshSummary ? deckSummaryHtml(XP.meshSummary) : `<p class="hint">Write .inp meshes the deck and writes the model .inp.</p>`;
+  h += XP.meshSummary ? deckSummaryHtml(XP.meshSummary) : `<p class="hint">Mesh meshes the deck and writes the model .inp.</p>`;
   return h;
 }
 
@@ -1190,7 +1275,7 @@ function renderBuild() {
   const spec = M.mode_spec[mode] || {};
   const rbvs = spec.rbv_values || M.rbv_modes;
   let h = `<div class="row">${selS("analysis_mode", "Analysis", M.analysis_modes)}</div><p class="hint">${esc(M.mode_help[mode] || "")}</p>`;
-  const inp = isModel() ? "(model .inp of the document: Write .inp)" : ((XP.doc.source || {}).inp || "(choose the .inp in Model)");
+  const inp = isModel() ? "(model .inp of the document: Mesh)" : ((XP.doc.source || {}).inp || "(choose the .inp in Model)");
   h += `<p class="hint">Source .inp: ${esc(inp)}<br>Output Dir: ${esc(S("out_dir") || "(next to the .inp)")}</p>`;
   h += `<div class="row wrap">${inS("tstop", "Time (Tstop) [s]", 60)}${inS("anim_frames", "Frames", 46)}${inS("fric", "Fric", 46)}` +
     `${inS("dt_min", "Min dt [s]", 70, "Mass scaling floor (/DT/NODA/CST DTmin); 0 = off")}${inS("dt_target_dmm", "target DM/M %", 36)}` +
@@ -1619,8 +1704,8 @@ function renderAllPanels() {
   renderModel(); renderRuns(); renderBuild(); renderSolve(); renderResults();
   $("#xp-supbtn").disabled = !isShiny();
   const mb = $("#xp-model-btn");
-  (mb.querySelector(".tb-lbl") || mb).textContent = isModel() ? "Write .inp" : "Show mesh";
-  $("#xp-model-btn").title = isDeck() ? "Mesh the deck (structured shells) and write the model .inp" : isShiny() ? "Mesh the bodies and write the model .inp" : "Show the mesh of the .inp";
+  (mb.querySelector(".tb-lbl") || mb).textContent = isModel() ? "Mesh" : "Show mesh";
+  $("#xp-model-btn").title = isDeck() ? "Mesh the deck (structured shells), write the model .inp and show the mesh" : isShiny() ? "Mesh the bodies and shells, write the model .inp and show the mesh" : "Show the mesh of the .inp";
 }
 let FM = null;
 function refreshList() { if (FM) FM.refresh(); refreshSources(); refreshRuns(); }
@@ -1700,7 +1785,7 @@ window.xpShown = async function () {
   $("#xp-supbtn").onclick = addSupport;
   document.querySelectorAll("#tab-xp [data-xpview]").forEach(b => b.onclick = () => view(b.dataset.xpview));
   $("#xp-show").onchange = () => {
-    if ($("#xp-show").value === "mesh" && !XP.mesh) { $("#xp-show").value = "model"; status(isModel() ? "Write .inp first" : "Show mesh first", true); }
+    if ($("#xp-show").value === "mesh" && !XP.mesh) { $("#xp-show").value = "model"; status(isModel() ? "Mesh first" : "Show mesh first", true); }
     if ($("#xp-show").value === "results" && !XP.res.frame) { $("#xp-show").value = XP.mesh ? "mesh" : "model"; status("Choose a job with frames in Results", true); }
     if (XP.three) XP.three.zoomed = false;
     draw();

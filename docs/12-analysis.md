@@ -2,7 +2,7 @@
 
 # 12. Analysis
 
-The **Analysis** tab runs a linear static, modal or linear buckling analysis with CalculiX (`ccx`, version 2.21). The model holds the bodies of a saved assembly or part, plates, beams, rods and fasteners. Plates and members are defined in the tab; a model of members and plates needs no geometry. The CalculiX input file, the result files and a text report are written to `analysis/<Name>/` of the project.
+The **Analysis** tab runs a linear static, modal or linear buckling analysis with CalculiX (`ccx`, version 2.21). The model holds the bodies of a saved assembly or part, shells (the surface bodies of the parts and the surface components of STEP files), plates, beams, rods and fasteners. Plates and members are defined in the tab; a model of members and plates needs no geometry. The CalculiX input file, the result files and a text report are written to `analysis/<Name>/` of the project.
 
 Units: mm, N, s, t (tonne): stress and pressure MPa (N/mm^2), moment N mm, line load N/mm, acceleration mm/s^2. Densities are entered in kg/m^3 (converted to t/mm^3).
 
@@ -17,8 +17,8 @@ The panel at the right is 480 px wide; the bar at its left edge changes the widt
 | Control | Function |
 |---|---|
 | **File ▾** | Project header, **Analysis** (saved analyses of the open project), **New**, **Save**, **Save as…**, **Rename…**, **Open run folder** (`analysis/<Name>/`), **Write input file** (mesh and `job.inp` without solving) |
-| **Geometry** | Saved assembly or part of the project, or **(none: members and plates)**. A part is one body. The analysis uses the saved file of the assembly. The sketches of a part that no feature of the part uses are drawn (purple lines and points); a part with sketches only is not a body. Member ends and plate points snap to the sketch points ([section 12.4](#124-members)) |
-| **Mesh** | Meshes the bodies, writes `job.inp` and shows the mesh. The status line gives the node and element counts and the element types per body. **Edges** draws the element edges (quadrangle faces of hexahedra without diagonals) |
+| **Geometry** | Saved assembly or part of the project, or **(none: members and plates)**. A part is one body. The analysis uses the saved file of the assembly. The sketches of a part that no feature of the part uses are drawn (purple lines and points); a part with sketches only is not a body. The surface bodies of a component are shells ([section 12.3](#123-model)), drawn translucent in their colour of the Part tab (shells set to **off** faint). Parts are imported and placed in the Assembly tab (**Add part**, **Add STEP**, **Position**, mates, **Drag**, **Move 2 pts**, [section 11](11-assembly.md#11-assembly)) and the assembly is the geometry. Member ends and plate points snap to the sketch points ([section 12.4](#124-members)) |
+| **Mesh** | Meshes the bodies and shells, writes `job.inp` and shows the mesh (**Show** **Mesh**); supports and loads are applied to the mesh nodes before the solve. The status line gives the node and element counts and the element types per body. **Edges** draws the element edges (quadrangle faces of hexahedra without diagonals) |
 | **Solve** | Meshes, writes `job.inp`, runs CalculiX and shows the results. The status line gives the stage and the time |
 | **Stop** | Stops the solver |
 | **Beam**, **Rod** | Adds a member: pick end A, then end B in the view ([section 12.4](#124-members)). The member gets the section, material, group, up vector, elements and hinges of the selected member of the same kind, else of the last one. After end B the next member starts with the same properties; Esc (or another toolbar command) ends the drawing and removes the member without ends. Esc on the first member keeps it for typed coordinates. **Sketch beams** uses the same properties |
@@ -26,8 +26,8 @@ The panel at the right is 480 px wide; the bar at its left edge changes the widt
 | **Plate on face**, **Plate by points** | Adds a plate ([section 12.5](#125-plates)) |
 | **Fastener** | Adds a fastener ([section 12.6](#126-fasteners)) |
 | **Ref. point** | Adds a reference point ([section 12.6.1](#1261-reference-points)): click the faces to connect (the first face sets the point at its centre); Esc ends the face picking |
-| **Support** | Adds a support at the selected member end or reference point; with no member end selected, starts the pick of a face or a member end ([section 12.7](#127-supports)) |
-| **Load** | Adds a force at the selected member end; with no member end selected, starts the pick of a face, a member end (force at the end) or a member (line load, 1 N/mm downwards) ([section 12.8](#128-loads)) |
+| **Support** | Adds a support at the selected member end or reference point; with no member end selected, starts the pick of a face, an edge or a member end ([section 12.7](#127-supports)) |
+| **Load** | Adds a force at the selected member end; with no member end selected, starts the pick of a face, an edge (line load, 1 N/mm downwards), a member end (force at the end) or a member (line load, 1 N/mm downwards) ([section 12.8](#128-loads)) |
 | **Show** | **Model** (bodies, members, fasteners, supports and loads), **Mesh**, **Results** |
 | **Result** | **von Mises stress**, **Displacement \|u\|**, **ux**, **uy**, **uz** as contours on the deformed shape, with the colour scale (12 bands) in the upper left of the view |
 | **State** | **Total**; with a fastener preload also **Step 1 preload** and **Step 2 loads**; modal and buckling: **Mode 1: f Hz** or **Mode 1: factor x**, one entry per mode |
@@ -35,7 +35,7 @@ The panel at the right is 480 px wide; the bar at its left edge changes the widt
 | **Undeformed** | Outline of the undeformed mesh |
 | **Iso**, **Front**, **Top**, **Right**, **Fit**, **Edges**, **Axes** | As in the Assembly tab |
 
-A click on a member, fastener, support or load in the 3D view selects it in the panel. A click within 10 px of a member end selects the end: the end is drawn as a large orange ball and **Members** shows its coordinates. A click on empty space clears the selection. The member end, point or face under the cursor is marked orange before a click (cursor: pointer for selection, crosshair during a pick). Esc cancels a pick.
+A click on a member, fastener, support or load in the 3D view selects it in the panel. A click within 10 px of a member end selects the end: the end is drawn as a large orange ball and **Members** shows its coordinates. A click on empty space clears the selection. The member end, point, edge or face under the cursor is marked orange before a click (cursor: pointer for selection, crosshair during a pick). During the pick of a support or a load, an edge of a component within 8 px of the cursor is taken before the face under it. Esc cancels a pick.
 
 ## 12.3 Model
 
@@ -43,7 +43,8 @@ A click on a member, fastener, support or load in the 3D view selects it in the 
 |---|---|
 | **Settings** | **Solver (ccx)**; **Analysis type** and **Number of modes** ([section 12.10](#1210-modal-and-buckling-analysis)); **Default material**; **Mesh** ([section 12.3.1](#1231-mesh-settings)); **Bonded contact between touching bodies**: touching solid bodies of one mesh strategy are meshed with shared nodes at the contact faces (gmsh fragment); plates and bodies of other strategies are tied (`*TIE`) to the faces they touch. Without it the bodies are connected only by members and fasteners |
 | **Materials** | Name, E (MPa), nu, rho (kg/m^3). **Add material**, × deletes |
-| **Bodies** | One row per component of the geometry: **Model** **solid** (meshed with the strategy in **Mesh**), **plate** (C3D8I through the thickness, C3D6 for the triangles left by the quadrangle mesh) or **off** (left out); **Mesh**: the strategy of the body (**tet**, **hex**, **hex sub**; in brackets: the default of **Settings**); **Material**; **Size (mm)** of the elements of the body |
+| **Shells** | One row per surface body of a component (**Component / surface body**): **Model** **shell** or **off**; **t (mm)** thickness (empty: 10 mm); **Position** **mid** (the surface is the mid-surface), **positive** or **negative** (the shell lies on that side of the surface, along the element normal; `*SHELL SECTION` `OFFSET` 0.5 or -0.5); **Material**; **Size (mm)** element size of the shell. The faces of all shells are meshed together (**Shell elements**, **Shell mesh** in [section 12.3.1](#1231-mesh-settings)); with **Bonded contact between touching bodies**, shells that touch or cross share their nodes on the common lines (gmsh fragment), and shell nodes on the faces of solid bodies are tied to them (`*TIE`). A face shared by two shells belongs to the shell listed first |
+| **Bodies** | One row per component of the geometry with a solid: **Model** **solid** (meshed with the strategy in **Mesh**), **plate** (C3D8I through the thickness, C3D6 for the triangles left by the quadrangle mesh) or **off** (left out); **Mesh**: the strategy of the body (**tet**, **hex**, **hex sub**; in brackets: the default of **Settings**); **Material**; **Size (mm)** of the elements of the body |
 
 ### 12.3.1 Mesh settings
 
@@ -57,6 +58,8 @@ A click on a member, fastener, support or load in the 3D view selects it in the 
 | **Elements per 360 deg of curvature** | Refinement on curved faces (empty: 12; 0: off) |
 | **3D algorithm** | **Delaunay**, **Frontal**, **HXT** (parallel Delaunay) for the tetrahedra |
 | **Optimise the mesh** | gmsh optimisation of the elements |
+| **Shell elements** | **S4** (CalculiX expands it to C3D8I elements), **S8R** (second order) or **S3** (triangles). The triangles the quadrangle mesh leaves are S3 (S6 with S8R) |
+| **Shell mesh** | gmsh surface algorithm of the shells: **Quasi-structured quadrangles** (the algorithm makes elements of about half the size it reads; the size is set at twice the element size), **Frontal-Delaunay for quadrangles**, **Delaunay, recombined**, **Triangles only** (S3) |
 
 The solid bodies of one strategy are meshed together (shared nodes with **Bonded contact**); bodies of different strategies, and plates, are tied where they touch. Body weight is distributed with the consistent nodal fractions of the element type. The report gives the mesh settings and the element counts per body and type.
 | **Members** | List and properties of the members. See 12.4 |
@@ -148,6 +151,7 @@ Supports and loads act on a reference point: select it (in the list or the view)
 
 | Target | Type |
 |---|---|
+| Edge, face of a shell | **fixed**: all six components; **pinned**: ux, uy, uz; **symmetry X** (ux, ry, rz), **symmetry Y** (uy, rx, rz), **symmetry Z** (uz, rx, ry); **chosen components**; **prescribed displacement**; on a face of a shell also **normal to the face (planar)**. The translations act on all nodes of the edge or face, the rotations on its shell nodes (nodes of solid elements have no rotations: a warning in the report). The nodes of an edge are the mesh nodes of the bodies and shells of the component on the edge curve |
 | Face | **fixed**: ux, uy, uz of all face nodes. **normal to the face (planar)**: displacement normal to the face (`*TRANSFORM`), 0 or **Normal displacement (mm, along the outward normal)**. **chosen components**: ux, uy, uz, rx, ry, rz as checked. **prescribed displacement**: the checked components prescribed (mm, rad), the others free. With rx, ry or rz checked the face is rigidly coupled (kinematic coupling) to a node at its weighted centre, which carries all checked components; the face then stays rigid |
 | Reference point | As a member end: **fixed** (all six), **pinned**, **chosen components**, **prescribed displacement** ([section 12.6.1](#1261-reference-points)) |
 | Member end | **fixed**: all six. **pinned**: ux, uy, uz. **chosen components**: as checked. **prescribed displacement**: the checked components of ux, uy, uz (mm) and rx, ry, rz (rad). At a rod-only node the rotations are left out |
@@ -165,15 +169,16 @@ Prescribed displacements act in the load step; with a fastener preload step they
 | **Moment on a face** | N mm about the weighted face centre, distributed as nodal forces by area (the RBE3 distribution) |
 | **Force at a member end**, **Moment at a member end** | N, N mm (global) at the end node. A moment needs a beam end |
 | **Line load on a member** | N/mm (global) along the whole member |
+| **Line load on an edge** | N/mm (global) along an edge of a body or shell, distributed over the edge nodes by their tributary length |
 | **Gravity** | Acceleration (mm/s^2), for example (0, 0, -9810). Bodies: consistent nodal loads of the element weights (C3D10: corner nodes -1/20, mid-side nodes 1/5 of the element weight). Members: line load rho A g. Fasteners: none |
 
-**Pick** in the load panel takes a face, a member end or a member and sets the type to match (pressure: a face only).
+**Pick** in the load panel takes a face, an edge, a member end or a member and sets the type to match (pressure: a face only; line load on an edge: an edge only). Forces, moments and pressures on a face of a shell are distributed over the shell nodes of the face.
 
 ## 12.9 Results
 
 | Table | Content |
 |---|---|
-| Bodies | Largest displacement and largest von Mises stress (nodal values averaged by CalculiX) per body |
+| Bodies | Largest displacement and largest von Mises stress (nodal values averaged by CalculiX) per body and shell. Shells: CalculiX writes the expanded 3D elements; the displacement of a shell node is the mean of its bottom and top layer nodes, the stress that of the layer with the larger von Mises stress |
 | Members | Largest section forces in the local axes: N (tension positive), V1, V2, T, M1, M2, and sig = \|N\| / A + \|M1\| c2 / I22 + \|M2\| c1 / I11 (ROUND and PIPE: \|N\| / A + M r / I). Section forces are those of the positive face (force of the part towards end B on the part towards end A), evaluated at both element ends and at the quarter points |
 | Fasteners | N, shear V, bending moment M, torsion T, and sig = \|N\| / A + M d / (2 I) |
 | Reactions | Force and moment of each support (moment about the weighted face centre or about the member node), their sum, and the applied loads |
@@ -203,7 +208,7 @@ Meshing runs in a separate process (`drawgen/femesh.py`) and stops after 1800 s.
 | **Modal (natural frequencies)** | `*FREQUENCY` with **Number of modes** (1 to 100) | Natural frequencies (Hz), effective modal mass per direction as a percentage of the total effective mass, mode shapes |
 | **Linear buckling** | `*BUCKLE` with **Number of modes** | Buckling factors and mode shapes. Critical loads: buckling factor x the applied loads and prescribed displacements; a negative factor: buckling under the reversed loads |
 
-Modal and buckling analyses take solid bodies, plates and rods. Beams and fasteners are refused (the CalculiX U1 beam element has no mass and no stress stiffness). A modal analysis needs a density for every material used and does not use the loads; supports hold their degrees of freedom with prescribed displacements set to 0. A buckling analysis needs loads or prescribed displacements.
+Modal and buckling analyses take solid bodies, shells, plates and rods. Beams and fasteners are refused (the CalculiX U1 beam element has no mass and no stress stiffness). A modal analysis needs a density for every material used and does not use the loads; supports hold their degrees of freedom with prescribed displacements set to 0. A buckling analysis needs loads or prescribed displacements.
 
 The mode shapes are normalised to a largest displacement of 1; **Result** offers **Displacement |u|**, **ux**, **uy**, **uz** (the legend reads "normalised"). The results panel lists the modes; a click on a row shows the mode. The report gives the analysis type, the table of frequencies (with the effective modal mass) or buckling factors, and the largest mode shape displacement per body and mode.
 

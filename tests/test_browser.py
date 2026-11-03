@@ -383,6 +383,101 @@ def test_part_hover_round_edges_and_faces(page, client):
     assert t[2].endswith(", Ø20 mm")
 
 
+def test_surface_bodies_in_analysis_explicit_and_assembly_views(page, client):
+    """A part with a solid and a surface body, and a part with surface bodies only: the surface bodies are drawn
+    translucent in the Analysis, Explicit and Assembly views (hidden surface bodies are not) and are pickable; the
+    Shells tables; a support picked on an edge (symmetry types offered) and, with CalculiX, solved; the Explicit
+    Mesh button and a support on an edge; Move 2 pts in the Assembly tab (vertex to vertex)."""
+    def surf(fid, name, plane, w, h):
+        from conftest import rect
+        return {"id": fid, "name": name, "type": "surf_sketch", "kind": "planar", "plane": plane, "offset": 0,
+                "sketch": {"entities": rect(w, h)}}
+    p = plate("ui_surf", 100.0, 50.0, 10.0, 0.0)
+    p["features"] += [surf("s1", "Wall", "XZ", 100, 60), surf("s2", "Hidden", "YZ", 50, 60)]
+    p["hidden"] = ["s2"]
+    client.put("/api/part/file/ui_surf", json=p)
+    client.put("/api/part/file/ui_surf_only", json={"name": "ui_surf_only", "version": 2, "next": 2,
+                                                      "features": [surf("s1", "Sheet", "XY", 40, 20)]})
+    client.put("/api/assembly/file/ui_surf_asm", json={"name": "ui_surf_asm", "next": 3, "components": [
+        {"id": "1", "name": "body", "source": {"type": "part", "name": "ui_surf"}, "pos": [0, 0, 0], "rot": [0, 0, 0]},
+        {"id": "2", "name": "sheet", "source": {"type": "part", "name": "ui_surf_only"}, "pos": [0, 0, 30], "rot": [0, 0, 0]}]})
+    # translucent materials of the component meshes (surface bodies: one material per body in the mesh groups)
+    count = ("(g) => { let n = 0; g.traverse(o => { if (!o.isMesh) return; for (const m of [].concat(o.material)) "
+             "if (m.transparent && m.opacity < 1 && m.opacity > 0.1) n++; }); return n; }")
+    translucent = lambda group: page.evaluate("(%s)(%s)" % (count, group))
+    # screen point of a global point in a view (FA, XP or AS)
+    scr = ("([T, p]) => { const r = T.renderer.domElement.getBoundingClientRect();"
+           " const v = new (Object.getPrototypeOf(T.camera.position).constructor)(...p).project(T.camera);"
+           " return [r.left + (v.x + 1) / 2 * r.width, r.top + (1 - v.y) / 2 * r.height]; }")
+    tab(page, "fea")
+    page.wait_for_function("window.__fea && window.__fea.FA.doc")
+    page.evaluate("() => { const s = document.getElementById('fa-source'); s.insertAdjacentHTML('beforeend', '<option value=\"assembly:ui_surf_asm\">ui_surf_asm</option>'); s.value = 'assembly:ui_surf_asm'; s.dispatchEvent(new Event('change')); }")
+    page.wait_for_function("window.__fea.FA.geo && window.__fea.FA.geo.components.length === 2 && window.__fea.FA.three.group.children.length")
+    wait_text(page, "#fa-info", "2 component(s)")
+    geo = page.evaluate("window.__fea.FA.geo.components.map(c => [c.id, c.error, c.mesh.vertices.length > 0, c.surfaces.map(s => s.name)])")
+    assert geo == [["1", None, True, ["Wall"]], ["2", None, True, ["Sheet"]]]
+    assert translucent("window.__fea.FA.three.group") == 2
+    assert page.evaluate("window.__fea.FA.three.pickables.filter(o => o.userData.comp === '2').length") == 1
+    assert page.locator("#fa-bodies tr[data-shell]").count() == 2 and page.locator("#fa-bodies tr[data-id]").count() == 1
+    page.fill("#fa-bodies tr[data-shell='2:s1'] [data-k=t]", "3")
+    page.dispatch_event("#fa-bodies tr[data-shell='2:s1'] [data-k=t]", "change")
+    assert page.evaluate("window.__fea.FA.doc.shells['2:s1'].t") == 3
+    if os.environ.get("DRAWGEN_SHOTS"):
+        page.screenshot(path=os.path.join(os.environ["DRAWGEN_SHOTS"], "fea_surfaces.png"))
+    # support on the edge x = 0 of the sheet (local midpoint (0, 10, 0), global z 30)
+    page.click("#fa-add-sup")
+    xy = page.evaluate("(a) => (%s)([window.__fea.FA.three, a])" % scr, [0, 10, 30])
+    page.mouse.move(xy[0] + 3, xy[1] + 2)
+    assert page.evaluate("!!window.__fea.FA.three.hover")
+    page.mouse.click(xy[0] + 3, xy[1] + 2)
+    page.wait_for_function("(() => { const s = window.__fea.FA.doc.supports[0]; return s && s.target && s.target.edge !== undefined; })()")
+    sup = page.evaluate("window.__fea.FA.doc.supports[0].target")
+    er = page.evaluate("window.__fea.FA.geo.components[1].erefs[%d]" % sup["edge"])
+    assert sup["comp"] == "2" and er["kind"] == "line" and abs(er["c"][0]) < 1e-6
+    assert "line edge" in page.inner_text("#fa-sups") and page.locator("#fsp-type option[value=xsymm]").count() == 1
+    from test_analysis import CCX
+    if CCX is not None:
+        page.evaluate("""() => { const d = window.__fea.FA.doc; d.bodies = { "1": { mode: "off" } }; d.shells["1:s1"] = { mode: "off" };
+            d.loads.push({ id: "lg", name: "g", type: "gravity", value: [0, 0, -9810] }); }""")
+        page.click("#fa-solve")
+        page.wait_for_function("window.__fea.FA.res && window.__fea.FA.res.tables", timeout=180000)
+        b = page.evaluate("window.__fea.FA.res.tables.total.bodies")
+        assert [x["name"] for x in b] == ["sheet / Sheet"] and b[0]["umax"] > 0
+    tab(page, "xp")
+    page.wait_for_function("window.__xp && window.__xp.XP.doc && window.__xp.XP.meta")
+    page.select_option("#xp-source", "assembly:ui_surf_asm")
+    page.wait_for_function("window.__xp.XP.geo && window.__xp.XP.geo.components.length === 2 && window.__xp.XP.three.group.children.length")
+    assert page.evaluate("window.__xp.XP.geo.components.map(c => c.surfaces.length)") == [1, 1]
+    assert translucent("window.__xp.XP.three.group") == 2
+    assert page.locator(".xp-shells tr[data-shell]").count() == 2
+    assert page.inner_text("#xp-model-btn").strip() == "Mesh"
+    page.click("#xp-supbtn")
+    xy = page.evaluate("(a) => (%s)([window.__xp.XP.three, a])" % scr, [40, 10, 30])
+    page.mouse.click(xy[0] + 2, xy[1] + 3)
+    page.wait_for_function("window.__xp.XP.doc.supports.length === 1 && window.__xp.XP.doc.supports[0].target.edge !== undefined")
+    page.select_option(".xp-sups [data-spre]", "xsymm")
+    assert page.evaluate("window.__xp.XP.doc.supports[0].dofs") == [1, 0, 0, 0, 1, 1]
+    if os.environ.get("DRAWGEN_SHOTS"):
+        page.screenshot(path=os.path.join(os.environ["DRAWGEN_SHOTS"], "xp_surfaces.png"))
+    tab(page, "asm")
+    page.evaluate("window.__asmLoadNamed('ui_surf_asm')")
+    page.wait_for_function("window.__asm.AS.result && window.__asm.AS.result.components.length === 2 && window.__asm.AS.three.group.children.length === 2")
+    assert translucent("window.__asm.AS.three.group") == 2
+    if os.environ.get("DRAWGEN_SHOTS"):
+        page.screenshot(path=os.path.join(os.environ["DRAWGEN_SHOTS"], "asm_surfaces.png"))
+    # Move 2 pts: the corner (0, 0, 30) of the sheet to the top corner (100, 0, 10) of the body
+    page.click("#as-move2")
+    for p_ in ([0, 0, 30], [100, 0, 10]):
+        xy = page.evaluate("(a) => (%s)([window.__asm.AS.three, a])" % scr, p_)
+        page.mouse.move(xy[0] + 4, xy[1] + 3)
+        page.mouse.click(xy[0] + 4, xy[1] + 3)
+        time.sleep(0.2)
+    page.wait_for_function("(() => { const c = window.__asm.comp('2'); return c && c.pos[0] === 100; })()")
+    assert page.evaluate("window.__asm.comp('2').pos") == [100, 0, 10]
+    page.keyboard.press("Escape")
+    assert page.evaluate("window.__asm.AS.move2") is None
+
+
 def test_analysis_plate_by_points(page, client):
     tab(page, "fea")
     page.wait_for_function("window.__fea && window.__fea.FA.doc")
@@ -4832,12 +4927,11 @@ def test_dimension_horizontal_text_drag_and_clear(page, client):
     page.wait_for_function("ED.anns.length === 2")
     # Decimals of the dimension: the select writes the dimension's decimals and the text shows them
     page.evaluate("select(ED.anns[0].id)")
-    page.select_option("#ann-decimals", "2")
-    page.dispatch_event("#ann-decimals", "change")
+    set_dec = "v => { const s = document.querySelector('#ann-decimals'); s.value = v; s.dispatchEvent(new Event('change')); }"
+    page.evaluate(set_dec, "2")
     page.wait_for_function("ED.anns[0].decimals === 2")
     page.wait_for_function("[...document.querySelectorAll('g.ann text')].some(t => /^\\d+\\.\\d\\d$/.test(t.textContent.trim()))")
-    page.select_option("#ann-decimals", "")
-    page.dispatch_event("#ann-decimals", "change")
+    page.evaluate(set_dec, "")
     page.wait_for_function("ED.anns[0].decimals === undefined")
     # the tolerance text option: deviations with the µm unit in the drawing and the mm unit in the fields
     page.evaluate("setOption('tol_unit', 'mm')")
@@ -4864,3 +4958,49 @@ def test_drawing_right_click_returns_to_select(page, client):
     page.mouse.click(box[0], box[1], button="right")
     page.wait_for_function("ED.tool === 'select' && ED.pick.length === 0")
     assert page.evaluate("document.querySelector('#ann-tools button[data-tool=select]').classList.contains('active')")
+
+
+def test_drawing_manual_centre_mark_and_line(page, client):
+    """Drawings: the Centre tool (key C) makes a centre mark from a click on a circle (two chain lines crossing at
+    the centre) and a centre line from two point picks; a drag moves the mark; the properties show no dimension
+    fields for it."""
+    client.put("/api/part/file/ui_cm", json=plate("ui_cm"))
+    tab(page, "part")
+    file_menu(page, "#tab-part")
+    page.select_option("#pt-list", "ui_cm")
+    wait_text(page, "#pt-info", "Volume")
+    file_menu(page, "#tab-part")
+    page.click("#pt-draw")
+    page.wait_for_selector("#ann-canvas svg", timeout=120000)
+    page.wait_for_function("typeof ED !== 'undefined' && ED.d && ED.d.maps && ED.circles.length")
+    assert page.is_visible("#ann-tools button[data-tool=centre]")
+    page.evaluate("document.activeElement && document.activeElement.blur()")
+    page.keyboard.press("c")
+    page.wait_for_function("ED.tool === 'centre'")
+    # the hole in the top view: a click on its circle
+    page.evaluate("() => { const c = ED.circles.find(x => x.view === 'top' && x.kind !== 'hidden') || ED.circles[0]; toolClick(c.X + c.R, c.Y); }")
+    page.wait_for_function("ED.anns.length === 1 && ED.anns[0].type === 'centre' && ED.anns[0].c && ED.anns[0].r === 10")
+    page.wait_for_function("document.querySelectorAll('g.ann[data-ann=\"' + ED.anns[0].id + '\"] line').length === 4")  # 2 lines + 2 hit lines
+    # a centre line between two snap points of the front view
+    page.evaluate("""() => { const P = ED.snapPts.filter(p => p.view === 'front'); const a = P[0], b = P.find(p => Math.hypot(p.X - a.X, p.Y - a.Y) > 5);
+        toolClick(a.X, a.Y); toolClick(b.X, b.Y); }""")
+    page.wait_for_function("ED.anns.length === 2 && ED.anns[1].p1 && ED.anns[1].p2 && ED.anns[1].view === 'front'")
+    page.evaluate("setTool('select'); select(ED.anns[0].id)")
+    assert page.is_hidden("#ann-dim-fields") and page.is_hidden("#ann-note-fields")
+    assert page.evaluate("document.querySelector('#ann-kind').textContent") == "Centre mark"
+    assert page.is_visible("#ann-centre-ext")
+    page.evaluate("() => { const f = document.querySelector('#ann-centre-ext'); f.value = '6'; f.dispatchEvent(new Event('change')); }")
+    page.wait_for_function("ED.anns[0].ext === 6")
+    page.wait_for_function("""() => { const l = document.querySelector('g.ann[data-ann="' + ED.anns[0].id + '"] line:not([stroke=transparent])');
+        return l && Math.abs(Math.abs(+l.getAttribute('x2') - +l.getAttribute('x1')) - 2 * (10 * ED.d.maps.top[2] + 6)) < 1e-3; }""")
+    c0 = page.evaluate("ED.anns[0].c.slice()")
+    g = page.evaluate("""() => { const g = document.querySelector('g.ann[data-ann="' + ED.anns[0].id + '"]'); const r = g.getBoundingClientRect();
+        const svg = document.querySelector('#ann-canvas svg'); return [r.x + r.width / 2, r.y + 2, ED.vb[2] / svg.clientWidth]; }""")
+    px = 10 / g[2]
+    page.mouse.move(g[0], g[1])
+    page.mouse.down()
+    page.mouse.move(g[0] + px / 2, g[1], steps=4)
+    page.mouse.move(g[0] + px, g[1], steps=4)
+    page.mouse.up()
+    f = page.evaluate("ED.d.maps.top[2]")
+    page.wait_for_function("([c0, f]) => Math.abs(ED.anns[0].c[0] - c0[0] - 10 / f) < 0.5 && Math.abs(ED.anns[0].c[1] - c0[1]) < 0.5", arg=[c0, f])

@@ -4,6 +4,7 @@ import * as THREE from "three";
 import { TumbleControls } from "/static/vendor/TumbleControls.js";
 import { updateAxes } from "/static/axes.js";
 import { createNavCube } from "/static/navcube.js";
+import { addBodyGroups, bodyMaterials, edgeAt as edgeAtScreen, edgeSegments, edgeLabel } from "/static/bodyview.js";
 
 const FA = { doc: null, dirty: false, three: null, geo: null, bbox: null, size: 100,
              sel: null,        // {kind: "member" | "fastener" | "support" | "load" | "rp", id}
@@ -28,9 +29,9 @@ const DIM_LABEL = { b: "b (mm)", h: "h (mm)", d: "d (mm)", t: "t (mm)", tf: "tf 
                     I11: "I11 (mm^4)", I22: "I22 (mm^4)", J: "J (mm^4)", c1: "c1 (mm)", c2: "c2 (mm)" };
 const LOAD_TYPES = { force: "Force on a face", pressure: "Pressure on a face", moment: "Moment on a face",
                      mforce: "Force at a member end or reference point", mmoment: "Moment at a member end or reference point", line: "Line load on a member",
-                     gravity: "Gravity" };
+                     eline: "Line load on an edge", gravity: "Gravity" };
 const COLORS = { support: 0x1c7ed6, load: 0xe03131, fastener: 0xe8590c, connect: 0x2f9e44, beam: 0x364fc7, rod: 0x0c8599,
-                 sel: 0xf08c00, sketch: 0x7048e8 };
+                 sel: 0xf08c00, sketch: 0x7048e8, surface: 0x5b7fb5, surfaceEdge: 0x3a5a8a };
 
 function blankDoc(name) {
   return { name: name || "analysis", source: { type: "assembly", name: "" },
@@ -203,7 +204,9 @@ function hoverView(e) {
   const end = !pk || pk.end || pk.point ? endAt(e) : null;
   if (end) pt = end.xyz;
   else if (pk && pk.point) pt = snapPointAt(e);
-  if (!pt && pk && !pk.noFace) {
+  let edge = null;
+  if (!pt && pk && pk.edge) edge = edgeUnder(e);
+  if (!pt && !edge && pk && !pk.noFace) {
     const h = rayAt(e).intersectObjects(t.pickables, false).find(x => x.object.userData && x.object.userData.comp !== undefined);
     const c = h && compOf(h.object.userData.comp);
     const fi = c && c.mesh ? c.mesh.face_of_tri[h.faceIndex] : null;
@@ -213,9 +216,23 @@ function hoverView(e) {
     const h = hitAt(e);
     item = !!(h && h.object.userData && (h.object.userData.kind || h.object.userData.comp !== undefined));
   }
-  if (pt || face) {
+  if (pt || face || edge) {
     const g = new THREE.Group();
-    if (pt) {
+    if (edge) {
+      const c = compOf(edge.comp), ep = edgeSegments(c.mesh, edge.edge);
+      const eg = new THREE.BufferGeometry();
+      eg.setAttribute("position", new THREE.Float32BufferAttribute(ep, 3));
+      const ls = new THREE.LineSegments(eg, new THREE.LineBasicMaterial({ color: COLORS.sel, depthTest: false }));
+      ls.matrixAutoUpdate = false;
+      ls.matrix.copy(matOf(c));
+      ls.renderOrder = 10;
+      g.add(ls);
+      const pts = new THREE.Points(eg, new THREE.PointsMaterial({ color: COLORS.sel, size: 6, sizeAttenuation: false, depthTest: false }));
+      pts.matrixAutoUpdate = false;
+      pts.matrix.copy(matOf(c));
+      pts.renderOrder = 10;
+      g.add(pts);
+    } else if (pt) {
       const b = new THREE.Mesh(new THREE.SphereGeometry(r * 3.2, 16, 12), new THREE.MeshBasicMaterial({ color: COLORS.sel, transparent: true, opacity: 0.55, depthTest: false }));
       b.position.set(...pt);
       b.renderOrder = 10;
@@ -234,8 +251,15 @@ function hoverView(e) {
     t.hover = g;
     t.scene.add(g);
   }
-  t.renderer.domElement.style.cursor = pk ? (pt || face ? "crosshair" : "") : (end || item) ? "pointer" : "";
+  t.renderer.domElement.style.cursor = pk ? (pt || face || edge ? "crosshair" : "") : (end || item) ? "pointer" : "";
   render3();
+}
+
+/** The edge of a component within 8 px of the cursor: {comp, edge}, or null. */
+function edgeUnder(e) {
+  const comps = ((FA.geo && FA.geo.components) || []).filter(c => c.mesh && !c.plate).map(c => ({ id: c.id, mesh: c.mesh, matrix: matOf(c) }));
+  const h = edgeAtScreen(comps, FA.three.camera, FA.three.renderer.domElement.getBoundingClientRect(), e.clientX, e.clientY, 8);
+  return h ? { comp: h.comp, edge: h.edge } : null;
 }
 
 // ------------------------------------------------------------------ geometry (assembly view data)
@@ -283,8 +307,8 @@ async function loadGeometry() {
     const r = await postJSON("/api/assembly/build", { assembly: asm, have: [...MESHES.keys()] });
     const j = await r.json();
     if (seq !== FA.seq) return;
-    for (const c of j.components) if (c.mkey && c.mesh) MESHES.set(c.mkey, { mesh: c.mesh, refs: c.refs || [] });
-    for (const c of j.components) if (c.mkey && MESHES.has(c.mkey)) { const e = MESHES.get(c.mkey); c.mesh = e.mesh; c.refs = e.refs; }
+    for (const c of j.components) if (c.mkey && c.mesh) MESHES.set(c.mkey, { mesh: c.mesh, refs: c.refs || [], erefs: c.erefs || [], surfaces: c.surfaces || [] });
+    for (const c of j.components) if (c.mkey && MESHES.has(c.mkey)) { const e = MESHES.get(c.mkey); c.mesh = e.mesh; c.refs = e.refs; c.erefs = e.erefs; c.surfaces = e.surfaces; }
     FA.geo = j;
     await loadPlates(true);
     const errs = j.components.filter(c => c.error && !c.plate && !(c.mesh === null && sketchOnly(c.id))).map(c => c.error);
@@ -330,8 +354,17 @@ function meshGeo(mkey) {
     for (const pl of m.edges) for (let k = 0; k + 1 < pl.length; k++) pos.push(...pl[k], ...pl[k + 1]);
     e.edgeGeo = new THREE.BufferGeometry();
     e.edgeGeo.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+    e.groups = addBodyGroups(e.geo, m);
   }
   return e;
+}
+/** Shell settings of a surface body of a component (doc.shells["<component>:<surface>"]). */
+function shellCfg(cid, sid) { return (FA.doc.shells || {})[cid + ":" + sid] || {}; }
+/** Whether a face of a component belongs to a surface body (a shell). */
+function shellFace(ref) {
+  const c = ref && ref.face !== undefined && compOf(ref.comp);
+  const fb = c && c.mesh && c.mesh.face_body;
+  return !!(fb && fb[ref.face] !== null && fb[ref.face] !== undefined);
 }
 
 // ------------------------------------------------------------------ drawing
@@ -391,14 +424,34 @@ function drawModel(box) {
     const col = selP ? COLORS.sel : mode === "plate" ? 0xc9a96e : 0x9aa7b5;
     const mat = new THREE.MeshStandardMaterial({ color: col, metalness: 0.1, roughness: 0.7, side: THREE.DoubleSide, transparent: mode === "off", opacity: mode === "off" ? 0.15 : 1,
                                                  polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });
-    const mesh = new THREE.Mesh(e.geo, mat);
-    mesh.userData = c.plate ? { comp: c.id, kind: "plate", id: c.id.slice(6) } : { comp: c.id };
-    inner.add(mesh);
-    t.pickables.push(mesh);
-    if ($("#fa-edges").checked) inner.add(new THREE.LineSegments(e.edgeGeo, new THREE.LineBasicMaterial({ color: 0x1d2125 })));
     const m = c.mesh;
+    if (m.vertices.length) {
+      // surface bodies: shells drawn in their colour (translucent), shells set to off faint
+      const mats = e.groups ? bodyMaterials(mat, c.surfaces, (k, sf) => ({ opacity: (shellCfg(c.id, sf.id).mode || "shell") === "off" ? 0.12 : 0.6 })) : mat;
+      const mesh = new THREE.Mesh(e.geo, mats);
+      mesh.userData = c.plate ? { comp: c.id, kind: "plate", id: c.id.slice(6) } : { comp: c.id };
+      inner.add(mesh);
+      t.pickables.push(mesh);
+      if ($("#fa-edges").checked) inner.add(new THREE.LineSegments(e.edgeGeo, new THREE.LineBasicMaterial({ color: 0x1d2125 })));
+      box.union(e.geo.boundingBox.clone().applyMatrix4(inner.matrix));
+    }
     for (const [ref, color, strong] of hl) {
       if (ref.comp !== c.id) continue;
+      if (ref.edge !== undefined) {                          // an edge: thick line drawn over the faces
+        const ep = edgeSegments(m, ref.edge);
+        if (!ep.length) continue;
+        const g = track(new THREE.BufferGeometry());
+        g.setAttribute("position", new THREE.Float32BufferAttribute(ep, 3));
+        const ls = new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: strong ? COLORS.sel : color, depthTest: false }));
+        ls.renderOrder = 8;
+        inner.add(ls);
+        const pg = track(new THREE.BufferGeometry());
+        pg.setAttribute("position", new THREE.Float32BufferAttribute(ep, 3));
+        const pm = new THREE.Points(pg, new THREE.PointsMaterial({ color: strong ? COLORS.sel : color, size: 5, sizeAttenuation: false, depthTest: false }));
+        pm.renderOrder = 8;
+        inner.add(pm);
+        continue;
+      }
       const pos = [];
       m.triangles.forEach((tr, k) => { if (m.face_of_tri[k] === ref.face) for (const v of tr) pos.push(...m.vertices[v]); });
       if (!pos.length) continue;
@@ -407,7 +460,6 @@ function drawModel(box) {
       inner.add(new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: strong ? COLORS.sel : color, transparent: true, opacity: strong ? 0.75 : 0.5, side: THREE.DoubleSide,
                                                                polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 })));
     }
-    box.union(e.geo.boundingBox.clone().applyMatrix4(inner.matrix));
   }
   for (const m of FA.doc.members) for (const k of ["a", "b"]) if (m[k] && m[k].xyz) box.expandByPoint(new THREE.Vector3(...m[k].xyz));
   const comps = new Set(((FA.asm && FA.asm.components) || []).filter(c => c.visible !== false).map(c => c.id));
@@ -505,6 +557,14 @@ function drawLoad(l, size, strong) {
   };
   const v = Array.isArray(l.value) ? l.value.map(Number) : null;
   if (l.type === "gravity") return;
+  if (l.type === "line" && l.target && l.target.edge !== undefined) {   // edge: arrows along the edge polyline
+    const c = compOf(l.target.comp);
+    const ep = c && v ? edgeSegments(c.mesh, l.target.edge) : [];
+    const M = c && matOf(c);
+    const step = Math.max(6, Math.floor(ep.length / 6 / 3) * 6);
+    for (let k = 0; k < ep.length; k += step) arrow(new THREE.Vector3(ep[k], ep[k + 1], ep[k + 2]).applyMatrix4(M).toArray(), v, L * 0.5);
+    return;
+  }
   if (l.type === "line") {
     const m = FA.doc.members.find(x => x.id === (l.target || {}).member);
     if (!m || !m.a || !m.b || !v) return;
@@ -786,6 +846,10 @@ function clickView(e) {
         if (Math.hypot(s[0] - e.clientX, s[1] - e.clientY) < 10) { const cb = FA.pick.cb; FA.pick = null; cb({ xyz: q.slice() }); changed(); renderAll(); draw(); schedulePlates(); return; }
       }
     }
+    if (FA.pick.edge) {
+      const eg = edgeUnder(e);
+      if (eg) return done({ edge: eg });
+    }
     if (FA.pick.noFace) return;
     const h = hits.find(x => x.object.userData && x.object.userData.comp !== undefined);
     if (!h) return;
@@ -828,6 +892,9 @@ const TET_TYPES = [["C3D10", "C3D10 (second order)"], ["C3D4", "C3D4 (first orde
 const HEX_TYPES = [["C3D8I", "C3D8I (incompatible modes)"], ["C3D8", "C3D8 (full integration)"], ["C3D8R", "C3D8R (reduced integration)"],
                    ["C3D20", "C3D20 (second order)"], ["C3D20R", "C3D20R (second order, reduced)"]];
 const ALGOS = [["delaunay", "Delaunay"], ["frontal", "Frontal"], ["hxt", "HXT (parallel Delaunay)"]];
+const SHELL_TYPES = [["S4", "S4 (incompatible modes)"], ["S8R", "S8R (second order)"], ["S3", "S3 (triangles)"]];
+const SHELL_ALGOS = [["quasi", "Quasi-structured quadrangles"], ["frontal", "Frontal-Delaunay for quadrangles"], ["delaunay", "Delaunay, recombined"], ["tri", "Triangles only"]];
+const SHELL_POS = [["mid", "mid"], ["positive", "positive"], ["negative", "negative"]];
 const optList = (list, cur) => list.map(([v, t]) => `<option value="${v}"${v === cur ? " selected" : ""}>${fesc(t)}</option>`).join("");
 
 /** Mesh settings of the analysis (doc.mesh): strategy, element types, size, minimum size, curvature, 3D algorithm. */
@@ -841,6 +908,8 @@ function meshSettingsHtml(m) {
     `<div class="grid2"><label title="Elements per 360 deg of curvature of the faces (0: off)">Elements per 360 deg of curvature<input type="text" class="numf" id="fs-curv" value="${m.curvature === undefined || m.curvature === null ? "" : m.curvature}" placeholder="12"></label>` +
     `<label>3D algorithm<select id="fs-algo">${optList(ALGOS, m.algorithm || "delaunay")}</select></label></div>` +
     `<label class="check"><input type="checkbox" id="fs-opt"${m.optimize === false ? "" : " checked"}> Optimise the mesh</label>` +
+    `<div class="grid2"><label title="Element type of the shells (surface bodies). S4: CalculiX expands it to C3D8I elements. Triangles left by the quadrangle mesh are S3 (S6 with S8R)">Shell elements<select id="fs-shtype">${optList(SHELL_TYPES, m.shell_type || "S4")}</select></label>` +
+    `<label title="gmsh surface algorithm of the shells">Shell mesh<select id="fs-shalgo">${optList(SHELL_ALGOS, m.shell_algorithm || "quasi")}</select></label></div>` +
     `<p class="hint">Structured hexahedra need bodies whose cells are blocks (6 faces with 4 edges each) or prisms (Part tab, Partition). Bodies of different strategies, and plates, are tied where they touch.</p>`;
 }
 function bindMeshSettings(d) {
@@ -852,6 +921,8 @@ function bindMeshSettings(d) {
   $("#fs-hextype").onchange = () => { m().hex_type = $("#fs-hextype").value; changed(); };
   $("#fs-algo").onchange = () => { m().algorithm = $("#fs-algo").value; changed(); };
   $("#fs-opt").onchange = () => { m().optimize = $("#fs-opt").checked; changed(); };
+  if ($("#fs-shtype")) $("#fs-shtype").onchange = () => { m().shell_type = $("#fs-shtype").value; changed(); };
+  if ($("#fs-shalgo")) $("#fs-shalgo").onchange = () => { m().shell_algorithm = $("#fs-shalgo").value; changed(); };
 }
 
 /** Width of the analysis panel: drag of the bar at its left edge, kept in the browser (localStorage). */
@@ -918,6 +989,7 @@ function renderMats() {
         if (d.default_material === n) d.default_material = nn;
         for (const arr of [d.members, d.fasteners]) for (const x of arr) if (x.material === n) x.material = nn;
         for (const b of Object.values(d.bodies)) if (b.material === n) b.material = nn;
+        for (const b of Object.values(d.shells || {})) if (b.material === n) b.material = nn;
       } else m[k] = fnum(inp.value) || 0;
       changed(); renderAll();
     });
@@ -939,13 +1011,35 @@ function renderBodies() {
   if (!comps.length) { $("#fa-bodies").innerHTML = `<p class="hint">No bodies: ${all.map(c => fesc(c.name)).join(", ")} has sketches only (members and plates snap to the sketch points).</p>`; return; }
   const defStrat = ((d.mesh || {}).strategy) || "tet";
   const stratShort = { tet: "tet", hex: "hex", hexsub: "hex sub" };
-  $("#fa-bodies").innerHTML = `<table class="pc-table"><tr><th>Body</th><th>Model</th><th>Mesh</th><th>Material</th><th>Size (mm)</th></tr>` + comps.map(c => {
+  const hasSolid = c => { const g = compOf(c.id); const m = g && g.mesh; return !m || (m.triangles.length > 0 && (!m.face_body || m.face_body.some(v => v === null || v === undefined))); };
+  const solids = comps.filter(hasSolid);
+  const shells = [];
+  for (const c of comps) { const g = compOf(c.id); for (const sf of (g && g.surfaces) || []) shells.push([c, sf]); }
+  $("#fa-bodies").innerHTML = (solids.length ? `<table class="pc-table"><tr><th>Body</th><th>Model</th><th>Mesh</th><th>Material</th><th>Size (mm)</th></tr>` + solids.map(c => {
     const b = d.bodies[c.id] || {};
     const strat = `<select data-k="strategy"${b.mode === "plate" || b.mode === "off" ? " disabled" : ""}><option value="">(${stratShort[defStrat]})</option>` +
       ["tet", "hex", "hexsub"].map(k => `<option value="${k}"${b.strategy === k ? " selected" : ""}>${stratShort[k]}</option>`).join("") + `</select>`;
     return `<tr data-id="${fesc(c.id)}"><td>${fesc(c.name)}</td><td><select data-k="mode">${["solid", "plate", "off"].map(m => `<option${(b.mode || "solid") === m ? " selected" : ""}>${m}</option>`).join("")}</select></td>` +
       `<td>${strat}</td><td><select data-k="material">${matOptions(b.material)}</select></td><td><input type="text" class="numf" data-k="size" value="${b.size || ""}" placeholder="auto"></td></tr>`;
-  }).join("") + `</table><p class="hint">solid: meshed with the strategy in Mesh (tet: tetrahedra; hex: structured hexahedra; hex sub: hexahedra by subdivision; in brackets: the default of Settings); plate: prismatic part meshed through the thickness (C3D8I); off: left out.</p>`;
+  }).join("") + `</table><p class="hint">solid: meshed with the strategy in Mesh (tet: tetrahedra; hex: structured hexahedra; hex sub: hexahedra by subdivision; in brackets: the default of Settings); plate: prismatic part meshed through the thickness (C3D8I); off: left out.</p>` : "") +
+    (shells.length ? `<table class="pc-table"><tr><th>Shell</th><th>Model</th><th>t (mm)</th><th>Position</th><th>Material</th><th>Size (mm)</th></tr>` + shells.map(([c, sf]) => {
+      const key = c.id + ":" + sf.id, b = (d.shells || {})[key] || {};
+      return `<tr data-shell="${fesc(key)}"><td>${fesc(c.name)} / ${fesc(sf.name)}</td><td><select data-k="mode">${["shell", "off"].map(m => `<option${(b.mode || "shell") === m ? " selected" : ""}>${m}</option>`).join("")}</select></td>` +
+        `<td><input type="text" class="numf" data-k="t" value="${b.t || ""}" placeholder="${d.shell_t || 10}"></td><td><select data-k="offset">${optList(SHELL_POS, b.offset || "mid")}</select></td>` +
+        `<td><select data-k="material">${matOptions(b.material)}</select></td><td><input type="text" class="numf" data-k="size" value="${b.size || ""}" placeholder="auto"></td></tr>`;
+    }).join("") + `</table><p class="hint">Shells: the surface bodies of the parts, meshed with shell elements (Shell elements in Settings) of thickness t (empty: ${d.shell_t || 10} mm). Position: the surface is the mid-surface, or the shell lies on the positive or negative side of the surface (the element normal). Touching shells share their nodes (bonded); shells on solid faces are tied to them.</p>` : "");
+  $("#fa-bodies").querySelectorAll("tr[data-shell]").forEach(tr => {
+    const key = tr.dataset.shell;
+    tr.querySelectorAll("[data-k]").forEach(el => el.onchange = () => {
+      d.shells = d.shells || {};
+      const b = d.shells[key] = d.shells[key] || {};
+      const k = el.dataset.k;
+      if (k === "t" || k === "size") { const v = fnum(el.value); if (v > 0) b[k] = v; else delete b[k]; }
+      else if (el.value && !(k === "mode" && el.value === "shell") && !(k === "offset" && el.value === "mid")) b[k] = el.value; else delete b[k];
+      if (!Object.keys(b).length) delete d.shells[key];
+      changed(); draw();
+    });
+  });
   $("#fa-bodies").querySelectorAll("tr[data-id]").forEach(tr => {
     const id = tr.dataset.id;
     tr.querySelectorAll("[data-k]").forEach(el => el.onchange = () => {
@@ -1606,7 +1700,11 @@ function targetText(tg) {
   if (!tg) return "(none)";
   if (tg.point !== undefined) { const p = (FA.doc.points || []).find(x => x.id === tg.point); return "reference point " + (p ? p.name : tg.point); }
   if (tg.member !== undefined) { const m = FA.doc.members.find(x => x.id === tg.member); return (m ? m.name : tg.member) + (tg.end ? " end " + tg.end.toUpperCase() : ""); }
-  return faceText(tg);
+  if (tg.edge !== undefined) {
+    const comp = (FA.asm && FA.asm.components || []).find(x => x.id === tg.comp), c = compOf(tg.comp);
+    return (comp ? comp.name : tg.comp) + " : " + edgeLabel(c && c.erefs, tg.edge, v => ffmt(v, 4));
+  }
+  return faceText(tg) + (shellFace(tg) ? " (shell)" : "");
 }
 function memberEndSelect(id, tg, withLine) {
   const opts = [];
@@ -1621,22 +1719,27 @@ function memberEndSelect(id, tg, withLine) {
 const DOF_NAMES = ["ux", "uy", "uz", "rx", "ry", "rz"];
 function renderSups() {
   const d = FA.doc, box = $("#fa-sups");
-  let h = d.supports.map(s => itemRow("support", s, `${s.name}: ${s.type}`, targetText(s.target))).join("") || '<p class="hint">Supports on faces of the bodies or at member ends.</p>';
+  let h = d.supports.map(s => itemRow("support", s, `${s.name}: ${s.type}`, targetText(s.target))).join("") || '<p class="hint">Supports on faces and edges of the bodies and shells, or at member ends.</p>';
   const s = FA.sel && FA.sel.kind === "support" && findItem("support", FA.sel.id);
   if (s) {
     const onMember = s.target && (s.target.member !== undefined || s.target.point !== undefined);
     const onPoint = s.target && s.target.point !== undefined;
+    const onEdge = s.target && s.target.edge !== undefined;
+    const onShell = onEdge || shellFace(s.target);
     const types = onMember ? [["fixed", "fixed (all 6)"], ["pinned", "pinned (ux uy uz)"], ["dofs", "chosen components"], ["displacement", "prescribed displacement"]]
+                : onShell ? [["fixed", "fixed (all 6)"], ["pinned", "pinned (ux uy uz)"], ...SYMM_TYPES, ...(onEdge ? [] : [["normal", "normal to the face (planar)"]]),
+                             ["dofs", "chosen components"], ["displacement", "prescribed displacement"]]
                            : [["fixed", "fixed (ux uy uz)"], ["normal", "normal to the face (planar)"], ["dofs", "chosen components"], ["displacement", "prescribed displacement"]];
     const dofs = s.dofs || [1, 1, 1, 0, 0, 0];
     const val = Array.isArray(s.value) ? s.value : [0, 0, 0, 0, 0, 0];
     const ndof = 6;
     h += `<div class="fa-props"><div class="grid2"><label>Name<input type="text" id="fsp-name" value="${fesc(s.name)}"></label>` +
       `<label>Type<select id="fsp-type">${types.map(([v, t]) => `<option value="${v}"${s.type === v ? " selected" : ""}>${t}</option>`).join("")}</select></label></div>` +
-      `<p class="hint">Target: ${fesc(targetText(s.target))} <button type="button" class="small" id="fsp-pick" title="Click a face or a member end in the view">Pick</button></p>` +
+      `<p class="hint">Target: ${fesc(targetText(s.target))} <button type="button" class="small" id="fsp-pick" title="Click a face, an edge or a member end in the view">Pick</button></p>` +
       (d.members.length ? `<label>or member end${memberEndSelect("fsp-mem", s.target, false)}</label>` : "") +
       (s.type === "dofs" ? `<div class="fa-dofs">${DOF_NAMES.slice(0, ndof).map((n, i) => `<label><input type="checkbox" data-dof="${i}"${dofs[i] ? " checked" : ""}>${n}</label>`).join("")}</div>` : "") +
-      (!onMember && (s.type === "dofs" || s.type === "displacement") ? `<p class="hint">rx, ry, rz on a face: the face is rigidly coupled (kinematic coupling) to a node at its centre, which carries the support.</p>` : "") +
+      (!onMember && !onShell && (s.type === "dofs" || s.type === "displacement") ? `<p class="hint">rx, ry, rz on a face: the face is rigidly coupled (kinematic coupling) to a node at its centre, which carries the support.</p>` : "") +
+      (onShell ? `<p class="hint">Edges and shell faces: the translations of all their nodes are held; the rotations act on the shell nodes only (nodes of solid elements have no rotations).</p>` : "") +
       ((d.points || []).length ? `<label>or reference point<select id="fsp-rp"><option value="">(choose)</option>${d.points.map(p => `<option value="${fesc(p.id)}"${onPoint && s.target.point === p.id ? " selected" : ""}>${fesc(p.name)}</option>`).join("")}</select></label>` : "") +
       (s.type === "displacement" ? `<p class="hint">Checked components are prescribed (mm; rotations in rad); unchecked components are free.</p><table class="pc-table fa-disp">` +
         DOF_NAMES.slice(0, ndof).map((n, i) => `<tr><td><label><input type="checkbox" data-dof="${i}"${dofs[i] ? " checked" : ""}>${n}</label></td><td><input type="text" class="numf" data-dval="${i}" value="${val[i] || 0}"${dofs[i] ? "" : " disabled"}></td></tr>`).join("") + `</table>` : "") +
@@ -1653,17 +1756,20 @@ function renderSups() {
     else if (s.type === "normal" && typeof s.value !== "number") s.value = 0;
     else if (s.type !== "displacement" && s.type !== "normal") delete s.value;
     changed(); renderSups(); draw(); };
-  $("#fsp-pick").onclick = () => startPick("Click the supported face, a member end or a reference point", { end: true }, hit => supportHit(s, hit));
+  $("#fsp-pick").onclick = () => startPick("Click the supported face or edge, a member end or a reference point", { end: true, edge: true }, hit => supportHit(s, hit));
   if ($("#fsp-rp")) $("#fsp-rp").onchange = () => { if ($("#fsp-rp").value) { s.target = { point: $("#fsp-rp").value }; if (s.type === "normal") s.type = "fixed"; } changed(); renderSups(); draw(); };
   if ($("#fsp-mem")) $("#fsp-mem").onchange = () => { const [mid, end] = $("#fsp-mem").value.split(":"); if (mid) { s.target = { member: mid, end }; if (s.type === "normal") s.type = "fixed"; } changed(); renderSups(); draw(); };
   box.querySelectorAll("[data-dof]").forEach(cb => cb.onchange = () => { const v = (s.dofs || [1, 1, 1, 0, 0, 0]).slice(); v[+cb.dataset.dof] = cb.checked ? 1 : 0; s.dofs = v; changed(); if (s.type === "displacement") renderSups(); });
   box.querySelectorAll("[data-dval]").forEach(inp => inp.onchange = () => { const v = (Array.isArray(s.value) ? s.value : [0, 0, 0, 0, 0, 0]).slice(); v[+inp.dataset.dval] = fnum(inp.value) || 0; s.value = v; changed(); });
   if ($("#fsp-nval")) $("#fsp-nval").onchange = () => { s.value = fnum($("#fsp-nval").value) || 0; changed(); };
 }
+const SYMM_TYPES = [["xsymm", "symmetry X (ux, ry, rz held)"], ["ysymm", "symmetry Y (uy, rx, rz held)"], ["zsymm", "symmetry Z (uz, rx, ry held)"]];
 function supportHit(s, hit) {
-  if (hit.point !== undefined && !hit.face) { s.target = { point: hit.point }; if (s.type === "normal") s.type = "fixed"; status(s.name + ": " + targetText(s.target)); return; }
-  if (hit.end) { s.target = { member: hit.member, end: hit.end }; if (s.type === "normal") s.type = "fixed"; }
-  else { s.target = hit.face; if (s.type === "pinned") s.type = "fixed"; }
+  const symm = SYMM_TYPES.some(([v]) => v === s.type);
+  if (hit.point !== undefined && !hit.face) { s.target = { point: hit.point }; if (s.type === "normal" || symm) s.type = "fixed"; status(s.name + ": " + targetText(s.target)); return; }
+  if (hit.edge) { s.target = hit.edge; if (s.type === "normal") s.type = "fixed"; }
+  else if (hit.end) { s.target = { member: hit.member, end: hit.end }; if (s.type === "normal" || symm) s.type = "fixed"; }
+  else { s.target = hit.face; if ((s.type === "pinned" || symm) && !shellFace(hit.face)) s.type = "fixed"; }
   status(s.name + ": " + targetText(s.target));
 }
 /** Reference points: name, coordinates (typed or picked), faces rigidly connected (*RIGID BODY). */
@@ -1719,24 +1825,24 @@ function addSupport() {
   FA.sel = { kind: "support", id: s.id };
   changed();
   if (at) { renderAll(); draw(); status(s.name + ": " + targetText(at)); return; }
-  startPick("Click the supported face, a member end or a reference point", { end: true }, hit => supportHit(s, hit));
+  startPick("Click the supported face or edge, a member end or a reference point", { end: true, edge: true }, hit => supportHit(s, hit));
 }
 
 function renderLoads() {
   const d = FA.doc, box = $("#fa-loads");
-  const UNITS = { force: "N", mforce: "N", moment: "N mm", mmoment: "N mm", line: "N/mm", gravity: "mm/s^2", pressure: "MPa" };
+  const UNITS = { force: "N", mforce: "N", moment: "N mm", mmoment: "N mm", line: "N/mm", eline: "N/mm", gravity: "mm/s^2", pressure: "MPa" };
   const valText = l => (Array.isArray(l.value) ? "(" + l.value.map(v => ffmt(v, 5)).join(", ") + ")" : ffmt(l.value, 5)) + " " + (UNITS[uiType(l)] || "");
   let h = d.loads.map(l => itemRow("load", l, `${l.name}: ${LOAD_TYPES[uiType(l)] || l.type}`, (l.type === "gravity" ? "" : targetText(l.target) + " ") + valText(l))).join("") ||
-    '<p class="hint">Forces, moments and pressures on faces, loads at member ends, line loads on members, gravity.</p>';
+    '<p class="hint">Forces, moments and pressures on faces, line loads on edges and members, loads at member ends, gravity.</p>';
   const l = FA.sel && FA.sel.kind === "load" && findItem("load", FA.sel.id);
   if (l) {
     const ut = uiType(l);
-    const unit = { force: "N", mforce: "N", moment: "N mm", mmoment: "N mm", line: "N/mm", gravity: "mm/s^2" }[ut];
+    const unit = { force: "N", mforce: "N", moment: "N mm", mmoment: "N mm", line: "N/mm", eline: "N/mm", gravity: "mm/s^2" }[ut];
     h += `<div class="fa-props"><div class="grid2"><label>Name<input type="text" id="fld-name" value="${fesc(l.name)}"></label>` +
       `<label>Type<select id="fld-type">${Object.entries(LOAD_TYPES).map(([k, t]) => `<option value="${k}"${k === ut ? " selected" : ""}>${t}</option>`).join("")}</select></label></div>` +
       (ut === "pressure" ? `<label>Pressure (MPa, positive into the face)<input type="text" class="numf" id="fld-p" value="${ffmt(Number(l.value) || 0, 8)}"></label>`
-                         : `<p class="hint" style="margin:6px 0 2px">${ut === "force" ? "Total force" : ut === "moment" ? "Moment about the face centre" : ut === "gravity" ? "Acceleration (-9810 in z: gravity down)" : "Value"} (${unit}, global x y z)</p>${v3("fld-v", l.value)}`) +
-      (ut !== "gravity" ? `<p class="hint">Target: ${fesc(targetText(l.target))} <button type="button" class="small" id="fld-pick" title="${ut === "pressure" ? "Click a face" : "Click a face, a member end or a member (line load)"} in the view">Pick</button></p>` : "") +
+                         : `<p class="hint" style="margin:6px 0 2px">${ut === "force" ? "Total force" : ut === "moment" ? "Moment about the face centre" : ut === "gravity" ? "Acceleration (-9810 in z: gravity down)" : ut === "eline" ? "Load per length of the edge" : "Value"} (${unit}, global x y z)</p>${v3("fld-v", l.value)}`) +
+      (ut !== "gravity" ? `<p class="hint">Target: ${fesc(targetText(l.target))} <button type="button" class="small" id="fld-pick" title="${ut === "pressure" ? "Click a face" : ut === "eline" ? "Click an edge" : "Click a face, an edge (line load), a member end or a member (line load)"} in the view">Pick</button></p>` : "") +
       (["mforce", "mmoment"].includes(ut) ? `<label>Member end${memberEndSelect("fld-mem", l.target, false)}</label>` +
         ((d.points || []).length ? `<label>or reference point<select id="fld-rp"><option value="">(choose)</option>${d.points.map(p => `<option value="${fesc(p.id)}"${l.target && l.target.point === p.id ? " selected" : ""}>${fesc(p.name)}</option>`).join("")}</select></label>` : "") : "") +
       (ut === "line" ? `<label>Member${memberEndSelect("fld-mem", l.target, true)}</label>` : "") + pickHint() + `</div>`;
@@ -1748,9 +1854,10 @@ function renderLoads() {
   $("#fld-name").onchange = () => { l.name = $("#fld-name").value.trim() || l.name; upd(); };
   $("#fld-type").onchange = () => {
     const nt = $("#fld-type").value;
-    l.type = { mforce: "force", mmoment: "moment" }[nt] || nt;
-    if (nt === "pressure") l.value = 0.1; else if (!Array.isArray(l.value)) l.value = nt === "gravity" ? [0, 0, -9810] : [0, 0, -1000];
+    l.type = { mforce: "force", mmoment: "moment", eline: "line" }[nt] || nt;
+    if (nt === "pressure") l.value = 0.1; else if (!Array.isArray(l.value)) l.value = nt === "gravity" ? [0, 0, -9810] : nt === "eline" ? [0, 0, -1] : [0, 0, -1000];
     if (nt === "gravity") l.target = null;
+    if ((nt === "eline") !== !!(l.target && l.target.edge !== undefined)) l.target = null;
     if (["mforce", "mmoment", "line"].includes(nt) && !(l.target && (l.target.member !== undefined || (l.target.point !== undefined && nt !== "line")))) l.target = FA.doc.members.length ? { member: FA.doc.members[0].id, end: nt === "line" ? undefined : "b" } : null;
     if (["force", "pressure", "moment"].includes(nt) && l.target && (l.target.member !== undefined || l.target.point !== undefined)) l.target = null;
     l._ui = nt;
@@ -1759,12 +1866,14 @@ function renderLoads() {
   if ($("#fld-p")) $("#fld-p").onchange = () => { l.value = fnum($("#fld-p").value) || 0; upd(); };
   if ($("#fld-v0")) [0, 1, 2].forEach(i => $("#fld-v" + i).onchange = () => { l.value = read3("fld-v"); upd(); });
   if ($("#fld-pick")) $("#fld-pick").onclick = () => uiType(l) === "pressure" ? startPick("Click the loaded face", {}, hit => loadHit(l, hit))
-    : startPick("Click the loaded face, a member end, a reference point or a member (line load)", { end: true, member: true }, hit => loadHit(l, hit));
+    : uiType(l) === "eline" ? startPick("Click the loaded edge", { edge: true, noFace: true }, hit => loadHit(l, hit))
+    : startPick("Click the loaded face or edge, a member end, a reference point or a member (line load)", { end: true, member: true, edge: true }, hit => loadHit(l, hit));
   if ($("#fld-rp")) $("#fld-rp").onchange = () => { if ($("#fld-rp").value) l.target = { point: $("#fld-rp").value }; upd(); };
   if ($("#fld-mem")) $("#fld-mem").onchange = () => { const [mid, end] = $("#fld-mem").value.split(":"); l.target = mid ? (end ? { member: mid, end } : { member: mid }) : null; upd(); };
 }
 function uiType(l) {
   if (l._ui) return l._ui;
+  if (l.target && l.target.edge !== undefined) return "eline";
   if (l.target && (l.target.member !== undefined || l.target.point !== undefined)) return l.type === "line" ? "line" : l.type === "moment" ? "mmoment" : "mforce";
   return l.type;
 }
@@ -1775,6 +1884,7 @@ function loadHit(l, hit) {
   if (hit.point !== undefined && !hit.face) { l.target = { point: hit.point }; if (l.type !== "moment") l.type = "force"; l._ui = l.type === "moment" ? "mmoment" : "mforce"; }
   else if (hit.end) { l.target = { member: hit.member, end: hit.end }; l.type = moment ? "moment" : "force"; l._ui = moment ? "mmoment" : "mforce"; }
   else if (hit.member !== undefined) { if (l.type !== "line") l.value = [0, 0, -1]; l.target = { member: hit.member }; l.type = "line"; l._ui = "line"; }
+  else if (hit.edge) { if (l.type !== "line") l.value = [0, 0, -1]; l.target = hit.edge; l.type = "line"; l._ui = "eline"; }
   else { l.target = hit.face; if (l.type === "line") { l.type = "force"; l.value = [0, 0, -1000]; } l._ui = l.type === "moment" ? "moment" : l.type === "pressure" ? "pressure" : "force"; }
   status(l.name + ": " + targetText(l.target));
 }
@@ -1786,7 +1896,7 @@ function addLoad() {
   FA.sel = { kind: "load", id: l.id };
   changed();
   if (at) { renderAll(); draw(); status(l.name + ": " + targetText(at)); return; }
-  startPick("Click the loaded face, a member end or a member (line load)", { end: true, member: true }, hit => loadHit(l, hit));
+  startPick("Click the loaded face or edge (line load), a member end or a member (line load)", { end: true, member: true, edge: true }, hit => loadHit(l, hit));
 }
 
 // ------------------------------------------------------------------ results panel

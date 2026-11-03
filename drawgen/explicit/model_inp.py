@@ -5,16 +5,20 @@ Explicit document (<name>.exp.json), model part:
    "materials": {name: {"library": MATERIAL_LIBRARY key or "", "E": MPa, "nu", "rho": kg/m^3}},
    "default_material": name,
    "mesh": {"size": mm, "size_min": mm, "curvature", "algorithm", "optimize", "strategy": "tet" | "hex" | "hexsub",
-            "tet_type": "C3D4" | "C3D10", "hex_type": "C3D8R" | "C3D8"},
-   "bonded": bool                     touching deformable bodies share nodes,
+            "tet_type": "C3D4" | "C3D10", "hex_type": "C3D8R" | "C3D8", "shell_type": "S4R" | "S4" | "S3",
+            "shell_algorithm": "quasi" | "frontal" | "delaunay" | "tri"},
+   "bonded": bool                     touching deformable bodies and shells share nodes,
    "bodies": {component id: {"role": "deformable" | "rigid" | "off", "material", "size", "strategy"}},
-   "supports": [{"id", "name", "target": face reference, "dofs": [ux, uy, uz] (1 = held)}]}
+   "shells": {"<component id>:<surface id>": {"mode": "shell" | "rigid" | "off", "t": mm, "offset": "mid" |
+              "positive" | "negative", "material", "size"}},
+   "supports": [{"id", "name", "target": face reference | {"comp", "edge"}, "dofs": [ux, uy, uz, rx, ry, rz] (1 = held)}]}
 
-The .inp holds *NODE, one *ELEMENT block per body (ELSET B_<body>), *SOLID SECTION per body, *MATERIAL with
-*ELASTIC and *DENSITY (t/mm^3), *RIGID BODY (NSET RB_<body>, REF NODE at the centre of mass of the body) for the
-rigid bodies, and *BOUNDARY for the supports. A material with a library entry is written with the E, nu and density
-of the entry; the build replaces it with the library card (library slot: the material name).
-Rigid bodies are meshed apart from the deformable bodies (no shared nodes).
+The .inp holds *NODE, one *ELEMENT block per body (ELSET B_<body>), *SOLID SECTION per solid body and *SHELL SECTION
+per shell (surface body of a part or a STEP file), *MATERIAL with *ELASTIC and *DENSITY (t/mm^3), *RIGID BODY (NSET
+RB_<body>, REF NODE at the centre of mass of the body) for the rigid bodies, and *BOUNDARY for the supports
+(translations on all nodes of the face or edge, rotations on its shell nodes). A material with a library entry is
+written with the E, nu and density of the entry; the build replaces it with the library card (library slot: the
+material name). Rigid bodies are meshed apart from the deformable bodies (no shared nodes).
 """
 import os
 import re
@@ -57,12 +61,18 @@ def library_slots(doc):
     return out
 
 
+SHELL_OFFSET = {"positive": "SPOS", "negative": "SNEG"}
+
+
 def _geometry_doc(doc):
     bodies = {}
     for cid, b in (doc.get("bodies") or {}).items():
         bodies[cid] = {"mode": "off" if b.get("role") == "off" else "solid", "size": b.get("size"),
                        "strategy": b.get("strategy"), "material": b.get("material")}
-    return {"bodies": bodies, "plates": [], "members": [], "materials": {}, "default_material": None}
+    shells = {}
+    for k, b in (doc.get("shells") or {}).items():
+        shells[k] = dict(b, mode="off" if b.get("mode") == "off" else "shell")
+    return {"bodies": bodies, "shells": shells, "plates": [], "members": [], "materials": {}, "default_material": None}
 
 
 def _mesh_group(group, doc, opts, size, bonded, workdir, tag):
@@ -72,8 +82,8 @@ def _mesh_group(group, doc, opts, size, bonded, workdir, tag):
     for b in group:
         p = os.path.join(workdir, "%s_%s.brep" % (tag, safe(b["id"])))
         export_brep(b["shape"], p)
-        job["bodies"].append({"id": b["id"], "brep": p, "mode": "solid", "size": b.get("size"),
-                              "strategy": b.get("strategy")})
+        job["bodies"].append({"id": b["id"], "brep": p, "mode": "shell" if b.get("mode") == "shell" else "solid",
+                              "size": b.get("size"), "strategy": b.get("strategy"), "t": b.get("t")})
     return femesh.run(job)
 
 
@@ -94,7 +104,7 @@ def _merge(meshes):
                 blocks.append({"type": bl["type"], "elements": els})
             surfs = [{"nodes": [n + noff for n in s["nodes"]], "facets": [[n + noff for n in f] for f in s["facets"]],
                       "sample": s["sample"]} for s in mb["surfaces"]]
-            out["bodies"][bid] = {"blocks": blocks, "surfaces": surfs, "group": mb.get("group")}
+            out["bodies"][bid] = {"blocks": blocks, "surfaces": surfs, "group": mb.get("group"), "thickness": mb.get("thickness")}
         out["warnings"] += m.get("warnings") or []
         noff += (max(ids) if ids else 0)
         eoff += emax
@@ -116,13 +126,17 @@ def build(doc, asm, sources, workdir, inp_path, title="", progress=None):
     if not bodies:
         raise ModelError("no bodies")
     role = {cid: (b.get("role") or "deformable") for cid, b in (doc.get("bodies") or {}).items()}
+    for k, b in (doc.get("shells") or {}).items():
+        role[k] = "rigid" if b.get("mode") == "rigid" else "off" if b.get("mode") == "off" else "deformable"
     deform = [b for b in bodies if role.get(b["id"], "deformable") == "deformable"]
     rigid = [b for b in bodies if role.get(b["id"]) == "rigid"]
     mopt = doc.get("mesh") or {}
-    opts = {k: mopt.get(k) for k in ("size_min", "curvature", "algorithm", "optimize", "strategy", "tet_type", "hex_type")
+    opts = {k: mopt.get(k) for k in ("size_min", "curvature", "algorithm", "optimize", "strategy", "tet_type", "hex_type",
+                                     "shell_type", "shell_algorithm")
             if mopt.get(k) not in (None, "")}
     opts.setdefault("tet_type", "C3D4")
     opts.setdefault("hex_type", "C3D8R")
+    opts.setdefault("shell_type", "S4R")
     size = float(mopt.get("size") or 0)
     meshes = []
     say("mesh", "Meshing %d bodies" % len(bodies))
@@ -180,7 +194,7 @@ def build(doc, asm, sources, workdir, inp_path, title="", progress=None):
                 nodes.update(e[1:])
                 nel += 1
         body_nodes[b["id"]] = nodes
-        cfg = (doc.get("bodies") or {}).get(b["id"]) or {}
+        cfg = ((doc.get("shells") if b.get("mode") == "shell" else doc.get("bodies")) or {}).get(b["id"]) or {}
         mname = cfg.get("material") or doc.get("default_material") or next(iter(doc.get("materials") or {}), None)
         if not mname:
             raise ModelError("body %s: no material" % b["name"])
@@ -192,21 +206,31 @@ def build(doc, asm, sources, workdir, inp_path, title="", progress=None):
         L.append("*NSET, NSET=RB_%s" % bname[b["id"]])
         L += ids_lines(body_nodes.get(b["id"], ()))
     sup_rows = []
+    rigid_nodes = set(n for b in rigid for n in body_nodes.get(b["id"], ()))
     for k, s in enumerate(doc.get("supports") or []):
         t = s.get("target")
         if not t or t.get("comp") is None:
             continue
-        if role.get(str(t.get("comp"))) == "rigid":
-            raise ModelError("support %s: the face is on a rigid body" % (s.get("name") or k + 1))
+        sname = s.get("name") or k + 1
         try:
-            f = M.face({"comp": str(t["comp"]), "face": int(t["face"])})
+            if t.get("edge") is not None:
+                nodes = M.edge({"comp": str(t["comp"]), "edge": int(t["edge"])})["nodes"]
+            else:
+                nodes = M.face({"comp": str(t["comp"]), "face": int(t["face"])})["nodes"]
         except analysis.AnalysisError as e:
-            raise ModelError("support %s: %s" % (s.get("name") or k + 1, e))
+            raise ModelError("support %s: %s" % (sname, e))
+        if rigid_nodes.intersection(nodes):
+            raise ModelError("support %s: the face or edge is on a rigid body" % sname)
         ns = "SUP_%d_%s" % (k + 1, safe(s.get("name") or "support", 30).upper())
         L.append("*NSET, NSET=%s" % ns)
-        L += ids_lines(f["nodes"])
-        dofs = s.get("dofs") or [1, 1, 1]
+        L += ids_lines(nodes)
+        dofs = (list(s.get("dofs") or [1, 1, 1]) + [0, 0, 0])[:6]
         sup_rows += ["%s, %d, %d" % (ns, d + 1, d + 1) for d in range(3) if dofs[d]]
+        rn = [n for n in nodes if n in M.shell_nodes]
+        if any(dofs[3:]) and rn:
+            L.append("*NSET, NSET=%s_R" % ns)
+            L += ids_lines(rn)
+            sup_rows += ["%s_R, %d, %d" % (ns, d + 1, d + 1) for d in range(3, 6) if dofs[d]]
     written = set()
     for b in bodies:
         if b["id"] not in mat_of:
@@ -219,7 +243,12 @@ def build(doc, asm, sources, workdir, inp_path, title="", progress=None):
                 L.append("** library material: %s" % lib)
             L += ["*ELASTIC", "%.9g, %.6g" % (E, nu), "*DENSITY", "%.6g" % rho]
             written.add(mname)
-        L.append("*SOLID SECTION, ELSET=B_%s, MATERIAL=%s" % (bname[b["id"]], safe(mname, 60).upper()))
+        if b.get("mode") == "shell":
+            off = SHELL_OFFSET.get(b.get("offset"))
+            L += ["*SHELL SECTION, ELSET=B_%s, MATERIAL=%s%s" % (bname[b["id"]], safe(mname, 60).upper(), ", OFFSET=%s" % off if off else ""),
+                  "%.9g" % float(b["t"])]
+        else:
+            L.append("*SOLID SECTION, ELSET=B_%s, MATERIAL=%s" % (bname[b["id"]], safe(mname, 60).upper()))
     for b in rigid:
         L.append("*RIGID BODY, NSET=RB_%s, REF NODE=%d" % (bname[b["id"]], ref_nodes[b["id"]]))
     if sup_rows:

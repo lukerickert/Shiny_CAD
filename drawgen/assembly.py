@@ -114,7 +114,7 @@ def fast_mesh(shape, tol=None):
 # view data of the sources on disk (mesh, face references, planes and axes, volume), so the first build after a
 # server start does not load or tessellate unchanged sources: <cache dir>/<mkey>.json.gz
 _VIEW_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "drawgen", "viewcache")
-_VIEW_KEYS = ("mesh", "refs", "datums", "erefs", "vrefs", "vol", "cog", "err", "mkey")
+_VIEW_KEYS = ("mesh", "refs", "datums", "erefs", "vrefs", "vol", "cog", "err", "mkey", "surfaces")
 
 
 def _view_read(mkey):
@@ -122,9 +122,9 @@ def _view_read(mkey):
     try:
         with gzip.open(os.path.join(_VIEW_DIR, mkey + ".json.gz"), "rt", encoding="utf-8") as f:
             d = json.load(f)
-        # entries written before the centre planes existed are computed again
-        return d if all(k in d for k in ("mesh", "refs", "vol", "cog", "erefs", "vrefs")) and "cplane:XY" in (d.get("datums") or {}) \
-            and "edge_ids" in d["mesh"] else None
+        # entries written before the centre planes or the surface bodies existed are computed again
+        return d if all(k in d for k in ("mesh", "refs", "vol", "cog", "erefs", "vrefs", "surfaces")) and "cplane:XY" in (d.get("datums") or {}) \
+            and "edge_ids" in d["mesh"] and "face_body" in d["mesh"] else None
     except (OSError, ValueError, EOFError):
         return None
 
@@ -202,14 +202,109 @@ def _mkey(k):
     return hashlib.sha1(repr(k).encode("utf-8")).hexdigest()[:16]
 
 
-_SRC_CACHE = {}     # source key -> {"shape", "err", and once computed: "mesh", "refs", "vol", "cog", "mkey"}
+_SRC_CACHE = {}     # source key -> {"shape" (component shape), "solid", "fsurfaces", "err", and once computed: "mesh",
+                    # "refs", "vol", "cog", "mkey", "surfaces"}
 _SRC_CACHE_MAX = 300
+
+
+def full_shape(solid, surfs):
+    """Component shape: the solid and the shown surface bodies in one compound, the faces of the solid first (face,
+    edge and vertex indices of the view data refer to this shape)."""
+    if not surfs:
+        return solid
+    from build123d import Shape
+    from . import model
+    parts = ([solid.wrapped] if solid is not None else []) + [b.wrapped for _f, _n, _c, b in surfs]
+    return Shape.cast(model.compound(parts))
+
+
+def face_owners(full, solid, surfs):
+    """Per face of the component shape: None (a face of the solid) or the index of its surface body in surfs."""
+    if not surfs:
+        return [None] * len(full.faces())
+    sol = set(solid.faces()) if solid is not None else set()
+    own = {}
+    for k, (_f, _n, _c, b) in enumerate(surfs):
+        for fc in b.faces():
+            if fc not in sol:
+                own.setdefault(fc, k)
+    return [own.get(fc) for fc in full.faces()]
+
+
+def _mesh_body_edges(full, surfs):
+    """Edge indices (TopExp.MapShapes order of the component shape) of the rough STL mesh bodies."""
+    from OCP.TopAbs import TopAbs_EDGE
+    from OCP.TopExp import TopExp
+    try:
+        from OCP.TopTools import TopTools_IndexedMapOfShape
+    except ImportError:
+        from OCP.collections import IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher as TopTools_IndexedMapOfShape
+    rough = [b for _f, _n, _c, b in surfs if getattr(b, "_mesh", False)]
+    if not rough:
+        return set()
+    emap = TopTools_IndexedMapOfShape()
+    TopExp.MapShapes_s(full.wrapped, TopAbs_EDGE, emap)
+    out = set()
+    for b in rough:
+        for e in b.edges():
+            k = emap.FindIndex(e.wrapped)
+            if k > 0:
+                out.add(k - 1)
+    return out
+
+
+def _step_cache_read(k):
+    """(solid or None, [(name, surface shape)]) of a whole STEP file from the BRep cache, or None."""
+    path = os.path.join(_VIEW_DIR, _mkey(k) + ".brep")
+    jp = os.path.join(_VIEW_DIR, _mkey(k) + ".parts.json")
+    if not (os.path.isfile(path) and os.path.isfile(jp)):
+        return None
+    try:
+        from build123d import Shape, import_brep
+        from OCP.TopoDS import TopoDS_Iterator
+        with open(jp, "r", encoding="utf-8") as f:
+            names = json.load(f)
+        comp = import_brep(path)
+        it = TopoDS_Iterator(comp.wrapped)
+        kids = []
+        while it.More():
+            kids.append(Shape.cast(it.Value()))
+            it.Next()
+        if len(kids) != len(names["surfaces"]) + 1:
+            return None
+        solid = kids[0] if names.get("solid") else None
+        return solid, list(zip(names["surfaces"], kids[1:]))
+    except Exception:
+        return None
+
+
+def _step_cache_write(k, solid, surfs):
+    from build123d import Shape, export_brep
+    from . import model
+    path = os.path.join(_VIEW_DIR, _mkey(k) + ".brep")
+    try:
+        os.makedirs(_VIEW_DIR, exist_ok=True)
+        empty = model.compound([])
+        comp = Shape.cast(model.compound([solid.wrapped if solid is not None else empty] + [s.wrapped for _n, s in surfs], always=True))
+        tmp = path + ".%d.%d.tmp.brep" % (os.getpid(), threading.get_ident())
+        export_brep(comp, tmp)
+        os.replace(tmp, path)
+        with open(os.path.join(_VIEW_DIR, _mkey(k) + ".parts.json"), "w", encoding="utf-8") as f:
+            json.dump({"solid": solid is not None, "surfaces": [n for n, _s in surfs]}, f)
+    except Exception:
+        pass
 
 
 class Sources(object):
     """Loads component source shapes. Shapes, their view meshes, face references and volume properties are kept
     between builds, keyed by the source and the state of its files (part file content, imported STEP files, STEP file
-    modification time and size), so a component whose source is unchanged is not rebuilt or tessellated again."""
+    modification time and size), so a component whose source is unchanged is not rebuilt or tessellated again.
+
+    The component shape (load) is the solid with the shown surface bodies: the surface bodies of a part that are not
+    hidden (curve bodies left out), and the faces of the STEP components without solids of a whole STEP file (one
+    surface body per component). solid() and surfaces() give the parts. The view data holds "surfaces" ([{"id",
+    "name", "color"}]) and mesh["face_body"] (per face: None for the solid, else the index into "surfaces"). Volume and
+    centre of mass are those of the solid; a component of surface bodies only has volume 0."""
 
     def __init__(self, part_dir, file_registry=None):
         self.part_dir = part_dir
@@ -217,6 +312,7 @@ class Sources(object):
         self.cache = {}
         self.keys = {}
         self.fdatums = {}       # source json -> [(feature id, name, datum)] of the plane and axis features of a part
+        self.fparts = {}        # source json -> (solid or None, [(surface id, name, color, shape)])
 
     def _step_path(self, src):
         path = src.get("path", "")
@@ -266,61 +362,108 @@ class Sources(object):
                 d["mkey"] = _mkey(k)
                 _SRC_CACHE[k] = d
                 return d
-        shape, err = self.load(src)
+        full, err = self.load(src)
         e = _SRC_CACHE.get(k) if k is not None else None
         if e is None:
-            e = {"shape": shape, "err": err}
-        if shape is not None and "mesh" not in e:
+            e = {"shape": full, "err": err}
+        solid, surfs = self.parts(src)
+        fdatums = self.fdatums.get(json.dumps(src, sort_keys=True)) or e.get("fdatums") or []
+        if full is not None and "mesh" not in e:
             # computed into a new dict and added in one update: a build in another thread that finds "mesh" also
             # finds the other entries
             try:
-                mesh = fast_mesh(shape)
+                mesh = fast_mesh(full)
             except Exception:
-                mesh = partmod.mesh(shape)
-            g = GProp_GProps()
-            BRepGProp.VolumeProperties_s(shape.wrapped, g)
-            cm = g.CentreOfMass()
-            e.update({"refs": face_refs(shape), "erefs": edge_refs(shape), "vrefs": vertex_refs(shape),
-                      "datums": datum_refs(shape, self.fdatums.get(json.dumps(src, sort_keys=True)) or e.get("fdatums") or []),
-                      "vol": g.Mass(), "cog": (cm.X(), cm.Y(), cm.Z()), "mkey": _mkey(k if k is not None else id(e)),
-                      "mesh": mesh})
+                mesh = partmod.mesh(full)
+            mesh["face_body"] = face_owners(full, solid, surfs)
+            rough = _mesh_body_edges(full, surfs)
+            if rough and "edge_ids" in mesh:              # a rough STL mesh body: its triangle edges are not drawn
+                keep = [i for i, ei in enumerate(mesh["edge_ids"]) if ei not in rough]
+                mesh["edges"] = [mesh["edges"][i] for i in keep]
+                mesh["edge_ids"] = [mesh["edge_ids"][i] for i in keep]
+            vol, cog = 0.0, (0.0, 0.0, 0.0)
+            if solid is not None:
+                g = GProp_GProps()
+                BRepGProp.VolumeProperties_s(solid.wrapped, g)
+                cm = g.CentreOfMass()
+                vol, cog = g.Mass(), (cm.X(), cm.Y(), cm.Z())
+            e.update({"refs": face_refs(full), "erefs": edge_refs(full), "vrefs": vertex_refs(full),
+                      "datums": datum_refs(full, fdatums), "vol": vol, "cog": cog,
+                      "mkey": _mkey(k if k is not None else id(e)), "mesh": mesh,
+                      "surfaces": [{"id": fid, "name": nm, "color": col} for fid, nm, col, _b in surfs]})
             if k is not None:
                 _view_write(e)
         return e
 
     def load(self, src):
+        """(component shape or None, error)."""
         jk = json.dumps(src, sort_keys=True)
         if jk in self.cache:
             return self.cache[jk]
         k = self.key(src)
-        if k is not None and "shape" in _SRC_CACHE.get(k, {}):
+        if k is not None and "shape" in _SRC_CACHE.get(k, {}) and "fsurfaces" in _SRC_CACHE[k]:
             e = _SRC_CACHE[k]
+            self.fparts[jk] = (e.get("solid"), e.get("fsurfaces") or [])
             self.cache[jk] = (e["shape"], e["err"])
             return self.cache[jk]
-        shape, err = self._load(src)
+        solid, surfs, err = self._load(src)
+        self.fparts[jk] = (solid, surfs)
+        full = full_shape(solid, surfs)
         if k is not None:
             if k not in _SRC_CACHE:
                 while len(_SRC_CACHE) >= _SRC_CACHE_MAX:
                     _SRC_CACHE.pop(next(iter(_SRC_CACHE)))
                 _SRC_CACHE[k] = {}
-            _SRC_CACHE[k].update({"shape": shape, "err": err, "fdatums": self.fdatums.get(jk) or []})
-        self.cache[jk] = (shape, err)
-        return shape, err
+            _SRC_CACHE[k].update({"shape": full, "solid": solid, "fsurfaces": surfs, "err": err,
+                                  "fdatums": self.fdatums.get(jk) or []})
+        self.cache[jk] = (full, err)
+        return full, err
+
+    def parts(self, src):
+        """(solid or None, [(surface id, name, color, shape)]) of a source."""
+        jk = json.dumps(src, sort_keys=True)
+        if jk not in self.fparts:
+            self.load(src)
+        return self.fparts.get(jk) or (None, [])
+
+    def solid(self, src):
+        """(solid or None, error): the solid of a source without its surface bodies."""
+        full, err = self.load(src)
+        solid = self.parts(src)[0]
+        if solid is None and err is None:
+            err = "no solid"
+        return solid, err
+
+    def surfaces(self, src):
+        return self.parts(src)[1]
 
     def _load(self, src):
-        shape, err = None, None
+        """(solid or None, surfaces, error)."""
+        shape, surfs, err = None, [], None
         try:
             if src.get("type") == "part":
                 path = os.path.join(self.part_dir, partmod_safe(src.get("name", "")) + ".part.json")
                 with open(path, "r", encoding="utf-8") as f:
                     p = json.load(f)
-                dz = {}
-                shape, st = partmod.build(p, datums=dz)
+                dz, bodies = {}, {}
+                shape, st = partmod.build(p, datums=dz, surfaces=bodies)
                 names = {f.get("id"): f.get("name") or f.get("id") for f in p.get("features") or []}
-                self.fdatums[json.dumps(src, sort_keys=True)] = [(fid, names.get(fid, fid), d) for fid, d in dz.items()
-                                                                if d.get("kind") in ("plane", "axis")]
+                jk = json.dumps(src, sort_keys=True)
+                self.fdatums[jk] = [(fid, names.get(fid, fid), d) for fid, d in dz.items()
+                                    if d.get("kind") in ("plane", "axis")]
+                hidden = set(p.get("hidden") or [])
+                colors = p.get("body_colors") or {}
+                for fid, b in bodies.items():
+                    if b is None or fid in hidden:
+                        continue
+                    try:
+                        if not b.faces():                 # a curve body
+                            continue
+                    except Exception:
+                        continue
+                    surfs.append((fid, names.get(fid, fid), colors.get(fid), b))
                 bad = [s["error"] for s in st if s.get("error")]
-                if shape is None:
+                if shape is None and not surfs:
                     err = "part %s has no solid" % src.get("name")
                 elif bad:
                     err = "part %s: %s" % (src.get("name"), bad[0])
@@ -330,12 +473,20 @@ class Sources(object):
                     err = "file not found: %s" % path
                 else:
                     k = self.key(src)
-                    shape = _brep_read(k) if k is not None else None
-                    if shape is not None:
-                        return shape, None
-                    comp, solids = _step_solids(path)
                     want = src.get("part")
-                    if want is not None and want != "":
+                    whole = want is None or want == ""
+                    if k is not None:
+                        if whole:
+                            hit = _step_cache_read(k)
+                            if hit is not None:
+                                return hit[0], [("s%d" % (i + 1), nm, None, sh) for i, (nm, sh) in enumerate(hit[1])], None
+                        else:
+                            shape = _brep_read(k)
+                            if shape is not None:
+                                return shape, [], None
+                    from . import model
+                    comp, solids = _step_solids(path)
+                    if not whole:
                         # by index or by label
                         pick = None
                         try:
@@ -348,15 +499,19 @@ class Sources(object):
                         if shape is None:
                             err = "solid %s not found in %s" % (want, os.path.basename(path))
                     else:
-                        shape = comp if len(solids) != 1 else solids[0][1]
+                        shape = (comp if len(solids) != 1 else solids[0][1]) if solids else None
+                        named = model.step_surfaces(path)
+                        surfs = [("s%d" % (i + 1), nm, None, sh) for i, (nm, sh) in enumerate(named)]
+                        if shape is None and not surfs:
+                            err = "no solids or faces in %s" % os.path.basename(path)
                     write_step_breps(path, solids)
-                    if shape is not None and k is not None and (want is None or want == ""):
-                        _brep_write(k, shape)
+                    if k is not None and whole and err is None:
+                        _step_cache_write(k, shape, [(nm, sh) for _i, nm, _c, sh in surfs])
             else:
                 err = "unknown source type"
         except Exception as e:
             err = str(e)
-        return shape, err
+        return shape, surfs, err
 
 
 def partmod_safe(s):
@@ -364,11 +519,13 @@ def partmod_safe(s):
     return re.sub(r"[^A-Za-z0-9_\-.]+", "_", s).strip("_") or "part"
 
 
-def build(asm, sources, explode=False):
-    """Returns [(component, placed shape or None, error)]."""
+def build(asm, sources, explode=False, solid_only=False):
+    """Returns [(component, placed shape or None, error)]: the component shapes (solid and shown surface bodies), or
+    with solid_only the solids alone (mass, interference, drawings)."""
     out = []
     for c in asm.get("components") or []:
-        shape, err = sources.load(c.get("source") or {})
+        src = c.get("source") or {}
+        shape, err = sources.solid(src) if solid_only else sources.load(src)
         placed = None
         if shape is not None:
             try:
@@ -509,7 +666,7 @@ def _worker_interference(pairs, comps, part_dir, files, explode):
     def get(cid):
         if cid not in placed:
             c = comps[cid]
-            shape, err = src.load(c.get("source") or {})
+            shape, err = src.solid(c.get("source") or {})
             placed[cid] = place(shape, c, explode) if shape is not None else None
         return placed[cid]
 
@@ -591,6 +748,7 @@ def view_data(asm, sources, explode=False, have=(), default_density=0.0):
         if e["mkey"] not in have:
             out["mesh"], out["refs"], out["datums"] = e["mesh"], e["refs"], e.get("datums") or {}
             out["erefs"], out["vrefs"] = e.get("erefs") or [], e.get("vrefs") or []
+            out["surfaces"] = e.get("surfaces") or []
         comps.append(out)
         if c.get("visible") is False:
             continue

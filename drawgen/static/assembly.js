@@ -3,6 +3,7 @@ import * as THREE from "three";
 import { TumbleControls } from "/static/vendor/TumbleControls.js";
 import { updateAxes } from "/static/axes.js";
 import { createNavCube } from "/static/navcube.js";
+import { addBodyGroups, bodyMaterials } from "/static/bodyview.js";
 
 const AS = { asm: null, sel: null, dirty: false, three: null, seq: 0, timer: null, result: null, bbox: null,
              matePick: null,   // {mateId, side: "a" | "b"} while a face is being picked for a mate
@@ -290,6 +291,7 @@ function setDragMode(on) {
   $("#as-rotate").classList.toggle("active", AS.dragMode === "rotate");
   if (on) AS.matePick = null;
   if (on && AS.measure) setMeasure(false);
+  if (on && AS.move2) setMove2(false);
   if (AS.three) AS.three.renderer.domElement.style.cursor = "";
   status(AS.dragMode === "move" ? "Drag: left drag moves a component that is not fixed, only in the directions its mates leave free (Shift: along X, Y or Z). D or Esc ends"
     : AS.dragMode === "rotate" ? "Rotate: left drag sideways rotates a component that is not fixed, about the axis its mates leave free, else about the view direction (Shift: 15 deg steps). R or Esc ends"
@@ -341,6 +343,7 @@ function rayAt(e) {
 
 function dragHover(e) {
   AS.mouse = { clientX: e.clientX, clientY: e.clientY };
+  if (!AS.drag && !e.buttons && AS.move2 && AS.result) { move2Hover(e); return; }
   if (!AS.drag && !e.buttons && AS.measure && AS.result) {
     const cid = compAt(e);
     if (cid) showPlanesOf(cid);
@@ -661,6 +664,7 @@ function pickSide() {
 
 function pickComponent(e) {
   const t = AS.three;
+  if (AS.move2) { move2Click(e); return; }
   if (AS.measure) { measureClick(e); return; }
   const ps = pickSide();
   if (ps) {
@@ -709,8 +713,14 @@ function meshEntry(mkey) {
     for (const pl of m.edges) for (let k = 0; k + 1 < pl.length; k++) pos.push(...pl[k], ...pl[k + 1]);
     e.edgeGeo = new THREE.BufferGeometry();
     e.edgeGeo.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+    e.groups = addBodyGroups(e.geo, m);
   }
   return e;
+}
+
+function disposeEntry(e) {
+  if (!e.geo) return;
+  e.geo.dispose(); e.edgeGeo.dispose();
 }
 
 /** Stores the meshes of a build result, fills c.mesh and c.refs from the store and drops meshes no longer used. */
@@ -718,18 +728,18 @@ function takeMeshes(res) {
   for (const c of res.components) if (c.mesh && !c.mkey) { c.mkey = "w" + AS.seq + "_" + c.id; c.placed = true; }  // placed mesh (server before the cache)
   for (const c of res.components) if (c.mkey && c.mesh) {
     const old = MESHES.get(c.mkey);
-    if (old && old.geo) { old.geo.dispose(); old.edgeGeo.dispose(); }
-    MESHES.set(c.mkey, { mesh: c.mesh, refs: c.refs || [], datums: c.datums || {}, erefs: c.erefs || [], vrefs: c.vrefs || [] });
+    if (old) disposeEntry(old);
+    MESHES.set(c.mkey, { mesh: c.mesh, refs: c.refs || [], datums: c.datums || {}, erefs: c.erefs || [], vrefs: c.vrefs || [], surfaces: c.surfaces || [] });
   }
   const used = new Set();
   let missing = false;
   for (const c of res.components) if (c.mkey) {
     const e = MESHES.get(c.mkey);
-    if (e) { c.mesh = e.mesh; c.refs = e.refs; c.datums = e.datums; c.erefs = e.erefs; c.vrefs = e.vrefs; used.add(c.mkey); }
+    if (e) { c.mesh = e.mesh; c.refs = e.refs; c.datums = e.datums; c.erefs = e.erefs; c.vrefs = e.vrefs; c.surfaces = e.surfaces; used.add(c.mkey); }
     else { c.error = c.error || "mesh missing"; missing = true; }
   }
   if (missing) scheduleBuild();                       // a mesh was dropped while the request was under way
-  for (const [k, e] of MESHES) if (!used.has(k)) { if (e.geo) { e.geo.dispose(); e.edgeGeo.dispose(); } MESHES.delete(k); }
+  for (const [k, e] of MESHES) if (!used.has(k)) { disposeEntry(e); MESHES.delete(k); }
 }
 
 /** Placement of a component from its current pos, rot and explode offset (assembly.trsf_of: rotations about the
@@ -784,7 +794,13 @@ function setMeshes(res) {
     if (disp === "transparent") { mat.transparent = true; mat.opacity = sel ? 0.5 : 0.25; mat.depthWrite = false; mat.side = THREE.DoubleSide; }
     if (lines) { mat.colorWrite = false; mat.depthWrite = disp === "hidden"; }   // pickable; hidden lines: depth only
     if (ghost) { mat.transparent = true; mat.opacity = 0.07; mat.depthWrite = false; mat.colorWrite = true; }
-    const mesh = new THREE.Mesh(e.geo, mat);
+    // surface bodies of a part: translucent in their Part tab colour (the solid in the component colour)
+    let mats = mat;
+    if (e.groups) {
+      mats = bodyMaterials(mat, c.surfaces, () => ({ opacity: ghost ? 0.07 : sel ? 0.6 : 0.45, extra: { emissive: sel ? 0x5a2200 : 0x000000 } }));
+      for (const sm of mats.slice(1)) { if (lines) sm.colorWrite = false; t.clipMats.push(sm); }
+    }
+    const mesh = new THREE.Mesh(e.geo, mats);
     mesh.userData = { id: c.id };
     inner.add(mesh);
     if (!ghost) t.pickables.push(mesh);
@@ -842,6 +858,7 @@ function setMeshes(res) {
     box.union(e.geo.boundingBox.clone().applyMatrix4(inner.matrix));
   }
   drawMeasureLine();
+  drawMove2Marks();
   t.group.updateMatrixWorld(true);
   const bb = box.isEmpty() ? null : [box.min.x, box.min.y, box.min.z, box.max.x, box.max.y, box.max.z];
   AS.bbox = bb;
@@ -865,6 +882,88 @@ function isolateSet() {
 }
 
 const MEAS_COL = 0x0ca678;
+
+/** Move by two points: a point on a component (a vertex within 12 px of the cursor, else the point on the face under
+ *  the cursor), then the point it goes to (on any component); the position of the component changes by the
+ *  difference. Mates are solved again after the move. */
+function setMove2(on) {
+  AS.move2 = on ? { p1: null, comp: null, snap: null } : null;
+  if (on) { if (AS.dragMode) setDragMode(false); if (AS.measure) setMeasure(false); AS.matePick = null; }
+  $("#as-move2").classList.toggle("active", !!on);
+  if (AS.three) AS.three.renderer.domElement.style.cursor = on ? "crosshair" : "";
+  if (AS.result) setMeshes(AS.result);
+  status(on ? "Move by two points: click the point on the component to move (vertices snap within 12 px). Esc ends" : "Move by two points ended");
+}
+/** Point under the cursor: {comp, p (global), vertex (bool)}: a visible vertex within 12 px, else the face point. */
+function pointAt(e) {
+  const t = AS.three, r = t.renderer.domElement.getBoundingClientRect();
+  const sx = e.clientX - r.left, sy = e.clientY - r.top;
+  const hits = pickHits(rayAt(e));
+  let best = null, bd = 12;
+  for (const c of (AS.result && AS.result.components) || []) {
+    const live = comp(c.id);
+    if (!live || live.visible === false || !c.mesh) continue;
+    const M = compMatrix(live);
+    (c.vrefs || []).forEach(v => {
+      const w = new THREE.Vector3(...v.c).applyMatrix4(M), q = w.clone().project(t.camera);
+      const d = Math.hypot((q.x + 1) / 2 * r.width - sx, (1 - q.y) / 2 * r.height - sy);
+      if (d >= bd) return;
+      const rc = new THREE.Raycaster();
+      rc.setFromCamera(new THREE.Vector2(q.x, q.y), t.camera);
+      const front = pickHits(rc);
+      const dv = rc.ray.origin.distanceTo(w);
+      if (front.length && front[0].distance < dv - 1e-3 * Math.max(1, dv)) return;    // behind a face
+      bd = d; best = { comp: c.id, p: w.toArray(), vertex: true };
+    });
+  }
+  if (best) return best;
+  return hits.length ? { comp: hits[0].object.userData.id, p: hits[0].point.toArray(), vertex: false } : null;
+}
+function move2Hover(e) {
+  const h = pointAt(e);
+  const m = AS.move2;
+  const prev = JSON.stringify(m.snap);
+  m.snap = h && h.vertex ? h.p : null;
+  if (JSON.stringify(m.snap) !== prev) setMeshes(AS.result);
+  AS.three.renderer.domElement.style.cursor = h ? "crosshair" : "";
+  if (h) status((m.p1 ? "To" : "From") + ": (" + h.p.map(v => afmt(v, 3)).join(", ") + ")" + (h.vertex ? " vertex" : "") + " on " + ((comp(h.comp) || {}).name || h.comp));
+}
+function move2Click(e) {
+  const h = pointAt(e);
+  if (!h) return;
+  const m = AS.move2;
+  if (!m.p1) {
+    const live = comp(h.comp);
+    if (!live) return;
+    if (live.fixed) { msg(live.name + " is fixed in space", true); return; }
+    m.p1 = h.p; m.comp = h.comp;
+    setMeshes(AS.result);
+    msg("From (" + h.p.map(v => afmt(v, 3)).join(", ") + ") on " + live.name + ": click the point it goes to");
+    return;
+  }
+  const live = comp(m.comp);
+  const d = h.p.map((v, i) => v - m.p1[i]);
+  live.pos = (live.pos || [0, 0, 0]).map((v, i) => Math.round(((Number(v) || 0) + d[i]) * 1e6) / 1e6);
+  m.p1 = null; m.comp = null;
+  changedAsm();
+  if ((AS.asm.mates || []).some(x => !x.suppressed && x.a && x.b)) solveMates();
+  msg(live.name + " moved by (" + d.map(v => afmt(v, 3)).join(", ") + ") mm");
+}
+/** Markers of Move by two points: the first point (red) and the vertex under the cursor (yellow). */
+function drawMove2Marks() {
+  const m = AS.move2, t = AS.three;
+  if (!m) return;
+  const r = Math.max(((AS.bbox && Math.max(AS.bbox[3] - AS.bbox[0], AS.bbox[4] - AS.bbox[1], AS.bbox[5] - AS.bbox[2])) || 100) / 200, 0.2);
+  for (const [p, col] of [[m.p1, 0xe03131], [m.snap, 0xf2c94c]]) {
+    if (!p) continue;
+    const sg = new THREE.SphereGeometry(r, 12, 8);
+    t.tempGeo.push(sg);
+    const sm = new THREE.Mesh(sg, new THREE.MeshBasicMaterial({ color: col, depthTest: false }));
+    sm.position.set(...p);
+    sm.renderOrder = 12;
+    t.group.add(sm);
+  }
+}
 
 /** Measure mode: on / off. */
 function setMeasure(on) {
@@ -1722,7 +1821,8 @@ window.asmShown = function () {
   document.addEventListener("keydown", e => {
     if (e.key === "Escape") {
       closeCompMenu();
-      if (AS.measure && !$("#tab-asm").hidden) setMeasure(false);
+      if (AS.move2 && !$("#tab-asm").hidden) setMove2(false);
+      else if (AS.measure && !$("#tab-asm").hidden) setMeasure(false);
       else if (AS.multi && !$("#tab-asm").hidden && !AS.dragMode && !pickSide()) { AS.multi = null; renderComps(); setMeshes(AS.result); status("Selection cleared"); }
       else if (AS.dragMode && !$("#tab-asm").hidden) setDragMode(false);
       else if (pickSide() && !$("#tab-asm").hidden) { AS.matePick = null; AS.noAutoPick = AS.selMate; AS.three.renderer.domElement.style.cursor = ""; renderMates(); setMeshes(AS.result); status("Mate picking ended (Pick starts it again)"); }
@@ -1749,6 +1849,7 @@ window.asmShown = function () {
     if (rotKey && free) setDragMode(AS.dragMode === "rotate" ? false : "rotate");
   });
   $("#as-drag").onclick = () => setDragMode(AS.dragMode === "move" ? false : "move");
+  $("#as-move2").onclick = () => setMove2(!AS.move2);
   $("#as-rotate").onclick = () => setDragMode(AS.dragMode === "rotate" ? false : "rotate");
   $("#as-mates-btn").onclick = () => showMatesWin($("#as-matewin").hidden);
   $("#as-matewin-close").onclick = () => showMatesWin(false);

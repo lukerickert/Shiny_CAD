@@ -13,6 +13,10 @@ named view, or sheet mm when "view" is null (notes only):
              two lines), "pos": [x, y] (arc position), "text", "prefix", "tol"}
   balloon   {"type": "balloon", "view", "anchor": [x, y], "pos": [x, y], "text": "1"}  item balloon (ISO 7573)
   note      {"type": "note", "view" | null, "anchor": [x, y] | null, "pos": [x, y], "text"}
+  centre    {"type": "centre", "view", "c": [x, y], "r", "ext"}  centre mark of a circle of radius r (model mm);
+            ext: length of the arms beyond the circle in sheet mm (default 2)
+            {"type": "centre", "view", "p1": [x, y], "p2": [x, y], "ext"}  centre line between two points,
+            extended by ext (sheet mm, default 2) at both ends
 
   every annotation may carry "height": text height in mm (default dim_text_height_mm)
 tol: {"mode": "none" | "fit" | "sym" | "dev", "fit": "H7", "show_dev": true,
@@ -335,6 +339,34 @@ def _balloon(a, M, h):
     return out
 
 
+CENTRE_EXT_MM = 2.0        # centre marks and lines extend this far beyond the circle or the points (sheet mm)
+CENTRE_CHAIN_MIN_MM = 5.0  # marks of circles below this radius on the sheet are thin continuous lines
+
+
+def _centre(a, M, f):
+    """Centre mark (a cross through the centre, extending beyond the circle) or centre line between two points
+    (ISO 128-24): chain lines; thin continuous lines for small circles. f: view scale on the sheet."""
+    out = []
+    ext = a.get("ext")
+    ext = CENTRE_EXT_MM if ext in (None, "") else max(0.0, float(ext))
+    if a.get("c") is not None:
+        C = M(a["c"])
+        R = float(a.get("r") or 0) * f
+        e = R + ext
+        layer = "chain" if R >= CENTRE_CHAIN_MIN_MM else "dim"
+        out.append(("line", C[0] - e, C[1], C[0] + e, C[1], layer))
+        out.append(("line", C[0], C[1] - e, C[0], C[1] + e, layer))
+        return out
+    P1, P2 = M(a["p1"]), M(a["p2"])
+    L = math.hypot(P2[0] - P1[0], P2[1] - P1[1])
+    if L < 1e-9:
+        raise ValueError("zero-length centre line")
+    ux, uy = (P2[0] - P1[0]) / L, (P2[1] - P1[1]) / L
+    e = ext
+    out.append(("line", P1[0] - ux * e, P1[1] - uy * e, P2[0] + ux * e, P2[1] + uy * e, "chain"))
+    return out
+
+
 def _note(a, M, h):
     raw = (a.get("text") or "").replace("\r\n", "\n")
     # typed line-break markers are also accepted: \n or /n surrounded by spaces
@@ -387,6 +419,8 @@ def render(anns, maps, cfg):
                 prims = _note(a, M, ah)
             elif t == "balloon":
                 prims = _balloon(a, M, ah)
+            elif t == "centre":
+                prims = _centre(a, M, f)
             else:
                 continue
         except (KeyError, TypeError, ValueError, ZeroDivisionError):

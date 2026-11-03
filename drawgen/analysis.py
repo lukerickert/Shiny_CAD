@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Linear static analysis with CalculiX: solid bodies, plates, beams, rods and fasteners.
+"""Linear static analysis with CalculiX: solid bodies, shells, plates, beams, rods and fasteners.
 
 Analysis record (JSON, <name>.fea.json):
   {"name", "source": {"type": "assembly" | "part", "name"},
@@ -7,15 +7,19 @@ Analysis record (JSON, <name>.fea.json):
    "default_material": name,
    "mesh": {"size": mm, "size_min": mm, "curvature": elements per 360 deg, "algorithm": "delaunay" | "frontal" | "hxt",
             "optimize": bool, "strategy": "tet" | "hex" | "hexsub", "tet_type": "C3D10" | "C3D4",
-            "hex_type": "C3D8I" | "C3D8" | "C3D8R" | "C3D20" | "C3D20R"}      (femesh.py)
+            "hex_type": "C3D8I" | "C3D8" | "C3D8R" | "C3D20" | "C3D20R",
+            "shell_type": "S4" | "S8R" | "S3", "shell_algorithm": "quasi" | "frontal" | "delaunay" | "tri"}  (femesh.py)
    "bonded": true,                          touching solid bodies share nodes; plates are tied to touching bodies
    "bodies": {component id: {"mode": "solid" | "plate" | "off", "material", "size": mm, "layers": n,
                              "strategy": null (mesh default) | "tet" | "hex" | "hexsub"}},
+   "shells": {"<component id>:<surface id>": {"mode": "shell" | "off", "t": mm, "offset": "mid" | "positive" |
+              "negative", "material", "size": mm}},   surface bodies of the components (default: shell, 10 mm)
    "members": [member], "plates": [plate], "fasteners": [fastener], "supports": [support], "loads": [load]}
 
 Units: N, mm, MPa, t/mm^3 inside the solver; densities are entered in kg/m^3 and accelerations in mm/s^2.
 
-Face reference: {"comp": component id, "face": index into the faces of the component shape}.
+Face reference: {"comp": component id, "face": index into the faces of the component shape (the solid and the surface
+bodies, assembly.Sources)}. Edge reference: {"comp", "edge": index into the edges of the component shape}.
 Point: {"xyz": [x, y, z]} (global, mm), optionally {"face": face reference} (member end connected to the face) and
 {"r": mm} (only the face nodes within r of the point are connected).
 
@@ -40,17 +44,20 @@ point:    {"id", "name", "xyz": [x, y, z], "faces": [face reference]}   referenc
           the faces (*RIGID BODY, REF NODE translations, ROT NODE translations = rotations); member ends at the point
           follow it. Targets {"point": id} for supports (six components) and loads (force, moment).
           A member end connected to a face takes "coupling": "rigid" (face nodes rigid with the end) instead of RBE3.
-support:  {"id", "name", "target": face reference | {"member", "end": "a" | "b"} | {"point": id},
-           "type": "fixed" | "pinned" | "normal" | "dofs" | "displacement", "dofs": [ux, uy, uz, rx, ry, rz] (1 = held),
+support:  {"id", "name", "target": face reference | edge reference | {"member", "end": "a" | "b"} | {"point": id},
+           "type": "fixed" | "pinned" | "normal" | "dofs" | "displacement" | "xsymm" | "ysymm" | "zsymm",
+           "dofs": [ux, uy, uz, rx, ry, rz] (1 = held),
            "value": [ux, uy, uz, rx, ry, rz] (displacement: mm, rad) | mm (normal: along the outward normal)}
           face: fixed = ux, uy, uz; normal = displacement normal to a planar face (0, or "value"); dofs = the global
           components held at 0; displacement = the chosen global components prescribed to "value".
           member end and reference point: fixed = all six; pinned = ux, uy, uz; dofs; displacement.
+          edge and face of a shell: fixed = all six, pinned, symmetry (x: ux ry rz, y: uy rx rz, z: uz rx ry), dofs,
+          displacement; translations on all nodes, rotations on the shell nodes.
           Rotations (rx, ry, rz) on a face: the face is rigidly coupled to a node at its weighted centre (kinematic
           coupling) that carries the support.
           Prescribed displacements act in the load step (with a fastener preload step they are 0 in the preload step).
 load:     {"id", "name", "type": "force" | "moment" | "pressure" | "gravity" | "line",
-           "target": face reference | {"member", "end"} | {"member"} , "value": [x, y, z] | p}
+           "target": face reference | {"member", "end"} | {"member"} | edge reference (line), "value": [x, y, z] | p}
           force on a face: total force distributed by area; moment on a face: about the face centre, distributed
           by area (RBE3 distribution); pressure: MPa, positive into the face; line: N/mm on a member (global);
           gravity: acceleration vector (mm/s^2) on all bodies and members.
@@ -258,42 +265,68 @@ def find_ccx(cfg_path=""):
 
 # --------------------------------------------------------------------------- geometry
 
+DEFAULT_SHELL_T = 10.0      # mm, thickness of a shell without one
+
+
 def geometry(doc, asm, sources):
     """Bodies of the analysis: [{"id", "name", "shape" (placed), "mode", "material", "size", "layers",
-    "faces": {index: (A, B, C) triangle corner arrays, global}, "refs": face refs (local)}]."""
+    "faces": {index: (A, B, C) triangle corner arrays, global}, "refs": face refs (local), "comp": component id,
+    "full": placed component shape (solid and surface bodies; face and edge indices of references)}].
+    The solid of a component is the body with the component id (mode solid | plate); each surface body of the
+    component that is not off is a shell body "<component id>:<surface id>" with "t" (mm) and "offset"."""
     from . import assembly
     out = []
     bcfg = doc.get("bodies") or {}
+    scfg = doc.get("shells") or {}
+    placed = {}
     for c in asm.get("components") or []:
         cid = str(c.get("id"))
         cfg = bcfg.get(cid) or {}
         mode = cfg.get("mode") or "solid"
-        if mode == "off" or c.get("visible") is False and not cfg.get("mode"):
+        if c.get("visible") is False and not cfg.get("mode") and not any(k.split(":")[0] == cid for k in scfg):
             continue
         src = c.get("source") or {}
-        shape, err = sources.load(src)
-        if shape is None and src.get("type") == "part" and (err or "").endswith("has no solid"):
+        full, err = sources.load(src)
+        if full is None and src.get("type") == "part" and (err or "").endswith("has no solid"):
             continue                                   # a part with sketches only: geometry for members and plates
-        if shape is None:
+        if full is None:
             raise AnalysisError("component %s: %s" % (c.get("name") or cid, err or "no solid"))
+        solid, surfs = sources.parts(src)
         info = sources.info(src)
         t = assembly.trsf_of(c)
         M = np.array([[t.Value(i, j) for j in (1, 2, 3, 4)] for i in (1, 2, 3)])
         mesh = info["mesh"]
-        V = np.asarray(mesh["vertices"], float) @ M[:, :3].T + M[:, 3]
+        V = np.asarray(mesh["vertices"], float).reshape(-1, 3) @ M[:, :3].T + M[:, 3]
         T = np.asarray(mesh["triangles"], int).reshape(-1, 3)
         fot = np.asarray(mesh["face_of_tri"], int)
+        fb = mesh.get("face_body") or []
         faces = {}
         for fi in np.unique(fot):
             tt = T[fot == fi]
             faces[int(fi)] = (V[tt[:, 0]], V[tt[:, 1]], V[tt[:, 2]])
         bb = mesh.get("bbox") or [0, 0, 0, 1, 1, 1]
         diag = math.sqrt(sum((bb[i + 3] - bb[i]) ** 2 for i in range(3))) or 1.0
-        out.append({"id": cid, "name": c.get("name") or cid, "shape": assembly.place(shape, c), "mode": mode,
-                    "material": cfg.get("material") or doc.get("default_material"), "size": cfg.get("size"),
-                    "layers": cfg.get("layers") or 1, "strategy": cfg.get("strategy"), "faces": faces, "refs": info.get("refs") or [],
-                    "tol": max(diag / 2000.0, 0.005), "M": M})
-    placed = {}
+        pf = assembly.place(full, c)
+        placed[cid] = pf
+        common = {"comp": cid, "full": pf, "refs": info.get("refs") or [], "tol": max(diag / 2000.0, 0.005), "M": M}
+        cname = c.get("name") or cid
+        if solid is not None and mode != "off":
+            out.append(dict(common, id=cid, name=cname, shape=assembly.place(solid, c), mode=mode,
+                            material=cfg.get("material") or doc.get("default_material"), size=cfg.get("size"),
+                            layers=cfg.get("layers") or 1, strategy=cfg.get("strategy"),
+                            faces={fi: v for fi, v in faces.items() if fi >= len(fb) or fb[fi] is None}))
+        for k, (sid, sname, _col, sh) in enumerate(surfs):
+            key = "%s:%s" % (cid, sid)
+            sc = scfg.get(key) or {}
+            if (sc.get("mode") or "shell") == "off":
+                continue
+            th = float(sc.get("t") or doc.get("shell_t") or DEFAULT_SHELL_T)
+            if th <= 0:
+                raise AnalysisError("shell %s / %s: thickness must be positive" % (cname, sname))
+            out.append(dict(common, id=key, name="%s / %s" % (cname, sname), shape=assembly.place(sh, c), mode="shell",
+                            material=sc.get("material") or doc.get("default_material"), size=sc.get("size"), layers=1,
+                            strategy=None, t=th, offset=sc.get("offset") or "mid",
+                            faces={fi: v for fi, v in faces.items() if fi < len(fb) and fb[fi] == k}))
 
     def placed_shape(cid):
         if cid not in placed:
@@ -305,8 +338,6 @@ def geometry(doc, asm, sources):
                 raise AnalysisError("component %s: %s" % (c.get("name") or cid, err or "no solid"))
             placed[cid] = assembly.place(shape, c)
         return placed[cid]
-    for b in out:
-        placed[b["id"]] = b["shape"]
     for p in resolve_plate_groups(doc):
         out.append(plate_body(p, placed_shape, doc))
     if not out and not (doc.get("members") or []):
@@ -379,7 +410,8 @@ def plate_body(p, placed_shape, doc):
     mesh, faces, refs = _mesh_faces(sol)
     bb = mesh["bbox"]
     diag = math.sqrt(sum((bb[i + 3] - bb[i]) ** 2 for i in range(3))) or 1.0
-    return {"id": "plate_" + str(p.get("id")), "name": p.get("name") or str(p.get("id")), "shape": sol, "mode": "plate",
+    return {"id": "plate_" + str(p.get("id")), "comp": "plate_" + str(p.get("id")), "full": sol,
+            "name": p.get("name") or str(p.get("id")), "shape": sol, "mode": "plate",
             "material": p.get("material") or doc.get("default_material"), "size": p.get("size"), "layers": 1,
             "faces": faces, "refs": refs, "tol": max(diag / 2000.0, 0.005),
             "M": np.hstack([np.eye(3), np.zeros((3, 1))]), "normal": [float(v) for v in n]}
@@ -430,7 +462,19 @@ FACE_NODES = {   # Abaqus element faces (1-based corner indices)
     "C3D8I": _HEX_FACES, "C3D8": _HEX_FACES, "C3D8R": _HEX_FACES, "C3D20": _HEX_FACES, "C3D20R": _HEX_FACES,
     "C3D6": _WEDGE_FACES, "C3D15": _WEDGE_FACES,
 }
-NCORNER = {"C3D4": 4, "C3D10": 4, "C3D8I": 8, "C3D8": 8, "C3D8R": 8, "C3D20": 8, "C3D20R": 8, "C3D6": 6, "C3D15": 6}
+NCORNER = {"C3D4": 4, "C3D10": 4, "C3D8I": 8, "C3D8": 8, "C3D8R": 8, "C3D20": 8, "C3D20R": 8, "C3D6": 6, "C3D15": 6,
+           "S4": 4, "S4R": 4, "S8R": 4, "S3": 3, "S6": 3}
+SHELL_ELEMS = ("S4", "S4R", "S8R", "S3", "S6")
+# consistent nodal fractions of a uniform surface load on a shell element (corners, then mid-side nodes)
+SHELL_FRACTIONS = {"S4": [0.25] * 4, "S4R": [0.25] * 4, "S3": [1.0 / 3] * 3, "S8R": [-1.0 / 12] * 4 + [1.0 / 3] * 4,
+                   "S6": [0.0] * 3 + [1.0 / 3] * 3}
+# expanded 3D element of CalculiX: node positions of the bottom / top layers for the shell nodes (corners, mid-sides)
+SHELL_EXPANSION = {"S4": [(0, 4), (1, 5), (2, 6), (3, 7)], "S4R": [(0, 4), (1, 5), (2, 6), (3, 7)],
+                   "S3": [(0, 3), (1, 4), (2, 5)],
+                   "S8R": [(0, 4), (1, 5), (2, 6), (3, 7), (8, 12), (9, 13), (10, 14), (11, 15)],
+                   "S6": [(0, 3), (1, 4), (2, 5), (6, 9), (7, 10), (8, 11)]}
+SHELL_OFFSET = {"mid": 0.0, "positive": 0.5, "negative": -0.5}
+SYMMETRY = {"xsymm": [1, 5, 6], "ysymm": [2, 4, 6], "zsymm": [3, 4, 5]}
 # consistent nodal fractions of a uniform body force (exact for straight-sided elements of constant Jacobian)
 _W_HEX20 = [-1.0 / 8] * 8 + [1.0 / 6] * 12
 _W_WEDGE15 = [-1.0 / 9] * 6 + [1.0 / 6] * 6 + [2.0 / 9] * 3
@@ -518,6 +562,13 @@ class Model(object):
         self.rps = {}                   # reference point id -> {"name", "ref", "rot", "xyz", "nodes", "joints"}
         self.rigid = []                 # (nset, ref node, rot node) of *RIGID BODY
         self.rp_rot_nodes = set()       # rotation nodes of reference points (their translations are rotations)
+        self.face_body = {}             # (component id, face index) -> body id
+        for bid, b in self.bodies.items():
+            for fi in b.get("faces") or {}:
+                self.face_body.setdefault((str(b.get("comp", bid)), int(fi)), bid)
+        self.shell_nodes = set(n for bid, mb in mesh["bodies"].items() for bl in mb["blocks"] if bl["type"] in SHELL_ELEMS
+                               for e in bl["elements"] for n in e[1:])
+        self.edge_cache = {}
         self.atype = doc.get("analysis_type") or "static"      # static | modal | buckling
         if self.atype not in ATYPES:
             raise AnalysisError("unknown analysis type %s" % self.atype)
@@ -550,13 +601,16 @@ class Model(object):
         key = (str(ref.get("comp")), int(ref.get("face", -1)))
         if key in self.face_cache:
             return self.face_cache[key]
-        b = self.bodies.get(key[0])
-        if b is None:
-            raise AnalysisError("face %s of component %s: the component is not in the analysis" % (key[1], key[0]))
-        tri = b["faces"].get(key[1])
-        if tri is None:
-            raise AnalysisError("face %s of component %s not found" % (key[1], key[0]))
-        mb = self.mesh["bodies"].get(key[0])
+        bid = self.face_body.get(key)
+        if bid is None:
+            if not any(str(b.get("comp", i)) == key[0] for i, b in self.bodies.items()):
+                raise AnalysisError("face %s of component %s: the component is not in the analysis" % (key[1], key[0]))
+            raise AnalysisError("face %s of component %s: its body is off or the face is not found" % (key[1], key[0]))
+        b = self.bodies[bid]
+        tri = b["faces"][key[1]]
+        mb = self.mesh["bodies"].get(bid)
+        if mb is None:
+            raise AnalysisError("face %s of %s: the body has no mesh" % (key[1], b["name"]))
         thr = 3 * b["tol"] + 1e-6 * self.diag
         A, B, C = tri
         lo = np.minimum(np.minimum(A.min(0), B.min(0)), C.min(0)) - thr
@@ -588,7 +642,8 @@ class Model(object):
             else:
                 for n in f[:nc]:
                     w[n] = w.get(n, 0.0) + area / nc
-        res = {"nodes": sorted(nodes), "w": w, "facets": facets, "area": sum(w.values()), "body": key[0]}
+        res = {"nodes": sorted(nodes), "w": w, "facets": facets, "area": sum(w.values()), "body": bid,
+               "shell": b.get("mode") == "shell"}
         self.face_cache[key] = res
         return res
 
@@ -602,7 +657,7 @@ class Model(object):
 
     def face_normal_out(self, ref, f):
         """Outward unit normal of a facet (sign from the nearest triangle of the CAD face)."""
-        b = self.bodies[str(ref["comp"])]
+        b = self.bodies[self.face_body[(str(ref["comp"]), int(ref["face"]))]]
         A, B, C = b["faces"][int(ref["face"])]
         cn = np.cross(B - A, C - A)
         cc = (A + B + C) / 3
@@ -614,6 +669,81 @@ class Model(object):
         if np.dot(n, cn[k]) < 0:
             n = -n
         return _unit(n), 0.5 * np.linalg.norm(n) if nc == 3 else 0.5 * np.linalg.norm(n)
+
+    def edge(self, ref):
+        """Mesh nodes on a referenced edge of a component, in their order along the edge: {"nodes", "w" (tributary
+        length per node, mm), "length" (mm), "centre"}. The nodes are those of the meshed bodies of the component
+        within half the view tolerance of the edge curve."""
+        from OCP.BRepAdaptor import BRepAdaptor_Curve
+        from OCP.GCPnts import GCPnts_QuasiUniformDeflection
+        from OCP.TopAbs import TopAbs_EDGE
+        from OCP.TopExp import TopExp
+        from OCP.TopoDS import TopoDS
+        try:
+            from OCP.TopTools import TopTools_IndexedMapOfShape
+        except ImportError:
+            from OCP.collections import IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher as TopTools_IndexedMapOfShape
+        key = (str(ref.get("comp")), int(ref.get("edge", -1)))
+        if key in self.edge_cache:
+            return self.edge_cache[key]
+        bs = [b for b in self.bodies.values() if str(b.get("comp")) == key[0]]
+        if not bs:
+            raise AnalysisError("edge %s of component %s: the component is not in the analysis" % (key[1], key[0]))
+        emap = TopTools_IndexedMapOfShape()
+        TopExp.MapShapes_s(bs[0]["full"].wrapped, TopAbs_EDGE, emap)
+        if not 0 <= key[1] < emap.Extent():
+            raise AnalysisError("edge %s of component %s not found" % (key[1], key[0]))
+        to_edge = getattr(TopoDS, "Edge_s", None) or TopoDS.Edge
+        ad = BRepAdaptor_Curve(to_edge(emap.FindKey(key[1] + 1)))
+        tol = bs[0]["tol"]
+        disc = GCPnts_QuasiUniformDeflection(ad, tol / 4.0)
+        if disc.IsDone() and disc.NbPoints() >= 2:
+            P = np.array([[disc.Value(i).X(), disc.Value(i).Y(), disc.Value(i).Z()] for i in range(1, disc.NbPoints() + 1)])
+        else:
+            u0, u1 = ad.FirstParameter(), ad.LastParameter()
+            P = np.array([[q.X(), q.Y(), q.Z()] for q in (ad.Value(u0 + (u1 - u0) * i / 64.0) for i in range(65))])
+        closed = float(np.linalg.norm(P[0] - P[-1])) <= max(tol, 1e-9)
+        nodes = sorted(set(n for b in bs for bl in (self.mesh["bodies"].get(b["id"]) or {}).get("blocks", [])
+                           for e in bl["elements"] for n in e[1:]))
+        if not nodes:
+            raise AnalysisError("edge %s of component %s: the bodies of the component have no mesh" % (key[1], key[0]))
+        thr = 0.5 * tol + 1e-7 * self.diag
+        X = np.asarray([self.X[n] for n in nodes])
+        lo, hi = P.min(0) - thr, P.max(0) + thr
+        inb = np.where(((X >= lo) & (X <= hi)).all(1))[0]
+        A, B = P[:-1], P[1:]
+        seg = B - A
+        L2 = np.maximum((seg * seg).sum(1), 1e-30)
+        cum = np.concatenate([[0.0], np.cumsum(np.sqrt(L2))])
+        found = []
+        for i0 in range(0, len(inb), 2000):
+            idx = inb[i0:i0 + 2000]
+            Q = X[idx]
+            t = np.clip(((Q[:, None, :] - A[None]) * seg[None]).sum(2) / L2[None], 0.0, 1.0)
+            D = np.linalg.norm(Q[:, None, :] - (A[None] + t[:, :, None] * seg[None]), axis=2)
+            k = D.argmin(1)
+            for j, i in enumerate(idx):
+                if D[j, k[j]] <= thr:
+                    found.append((cum[k[j]] + t[j, k[j]] * math.sqrt(L2[k[j]]), nodes[i]))
+        if len(found) < 2:
+            raise AnalysisError("edge %s of component %s: no mesh nodes found on the edge" % (key[1], key[0]))
+        found.sort()
+        ids = [n for _s, n in found]
+        Y = np.asarray([self.X[n] for n in ids])
+        segl = np.linalg.norm(Y[1:] - Y[:-1], axis=1)
+        if closed:
+            segl = np.append(segl, np.linalg.norm(Y[0] - Y[-1]))
+        w = np.zeros(len(ids))
+        w[:-1] += segl[:len(ids) - 1] / 2
+        w[1:] += segl[:len(ids) - 1] / 2
+        if closed:
+            w[-1] += segl[-1] / 2
+            w[0] += segl[-1] / 2
+        length = float(segl.sum())
+        res = {"nodes": ids, "w": {n: float(x) for n, x in zip(ids, w)}, "length": length,
+               "centre": (w[:, None] * Y).sum(0) / max(w.sum(), 1e-30)}
+        self.edge_cache[key] = res
+        return res
 
     def nset(self, name, nodes):
         self.nsets[name] = sorted(set(int(n) for n in nodes))
@@ -787,7 +917,8 @@ class Model(object):
                 raise AnalysisError("modal analysis: material %s has no density" % ", ".join(bad))
         if self.atype == "buckling":
             loaded = any(v for v in self.cloads[1].values()) or any(v for sp in self.supports for v in sp["values"].values()) \
-                or any(v for sp in self.supports for v in ((sp.get("rot") or {}).get("values") or {}).values())
+                or any(v for sp in self.supports for v in ((sp.get("rot") or {}).get("values") or {}).values()) \
+                or any(v for sp in self.supports for v in (sp.get("rvalues") or {}).values())
             if not loaded:
                 raise AnalysisError("buckling analysis: no loads (the buckling factors multiply the loads)")
 
@@ -974,6 +1105,8 @@ class Model(object):
         trans = None
         values = {}                     # dof -> prescribed displacement (mm; rad for rotations)
         fl6 = list(s.get("dofs") or [1, 1, 1, 0, 0, 0]) + [0] * 6
+        if "edge" in tgt or ("point" not in tgt and "member" not in tgt and typ != "normal" and self.face(tgt)["shell"]):
+            return self._support_nodes(s, name, tgt, typ)
         if "point" not in tgt and "member" not in tgt and typ in ("dofs", "displacement") and any(fl6[3:6]):
             # rotations on a face: the face is rigidly coupled (kinematic coupling) to a node at its weighted centre
             face = self.face(tgt)
@@ -1063,6 +1196,55 @@ class Model(object):
             self.spc.setdefault(n, set()).update(dofs)
         self.supports.append({"s": s, "name": name, "nset": ns, "nodes": list(nodes), "dofs": dofs, "trans": trans, "values": values,
                               "member": "member" in tgt, "centre": np.asarray(centre, float)})
+
+    def _support_nodes(self, s, name, tgt, typ):
+        """Support on an edge or on a face of a shell: the translations of all its nodes and the rotations of its
+        shell nodes (solid nodes have no rotations). Types fixed (all six), pinned (translations), xsymm / ysymm /
+        zsymm (symmetry about the plane normal to x / y / z), dofs, displacement."""
+        if "edge" in tgt:
+            ed = self.edge(tgt)
+            nodes, centre = ed["nodes"], ed["centre"]
+        else:
+            face = self.face(tgt)
+            nodes = face["nodes"]
+            ws = face["w"]
+            tw = sum(ws.values())
+            centre = sum(self.X[n] * w for n, w in ws.items()) / tw if tw > 0 else np.mean([self.X[n] for n in nodes], axis=0)
+        fl6 = (list(s.get("dofs") or [1, 1, 1, 0, 0, 0]) + [0] * 6)[:6]
+        values = {}
+        if typ == "fixed":
+            dofs = [1, 2, 3, 4, 5, 6]
+        elif typ == "pinned":
+            dofs = [1, 2, 3]
+        elif typ in SYMMETRY:
+            dofs = list(SYMMETRY[typ])
+        elif typ in ("dofs", "displacement"):
+            dofs = [i + 1 for i, v in enumerate(fl6) if v]
+            if typ == "displacement":
+                vv = (list(s.get("value") or []) + [0.0] * 6)[:6]
+                values = {d: float(vv[d - 1] or 0) for d in dofs}
+        else:
+            raise AnalysisError("support %s: type %s is not available on an edge" % (name, typ))
+        if not dofs:
+            raise AnalysisError("support %s fixes no degree of freedom" % name)
+        rn = [n for n in nodes if n in self.shell_nodes]
+        td = [d for d in dofs if d <= 3]
+        rd = [d for d in dofs if d > 3] if rn else []
+        if not rn and any(d > 3 for d in dofs):
+            self.warnings.append("support %s: rotations left out (the nodes are nodes of solid elements)" % name)
+        if not td and not rd:
+            raise AnalysisError("support %s fixes no degree of freedom of its nodes" % name)
+        k = len(self.supports) + 1
+        ns = self.nset("SUP%d" % k, nodes)
+        rns = self.nset("SUP%dR" % k, rn) if rd else None
+        for n in nodes:
+            self.spc.setdefault(n, set()).update(td)
+        for n in rn:
+            self.spc.setdefault(n, set()).update(rd)
+        self.supports.append({"s": s, "name": name, "nset": ns, "nodes": list(nodes), "dofs": td, "trans": None,
+                              "values": {d: v for d, v in values.items() if d <= 3}, "member": False,
+                              "rdofs": rd, "rnset": rns, "rvalues": {d: v for d, v in values.items() if d > 3},
+                              "centre": np.asarray(centre, float)})
 
     def _has_rot(self, n):
         return n in self.rot_nodes or any(d > 3 for d in self.spc.get(n, ()))
@@ -1161,6 +1343,15 @@ class Model(object):
                 info["q"] = info["q"] + rho * info["sec"]["A"] * g
             self.loads.append({"l": ld, "name": name, "type": typ})
             return
+        if typ == "line" and "edge" in tgt:
+            ed = self.edge(tgt)
+            q = np.asarray(val, float)
+            for n in ed["nodes"]:
+                for d in range(3):
+                    if q[d]:
+                        self.cload(n, d + 1, q[d] * ed["w"][n])
+            self.loads.append({"l": ld, "name": name, "type": typ, "total": q * ed["length"]})
+            return
         if typ == "line":
             info = next((x for x in self.members if str(x["m"].get("id")) == str(tgt.get("member"))), None)
             if info is None:
@@ -1236,6 +1427,20 @@ class Model(object):
             rho = float(mats[mname].get("rho") or 0) * 1e-12
             if rho <= 0:
                 continue
+            if typ in SHELL_ELEMS:
+                th = float(self.bodies[next(b for e2, b, mn in self.body_sets if e2 == es)]["t"])
+                fr = SHELL_FRACTIONS[typ]
+                for e in els:
+                    n = e[1:]
+                    P = [self.X[k] for k in n[:NCORNER[typ]]]
+                    A = 0.5 * np.linalg.norm(np.cross(P[1] - P[0], P[2] - P[0])) if len(P) == 3 else \
+                        0.5 * np.linalg.norm(np.cross(P[2] - P[0], P[3] - P[1]))
+                    W = rho * A * th * g
+                    for k, f in zip(n, fr):
+                        for d in range(3):
+                            self.cload(k, d + 1, W[d] * f)
+                    self.body_weight = self.body_weight + W
+                continue
             fr = BODY_FRACTIONS[typ]
             tets = tets_of[NCORNER[typ]]
             for e in els:
@@ -1272,7 +1477,7 @@ class Model(object):
             for si, s in enumerate(self.mesh["bodies"][pid]["surfaces"]):
                 sp = np.asarray(s["sample"], float)
                 for bid, mb in self.mesh["bodies"].items():
-                    if bid == pid or group[bid] == group[pid]:
+                    if bid == pid or group[bid] == group[pid] or group[bid] == "shell":
                         continue
                     tol = max(1e-3 * self.diag, 0.51 * max(thick[pid], thick[bid]))
                     cands = []
@@ -1287,15 +1492,25 @@ class Model(object):
                         C = np.asarray([self.X[f[2]] for f in F])
                         lo, hi = np.minimum(np.minimum(A, B), C).min(0), np.maximum(np.maximum(A, B), C).max(0)
                         inb = ((sp >= lo - tol) & (sp <= hi + tol)).all(1)
-                        if inb.sum() < max(3, len(sp) // 2):
+                        # a shell face may lie on a solid face in part only: one sample point near it is enough
+                        need = 1 if group[pid] == "shell" else max(3, len(sp) // 2)
+                        if group[pid] == "shell":
+                            snx = np.asarray([self.X[n] for n in s["nodes"]])
+                            inb_n = ((snx >= lo - tol) & (snx <= hi + tol)).all(1)
+                            if not inb_n.any():
+                                continue
+                            sp_t, inb = snx[inb_n], np.ones(int(inb_n.sum()), bool)
+                        else:
+                            sp_t = sp
+                        if inb.sum() < need:
                             continue
                         quads = [f for f in F if len(f) in (4, 8)]
                         if quads:
                             A = np.vstack([A, np.asarray([self.X[f[0]] for f in quads])])
                             B = np.vstack([B, np.asarray([self.X[f[2]] for f in quads])])
                             C = np.vstack([C, np.asarray([self.X[f[3]] for f in quads])])
-                        d = _point_tri_dist(sp[inb], A, B, C)
-                        if (d <= tol).sum() < max(3, len(sp) // 2):
+                        d = _point_tri_dist(sp_t[inb], A, B, C)
+                        if (d <= tol).sum() < (3 if group[pid] == "shell" else need):
                             continue
                         mnodes = set(n for f in F for n in f)
                         fixed = sum(1 for n in mnodes if self.spc.get(n)) / float(len(mnodes))
@@ -1437,7 +1652,12 @@ class Model(object):
             if rho > 0:
                 L += ["*DENSITY", "%.6g" % rho]
         for es, bid, mname in self.body_sets:
-            L.append("*SOLID SECTION, ELSET=%s, MATERIAL=%s" % (es, self.mat_names[mname]))
+            b = self.bodies[bid]
+            if self.elsets[es][0] in SHELL_ELEMS:
+                L += ["*SHELL SECTION, ELSET=%s, MATERIAL=%s, OFFSET=%g" % (es, self.mat_names[mname], SHELL_OFFSET.get(b.get("offset"), 0.0)),
+                      "%.9g" % float(b["t"])]
+            else:
+                L.append("*SOLID SECTION, ELSET=%s, MATERIAL=%s" % (es, self.mat_names[mname]))
         for info in beams:
             s = info["sec"]
             L += ["*BEAM SECTION, ELSET=%s, MATERIAL=%s, SECTION=GENERAL" % (info["elset"], info["mset"]),
@@ -1468,6 +1688,9 @@ class Model(object):
                 for d in (sp.get("rot") or {}).get("dofs") or []:
                     v = sp["rot"]["values"].get(d, 0.0) if buck else 0.0
                     L.append("%s, %d, %d" % (sp["rot"]["nset"], d, d) + (", %.12g" % v if v else ""))
+                for d in sp.get("rdofs") or []:
+                    v = sp["rvalues"].get(d, 0.0) if buck else 0.0
+                    L.append("%s, %d, %d" % (sp["rnset"], d, d) + (", %.12g" % v if v else ""))
             if buck:
                 L.append("*CLOAD")
                 for (n, d), v in sorted(self.cloads[1].items()):
@@ -1488,6 +1711,9 @@ class Model(object):
                 for d in (sp.get("rot") or {}).get("dofs") or []:          # reference point rotations
                     v = sp["rot"]["values"].get(d, 0.0) if st == 1 else 0.0
                     L.append("%s, %d, %d" % (sp["rot"]["nset"], d, d) + (", %.12g" % v if v else ""))
+                for d in sp.get("rdofs") or []:                             # shell node rotations
+                    v = sp["rvalues"].get(d, 0.0) if st == 1 else 0.0
+                    L.append("%s, %d, %d" % (sp["rnset"], d, d) + (", %.12g" % v if v else ""))
             for f in springs:
                 L.append("%d, 2, 6" % f["pt"])
                 if st == 1:
@@ -1571,6 +1797,58 @@ def read_frd(path, want=("DISP", "STRESS")):
             elif line.startswith(" -3"):
                 cur = None
     return out
+
+
+def read_frd_shell_map(path, model):
+    """Expanded nodes of the shell nodes: {shell node: [expanded nodes]}. CalculiX writes a shell element to the .frd
+    as its expanded 3D element (same element number); the bottom and top layer nodes follow the order of the shell
+    nodes (SHELL_EXPANSION)."""
+    shells = {e[0]: (bl["type"], e[1:]) for mb in model.mesh["bodies"].values() for bl in mb["blocks"]
+              if bl["type"] in SHELL_ELEMS for e in bl["elements"]}
+    if not shells or not os.path.isfile(path):
+        return {}
+    els, cur, inblock = {}, None, False
+    with open(path, "r", errors="replace") as f:
+        for line in f:
+            if line.startswith("    3C"):
+                inblock = True
+                continue
+            if not inblock:
+                continue
+            if line.startswith(" -3"):
+                break
+            if line.startswith(" -1"):
+                cur = int(line[3:13])
+                els[cur] = [] if cur in shells else None
+            elif line.startswith(" -2") and els.get(cur) is not None:
+                s = line.rstrip("\n")
+                els[cur] += [int(s[k:k + 10]) for k in range(3, len(s) - 9, 10) if s[k:k + 10].strip()]
+    out = {}
+    for eid, (typ, nn) in shells.items():
+        x = els.get(eid)
+        if not x:
+            continue
+        for i, (a, b) in enumerate(SHELL_EXPANSION[typ]):
+            if i < len(nn) and b < len(x):
+                out.setdefault(nn[i], set()).update((x[a], x[b]))
+    return {n: sorted(v) for n, v in out.items()}
+
+
+def shell_results(blocks, smap):
+    """Shell node results from the expanded nodes: displacement the mean of the bottom and top layers, stress the
+    tensor of the layer with the larger von Mises stress. blocks: {name: {node: values}} (in place)."""
+    if not smap:
+        return
+    U, S = blocks.get("DISP"), blocks.get("STRESS")
+    for n, xs in smap.items():
+        if U is not None:
+            v = [U[x] for x in xs if x in U]
+            if v:
+                U[n] = list(np.mean(np.asarray([w[:3] for w in v], float), axis=0))
+        if S is not None:
+            v = [S[x] for x in xs if x in S]
+            if v:
+                S[n] = max(v, key=von_mises)
 
 
 def read_frd_modes(path):
@@ -2309,13 +2587,14 @@ def run(doc, asm, sources, workdir, ccx, progress=None, mesh_only=False, meta=No
     bodies = geometry(doc, asm, sources)
     mopt = doc.get("mesh") or {}
     job = {"size": float(mopt.get("size") or 0), "bonded": bool(doc.get("bonded", True)), "bodies": [],
-           "mesh": {k: mopt.get(k) for k in ("size_min", "curvature", "algorithm", "optimize", "strategy", "tet_type", "hex_type")
+           "mesh": {k: mopt.get(k) for k in ("size_min", "curvature", "algorithm", "optimize", "strategy", "tet_type", "hex_type",
+                                             "shell_type", "shell_algorithm")
                     if mopt.get(k) is not None}}
     for b in bodies:
         p = os.path.join(workdir, "body_%s.brep" % re.sub(r"[^A-Za-z0-9]+", "_", b["id"]))
         export_brep(b["shape"], p)
         job["bodies"].append({"id": b["id"], "brep": p, "mode": b["mode"], "size": b["size"], "layers": b["layers"],
-                              "normal": b.get("normal"), "strategy": b.get("strategy")})
+                              "normal": b.get("normal"), "strategy": b.get("strategy"), "t": b.get("t")})
     say("mesh", "Meshing %d bodies" % len(bodies))
     t0 = time.time()
     mesh = femesh.run(job) if bodies else {"nodes": {"ids": [], "xyz": []}, "bodies": {}, "warnings": []}
@@ -2355,12 +2634,18 @@ def run(doc, asm, sources, workdir, ccx, progress=None, mesh_only=False, meta=No
         raise AnalysisError("solver failed: %s (see %s)" % ("; ".join(errs[:3]) or (text.strip().splitlines() or ["no output"])[-1], log))
     summary["solve_time"] = round(time.time() - t1, 2)
     say("results", "Reading the results")
+    smap = read_frd_shell_map(os.path.join(workdir, "job.frd"), M)
     if M.atype == "static":
         frd = read_frd(os.path.join(workdir, "job.frd"))
+        for blocks in frd.values():
+            shell_results(blocks, smap)
         dat = read_dat(os.path.join(workdir, "job.dat"))
         res = Results(M, frd, dat)
     else:
-        res = ModeResults(M, read_frd_modes(os.path.join(workdir, "job.frd")), read_eigen(os.path.join(workdir, "job.dat")))
+        modes = read_frd_modes(os.path.join(workdir, "job.frd"))
+        for b in modes:
+            shell_results({"DISP": b}, smap)
+        res = ModeResults(M, modes, read_eigen(os.path.join(workdir, "job.dat")))
     meta["solver"] = ccx
     rep = report(res, meta)
     rp = os.path.join(workdir, "%s_report.txt" % re.sub(r"[^A-Za-z0-9_\-.]+", "_", meta.get("name") or "analysis"))

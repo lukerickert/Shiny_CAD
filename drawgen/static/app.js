@@ -12,7 +12,7 @@ window.addEventListener("unhandledrejection", (e) => {
 
 const $ = (s) => document.querySelector(s);
 const state = { cfg: null, files: [], busy: 0 };
-const VIEW_KEYS = ["orthographic", "section", "isometric", "hidden_lines", "smooth_lines"];
+const VIEW_KEYS = ["orthographic", "section", "isometric", "hidden_lines", "smooth_lines", "centre_lines"];
 const AUTO_FIELDS = { Title: "auto: part name", DrawingNumber: "auto: from title", Date: "auto: today",
                       Scale: "auto", Mass: "auto with density" };
 const FIELD_LABELS = {};
@@ -84,7 +84,7 @@ function fillForm(cfg) {
   cfg.standard_scales.forEach(s => scale.add(new Option(scaleText(s), scaleText(s))));
   scale.value = cfg.scale || "auto";
   $("#mode").value = cfg.mode || "per_part";
-  VIEW_KEYS.forEach(k => $("#v-" + k).checked = !!cfg.views[k]);
+  VIEW_KEYS.forEach(k => $("#v-" + k).checked = k in cfg.views ? !!cfg.views[k] : k === "centre_lines");
   $("#v-section_axis").value = cfg.views.section_axis || "X";
   $("#v-section_offset_mm").value = cfg.views.section_offset_mm || 0;
   $("#v-section_flip").checked = !!cfg.views.section_flip;

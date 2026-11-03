@@ -45,13 +45,14 @@ Without an open project the folders are `explicit/` and the document folder of t
 
 | Control | Function |
 |---|---|
-| **Source** | **ShinyCAD geometry (assembly or part)**: the saved assembly or part chosen in **Geometry** (toolbar). **Deck generator (stiffened panel, shells)**: [section 13.3.1](#1331-deck-generator). **External .inp (PrePoMax)**: the meshed .inp in the **.inp** field |
+| **Source** | **ShinyCAD geometry (assembly or part)**: the saved assembly or part chosen in **Geometry** (toolbar); the surface bodies of a part that are not hidden are drawn translucent and are not meshed. **Deck generator (stiffened panel, shells)**: [section 13.3.1](#1331-deck-generator). **External .inp (PrePoMax)**: the meshed .inp in the **.inp** field |
 | **.inp**, **…**, **Show mesh** | External .inp: path; **Show mesh** draws the nodes and elements (*NODE, *ELEMENT; solids C3D4, C3D10, C3D8, C3D8R, C3D8I, C3D20, C3D6, C3D15; shells S3, S4, S4R, S8R, R3D3, R3D4, M3D3, M3D4) with one colour per ELSET |
 | **Materials** | **Name**, **Library** (an entry of the ORC\*\*3 material library, or **(elastic: E, nu, rho)**), **E (MPa)**, **nu**, **rho (kg/m^3)**; **Add material**, × deletes; **Default**: material of the bodies without one |
-| **Bodies** | One row per component: **Role** **deformable**, **rigid (impactor)** or **off**; **Material**; **Size (mm)** element size of the body (empty: **Element size**); **Mesh** strategy of the body |
-| **Mesh** | **Element size (mm)** (empty: bounding box diagonal / 20), **Minimum size (mm)** (empty: element size / 5), **Strategy** (**Tetrahedra (free)**, **Hexahedra, structured (block cells)**, **Hexahedra by subdivision**; [section 12.3.1](12-analysis.md#1231-mesh-settings)), **Tetrahedra** C3D4 or C3D10, **Hexahedra** C3D8R or C3D8, **Elements per 360 deg** (empty: 12), **Bonded: touching deformable bodies share nodes** |
-| **Supports** | **Support** (toolbar), then a click on a face of a deformable body. **ux**, **uy**, **uz**: the held displacements of the face nodes; **Pick** picks the face again; × deletes |
-| **Write .inp** (toolbar) | Meshes the bodies (gmsh), writes `explicit/<Name>/model/<Name>.inp` and draws the mesh (**Show** **Mesh**). The table gives the nodes, elements, ELSET, material and reference node of each body |
+| **Bodies** | One row per component with a solid: **Role** **deformable**, **rigid (impactor)** or **off**; **Material**; **Size (mm)** element size of the body (empty: **Element size**); **Mesh** strategy of the body |
+| **Shells** | One row per surface body of a component: **Role** **deformable**, **rigid (impactor)** or **off**; **t (mm)** (empty: 10 mm); **Position** **mid**, **positive (SPOS)**, **negative (SNEG)** (`*SHELL SECTION` `OFFSET`; inp2rad does not read it); **Material**; **Size (mm)**. Deformable shells are meshed together and share their nodes where they touch (**Bonded**) |
+| **Mesh** | **Element size (mm)** (empty: bounding box diagonal / 20), **Minimum size (mm)** (empty: element size / 5), **Strategy** (**Tetrahedra (free)**, **Hexahedra, structured (block cells)**, **Hexahedra by subdivision**; [section 12.3.1](12-analysis.md#1231-mesh-settings)), **Tetrahedra** C3D4 or C3D10, **Hexahedra** C3D8R or C3D8, **Elements per 360 deg** (empty: 12), **Shell elements** S4R, S4 or S3, **Shell mesh** (as in [section 12.3.1](12-analysis.md#1231-mesh-settings)), **Bonded: touching deformable bodies share nodes** |
+| **Supports** | **Support** (toolbar), then a click on a face or an edge (within 8 px of the cursor) of a deformable body or shell. **Preset** (**fixed**, **pinned**, **symmetry X**, **symmetry Y**, **symmetry Z**) sets the check boxes; **ux**, **uy**, **uz**, **rx**, **ry**, **rz**: the held components; the translations act on all nodes of the face or edge, the rotations on its shell nodes. **Pick** picks the face or edge again; × deletes |
+| **Mesh** (toolbar) | Meshes the bodies and shells (gmsh), writes `explicit/<Name>/model/<Name>.inp` and draws the mesh (**Show** **Mesh**). The table gives the nodes, elements, ELSET, material and reference node of each body and shell |
 
 The .inp of the ShinyCAD geometry holds:
 
@@ -60,11 +61,12 @@ The .inp of the ShinyCAD geometry holds:
 | `*NODE` | Mesh nodes; one reference node per rigid body at the centre of mass of the body (the last node numbers) |
 | `*ELEMENT, TYPE=<type>, ELSET=B_<BODY>` | Elements of each body (body name in upper case) |
 | `*NSET, NSET=RB_<BODY>` | Nodes of a rigid body |
-| `*NSET, NSET=SUP_<n>_<NAME>` | Face nodes of a support |
+| `*NSET, NSET=SUP_<n>_<NAME>`, `SUP_<n>_<NAME>_R` | Nodes of the face or edge of a support; `_R`: its shell nodes (rotations) |
 | `*MATERIAL, NAME=<NAME>` | `*ELASTIC` and `*DENSITY`; with a library entry the E, nu and density of the entry |
 | `*SOLID SECTION, ELSET=B_<BODY>, MATERIAL=<NAME>` | Section of each body |
+| `*SHELL SECTION, ELSET=B_<COMPONENT>_<SURFACE>, MATERIAL=<NAME>[, OFFSET=SPOS \| SNEG]` | Section of each shell, the thickness on the next line |
 | `*RIGID BODY, NSET=RB_<BODY>, REF NODE=<n>` | Rigid bodies; inp2rad writes an /RBODY with the reference node as main node (ICoG 3) |
-| `*BOUNDARY` | `SUP_<n>_<NAME>, <dof>, <dof>` for each held displacement |
+| `*BOUNDARY` | `SUP_<n>_<NAME>, <dof>, <dof>` for each held translation, `SUP_<n>_<NAME>_R, <dof>, <dof>` for each held rotation |
 
 Rigid bodies are meshed apart from the deformable bodies and share no nodes with them.
 Each material with a library entry is added to **Library materials** of the build with its name as **Name in model** (rows marked **Model**).
@@ -91,7 +93,7 @@ In `deck_stepgen.py` cadquery is replaced by build123d (same OpenCascade calls t
 | **Shell type**, **Triangles** | S4 / S3 or S4R / S3R; **Triangles**: no recombination to quadrangles |
 | **Material** | Material of all sections (**(default)**: the **Default** material of the **Materials** table) |
 | **Edge supports** | **x = 0**, **x = X distance**, **y = 0**, **y = Y distance**: **free**, **pinned (ux uy uz)** or **clamped (ux uy uz rx ry rz)** for the nodes on the edge plane (deck and webs) |
-| **Write .inp** (toolbar) | Meshes the deck (gmsh, in a separate process), writes `explicit/<Name>/model/<Name>.inp` and `<Name>_Parameters.pmp` and draws the mesh. The table gives the elements, z range, thickness, PrePoMax section number and parameter of each element set; below: longest element edge, aspect ratio, element edges by the number of plates sharing them (1 free edge, 2 inside a plate, 3 T junction, 4 cruciform) |
+| **Mesh** (toolbar) | Meshes the deck (gmsh, in a separate process), writes `explicit/<Name>/model/<Name>.inp` and `<Name>_Parameters.pmp` and draws the mesh. The table gives the elements, z range, thickness, PrePoMax section number and parameter of each element set; below: longest element edge, aspect ratio, element edges by the number of plates sharing them (1 free edge, 2 inside a plate, 3 T junction, 4 cruciform) |
 | **Generate STEP** | Writes `<Name>_deck.step` (assembly DECK_STRUCTURE, one named and coloured component of sewn shells per element set) and `<Name>_deck_model.json` to the step folder of the project, and the part `<Name>_deck` with one **Import surface** feature per component. A second **Generate STEP** replaces the **Import surface** features of that STEP and keeps the other features of the part. **Open part** opens it in the **Part** tab |
 
 Two beams of one axis within 0.5 mm of each other are refused when typed and reported as an error by **Write .inp** and **Generate STEP**.

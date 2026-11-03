@@ -636,3 +636,158 @@ def test_modal_and_buckling_refusals():
         analysis.Model(dict(nod, analysis_type="buckling"), [], mesh).build()
     with pytest.raises(analysis.AnalysisError, match="unknown analysis type"):
         analysis.Model(dict(nod, analysis_type="dynamic"), [], mesh)
+
+
+# --------------------------------------------------------------------------- shells (surface bodies)
+
+def _surf(fid, name, plane, w, h, x=0.0, y=0.0):
+    from conftest import rect
+    return {"id": fid, "name": name, "type": "surf_sketch", "kind": "planar", "plane": plane, "offset": 0,
+            "sketch": {"entities": rect(w, h, x, y)}}
+
+
+def _edge_at(erefs, axis, value, M=None):
+    """Index of the straight edge whose midpoint has coordinate axis = value (local coordinates)."""
+    return next(i for i, r in enumerate(erefs) if r and r["kind"] == "line" and abs(r["c"][axis] - value) < 1e-6)
+
+
+def _shell_doc(name, shells, supports, loads, **kw):
+    d = {"name": name, "materials": STEEL, "default_material": "Steel", "mesh": {"size": 5}, "bonded": True,
+         "bodies": {}, "shells": shells, "members": [], "plates": [], "fasteners": [], "supports": supports, "loads": loads}
+    d.update(kw)
+    return d
+
+
+def _cantilever(client, name="sh_cant"):
+    ok(client.put("/api/part/file/" + name, json={"name": name, "version": 2, "next": 2, "features": [_surf("s1", "Plate", "XY", 100, 20)]}))
+    asm = {"components": [{"id": "1", "name": name, "source": {"type": "part", "name": name}, "pos": [0, 0, 0], "rot": [0, 0, 0]}]}
+    c = ok(client.post("/api/assembly/build", json={"assembly": asm}))["components"][0]
+    return c, _edge_at(c["erefs"], 0, 0.0), _edge_at(c["erefs"], 0, 100.0)
+
+
+@needs_ccx
+@pytest.mark.parametrize("stype", ["S4", "S8R"])
+def test_shell_cantilever_edge_support_and_line_load(client, web, tmp_path, stype):
+    """Surface body 100 x 20 mm, t 2 mm, clamped edge (fixed: all six), line load on the free edge (total 10 N):
+    tip deflection within 10 % of the plate solution (beam: F L^3 / (3 E I) times 1 - nu^2), root bending stress
+    within 10 % of 6 F L / (b t^2), reaction equal to the load."""
+    c, e0, e1 = _cantilever(client)
+    doc = _shell_doc("sh_cant", {"1:s1": {"t": 2}},
+                     [{"id": "s1", "name": "root", "target": {"comp": "1", "edge": e0}, "type": "fixed"}],
+                     [{"id": "l1", "name": "tip", "type": "line", "target": {"comp": "1", "edge": e1}, "value": [0, 0, -0.5]}],
+                     source={"type": "part", "name": "sh_cant"}, mesh={"size": 5, "shell_type": stype})
+    asm = web._fea_asm(doc)
+    r = analysis.run(doc, asm, web._asm_sources(), str(tmp_path), CCX, meta={"name": "sh_cant"})
+    t = r["tables"]["total"]
+    assert r["summary"]["bodies"][0]["types"][0] == stype
+    w = 10.0 * 100 ** 3 / (3 * 210000.0 * 20 * 2 ** 3 / 12) * (1 - 0.3 ** 2)
+    assert t["bodies"][0]["umax"] == pytest.approx(w, rel=0.1)
+    assert t["bodies"][0]["smax"] == pytest.approx(6 * 10.0 * 100 / (20 * 2 ** 2), rel=0.1)
+    assert np.allclose(t["reactions"][0]["F"], [0, 0, 10.0], atol=1e-3) and np.allclose(t["applied"], [0, 0, -10.0], atol=1e-6)
+    text = open(r["files"]["inp"]).read()
+    assert "*SHELL SECTION, ELSET=B1_s1_1, MATERIAL=M1_Steel, OFFSET=0" in text and "SUP1R, 4, 4" in text
+
+
+@needs_ccx
+def test_shell_symmetry_pinned_and_modal(client, web, tmp_path):
+    """Half of a simply supported strip with a symmetry edge: pinned edge (ux uy uz) at x = 0, symmetry X (ux, ry,
+    rz) at x = 50, pressure 0.01 MPa: mid-span deflection 5 q L^4 / (384 D) of the full span 100 mm within 10 %.
+    Modal: first natural frequency of the clamped strip (1.875^2 / (2 pi L^2) sqrt(D / (rho t))) within 5 %."""
+    ok(client.put("/api/part/file/sh_half", json={"name": "sh_half", "version": 2, "next": 2, "features": [_surf("s1", "Strip", "XY", 50, 20)]}))
+    asm = {"components": [{"id": "1", "name": "half", "source": {"type": "part", "name": "sh_half"}, "pos": [0, 0, 0], "rot": [0, 0, 0]}]}
+    c = ok(client.post("/api/assembly/build", json={"assembly": asm}))["components"][0]
+    e0, e1 = _edge_at(c["erefs"], 0, 0.0), _edge_at(c["erefs"], 0, 50.0)
+    y0, y1 = _edge_at(c["erefs"], 1, 0.0), _edge_at(c["erefs"], 1, 20.0)
+    sups = [{"id": "a", "name": "pin", "target": {"comp": "1", "edge": e0}, "type": "pinned"},
+            {"id": "b", "name": "sym", "target": {"comp": "1", "edge": e1}, "type": "xsymm"},
+            {"id": "c", "name": "cyl1", "target": {"comp": "1", "edge": y0}, "type": "dofs", "dofs": [0, 1, 0, 1, 0, 0]},
+            {"id": "d", "name": "cyl2", "target": {"comp": "1", "edge": y1}, "type": "dofs", "dofs": [0, 1, 0, 1, 0, 0]}]
+    doc = _shell_doc("sh_half", {"1:s1": {"t": 2}}, sups,
+                     [{"id": "p", "name": "p", "type": "pressure", "target": {"comp": "1", "face": 0}, "value": 0.01}],
+                     mesh={"size": 2.5})
+    r = analysis.run(doc, asm, web._asm_sources(), str(tmp_path / "s"), CCX, meta={"name": "sh_half"})
+    D = 210000.0 * 2 ** 3 / (12 * (1 - 0.09))
+    w = 5 * 0.01 * 100 ** 4 / (384 * D)
+    assert r["tables"]["total"]["bodies"][0]["umax"] == pytest.approx(w, rel=0.1)
+    text = open(r["files"]["inp"]).read()
+    assert "SUP2, 1, 1" in text and "SUP2R, 5, 5" in text and "SUP2R, 6, 6" in text and "SUP1R" not in text
+    # modal: the strip clamped at x = 0 (the full 50 mm as cantilever)
+    m = _shell_doc("sh_modal", {"1:s1": {"t": 2}}, [{"id": "a", "name": "clamp", "target": {"comp": "1", "edge": e0}, "type": "fixed"}], [],
+                   mesh={"size": 2.5}, analysis_type="modal", modes=2)
+    r = analysis.run(m, asm, web._asm_sources(), str(tmp_path / "m"), CCX, meta={"name": "sh_modal"})
+    f1 = 1.875 ** 2 / (2 * math.pi * 50.0 ** 2) * math.sqrt(D / (7850e-12 * 2))
+    assert r["modes"][0]["value"] == pytest.approx(f1, rel=0.05)
+
+
+@needs_ccx
+def test_shells_of_two_parts_bonded_and_tied_to_a_solid(client, web, tmp_path):
+    """Deck (surface XY 200 x 100) and web (surface XZ 200 x 40, turned 180 deg about X, hanging below the deck at
+    y = 50) as two parts: the shells share the nodes of their junction line (one mesh group, fragmented); a solid
+    block under the deck end is tied to the deck. Sum of the reactions equal to the applied loads (weight and
+    pressure)."""
+    ok(client.put("/api/part/file/sh_deck", json={"name": "sh_deck", "version": 2, "next": 2, "features": [_surf("s1", "Deck", "XY", 200, 100)]}))
+    ok(client.put("/api/part/file/sh_web", json={"name": "sh_web", "version": 2, "next": 2, "features": [_surf("w", "Web", "XZ", 200, 40)]}))
+    ok(client.put("/api/part/file/sh_blk", json=plate("sh_blk", 40, 100, 30, 0)))
+    asm = {"components": [
+        {"id": "1", "name": "deck", "source": {"type": "part", "name": "sh_deck"}, "pos": [0, 0, 0], "rot": [0, 0, 0]},
+        {"id": "2", "name": "web", "source": {"type": "part", "name": "sh_web"}, "pos": [0, 50, 0], "rot": [180, 0, 0]},
+        {"id": "3", "name": "block", "source": {"type": "part", "name": "sh_blk"}, "pos": [160, 0, -30], "rot": [0, 0, 0]}]}
+    cs = {c["id"]: c for c in ok(client.post("/api/assembly/build", json={"assembly": asm}))["components"]}
+    x0 = _edge_at(cs["1"]["erefs"], 0, 0.0)
+    bot = next(i for i, r in enumerate(cs["3"]["refs"]) if r["kind"] == "plane" and abs(r["c"][2]) < 1e-6)
+    doc = _shell_doc("sh_t", {"1:s1": {"t": 8}, "2:w": {"t": 6, "offset": "negative"}},
+                     [{"id": "s1", "name": "root", "target": {"comp": "1", "edge": x0}, "type": "fixed"},
+                      {"id": "s2", "name": "blk", "target": {"comp": "3", "face": bot}, "type": "fixed"}],
+                     [{"id": "g", "name": "g", "type": "gravity", "value": [0, 0, -9810]},
+                      {"id": "p", "name": "p", "type": "pressure", "target": {"comp": "1", "face": 0}, "value": 0.01}],
+                     mesh={"size": 10})
+    sources = web._asm_sources()
+    bodies = analysis.geometry(doc, asm, sources)
+    assert [(b["id"], b["mode"]) for b in bodies] == [("1:s1", "shell"), ("2:w", "shell"), ("3", "solid")]
+    r = analysis.run(doc, asm, sources, str(tmp_path), CCX, meta={"name": "sh_t"})
+    assert r["summary"]["ties"] >= 1
+    t = r["tables"]["total"]
+    F = np.sum([x["F"] for x in t["reactions"]], axis=0)
+    assert np.allclose(F + np.asarray(t["applied"]), 0, atol=1e-3 * abs(t["applied"][2]))
+    W = 7850e-12 * 9810 * (200 * 100 * 8 + 200 * 40 * 6 + 40 * 100 * 30)
+    assert -t["applied"][2] == pytest.approx(W + 0.01 * 200 * 100, rel=1e-3)
+    text = open(r["files"]["inp"]).read()
+    assert "OFFSET=-0.5" in text and "*TIE" in text
+    # junction line: deck and web elements share nodes on y = 50, z = 0
+    import re as _re
+    nodes = {int(a): (float(b), float(c), float(d)) for a, b, c, d in _re.findall(r"^(\d+), ([-\d.e+]+), ([-\d.e+]+), ([-\d.e+]+)$", text.split("*ELEMENT")[0], _re.M)}
+    blocks = _re.findall(r"\*ELEMENT, TYPE=S4, ELSET=(B\S+)\n((?:\d+(?:, \d+)+\n)+)", text)
+    used = {es: set(int(v) for ln in body.strip().splitlines() for v in ln.split(", ")[1:]) for es, body in blocks}
+    deck = used[next(k for k in used if k.startswith("B1_s1"))]
+    web_ = used[next(k for k in used if k.startswith("B2_w"))]
+    shared = deck & web_
+    assert len(shared) >= 200 / 10 and all(abs(nodes[n][1] - 50) < 1e-6 and abs(nodes[n][2]) < 1e-6 for n in shared)
+
+
+def test_step_surface_component_shells(tmp_path, web):
+    """A surface STEP file (two labelled faces, no solids) as an assembly component: one surface body per STEP
+    component, named from the labels; the analysis makes one shell per surface body."""
+    from build123d import Compound, Face, Pos, export_step
+    from drawgen import assembly
+    f1 = Face.make_rect(100, 50)
+    f2 = Pos(0, 0, 30) * Face.make_rect(100, 50)
+    f1.label, f2.label = "LOWER", "UPPER"
+    comp = Compound(children=[f1, f2])
+    comp.label = "PANELS"
+    p = str(tmp_path / "panels.step")
+    export_step(comp, p)
+    src = assembly.Sources(str(tmp_path))
+    s = {"type": "step", "path": p, "part": None}
+    full, err = src.load(s)
+    assert err is None and len(full.faces()) == 2
+    assert [(i, n) for i, n, _c, _sh in src.surfaces(s)] == [("s1", "LOWER"), ("s2", "UPPER")]
+    e = src.info(s)
+    assert e["mesh"]["face_body"] == [0, 1] and e["vol"] == 0
+    # read again from the BRep cache of the whole file
+    assembly._SRC_CACHE.clear()
+    src2 = assembly.Sources(str(tmp_path))
+    solid, surfs = src2.parts(s)
+    assert solid is None and [n for _i, n, _c, _s in surfs] == ["LOWER", "UPPER"]
+    asm = {"components": [{"id": "7", "name": "panels", "source": s, "pos": [0, 0, 0], "rot": [0, 0, 0]}]}
+    bodies = analysis.geometry({"bodies": {}, "shells": {"7:s2": {"t": 3}}}, asm, src2)
+    assert [(b["id"], b["t"], b["name"]) for b in bodies] == [("7:s1", analysis.DEFAULT_SHELL_T, "panels / LOWER"), ("7:s2", 3.0, "panels / UPPER")]

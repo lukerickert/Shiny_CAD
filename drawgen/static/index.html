@@ -59,6 +59,7 @@
       <label class="check"><input type="checkbox" id="v-isometric"> Isometric</label>
       <label class="check"><input type="checkbox" id="v-hidden_lines"> Hidden lines</label>
       <label class="check"><input type="checkbox" id="v-smooth_lines"> Tangent edges</label>
+      <label class="check" title="Centre marks of holes and bosses in the views along their axis, centre lines along the axis in the views across it (cylindrical and conical faces)"><input type="checkbox" id="v-centre_lines"> Centre lines</label>
       <div class="grid2">
         <label>Isometric scale factor<input type="number" id="v-isometric_scale_factor" step="0.1" min="0.1"></label>
         <label>Density (kg/m^3)<input type="number" id="density" step="1" min="0"></label>
@@ -171,6 +172,7 @@
           <button type="button" data-tool="angle" title="Angle dimension (G): pick two straight edges, then the arc position">Angle</button>
           <button type="button" data-tool="diameter" title="Diameter (D)">&#216; Diameter</button>
           <button type="button" data-tool="radius" title="Radius (R)">R Radius</button>
+          <button type="button" data-tool="centre" title="Centre mark or centre line (C): pick a circle or arc for a centre mark, or two points for a centre line">Centre</button>
           <button type="button" data-tool="note" title="Note (N)">Note</button>
           <button type="button" data-tool="leader" title="Note with leader (L)">Leader note</button>
           <button type="button" data-tool="balloon" title="Item balloon (B)">Balloon</button>
@@ -237,6 +239,9 @@
                 <label><span>Upper (<span class="dev-unit">&#181;m</span>)</span><input type="text" inputmode="decimal" class="numf" id="ann-plus"></label>
                 <label><span>Lower (<span class="dev-unit">&#181;m</span>)</span><input type="text" inputmode="decimal" class="numf" id="ann-minus"></label>
               </div>
+            </div>
+            <div id="ann-centre-fields" hidden>
+              <label title="Length of the arms beyond the circle (centre mark) or beyond the end points (centre line), in sheet mm">Extension (mm)<input type="number" id="ann-centre-ext" step="0.5" min="0" placeholder="2"></label>
             </div>
             <div id="ann-note-fields">
               <label>Text<textarea id="ann-notetext" rows="6"></textarea></label>
@@ -553,6 +558,7 @@
         <div class="toolbar">
           <button type="button" id="as-drag" data-icon="move" title="Drag mode (D): left drag moves a component that is not fixed, in the directions its mates leave free; Shift: along the nearest axis X, Y or Z">Drag</button>
           <button type="button" id="as-rotate" data-icon="rotate" title="Rotate mode (R): left drag rotates a component that is not fixed, about the axis its mates leave free (else about the view direction); Shift: steps of 15 deg">Rotate</button>
+          <button type="button" id="as-move2" data-icon="move" title="Move by two points: click a point on a component (vertices snap within 12 px), then the point it goes to. Esc ends">Move 2 pts</button>
         </div>
         <div class="toolbar" id="as-tb-mates">
           <button type="button" data-mate="coincident" data-icon="mate_coincident" title="Coincident mate: planar faces facing each other in one plane, or an axis in a plane, or two collinear axes. Click a face on each of two components">Coincident</button>
@@ -702,7 +708,7 @@
         </div>
         <label class="inline" title="Geometry of the model: a saved assembly or part (Model: Source)">Geometry<select id="xp-source"></select></label>
         <div class="toolbar">
-          <button type="button" id="xp-model-btn" data-icon="fa_mesh" title="Mesh the bodies and write the model .inp">Write .inp</button>
+          <button type="button" id="xp-model-btn" data-icon="fa_mesh" title="Mesh the bodies and shells, write the model .inp and show the mesh">Mesh</button>
           <button type="button" id="xp-supbtn" data-icon="fa_sup" title="Support: click a face of a deformable body">Support</button>
           <button type="button" id="xp-build" data-icon="xp_build" title="Build the OpenCourant deck (inp2rad and the Build settings)">Build</button>
           <button type="button" id="xp-run" data-icon="fa_solve" class="primary" title="Run the Target .rad (or the queue): starter, engine, VTK and CSV conversion, post-processing">Run</button>

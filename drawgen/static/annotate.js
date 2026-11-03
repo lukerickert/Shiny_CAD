@@ -21,12 +21,12 @@ const ED = {
 };
 const SVGNS = "http://www.w3.org/2000/svg";
 // default: letters (e.key); left-handed: physical keys on the right side of the keyboard (e.code)
-const TOOL_KEYS = { s: "select", h: "h", v: "v", a: "a", g: "angle", d: "diameter", r: "radius", n: "note", l: "leader", b: "balloon", e: "detail", k: "sketch" };
-const TOOL_CODES_LEFT = { KeyJ: "select", KeyH: "h", KeyI: "v", Slash: "a", Semicolon: "angle", KeyO: "diameter", KeyU: "radius", KeyN: "note",
+const TOOL_KEYS = { s: "select", h: "h", v: "v", a: "a", g: "angle", d: "diameter", r: "radius", c: "centre", n: "note", l: "leader", b: "balloon", e: "detail", k: "sketch" };
+const TOOL_CODES_LEFT = { KeyJ: "select", KeyH: "h", KeyI: "v", Slash: "a", Semicolon: "angle", KeyO: "diameter", KeyU: "radius", Period: "centre", KeyN: "note",
                           KeyL: "leader", KeyK: "balloon", KeyY: "detail", KeyP: "sketch" };
 const FIT_KEY = { default: "f", left: "KeyM" };
 const TOOL_NAMES = { select: "Select", h: "Horizontal dimension", v: "Vertical dimension", a: "Aligned dimension", angle: "Angle dimension", diameter: "Diameter",
-                     radius: "Radius", note: "Note", leader: "Note with leader", balloon: "Item balloon", detail: "Detail view",
+                     radius: "Radius", centre: "Centre mark / centre line", note: "Note", leader: "Note with leader", balloon: "Item balloon", detail: "Detail view",
                      sketch: "Sketch on a view or on the sheet" };
 function annToolKey(tool) {
   if (leftKeys()) { const c = Object.keys(TOOL_CODES_LEFT).find(k => TOOL_CODES_LEFT[k] === tool); return c ? codeLabel(c) : ""; }
@@ -51,6 +51,7 @@ const HINTS = {
   diameter: ["Diameter: pick a circle or arc, or the first edge point of a shaft or bore (side view).",
              "Pick the opposite edge point.", "Click to place the dimension line."],
   radius: ["Radius: pick an arc or circle.", "Click to place the text."],
+  centre: ["Centre: pick a circle or arc for a centre mark, or the first point of a centre line.", "Pick the second point of the centre line."],
   note: ["Note: click the text position."],
   leader: ["Leader note: pick the point the arrow points to.", "Click the text position."],
   balloon: ["Balloon: pick the point on the part.", "Click the balloon position."],
@@ -636,8 +637,14 @@ function onUp(e) {
         // the annotation is moved by the drag distance (its text or position point follows the mouse)
         const [X, Y] = eventSheet(e);
         const [X0, Y0] = dr.X0 !== undefined ? [dr.X0, dr.Y0] : eventSheetXY(dr.x, dr.y);
-        const P = toSheet(a.view, a.pos[0], a.pos[1]);
-        commit(() => { a.pos = toModel(a.view, P[0] + X - X0, P[1] + Y - Y0); if (a.type === "linear") a.text_free = true; });
+        if (a.type === "centre") {
+          // no text position: the mark or line itself moves by the drag distance
+          const q = toModel(a.view, X, Y), q0 = toModel(a.view, X0, Y0), dx = q[0] - q0[0], dy = q[1] - q0[1];
+          commit(() => { for (const k of ["c", "p1", "p2"]) if (a[k]) a[k] = [a[k][0] + dx, a[k][1] + dy]; });
+        } else {
+          const P = toSheet(a.view, a.pos[0], a.pos[1]);
+          commit(() => { a.pos = toModel(a.view, P[0] + X - X0, P[1] + Y - Y0); if (a.type === "linear") a.text_free = true; });
+        }
       }
     }
     drawOverlay();
@@ -728,6 +735,26 @@ function toolClick(X, Y) {
     } else {
       const c = ED.pick[0];
       const a = { id: uid(), type: t, view: c.view, c: c.c, r: c.r, pos: toModel(c.view, X, Y), tol: { mode: "none" } };
+      ED.pick = [];
+      commit(() => ED.anns.push(a), a.id);
+    }
+  } else if (t === "centre") {
+    // a circle or arc: centre mark at once; otherwise two points: centre line
+    if (!ED.pick.length) {
+      const c = nearestCircle(X, Y);
+      if (c) {
+        const a = { id: uid(), type: "centre", view: c.view, c: c.c, r: c.r };
+        commit(() => ED.anns.push(a), a.id);
+      } else {
+        const p = pickPoint(X, Y, null);
+        if (!p) return status("Pick a circle, an arc or a point inside a view", true);
+        ED.pick.push(p);
+      }
+    } else {
+      const p = pickPoint(X, Y, ED.pick[0].view);
+      if (!p) return status("Pick the second point in the same view", true);
+      if (p.x === ED.pick[0].x && p.y === ED.pick[0].y) return;
+      const a = { id: uid(), type: "centre", view: p.view, p1: [ED.pick[0].x, ED.pick[0].y], p2: [p.x, p.y] };
       ED.pick = [];
       commit(() => ED.anns.push(a), a.id);
     }
@@ -864,15 +891,19 @@ function annShowProps() {
   $("#ann-form").hidden = !a;
   if (!a) return;
   const names = { linear: { h: "Horizontal dimension", v: "Vertical dimension", a: "Aligned dimension" },
-                  diameter: "Diameter", radius: "Radius", note: "Note", balloon: "Balloon" };
+                  diameter: "Diameter", radius: "Radius", note: "Note", balloon: "Balloon", centre: a.c ? "Centre mark" : "Centre line" };
   $("#ann-kind").textContent = a.type === "linear" ? (a.dia ? "Diameter (side view)" : names.linear[a.orient]) : names[a.type];
   const v = measured(a);
   $("#ann-value").textContent = v === null ? "" : a.type === "angle" ? fmtNum(v) + "°" :
     (a.type === "diameter" || a.dia ? "Ø" : a.type === "radius" ? "R" : "") + (isInch() ? inchText(v, 3) + " in" : fmtNum(v) + " mm");
   const isNote = a.type === "note" || a.type === "balloon";
-  $("#ann-dim-fields").hidden = isNote;
+  const isCentre = a.type === "centre";
+  $("#ann-dim-fields").hidden = isNote || isCentre;
   $("#ann-note-fields").hidden = !isNote;
+  $("#ann-centre-fields").hidden = !isCentre;
+  $("#ann-height").parentElement.hidden = isCentre;
   $("#ann-height").value = a.height || "";
+  if (isCentre) { $("#ann-centre-ext").value = a.ext === undefined || a.ext === null ? "" : a.ext; return; }
   if (isNote) { $("#ann-notetext").value = a.text || ""; return; }
   const tol = a.tol || { mode: "none" };
   $("#ann-prefix").value = a.prefix || "";
@@ -906,6 +937,11 @@ function propsChanged() {
   const a = current();
   if (!a) return;
   commit(() => {
+    if (a.type === "centre") {
+      const ext = parseFloat($("#ann-centre-ext").value);
+      if (isFinite(ext) && ext >= 0) a.ext = ext; else delete a.ext;
+      return;
+    }
     const hgt = parseFloat($("#ann-height").value);
     if (hgt > 0) a.height = hgt; else delete a.height;
     if (a.type === "note" || a.type === "balloon") { a.text = $("#ann-notetext").value.trim(); return; }
@@ -955,7 +991,7 @@ function deleteSelected() {
     const d = (state.drawings || []).find(x => x.name === $("#ann-drawing").value);
     if (d) loadDrawing(d, false);
   };
-  ["#ann-prefix", "#ann-text", "#ann-centred", "#ann-horiz", "#ann-decimals", "#ann-tolmode", "#ann-fit", "#ann-showdev", "#ann-plus", "#ann-minus", "#ann-notetext", "#ann-height"]
+  ["#ann-prefix", "#ann-text", "#ann-centred", "#ann-horiz", "#ann-decimals", "#ann-tolmode", "#ann-fit", "#ann-showdev", "#ann-plus", "#ann-minus", "#ann-notetext", "#ann-height", "#ann-centre-ext"]
     .forEach(s => $(s).addEventListener("change", propsChanged));
   document.addEventListener("keydown", e => {
     if ($("#tab-annotate").hidden || document.querySelector(".modal:not([hidden])")) return;   // keys of an open window

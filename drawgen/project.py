@@ -371,6 +371,74 @@ def project_point(p, direction, xdir):
     return _dot(p, x), _dot(p, y)
 
 
+def axes_of(shape, min_span_deg=180.0):
+    """Axes of the cylindrical and conical faces of a shape, for centre lines and centre marks:
+    [{"p": point on the axis, "d": unit direction, "radii": [radius, ...], "t0": start, "t1": end}, ...]
+    t0, t1: extent of the faces along the axis measured from p. Coaxial faces share one axis. A radius is kept
+    when the faces of that radius cover at least min_span_deg around the axis (holes, bosses, slot ends;
+    fillets and rounded corners are left out)."""
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepTools import BRepTools
+    from OCP.GeomAbs import GeomAbs_Cylinder, GeomAbs_Cone
+    from OCP.TopAbs import TopAbs_VERTEX
+    if shape is None or shape.IsNull():
+        return []
+    uv_bounds = _static(BRepTools, "UVBounds")
+    pnt = _static(BRep_Tool, "Pnt")
+    to_vertex = _static(TopoDS, "Vertex")
+    groups = {}
+    ex = TopExp_Explorer(shape, TopAbs_FACE)
+    while ex.More():
+        face = _to_face(ex.Current())
+        ex.Next()
+        try:
+            ad = BRepAdaptor_Surface(face)
+            t = ad.GetType()
+            if t == GeomAbs_Cylinder:
+                ax = ad.Cylinder().Axis()
+            elif t == GeomAbs_Cone:
+                ax = ad.Cone().Axis()
+            else:
+                continue
+            u0, u1, _, _ = uv_bounds(face)
+        except Exception:
+            continue
+        span = math.degrees(abs(u1 - u0))
+        loc, dr = ax.Location(), ax.Direction()
+        d = (dr.X(), dr.Y(), dr.Z())
+        # one orientation per axis line: the first non-zero component positive
+        for c in d:
+            if abs(c) > 1e-9:
+                if c < 0:
+                    d = (-d[0], -d[1], -d[2])
+                break
+        o = (loc.X(), loc.Y(), loc.Z())
+        k = _dot(o, d)
+        foot = tuple(o[i] - k * d[i] for i in range(3))             # the axis point nearest the origin
+        key = tuple(round(v, 3) for v in d) + tuple(round(v, 3) for v in foot)
+        g = groups.setdefault(key, {"p": foot, "d": d, "t0": None, "t1": None, "spans": {}})
+        vx = TopExp_Explorer(face, TopAbs_VERTEX)
+        radii = set()
+        while vx.More():
+            q = pnt(to_vertex(vx.Current()))
+            vx.Next()
+            q = (q.X(), q.Y(), q.Z())
+            tt = _dot(tuple(q[i] - foot[i] for i in range(3)), d)
+            rv = tuple(q[i] - foot[i] - tt * d[i] for i in range(3))
+            radii.add(round(math.sqrt(_dot(rv, rv)), 3))
+            g["t0"] = tt if g["t0"] is None else min(g["t0"], tt)
+            g["t1"] = tt if g["t1"] is None else max(g["t1"], tt)
+        for r in radii:
+            if r > 1e-3:
+                g["spans"][r] = g["spans"].get(r, 0.0) + span
+    out = []
+    for g in groups.values():
+        radii = sorted(r for r, sp in g["spans"].items() if sp >= min_span_deg - 1e-3)
+        if radii and g["t0"] is not None:
+            out.append({"p": g["p"], "d": g["d"], "radii": radii, "t0": g["t0"], "t1": g["t1"]})
+    return out
+
+
 # --------------------------------------------------------------------------- parallel execution
 
 def write_brep(shape, path):

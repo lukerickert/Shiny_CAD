@@ -2466,3 +2466,75 @@ def test_dimension_decimals_and_tolerance_text():
     assert units.fixed_decimals({"decimals": "auto"}, {"decimals": "x"}) is None
     o = units.options({"options": {"decimals": "7", "tol_unit": "um_unit"}})
     assert o["decimals"] == "auto" and o["tol_unit"] == "um_unit"
+
+
+def test_centre_lines_and_marks():
+    """Drawings: holes, bosses and shafts get centre marks (two crossing lines through the centre, extending
+    beyond the circle) in the views along their axis and a chain line along the axis in the views across it;
+    fillets and rounded corners get none; coaxial holes share one merged axis line; the view setting
+    centre_lines False removes them."""
+    import json
+    import os
+    from build123d import Axis, Box, Cylinder, Pos, Rot, fillet
+    from drawgen import drawing, project as pj
+    with open(os.environ["DRAWGEN_CONFIG"], "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    b = Box(60, 40, 10) - Pos(15, 0, 0) * Cylinder(5, 20) - Pos(-15, 0, 0) * Cylinder(3, 20)
+    b = fillet(b.edges().filter_by(Axis.Z), 4)
+    axes = pj.axes_of(b.wrapped)
+    assert sorted((round(a["p"][0]), a["radii"]) for a in axes) == [(-15, [3.0]), (15, [5.0])]
+    assert all(a["d"] == (0.0, 0.0, 1.0) and a["t0"] == -5.0 and a["t1"] == 5.0 for a in axes)
+
+    def centre(d):
+        return [p for p in d["prims"] if p[0] == "line" and p[5] in ("chain", "dim")]
+    d = drawing.compose("t", b.wrapped, b.volume, cfg)
+    c = centre(d)
+    top = d["meta"]["maps"]["top"]
+    f = top[2]
+    crosses = [p for p in c if abs(p[2] - top[1]) < 1e-6 and abs(p[4] - top[1]) < 1e-6 and abs(p[3] - p[1]) < 30]
+    assert len(crosses) == 2                       # one horizontal arm per hole in the top view
+    arm = sorted(abs(p[3] - p[1]) for p in crosses)
+    assert abs(arm[0] - 2 * (3 * f + drawing.CENTRE_EXT_MM)) < 1e-6 and abs(arm[1] - 2 * (5 * f + drawing.CENTRE_EXT_MM)) < 1e-6
+    right = d["meta"]["maps"]["right"]
+    vert = [p for p in c if abs(p[1] - right[0]) < 1e-6 and abs(p[3] - right[0]) < 1e-6]
+    assert len(vert) == 1 and abs(abs(vert[0][4] - vert[0][2]) - (10 * f + 2 * drawing.CENTRE_EXT_MM)) < 1e-6
+    front = d["meta"]["maps"]["front"]
+    fr = [p for p in c if abs(p[1] - p[3]) < 1e-6 and abs(p[2] - front[1]) < 20 and front[5] <= p[1] <= front[7]]
+    assert len(fr) == 2
+    cfg2 = dict(cfg, views=dict(cfg["views"], centre_lines=False))
+    assert len(centre(drawing.compose("t", b.wrapped, b.volume, cfg2))) == len(c) - 9     # 4 arms, 1 right, 2 front, 2 section
+    # a stepped shaft along X: one axis line through both diameters in the front view, a cross in the right view
+    sh = Rot(0, 90, 0) * (Cylinder(10, 40) + Pos(0, 0, 30) * Cylinder(6, 20))
+    axes = pj.axes_of(sh.wrapped)
+    assert len(axes) == 1 and axes[0]["radii"] == [6.0, 10.0] and axes[0]["t1"] - axes[0]["t0"] == 60.0
+    d = drawing.compose("t", sh.wrapped, sh.volume, cfg)
+    front = d["meta"]["maps"]["front"]
+    f = front[2]
+    ax = [p for p in centre(d) if abs(p[2] - front[1]) < 1e-6 and abs(p[4] - front[1]) < 1e-6 and abs(p[3] - p[1]) > 50 * f and front[5] - 5 <= p[1] <= front[7] + 5]
+    assert len(ax) == 1 and abs(abs(ax[0][3] - ax[0][1]) - (60 * f + 2 * drawing.CENTRE_EXT_MM)) < 1e-6
+
+
+def test_manual_centre_mark_and_line():
+    """Annotations of type centre: a mark is two crossing lines through the centre extending 2 mm (sheet) beyond
+    the circle, chain lines for circles of 5 mm sheet radius or more and thin continuous lines below; a centre
+    line runs between two points extended by 2 mm at both ends."""
+    from drawgen import annotate
+    maps = {"front": [100.0, 100.0, 2.0, 0.0, 0.0]}
+    cfg = {"dim_text_height_mm": 3.5}
+    out = annotate.render([{"id": "c1", "type": "centre", "view": "front", "c": [10, 5], "r": 4},
+                           {"id": "c2", "type": "centre", "view": "front", "c": [0, 0], "r": 1},
+                           {"id": "c3", "type": "centre", "view": "front", "p1": [0, 0], "p2": [30, 0]}], maps, cfg)
+    assert [g[1] for g in out] == ["c1", "c2", "c3"]
+    big = out[0][2]
+    assert len(big) == 2 and all(p[5] == "chain" for p in big)
+    assert big[0][1:5] == (120.0 - 10.0, 110.0, 120.0 + 10.0, 110.0) and big[1][1:5] == (120.0, 100.0, 120.0, 120.0)
+    small = out[1][2]
+    assert all(p[5] == "dim" for p in small) and abs(small[0][3] - small[0][1] - 8.0) < 1e-9
+    line = out[2][2]
+    assert len(line) == 1 and line[0][5] == "chain" and line[0][1:5] == (98.0, 100.0, 162.0, 100.0)
+    assert annotate.render([{"id": "x", "type": "centre", "view": "front", "p1": [1, 1], "p2": [1, 1]}], maps, cfg) == []
+    # ext: the arms beyond the circle (sheet mm), also of a centre line
+    big = annotate.render([{"id": "c1", "type": "centre", "view": "front", "c": [10, 5], "r": 4, "ext": 5}], maps, cfg)[0][2]
+    assert big[0][1:5] == (120.0 - 13.0, 110.0, 120.0 + 13.0, 110.0)
+    line = annotate.render([{"id": "c3", "type": "centre", "view": "front", "p1": [0, 0], "p2": [30, 0], "ext": 0}], maps, cfg)[0][2]
+    assert line[0][1:5] == (100.0, 100.0, 160.0, 100.0)

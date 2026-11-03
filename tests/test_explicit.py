@@ -546,3 +546,57 @@ def test_solver_packages_in_the_solvers_folder(tmp_path, monkeypatch):
     for n in ("ccx_dynamic", "ccx_static"):
         (sv / (n + ext)).write_text("x")
     assert analysis.find_ccx("") == str(sv / ("ccx_static" + ext))
+
+
+def test_model_inp_of_shells_with_edge_supports(client, tmp_path):
+    """Two surface parts (a plate and a stiffener) as shells, one rigid shell impactor and one solid block: the .inp
+    holds *SHELL SECTION with the thickness and OFFSET, the edge support with the translations on all its nodes and
+    the rotations on its shell nodes (NSET ..._R), and inp2rad converts it (/PROP/SHELL, /BCS)."""
+    def surf(fid, name, plane, w, h, x=0.0, y=0.0):
+        return {"id": fid, "name": name, "type": "surf_sketch", "kind": "planar", "plane": plane, "offset": 0,
+                "sketch": {"entities": rect(w, h, x, y)}}
+    ok(client.put("/api/part/file/xs_plate", json={"name": "xs_plate", "version": 2, "next": 2, "features": [surf("s1", "Plate", "XY", 200, 100)]}))
+    ok(client.put("/api/part/file/xs_stiff", json={"name": "xs_stiff", "version": 2, "next": 2, "features": [surf("s1", "Stiffener", "XZ", 200, 30)]}))
+    ok(client.put("/api/part/file/xs_imp", json={"name": "xs_imp", "version": 2, "next": 2, "features": [surf("s1", "Tup", "XY", 20, 20, -10, -10)]}))
+    ok(client.put("/api/assembly/file/xs_asm", json={"name": "xs_asm", "next": 4, "components": [
+        {"id": "1", "name": "plate", "source": {"type": "part", "name": "xs_plate"}, "pos": [0, 0, 0], "rot": [0, 0, 0]},
+        {"id": "2", "name": "stiff", "source": {"type": "part", "name": "xs_stiff"}, "pos": [0, 50, 0], "rot": [180, 0, 0]},
+        {"id": "3", "name": "tup", "source": {"type": "part", "name": "xs_imp"}, "pos": [100, 25, 20], "rot": [0, 0, 0]}]}))
+    asm = ok(client.get("/api/assembly/file/xs_asm"))
+    c = ok(client.post("/api/assembly/build", json={"assembly": asm}))["components"][0]
+    x0 = next(i for i, r in enumerate(c["erefs"]) if r and r["kind"] == "line" and abs(r["c"][0]) < 1e-6)
+    doc = {"name": "xs1", "source": {"kind": "shinycad", "type": "assembly", "name": "xs_asm"},
+           "materials": {"S355": {"library": "", "E": 210000, "nu": 0.3, "rho": 7850}}, "default_material": "S355",
+           "mesh": {"size": 10, "shell_type": "S4R"}, "bonded": True, "bodies": {},
+           "shells": {"1:s1": {"t": 8}, "2:s1": {"t": 6, "offset": "positive"}, "3:s1": {"t": 5, "mode": "rigid"}},
+           "supports": [{"id": "s1", "name": "clamp", "target": {"comp": "1", "edge": x0}, "dofs": [1, 1, 1, 1, 1, 1]}],
+           "settings": {}, "next": 2}
+    j = wait_job(client, ok(client.post("/api/explicit/model", json={"name": "xs1", "doc": doc}))["job"])
+    assert j["state"] == "done", j
+    s = j["result"]["summary"]
+    assert [(b["name"], b["role"], b["types"][0]) for b in s["bodies"]] == [
+        ("plate / Plate", "deformable", "S4R"), ("stiff / Stiffener", "deformable", "S4R"), ("tup / Tup", "rigid", "S4R")]
+    text = open(j["result"]["inp"]).read()
+    for k in ("*SHELL SECTION, ELSET=B_PLATE_PLATE, MATERIAL=S355\n8", "*SHELL SECTION, ELSET=B_STIFF_STIFFENER, MATERIAL=S355, OFFSET=SPOS\n6",
+              "*RIGID BODY, NSET=RB_TUP_TUP", "SUP_1_CLAMP, 1, 1", "SUP_1_CLAMP_R, 6, 6"):
+        assert k in text, k
+    m = meshview.read_inp(j["result"]["inp"])
+    sup = text.split("*NSET, NSET=SUP_1_CLAMP\n")[1].split("*")[0]
+    ids = [int(v) for v in sup.replace("\n", ",").split(",") if v.strip()]
+    xyz = np.asarray([m["xyz"][list(m["node_ids"]).index(n)] for n in ids])
+    assert len(ids) >= 100 / 10 and np.allclose(xyz[:, 0], 0) and np.allclose(xyz[:, 2], 0)
+    # inp2rad
+    import shutil
+    import subprocess
+    import sys
+    from drawgen.explicit import build as xb
+    work = tmp_path / "rad"
+    work.mkdir()
+    inp = str(work / "xs1.inp")
+    shutil.copy(j["result"]["inp"], inp)
+    r = subprocess.run([sys.executable, os.path.join(xb.SCRIPT_DIR, "inp2rad_run.py"), os.path.join(xb.SCRIPT_DIR, "inp2rad.py"), inp],
+                       cwd=str(work), input="y\n" * 500, text=True, capture_output=True, timeout=300)
+    rad = glob.glob(str(work / "*_0000.rad"))
+    assert rad, r.stdout[-2000:] + r.stderr[-2000:]
+    deck = open(rad[0], errors="replace").read()
+    assert "/PROP/SHELL" in deck and "/BCS" in deck and "/RBODY" in deck

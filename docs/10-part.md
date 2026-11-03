@@ -204,7 +204,7 @@ A cell is a block when it has 6 faces with 4 edges each. A block gets a structur
 
 ## 10.9 Surfaces
 
-The **Surfaces ▾** menu of the **Part** tab creates surface bodies (faces or shells) that are kept beside the solid, listed under **Bodies**, shown translucent blue in the 3D view (green when selected), and used as tools on the solid. Surface features are ordered, suppressible and rebuilt with the part. They are not exported to STEP or drawn.
+The **Surfaces ▾** menu of the **Part** tab creates surface bodies (faces or shells) that are kept beside the solid, listed under **Bodies**, shown translucent blue in the 3D view (green when selected), and used as tools on the solid. Surface features are ordered, suppressible and rebuilt with the part. The surface bodies that are not hidden are exported to STEP with the solid; in the Assembly, Analysis and Explicit tabs they are part of the component (translucent, pickable; curve bodies are not) and the Analysis and Explicit tabs mesh them as shells ([section 12.3](12-analysis.md#123-model), [section 13.3](13-explicit.md#133-model)). They are not drawn on drawings.
 
 | Feature | Function |
 |---|---|
