@@ -9,7 +9,8 @@ Cells: [(kind, conn array (n, k) of indices into xyz, part ids or None)], kind "
 
 read_vtk(path) -> {"xyz", "cells", "point": {name: array}, "cell": {name: array}, "time", "cycle"} (ASCII or BINARY
 legacy VTK, UNSTRUCTURED_GRID or POLYDATA).
-read_inp(path) -> {"xyz", "cells", "node_ids", "elem_ids", "parts": [(elset, type)]} (*NODE, *ELEMENT).
+read_inp(path) -> {"xyz", "cells", "node_ids", "elem_ids", "parts": [(elset, type)], "part_thick": [[t, offset] | None]}
+    (*NODE, *ELEMENT, *SHELL SECTION: thickness and OFFSET of the shell elements of each *ELEMENT ELSET).
 """
 import base64
 import re
@@ -24,6 +25,7 @@ FACES = {
     "pyr": [(0, 3, 2, 1), (0, 1, 4), (1, 2, 4), (2, 3, 4), (3, 0, 4)],
 }
 NCORNER = {"tet": 4, "hex": 8, "wedge": 6, "pyr": 5, "tri": 3, "quad": 4, "line": 2}
+SHELL_KINDS = ("tri", "quad")
 
 # VTK cell type -> (kind, corner count)
 VTK_KIND = {3: ("line", 2), 5: ("tri", 3), 9: ("quad", 4), 10: ("tet", 4), 12: ("hex", 8), 13: ("wedge", 6),
@@ -325,6 +327,7 @@ def read_inp(path):
     """Nodes and elements of an Abaqus .inp (without *INCLUDE files and *PART instancing)."""
     nodes_id, nodes_xyz = [], []
     groups = {}                                       # (kind, elset) -> (ids, conn rows)
+    shell_sec = {}                                    # ELSET (upper case) -> [thickness, offset]
     mode = None
     cur = None
     pending = []
@@ -339,6 +342,17 @@ def read_inp(path):
                 pending = []
                 if kw == "*NODE" and not any(x in s.upper() for x in ("OUTPUT", "PRINT", "FILE")):
                     mode = "node"
+                elif kw == "*SHELL SECTION" and prm.get("ELSET"):
+                    o = str(prm.get("OFFSET", "0")).strip().upper()
+                    try:
+                        off = {"SPOS": 0.5, "SNEG": -0.5}.get(o, None)
+                        off = float(o) if off is None else off
+                    except ValueError:
+                        off = 0.0
+                    cur = str(prm["ELSET"]).upper()
+                    shell_sec[cur] = [None, off]
+                    mode = "shellsec"
+                    continue
                 elif kw == "*ELEMENT" and "OUTPUT" not in s.upper():
                     t = str(prm.get("TYPE", ""))
                     kind = inp_kind(t)
@@ -347,6 +361,13 @@ def read_inp(path):
                     groups.setdefault(cur[:3] + (cur[3],), ([], []))
                 else:
                     mode = None
+                continue
+            if mode == "shellsec":
+                try:
+                    shell_sec[cur][0] = float(s.split(",")[0])
+                except (ValueError, IndexError):
+                    pass
+                mode = None
                 continue
             if mode == "node":
                 p = s.split(",")
@@ -381,7 +402,9 @@ def read_inp(path):
         cells.append((kind, conn, np.full(len(ok), len(parts), np.int64)))
         elem_ids.append(np.asarray([ids[i] for i in ok], np.int64))
         parts.append((elset, etype))
-    return {"xyz": xyz, "cells": cells, "node_ids": nid, "elem_ids": elem_ids, "parts": parts}
+    thick = [shell_sec.get(str(e).upper()) if inp_kind(t) in SHELL_KINDS else None for e, t in parts]
+    return {"xyz": xyz, "cells": cells, "node_ids": nid, "elem_ids": elem_ids, "parts": parts,
+            "part_thick": [x if x and x[0] and x[0] > 0 else None for x in thick]}
 
 
 def eps1(T9):
@@ -389,6 +412,13 @@ def eps1(T9):
     M = np.asarray(T9, float).reshape(-1, 3, 3)
     M = 0.5 * (M + np.transpose(M, (0, 2, 1)))
     return np.linalg.eigvalsh(M)[:, 2]
+
+
+def eig_min(T9):
+    """Smallest eigenvalue of the symmetric part of 3x3 tensors (rows of 9 components)."""
+    M = np.asarray(T9, float).reshape(-1, 3, 3)
+    M = 0.5 * (M + np.transpose(M, (0, 2, 1)))
+    return np.linalg.eigvalsh(M)[:, 0]
 
 
 def safe_field_name(name):

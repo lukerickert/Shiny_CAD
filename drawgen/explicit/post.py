@@ -351,6 +351,19 @@ class PostMixin:
         except Exception as e:
             self.log_msg(f"PV macro install failed: {e}")
 
+    STRAIN_TIMEOUT = 600          # s, pvbatch of Extract Strains
+
+    def _post_steps(self, run_folder, jobname):
+        """Post-processing after a run: KE plot, ParaView session files, Extract Strains, PV Images; the step running
+        is the note of the status row."""
+        for note, fn in (("KE plot", lambda: self._plot_ke(run_folder, jobname)),
+                         ("ParaView files", lambda: self._write_pv_assets(run_folder, jobname)),
+                         ("Extract Strains, pvbatch", lambda: self._extract_principal_strains(run_folder)),
+                         ("PV Images, pvbatch", lambda: self._render_pv_images(run_folder, jobname))):
+            self._status_touch(jobname, note=note)
+            fn()
+        self._status_touch(jobname, note="")
+
     def _extract_principal_strains(self, run_folder, force=False):
         """Run the embedded principal-strain extractor via pvbatch over run_folder,
         writing principal_strains_summary.csv. Skipped unless enabled (or force)."""
@@ -366,8 +379,13 @@ class PostMixin:
             with open(script_path, "w") as f:
                 f.write(_EXTRACTOR_SCRIPT)
             self.log_msg("> Extracting principal strains (eps_1) via pvbatch ...")
-            proc = subprocess.run([pvb, script_path, run_folder],
-                                  capture_output=True, text=True, creationflags=NO_WINDOW)
+            try:
+                proc = subprocess.run([pvb, script_path, run_folder], capture_output=True, text=True,
+                                      timeout=self.STRAIN_TIMEOUT, creationflags=NO_WINDOW)
+            except subprocess.TimeoutExpired:
+                self.log_msg(f"> Strain extraction: pvbatch did not finish in {self.STRAIN_TIMEOUT} s - stopped "
+                             f"({pvb}). Run pvbatch from a command prompt to see its message, or untick Extract Strains.")
+                return
             for ln in (proc.stdout or "").splitlines():
                 self.log_msg(f"  {ln}")
             err = (proc.stderr or "").strip()
@@ -416,7 +434,8 @@ class PostMixin:
                 env = self._remote_env_prefix()
                 ex = self.remote_exec.get().strip().rstrip("/")
                 payload = (
-                    f"for f in {jobname}A[0-9]*; do suff=$(echo $f | sed \'s/{jobname}A//\'); {ex}/anim_to_vtk_linux64_gf $f > {jobname}_$suff.vtk; done; "
+                    (f"for f in {jobname}A[0-9]*; do suff=$(echo $f | sed \'s/{jobname}A//\'); {ex}/anim_to_vtk_linux64_gf $f > {jobname}_$suff.vtk; done; "
+                     if self.vtk_convert.get() else "") +
                     f"{ex}/th_to_csv_linux64_gf {jobname}T01 > \"{jobname}_Results.csv\"; true"
                 )
                 cmd = self._ssh_base() + [f"cd '{workdir}' && {env}sh -c '{payload}'"]
@@ -435,7 +454,9 @@ class PostMixin:
                 # Local run, or a remote share-mode run: the A-files/T01 are in
                 # (or visible at) run_folder, so convert with the local tools.
                 anim_files = sorted(glob.glob(os.path.join(run_folder, f"{jobname}A[0-9]*")))
-                if anim_files:
+                if anim_files and not self.vtk_convert.get():
+                    self.log_msg(f"> Salvage: Convert to VTK off - {len(anim_files)} animation file(s) read directly by the 3D view.")
+                elif anim_files:
                     ok = bad = skipped = 0
                     for anim_file in anim_files:
                         base = os.path.basename(anim_file)

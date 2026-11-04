@@ -286,6 +286,43 @@ class BuildMixin:
             f"list). Fix: use the builder's 'Export /RBODY' output, or its "
             f"primitives Save file.")
 
+    def _gen_initial_state(self, final_lines, inp_file):
+        """Initial state (Model, Initial state; setting init_state): /NODE coordinates moved by the static displacements
+        and /INIBRI/STRS_FGLO, /INISHE/STRS_F/GLOB, /INISH3/STRS_F/GLOB from model/<name>_initial.json.gz. Returns the
+        lines, or None (build halted)."""
+        if not self.init_state.get():
+            return final_lines
+        from . import initstate
+        try:
+            st = initstate.load(inp_file)
+        except (initstate.InitError, OSError, ValueError) as e:
+            self.log_msg(f"BUILD HALTED: initial state: {e}")
+            return None
+        if st is None:
+            self.log_msg("BUILD HALTED: initial state: no static solve of this model .inp (Model, Initial state, "
+                         "Solve static), or untick Use in Build.")
+            return None
+        ns = set()
+        for k, l in enumerate(final_lines):
+            if l.strip().upper().startswith("/PROP/SHELL"):
+                for m in range(k + 1, min(k + 12, len(final_lines))):
+                    if final_lines[m].lstrip().startswith("#") and "THICK" in final_lines[m].upper():
+                        try:
+                            ns.add(int(final_lines[m + 1].split()[0]))
+                        except (ValueError, IndexError):
+                            pass
+                        break
+        if st.get("shells") and ns and ns != {len(initstate.T_POINTS)}:
+            self.log_msg(f"WARNING: initial state: /PROP/SHELL N = {sorted(ns)}; the shell stresses are written for "
+                         f"N = {len(initstate.T_POINTS)} points through the thickness.")
+        out, cnt = initstate.apply(final_lines, st, self.init_geometry.get(), self.init_stress.get(), self.init_peeq.get())
+        sm = st.get("summary") or {}
+        self.log_msg(f"Initial state from the static solve of '{sm.get('analysis')}' ({sm.get('time')}, materials "
+                     f"{sm.get('materials')}): {cnt['nodes']} node(s) moved, initial stress of {cnt['solids']} solid and "
+                     f"{cnt['shells']} shell element(s)" + (", plastic strain" if self.init_peeq.get() and self.init_stress.get() else "")
+                     + f"; max displacement {sm.get('umax', 0):.4g} mm, max von Mises {sm.get('smax', 0):.4g} MPa.")
+        return out
+
     def _gen_point_mass(self, final_lines):
         """v20.71: concentrated-mass impactor, MERGED into the model's rigid body.
 
@@ -1142,6 +1179,11 @@ class BuildMixin:
         # injected BEFORE the /RBODY scan below so its free master node is driven
         # by the Impactor Velocity modes exactly like a rigidified part's node.
         final_lines = self._gen_point_mass(final_lines)
+
+        # initial state from a static solve on the mesh of the Explicit model (initstate.py)
+        final_lines = self._gen_initial_state(final_lines, inp_file)
+        if final_lines is None:
+            return
 
         # Pre-flight: elements filed under nonexistent part 0 mean an element
         # set got NO section in PrePoMax; inp2rad converts them silently and

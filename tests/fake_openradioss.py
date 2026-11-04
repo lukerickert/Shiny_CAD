@@ -3,13 +3,17 @@
 
 python fake_openradioss.py <tool> <arguments of the tool>; install(folder) writes launchers named like the
 OpenCourant executables (<tool>_win64.cmd on Windows, <tool>_linux64_gf elsewhere) into folder.
-The engine writes 5 animation files and a T01 file; anim_to_vtk writes a legacy ASCII VTK of a 4 x 4 x 1 hexahedron
-grid (10 mm cells) with Displacement, EROSION_STATUS, von Mises and a strain tensor that grow with the frame number;
+The engine writes 5 animation files (FASTMAGI10, anim_writer.py) and a T01 file of a 4 x 4 x 1 hexahedron grid
+(10 mm cells) with Displacement, erosion, von Mises and a strain tensor that grow with the frame number; anim_to_vtk
+writes the same frame as legacy ASCII VTK;
 th_to_csv prints the energies. FAKE_OR_FAIL=engine makes the engine stop with a RUN KILLED message."""
 import os
 import re
+import struct
 import sys
 import time
+
+from anim_writer import write_anim
 
 TOOLS = ("starter", "engine", "anim_to_vtk", "th_to_csv")
 
@@ -69,8 +73,11 @@ def engine():
         t = tstop * (k - 1) / (n - 1)
         print("  NC= %6d T= %.4E DT= 1.0000E-07 ERR= -0.%d%% DM/M= %.4E" % (k * 100, t, k, 1e-4 * k))
         print("  ELAPSED TIME= %.2f s  REMAINING TIME= %.2f s" % (0.1 * k, 0.1 * (n - k)))
-        with open("%sA%03d" % (job, k), "w") as f:
-            f.write("fake animation %d %g\n" % (k, t))
+        pts, disp, cells, er, vm, eps = grid(k)
+        write_anim("%sA%03d" % (job, k), t, pts, nodal=(), vect=[("Displacement", disp)], hexes=cells,
+                   parts3=[(len(cells), "1 part")], efun3=[("Von Mises", vm)],
+                   tens3=[("Strain", [(e, -0.5 * e, -0.5 * e, 0, 0, 0) for e in eps])], del3=er,
+                   node_ids=list(range(1, len(pts) + 1)))
         if fail and k == 3:
             print(" ** RUN KILLED : TOTAL MASS ERROR")
             print(" MESSAGE ID : 207")
@@ -86,11 +93,8 @@ def engine():
     return 0
 
 
-def anim_to_vtk():
-    a = sys.argv[2]
-    k = int(re.search(r"A(\d+)$", a).group(1))
-    with open(a) as f:
-        t = float(f.read().split()[3])
+def grid(k):
+    """Frame k: points, displacements, hexahedra, active flag, von Mises and the xx strain of each element."""
     nx, ny, h = 4, 4, 10.0
     pts, disp = [], []
     for z in (0, 1):
@@ -107,8 +111,21 @@ def anim_to_vtk():
             u = (nx + 1) * (ny + 1)
             cells.append((b, b + 1, b + nx + 2, b + nx + 1, b + u, b + 1 + u, b + nx + 2 + u, b + nx + 1 + u))
     nc = len(cells)
+    er = [0 if (k >= 4 and i == 5) else 1 for i in range(nc)]
+    vm = [10.0 * k + i for i in range(nc)]
+    eps = [0.001 * k * (1 + i % 3) for i in range(nc)]
+    return pts, disp, cells, er, vm, eps
+
+
+def anim_to_vtk():
+    a = sys.argv[2]
+    k = int(re.search(r"A(\d+)$", a).group(1))
+    with open(a, "rb") as f:
+        t = struct.unpack(">f", f.read(8)[4:8])[0]
+    pts, disp, cells, er, vm, eps = grid(k)
+    nc = len(cells)
     out = ["# vtk DataFile Version 3.0", "fake anim_to_vtk", "ASCII", "DATASET UNSTRUCTURED_GRID",
-           "FIELD FieldData 2", "TIME 1 1 double", "%g" % t, "CYCLE 1 1 int", "%d" % (k * 100),
+           "FIELD FieldData 2", "TIME 1 1 double", "%.7g" % t, "CYCLE 1 1 int", "%d" % (k * 100),
            "POINTS %d float" % len(pts)]
     out += ["%g %g %g" % p for p in pts]
     out.append("CELLS %d %d" % (nc, nc * 9))
@@ -130,13 +147,12 @@ def anim_to_vtk():
     out += ["1"] * nc
     out.append("SCALARS EROSION_STATUS float 1")
     out.append("LOOKUP_TABLE default")
-    out += ["0" if (k >= 4 and i == 5) else "1" for i in range(nc)]
+    out += [str(x) for x in er]
     out.append("SCALARS 3DELEM_Von_Mises float 1")
     out.append("LOOKUP_TABLE default")
-    out += ["%g" % (10.0 * k + i) for i in range(nc)]
+    out += ["%g" % x for x in vm]
     out.append("TENSORS 3DELEM_Strain float")
-    for i in range(nc):
-        e = 0.001 * k * (1 + i % 3)
+    for e in eps:
         out += ["%g 0 0" % e, "0 %g 0" % (-0.5 * e), "0 0 %g" % (-0.5 * e)]
     sys.stdout.write("\n".join(out) + "\n")
 

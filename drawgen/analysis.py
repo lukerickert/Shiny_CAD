@@ -1,9 +1,19 @@
 # -*- coding: utf-8 -*-
-"""Linear static analysis with CalculiX: solid bodies, shells, plates, beams, rods and fasteners.
+"""Static analysis with CalculiX (linear, or nonlinear with contact, plastic and hyperelastic materials and large
+deformation): solid bodies, shells, plates, beams, rods and fasteners.
 
 Analysis record (JSON, <name>.fea.json):
   {"name", "source": {"type": "assembly" | "part", "name"},
-   "materials": {name: {"E": MPa, "nu", "rho": kg/m^3}},
+   "materials": {name: {"E": MPa, "nu", "rho": kg/m^3, "law": "elastic" | "plastic" | "hyper",
+                        "hardening": "isotropic" | "kinematic", "plastic": [[yield stress MPa, plastic strain], ...],
+                        "library": name in the ORC**3 material library (E, nu, rho and the hardening curve),
+                        "hyper": "neohooke" | "mooney", "C10", "C01" (MPa), "D1" (1/MPa)}},
+   "contacts": [{"id", "name", "type": "surface" | "node" | "tied", "master": [face refs], "slave": [face refs],
+                 "slave_nset": node set id (node-to-surface and tied: the slave nodes), "friction": mu,
+                 "stiffness": N/mm^3 (penalty slope; empty: 10 x the largest E per mm), "adjust": mm (slave nodes
+                 within this distance moved onto the master), "tol": mm (tied: position tolerance)}],
+   "nonlinear": {"nlgeom": bool, "inc0": first increment (fraction of the step), "incmin", "incmax", "maxinc":
+                 number of increments, "every": output every n increments},
    "default_material": name,
    "mesh": {"size": mm, "size_min": mm, "curvature": elements per 360 deg, "algorithm": "delaunay" | "frontal" | "hxt",
             "optimize": bool, "strategy": "tet" | "hex" | "hexsub", "tet_type": "C3D10" | "C3D4",
@@ -13,7 +23,9 @@ Analysis record (JSON, <name>.fea.json):
    "bodies": {component id: {"mode": "solid" | "plate" | "off", "material", "size": mm, "layers": n,
                              "strategy": null (mesh default) | "tet" | "hex" | "hexsub"}},
    "shells": {"<component id>:<surface id>": {"mode": "shell" | "off", "t": mm, "offset": "mid" | "positive" |
-              "negative", "material", "size": mm}},   surface bodies of the components (default: shell, 10 mm)
+              "negative", "material", "size": mm, "layers": n}},   surface bodies of the components (default: shell,
+              10 mm); "layers" (also in "sections"): S8R written as *SHELL SECTION, COMPOSITE with n layers of t / n of
+              the material (each layer with its own integration points through the thickness); other shells: 1 layer
    "members": [member], "plates": [plate], "fasteners": [fastener], "supports": [support], "loads": [load]}
 
 Units: N, mm, MPa, t/mm^3 inside the solver; densities are entered in kg/m^3 and accelerations in mm/s^2.
@@ -40,11 +52,14 @@ fastener: {"id", "name", "faces": [face A, face B], "d": mm, "material", "preloa
           are connected to their face by RBE3 equations (weighted mean of the face nodes). With a preload the
           fastener is cut at mid-length: step 1 applies the preload force across the cut, step 2 the loads with
           the cut length fixed; the results are the sum of both steps.
-point:    {"id", "name", "xyz": [x, y, z], "faces": [face reference]}   reference point ("points"): rigidly connected to
-          the faces (*RIGID BODY, REF NODE translations, ROT NODE translations = rotations); member ends at the point
-          follow it. Targets {"point": id} for supports (six components) and loads (force, moment).
+point:    {"id", "name", "xyz": [x, y, z], "coupling", "dofs", "faces", "edges", "nsets"}   reference point ("points"):
+          coupled to the nodes of its faces, edges and node sets (constraints.py: rigid, kinematic, distributing or
+          none); a node for the translations and a node whose translations are the rotations; member ends at the
+          point follow it. Targets {"point": id} for supports (six components) and loads (force, moment).
+          Springs, joints and equations: constraints.py.
           A member end connected to a face takes "coupling": "rigid" (face nodes rigid with the end) instead of RBE3.
-support:  {"id", "name", "target": face reference | edge reference | {"member", "end": "a" | "b"} | {"point": id},
+support:  {"id", "name", "target": face reference | edge reference | {"member", "end": "a" | "b"} | {"point": id} |
+          {"faces": [face refs], "edges": [edge refs], "bodies": [body ids]} (several items: the nodes of all),
            "type": "fixed" | "pinned" | "normal" | "dofs" | "displacement" | "xsymm" | "ysymm" | "zsymm",
            "dofs": [ux, uy, uz, rx, ry, rz] (1 = held),
            "value": [ux, uy, uz, rx, ry, rz] (displacement: mm, rad) | mm (normal: along the outward normal)}
@@ -57,7 +72,8 @@ support:  {"id", "name", "target": face reference | edge reference | {"member", 
           coupling) that carries the support.
           Prescribed displacements act in the load step (with a fastener preload step they are 0 in the preload step).
 load:     {"id", "name", "type": "force" | "moment" | "pressure" | "gravity" | "line",
-           "target": face reference | {"member", "end"} | {"member"} | edge reference (line), "value": [x, y, z] | p}
+           "target": face reference | {"member", "end"} | {"member"} | edge reference (line) | {"faces": [face refs]}
+           (force and moment over all faces by area, pressure on each) | {"edges": [edge refs]} (line), "value": [x, y, z] | p}
           force on a face: total force distributed by area; moment on a face: about the face centre, distributed
           by area (RBE3 distribution); pressure: MPa, positive into the face; line: N/mm on a member (global);
           gravity: acceleration vector (mm/s^2) on all bodies and members.
@@ -73,8 +89,176 @@ import time
 
 import numpy as np
 
+from . import constraints
+
 KAPPA = 1.0e7       # U1 shear factor: Euler-Bernoulli beam (1e7: equilibrium to 1e-5 and section forces to 6 digits); the U1 torsion output is scaled by it
 SPRING_K = 1.0e-6       # stiffness (N/mm) of the preload node to ground (the node needs one element)
+
+
+CONTACT_TYPES = ("surface", "node", "tied")
+MAX_INC_STATES = 40         # increments sent to the view (evenly spaced, the last always)
+
+
+def library_material(name):
+    """E, nu, rho (kg/m^3) and the hardening table [[stress, plastic strain]] of an ORC**3 library material (static
+    curve; Johnson-Cook a + b eps^n sampled), or None."""
+    from .explicit.constants import MATERIAL_LIBRARY
+    e = MATERIAL_LIBRARY.get(name or "")
+    if not e:
+        return None
+    out = {"E": float(e["E"]), "nu": float(e["nu"]), "rho": float(e.get("rho") or 0) * 1e12, "plastic": []}
+    if e.get("curve"):
+        pts = sorted((float(a), float(b)) for a, b in e["curve"])
+        out["plastic"] = [[sg, ep] for ep, sg in pts]
+    elif e.get("a") is not None:
+        a, b, n = float(e["a"]), float(e.get("b") or 0), float(e.get("n") or 1)
+        out["plastic"] = [[a + b * ep ** n if ep > 0 else a, ep] for ep in (0, 0.002, 0.005, 0.01, 0.02, 0.03, 0.05, 0.075,
+                                                                         0.1, 0.15, 0.2, 0.3, 0.4, 0.6, 0.8, 1.0)]
+    return out
+
+
+def _shell_layers(cfg, what):
+    """Number of layers of a shell or section (1 to 20)."""
+    v = (cfg or {}).get("layers")
+    if v in (None, ""):
+        return 1
+    try:
+        n = int(float(v))
+    except (TypeError, ValueError):
+        raise AnalysisError("%s: layers must be a whole number" % what)
+    if not 1 <= n <= 20:
+        raise AnalysisError("%s: layers must be 1 to 20" % what)
+    return n
+
+
+def library_list():
+    from .explicit.constants import MATERIAL_LIBRARY
+    out = []
+    for k, e in MATERIAL_LIBRARY.items():
+        if not e:
+            continue
+        m = library_material(k)
+        out.append({"name": k, "E": m["E"], "nu": m["nu"], "rho": m["rho"], "plastic": m["plastic"]})
+    return out
+
+
+def material_values(m):
+    """Material record with the library values applied: {"E", "nu", "rho", "law", "hardening", "plastic", ...}."""
+    m = dict(m or {})
+    lib = library_material(m.get("library")) if m.get("library") else None
+    if lib:
+        m.update(E=lib["E"], nu=lib["nu"], rho=lib["rho"])
+        if (m.get("law") or "elastic") == "plastic" and lib["plastic"]:
+            m["plastic"] = lib["plastic"]
+    return m
+
+
+def material_cards(m):
+    """CalculiX material cards (after *MATERIAL) of a material record."""
+    m = material_values(m)
+    law = m.get("law") or "elastic"
+    E = float(m.get("E") or 210000)
+    nu = float(m.get("nu") if m.get("nu") is not None else 0.3)
+    L = []
+    if law == "hyper":
+        c10, c01, d1 = float(m.get("C10") or 0), float(m.get("C01") or 0), float(m.get("D1") or 0)
+        if c10 <= 0:
+            raise AnalysisError("material: hyperelastic C10 must be positive")
+        if (m.get("hyper") or "neohooke") == "mooney":
+            L += ["*HYPERELASTIC, MOONEY-RIVLIN", "%.9g, %.9g, %.9g" % (c10, c01, d1)]
+        else:
+            L += ["*HYPERELASTIC, NEO HOOKE", "%.9g, %.9g" % (c10, d1)]
+    else:
+        L += ["*ELASTIC", "%.12g, %.6g" % (E, nu)]
+        if law == "plastic":
+            rows = [(float(a), float(b)) for a, b in (m.get("plastic") or []) if a is not None and b is not None]
+            rows.sort(key=lambda r: r[1])
+            if not rows or rows[0][1] != 0:
+                raise AnalysisError("material: the plastic table must start at plastic strain 0 (the yield stress)")
+            hard = "KINEMATIC" if m.get("hardening") == "kinematic" else "ISOTROPIC"
+            L += ["*PLASTIC, HARDENING=%s" % hard] + ["%.9g, %.9g" % r for r in rows]
+    rho = float(m.get("rho") or 0) * 1e-12
+    if rho > 0:
+        L += ["*DENSITY", "%.6g" % rho]
+    return L
+
+
+def face_bodies(bodies):
+    """(component id, face index) -> body id of the bodies of geometry() (the first body listing the face)."""
+    out = {}
+    for b in bodies:
+        keys = b.get("faces_by") or {(str(b.get("comp", b["id"])), int(fi)): 1 for fi in (b.get("faces") or {})}
+        for k in keys:
+            out.setdefault((str(k[0]), int(k[1])), b["id"])
+    return out
+
+
+def contact_body_pairs(doc, bodies):
+    """Pairs of bodies (ids) with a contact pair between their faces: meshed apart (no shared nodes, femesh "apart")
+    and not tied by the bonded ties."""
+    fb = face_bodies(bodies)
+    pairs = set()
+    for c in doc.get("contacts") or []:
+        A = set(fb.get((str(r.get("comp")), int(r.get("face", -1)))) for r in c.get("master") or [] if r)
+        B = set(fb.get((str(r.get("comp")), int(r.get("face", -1)))) for r in c.get("slave") or [] if r)
+        ns_ = next((x for x in doc.get("nsets") or [] if c.get("slave_nset") and str(x.get("id")) == str(c["slave_nset"])), None)
+        if ns_ is not None and ns_.get("kind") == "faces":
+            B |= set(fb.get((str(r.get("comp")), int(r.get("face", -1)))) for r in ns_.get("faces") or [] if r)
+        elif ns_ is not None and ns_.get("kind") == "body":
+            B |= set(str(x) for x in ns_.get("bodies") or [])
+        for a in A:
+            for b in B:
+                if a and b and a != b:
+                    pairs.add(tuple(sorted((a, b))))
+    return sorted(pairs)
+
+
+def contact_search(bodies, gap):
+    """Faces of different bodies within gap (mm) of each other: [{"bodies": [a, b], "master": [refs], "slave": [refs]}]
+    per pair of bodies; master: the side with the larger area of the faces found."""
+    fb = {}
+    for b in bodies:
+        keys = b.get("faces_by") or {(str(b.get("comp", b["id"])), int(fi)): v for fi, v in (b.get("faces") or {}).items()}
+        for k, tri in keys.items():
+            A, B, C = (np.asarray(x, float) for x in tri)
+            if not len(A):
+                continue
+            fb[(str(k[0]), int(k[1]))] = (b["id"], A, B, C, np.minimum(np.minimum(A, B), C).min(0), np.maximum(np.maximum(A, B), C).max(0),
+                                          float(0.5 * np.linalg.norm(np.cross(B - A, C - A), axis=1).sum()))
+    keys = sorted(fb)
+    found = {}
+    for i, ka in enumerate(keys):
+        ba, A1, B1, C1, lo1, hi1, ar1 = fb[ka]
+        P1 = (A1 + B1 + C1) / 3.0                  # triangle centres: faces that only meet along an edge are not pairs
+        N1 = np.cross(B1 - A1, C1 - A1)
+        for kb in keys[i + 1:]:
+            bb, A2, B2, C2, lo2, hi2, ar2 = fb[kb]
+            if ba == bb or (lo1 > hi2 + gap).any() or (lo2 > hi1 + gap).any():
+                continue
+            P2 = (A2 + B2 + C2) / 3.0
+            N2 = np.cross(B2 - A2, C2 - A2)
+            i1 = np.where(((P1 >= lo2 - gap) & (P1 <= hi2 + gap)).all(1))[0]
+            i2 = np.where(((P2 >= lo1 - gap) & (P2 <= hi1 + gap)).all(1))[0]
+            n1 = i1[_point_tri_dist(P1[i1], A2, B2, C2) <= gap] if len(i1) else i1
+            n2 = i2[_point_tri_dist(P2[i2], A1, B1, C1) <= gap] if len(i2) else i2
+            if not len(n1) and not len(n2):
+                continue
+            m1 = N1[n1].sum(0) if len(n1) else N1.sum(0)
+            m2 = N2[n2].sum(0) if len(n2) else N2.sum(0)
+            l1, l2 = np.linalg.norm(m1), np.linalg.norm(m2)
+            if l1 > 0 and l2 > 0 and abs(np.dot(m1, m2)) / (l1 * l2) < 0.5:     # faces crossing at an angle
+                continue
+            pair = tuple(sorted((ba, bb)))
+            e = found.setdefault(pair, {pair[0]: {}, pair[1]: {}})
+            e[ba][ka] = ar1
+            e[bb][kb] = ar2
+    out = []
+    for (a, b), sides in sorted(found.items()):
+        aa, ab = sum(sides[a].values()), sum(sides[b].values())
+        m, s_ = (a, b) if aa >= ab else (b, a)
+        out.append({"bodies": [m, s_], "master": [{"comp": k[0], "face": k[1]} for k in sorted(sides[m])],
+                    "slave": [{"comp": k[0], "face": k[1]} for k in sorted(sides[s_])]})
+    return out
 
 
 ATYPES = ("static", "modal", "buckling")
@@ -84,6 +268,26 @@ MAX_MODES = 100
 
 class AnalysisError(Exception):
     pass
+
+
+MULTI_KEYS = ("faces", "edges", "bodies")
+
+
+def is_multi(tgt):
+    """A target of several items: {"faces": [face refs], "edges": [edge refs], "bodies": [body ids]}."""
+    return isinstance(tgt, dict) and any(k in tgt for k in MULTI_KEYS)
+
+
+def single_target(tgt):
+    """A multi-item target of one face or one edge as the plain face or edge reference; other targets unchanged."""
+    if not is_multi(tgt):
+        return tgt
+    f, e, b = (list(tgt.get(k) or []) for k in MULTI_KEYS)
+    if len(f) == 1 and not e and not b:
+        return dict(f[0])
+    if len(e) == 1 and not f and not b:
+        return dict(e[0])
+    return tgt
 
 
 # --------------------------------------------------------------------------- sections
@@ -279,6 +483,10 @@ def geometry(doc, asm, sources):
     bcfg = doc.get("bodies") or {}
     scfg = doc.get("shells") or {}
     placed = {}
+    surf_faces = {}                 # (component id, face index) -> (triangles, placed face, common, component name)
+    surf_of = {}                    # (component id, face index) -> surface body "<component id>:<surface id>"
+    in_section = set((str(r.get("comp")), int(r.get("face", -1))) for sec in doc.get("sections") or []
+                     if (sec.get("mode") or "shell") != "off" for r in sec.get("faces") or [])
     for c in asm.get("components") or []:
         cid = str(c.get("id"))
         cfg = bcfg.get(cid) or {}
@@ -315,6 +523,12 @@ def geometry(doc, asm, sources):
                             material=cfg.get("material") or doc.get("default_material"), size=cfg.get("size"),
                             layers=cfg.get("layers") or 1, strategy=cfg.get("strategy"),
                             faces={fi: v for fi, v in faces.items() if fi >= len(fb) or fb[fi] is None}))
+        pfaces = pf.faces() if surfs else []
+        for fi, v in faces.items():
+            if fi < len(fb) and fb[fi] is not None:
+                surf_faces[(cid, fi)] = (v, pfaces[fi] if fi < len(pfaces) else None, common, cname)
+                if fb[fi] < len(surfs):
+                    surf_of[(cid, fi)] = "%s:%s" % (cid, surfs[fb[fi]][0])
         for k, (sid, sname, _col, sh) in enumerate(surfs):
             key = "%s:%s" % (cid, sid)
             sc = scfg.get(key) or {}
@@ -323,10 +537,47 @@ def geometry(doc, asm, sources):
             th = float(sc.get("t") or doc.get("shell_t") or DEFAULT_SHELL_T)
             if th <= 0:
                 raise AnalysisError("shell %s / %s: thickness must be positive" % (cname, sname))
-            out.append(dict(common, id=key, name="%s / %s" % (cname, sname), shape=assembly.place(sh, c), mode="shell",
+            own = {fi: v for fi, v in faces.items() if fi < len(fb) and fb[fi] == k and (cid, fi) not in in_section}
+            if not own:
+                continue                               # all faces in sections
+            whole = len(own) == sum(1 for fi in range(len(fb)) if fb[fi] == k)
+            shape = assembly.place(sh, c) if whole else _faces_shape([pfaces[fi] for fi in own])
+            out.append(dict(common, id=key, name="%s / %s" % (cname, sname), shape=shape, mode="shell",
                             material=sc.get("material") or doc.get("default_material"), size=sc.get("size"), layers=1,
-                            strategy=None, t=th, offset=sc.get("offset") or "mid",
-                            faces={fi: v for fi, v in faces.items() if fi < len(fb) and fb[fi] == k}))
+                            strategy=None, t=th, offset=sc.get("offset") or "mid", faces=own,
+                            shell_layers=_shell_layers(sc, "shell %s / %s" % (cname, sname))))
+
+    # sections: faces of the surface bodies of any components with one thickness, material, offset and size
+    used = set()
+    for sec in doc.get("sections") or []:
+        if (sec.get("mode") or "shell") == "off":
+            continue
+        name = sec.get("name") or sec.get("id")
+        fby, shapes, comps, fulls = {}, [], [], {}
+        for r in sec.get("faces") or []:
+            key = (str(r.get("comp")), int(r.get("face", -1)))
+            if key not in surf_faces or key in used:
+                continue
+            tri, pfc, common, _cn = surf_faces[key]
+            used.add(key)
+            fby[key] = tri
+            shapes.append(pfc)
+            if key[0] not in comps:
+                comps.append(key[0])
+            fulls[key[0]] = common
+        if not fby:
+            continue
+        th = float(sec.get("t") or doc.get("shell_t") or DEFAULT_SHELL_T)
+        if th <= 0:
+            raise AnalysisError("section %s: thickness must be positive" % name)
+        c0 = fulls[comps[0]]
+        out.append({"id": "sec:%s" % sec.get("id"), "name": name, "shape": _faces_shape(shapes), "mode": "shell",
+                    "material": sec.get("material") or doc.get("default_material"), "size": sec.get("size"),
+                    "layers": 1, "strategy": None, "t": th, "offset": sec.get("offset") or "mid",
+                    "shell_layers": _shell_layers(sec, "section %s" % name),
+                    "comp": comps[0], "comps": comps, "fulls": {k: v["full"] for k, v in fulls.items()},
+                    "full": c0["full"], "refs": [], "tol": max(v["tol"] for v in fulls.values()), "M": c0["M"],
+                    "faces_by": fby, "faces": {}, "surf_of": {k: surf_of.get(k) for k in fby}})
 
     def placed_shape(cid):
         if cid not in placed:
@@ -343,6 +594,120 @@ def geometry(doc, asm, sources):
     if not out and not (doc.get("members") or []):
         raise AnalysisError("no bodies, plates or members")
     return out
+
+
+def _fmt_coord(x):
+    if abs(x) < 1e-6:
+        x = 0.0
+    t = ("%.1f" % x).rstrip("0").rstrip(".")
+    return t.replace("-", "M").replace(".", "P") or "0"
+
+
+def shell_groups(asm, sources, angle_deg=1.0):
+    """Groups of the faces of the surface bodies of an assembly (step2shell "By geometry"): connected faces (touching
+    within the tolerance) on the same plane, within angle_deg, or on the same cylinder form one group. Names:
+    PLATE_Z0 (plane normal to z at z = 0), WEB_X1500 (plane normal to x or y), PLANE, CYL_R800 (cylinder of radius
+    800 mm), SURF; a second group with the same name gets _2. Returns [{"name", "faces": [face references],
+    "area"}], the largest area first."""
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+    from OCP.GeomAbs import GeomAbs_Cylinder, GeomAbs_Plane
+    from . import assembly
+    items = []
+    for c in asm.get("components") or []:
+        if c.get("visible") is False:
+            continue
+        src = c.get("source") or {}
+        full, _err = sources.load(src)
+        if full is None:
+            continue
+        fb = (sources.info(src).get("mesh") or {}).get("face_body") or []
+        if not any(v is not None for v in fb):
+            continue
+        pf = assembly.place(full, c)
+        for fi, fc in enumerate(pf.faces()):
+            if fi >= len(fb) or fb[fi] is None:
+                continue
+            ad = BRepAdaptor_Surface(fc.wrapped)
+            t = ad.GetType()
+            rec = {"ref": {"comp": str(c.get("id")), "face": fi}, "face": fc, "area": fc.area, "kind": "other"}
+            if t == GeomAbs_Plane:
+                ax = ad.Plane().Axis()
+                n = _unit([ax.Direction().X(), ax.Direction().Y(), ax.Direction().Z()])
+                L = ax.Location()
+                rec.update(kind="plane", n=n, d=float(np.dot(n, [L.X(), L.Y(), L.Z()])))
+            elif t == GeomAbs_Cylinder:
+                cy = ad.Cylinder()
+                ax = cy.Axis()
+                rec.update(kind="cylinder", p=np.array([ax.Location().X(), ax.Location().Y(), ax.Location().Z()]),
+                           a=_unit([ax.Direction().X(), ax.Direction().Y(), ax.Direction().Z()]), r=cy.Radius())
+            bb = fc.bounding_box()
+            rec["bb"] = (np.array([bb.min.X, bb.min.Y, bb.min.Z]), np.array([bb.max.X, bb.max.Y, bb.max.Z]))
+            items.append(rec)
+    if not items:
+        return []
+    lo = np.min([r["bb"][0] for r in items], axis=0)
+    hi = np.max([r["bb"][1] for r in items], axis=0)
+    tol = max(float(np.linalg.norm(hi - lo)) * 1e-5, 1e-6)
+    cos_lim = math.cos(math.radians(angle_deg))
+
+    def same(a, b):
+        if a["kind"] != b["kind"]:
+            return False
+        if a["kind"] == "plane":
+            dot = float(np.dot(a["n"], b["n"]))
+            return abs(dot) > cos_lim and abs(a["d"] - (b["d"] if dot > 0 else -b["d"])) < tol * 10
+        if a["kind"] == "cylinder":
+            if abs(a["r"] - b["r"]) > tol * 10 or abs(float(np.dot(a["a"], b["a"]))) < cos_lim:
+                return False
+            w = b["p"] - a["p"]
+            return float(np.linalg.norm(w - np.dot(w, a["a"]) * a["a"])) < tol * 10
+        return False
+    parent = list(range(len(items)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            a, b = items[i], items[j]
+            if find(i) == find(j) or not same(a, b):
+                continue
+            if (a["bb"][1] < b["bb"][0] - tol * 10).any() or (b["bb"][1] < a["bb"][0] - tol * 10).any():
+                continue
+            ex = BRepExtrema_DistShapeShape(a["face"].wrapped, b["face"].wrapped)
+            if ex.IsDone() and ex.Value() <= tol * 10:
+                parent[max(find(i), find(j))] = min(find(i), find(j))
+    groups = {}
+    for i in range(len(items)):
+        groups.setdefault(find(i), []).append(i)
+    out, used = [], {}
+    for g in sorted(groups.values(), key=lambda g: -sum(items[i]["area"] for i in g)):
+        f = items[g[0]]
+        base = "SURF"
+        if f["kind"] == "plane":
+            n = f["n"]
+            ax = int(np.argmax(np.abs(n)))
+            if abs(n[ax]) > 0.999:
+                base = ("PLATE" if ax == 2 else "WEB") + "_" + "XYZ"[ax] + _fmt_coord(f["d"] / n[ax])
+            else:
+                base = "PLANE"
+        elif f["kind"] == "cylinder":
+            base = "CYL_R" + _fmt_coord(f["r"])
+        k = used.get(base, 0) + 1
+        used[base] = k
+        out.append({"name": base if k == 1 else "%s_%d" % (base, k), "faces": [items[i]["ref"] for i in g],
+                    "area": sum(items[i]["area"] for i in g)})
+    return out
+
+
+def _faces_shape(faces):
+    """One shape of the faces (a compound)."""
+    from build123d import Shape
+    from . import model
+    return Shape.cast(model.compound([f.wrapped for f in faces if f is not None], always=True))
 
 
 def _mesh_faces(shape):
@@ -532,12 +897,15 @@ class Model(object):
         self.next_elem = 1 + max([e[0] for b in mesh["bodies"].values() for bl in b["blocks"] for e in bl["elements"]] or [0])
         self.lines = []
         self.warnings = list(mesh.get("warnings") or [])
+        self._layer_warned = set()
         self.equations = []             # input lines
         self.dependent = set()          # (node, dof)
         self.spc = {}                   # node -> set of dofs (global, or local for transformed nodes)
         self.transforms = []            # (nset name, a, b)
         self.nsets, self.elsets = {}, {}
         self.cloads = [{}, {}]          # step index (0: preload, 1: loads) -> {(node, dof): value}
+        self._vis = None                # {(node, dof): value} of the load being applied (view data)
+        self.load_vis = []              # [{"id", "name", "type", "nodal": {(node, dof): value}, "value"}]
         self.grav = None
         self.members, self.fasteners, self.supports, self.loads = [], [], [], []
         self.mat_names = {}
@@ -562,10 +930,16 @@ class Model(object):
         self.rps = {}                   # reference point id -> {"name", "ref", "rot", "xyz", "nodes", "joints"}
         self.rigid = []                 # (nset, ref node, rot node) of *RIGID BODY
         self.rp_rot_nodes = set()       # rotation nodes of reference points (their translations are rotations)
+        self.rot_used = set()           # rotation nodes of reference points used by a coupling, spring, joint or equation
+        self.user_springs = []          # [{"elset", "type": SPRING1 | SPRING2, "elem", "dofs", "k"}]
+        self.spring_vis, self.joint_vis = [], []
+        self.extra_fix = []             # (node, first dof, last dof) held in every step
         self.face_body = {}             # (component id, face index) -> body id
         for bid, b in self.bodies.items():
-            for fi in b.get("faces") or {}:
-                self.face_body.setdefault((str(b.get("comp", bid)), int(fi)), bid)
+            if not b.get("faces_by"):
+                b["faces_by"] = {(str(b.get("comp", bid)), int(fi)): v for fi, v in (b.get("faces") or {}).items()}
+            for key in b["faces_by"]:
+                self.face_body.setdefault(key, bid)
         self.shell_nodes = set(n for bid, mb in mesh["bodies"].items() for bl in mb["blocks"] if bl["type"] in SHELL_ELEMS
                                for e in bl["elements"] for n in e[1:])
         self.edge_cache = {}
@@ -573,6 +947,8 @@ class Model(object):
         if self.atype not in ATYPES:
             raise AnalysisError("unknown analysis type %s" % self.atype)
         self.nmodes = max(1, min(MAX_MODES, int(doc.get("modes") or 6)))
+        self.contact_defs = []          # [{"name", "type", "master": [(elem, label)], "slave": ..., ...}] (_contacts)
+        self.contact_bodies = set(frozenset(p) for p in contact_body_pairs(doc, bodies))
 
     # ------------------------------------------------------------------ helpers
     def new_node(self, p):
@@ -607,7 +983,7 @@ class Model(object):
                 raise AnalysisError("face %s of component %s: the component is not in the analysis" % (key[1], key[0]))
             raise AnalysisError("face %s of component %s: its body is off or the face is not found" % (key[1], key[0]))
         b = self.bodies[bid]
-        tri = b["faces"][key[1]]
+        tri = b["faces_by"][key]
         mb = self.mesh["bodies"].get(bid)
         if mb is None:
             raise AnalysisError("face %s of %s: the body has no mesh" % (key[1], b["name"]))
@@ -647,6 +1023,17 @@ class Model(object):
         self.face_cache[key] = res
         return res
 
+    def faces_merged(self, refs):
+        """Nodes, area weights and facets of several faces as one face (weights of shared nodes added)."""
+        nodes, w, facets = set(), {}, []
+        for r in refs:
+            f = self.face(r)
+            nodes.update(f["nodes"])
+            for n, v in f["w"].items():
+                w[n] = w.get(n, 0.0) + v
+            facets += f["facets"]
+        return {"nodes": sorted(nodes), "w": w, "facets": facets, "area": sum(w.values())}
+
     def face_near(self, face, p, r, what):
         """The part of a face within distance r of point p (nodes and weights)."""
         ids = [n for n in face["nodes"] if np.linalg.norm(self.X[n] - p) <= r]
@@ -657,8 +1044,8 @@ class Model(object):
 
     def face_normal_out(self, ref, f):
         """Outward unit normal of a facet (sign from the nearest triangle of the CAD face)."""
-        b = self.bodies[self.face_body[(str(ref["comp"]), int(ref["face"]))]]
-        A, B, C = b["faces"][int(ref["face"])]
+        key = (str(ref["comp"]), int(ref["face"]))
+        A, B, C = self.bodies[self.face_body[key]]["faces_by"][key]
         cn = np.cross(B - A, C - A)
         cc = (A + B + C) / 3
         nc = 4 if len(f) in (4, 8) else 3
@@ -686,11 +1073,12 @@ class Model(object):
         key = (str(ref.get("comp")), int(ref.get("edge", -1)))
         if key in self.edge_cache:
             return self.edge_cache[key]
-        bs = [b for b in self.bodies.values() if str(b.get("comp")) == key[0]]
+        bs = [b for b in self.bodies.values() if str(b.get("comp")) == key[0] or key[0] in (b.get("comps") or ())]
         if not bs:
             raise AnalysisError("edge %s of component %s: the component is not in the analysis" % (key[1], key[0]))
+        full = next((b["full"] for b in bs if str(b.get("comp")) == key[0]), None) or bs[0]["fulls"][key[0]]
         emap = TopTools_IndexedMapOfShape()
-        TopExp.MapShapes_s(bs[0]["full"].wrapped, TopAbs_EDGE, emap)
+        TopExp.MapShapes_s(full.wrapped, TopAbs_EDGE, emap)
         if not 0 <= key[1] < emap.Extent():
             raise AnalysisError("edge %s of component %s not found" % (key[1], key[0]))
         to_edge = getattr(TopoDS, "Edge_s", None) or TopoDS.Edge
@@ -744,6 +1132,91 @@ class Model(object):
                "centre": (w[:, None] * Y).sum(0) / max(w.sum(), 1e-30)}
         self.edge_cache[key] = res
         return res
+
+    def body_nodes(self, bid):
+        mb = self.mesh["bodies"].get(bid) or {}
+        return set(n for bl in mb.get("blocks", []) for e in bl["elements"] for n in e[1:])
+
+    def shell_edges(self, bids):
+        """Element edges of the shell elements of the bodies: {(corner a, corner b): [nodes of the edge]} with the
+        number of elements using each edge: ({key: nodes}, {key: count})."""
+        nodes, count = {}, {}
+        for bid in bids:
+            for bl in (self.mesh["bodies"].get(bid) or {}).get("blocks", []):
+                if bl["type"] not in SHELL_ELEMS:
+                    continue
+                nc = NCORNER[bl["type"]]
+                for e in bl["elements"]:
+                    n = e[1:]
+                    for i in range(nc):
+                        a, b = n[i], n[(i + 1) % nc]
+                        k = (a, b) if a < b else (b, a)
+                        nodes[k] = [a, b] + ([n[nc + i]] if len(n) > nc else [])
+                        count[k] = count.get(k, 0) + 1
+        return nodes, count
+
+    def node_set(self, ns):
+        """Nodes of a node set (doc["nsets"]):
+            {"kind": "plane", "axis": "x" | "y" | "z", "value": mm, "tol": mm}   all mesh nodes within tol of the plane
+            {"kind": "edges", "edges": [edge references]}                       the nodes on the edges
+            {"kind": "faces", "faces": [face references]}                       the nodes of the faces
+            {"kind": "selection", "faces", "edges", "bodies"}                   the nodes of the faces, edges and bodies
+            {"kind": "body", "bodies": [body ids]}                              all nodes of the bodies (component id,
+                                                                                "<component>:<surface>", "sec:<id>")
+            {"kind": "section_edges", "body": body id ("sec:<id>" or "<component>:<surface>"), "which": "free" |
+             "outline"}   free: the element edges of the body that bound one shell element of the whole model;
+                          outline: the element edges of the body used by one element of the body."""
+        kind = ns.get("kind")
+        name = ns.get("name") or ns.get("id")
+        ids = set()
+        if kind == "plane":
+            ax = "xyz".index(str(ns.get("axis") or "z").lower()[:1])
+            c, tol = float(ns.get("value") or 0), float(ns.get("tol") if ns.get("tol") not in (None, "") else 0.01)
+            for bid in self.mesh["bodies"]:
+                ids.update(n for n in self.body_nodes(bid) if abs(self.X[n][ax] - c) <= tol)
+        elif kind == "edges":
+            for r in ns.get("edges") or []:
+                ids.update(self.edge(r)["nodes"])
+        elif kind == "faces":
+            for r in ns.get("faces") or []:
+                ids.update(self.face(r)["nodes"])
+        elif kind == "selection":
+            for r in ns.get("faces") or []:
+                ids.update(self.face(r)["nodes"])
+            for r in ns.get("edges") or []:
+                ids.update(self.edge(r)["nodes"])
+            if ns.get("bodies"):
+                ids.update(self.node_set({"kind": "body", "name": name, "bodies": ns["bodies"]}))
+        elif kind == "body":
+            for bid in ns.get("bodies") or []:
+                bid = str(bid)
+                # faces of a surface body meshed in sections: the nodes of those faces
+                sec = [key for b in self.bodies.values() for key, sb in (b.get("surf_of") or {}).items() if sb == bid]
+                if bid not in self.mesh["bodies"] and not sec:
+                    raise AnalysisError("node set %s: body %s is not meshed (off)" % (name, bid))
+                if bid in self.mesh["bodies"]:
+                    ids.update(self.body_nodes(bid))
+                for cid, fi in sec:
+                    ids.update(self.face({"comp": cid, "face": fi})["nodes"])
+        elif kind == "section_edges":
+            bid = str(ns.get("body") or "")
+            if not bid:
+                raise AnalysisError("node set %s: choose the section or shell of its edges" % name)
+            if bid not in self.mesh["bodies"]:
+                raise AnalysisError("node set %s: shell or section %s is not meshed" % (name, bid))
+            own, ocount = self.shell_edges([bid])
+            if ns.get("which") == "outline":
+                keys = [k for k, n in ocount.items() if n == 1]
+            else:
+                _all, acount = self.shell_edges(list(self.mesh["bodies"]))
+                keys = [k for k in own if acount.get(k) == 1]
+            for k in keys:
+                ids.update(own[k])
+        else:
+            raise AnalysisError("node set %s: unknown kind %s" % (name, kind))
+        if not ids:
+            raise AnalysisError("node set %s has no nodes" % name)
+        return sorted(ids)
 
     def nset(self, name, nodes):
         self.nsets[name] = sorted(set(int(n) for n in nodes))
@@ -830,6 +1303,8 @@ class Model(object):
     def cload(self, n, d, v, step=1):
         cl = self.cloads[step]
         cl[(n, d)] = cl.get((n, d), 0.0) + float(v)
+        if self._vis is not None:
+            self._vis[(n, d)] = self._vis.get((n, d), 0.0) + float(v)
 
     def point_node(self, p):
         """Member node at point p (shared by the members meeting there)."""
@@ -842,8 +1317,17 @@ class Model(object):
         return n
 
     # ------------------------------------------------------------------ build
-    def build(self):
+    def build(self, mesh_only=False):
+        """Builds the model. mesh_only: the mesh with the items that are complete; supports, loads, fasteners and
+        members without their targets or points are left out, supports and loads whose targets are not found give
+        a warning, and the checks of the solve (no supports, analysis type) are not made."""
         doc = self.doc
+        if mesh_only:
+            doc = self.doc = dict(doc,
+                                  supports=[x for x in doc.get("supports") or [] if x.get("target")],
+                                  loads=[x for x in doc.get("loads") or [] if (x.get("type") or "force") == "gravity" or x.get("target")],
+                                  fasteners=[x for x in doc.get("fasteners") or [] if len([r for r in (x.get("faces") or []) if r]) == 2],
+                                  members=[x for x in doc.get("members") or [] if all((x.get(k) or {}).get("xyz") for k in ("a", "b"))])
         for s in doc.get("supports") or []:
             if not s.get("target"):
                 raise AnalysisError("support %s has no target (pick a face or choose a member end)" % (s.get("name") or s.get("id")))
@@ -857,9 +1341,9 @@ class Model(object):
             for k in ("a", "b"):
                 if not (m.get(k) or {}).get("xyz"):
                     raise AnalysisError("member %s: end %s has no point" % (m.get("name") or m.get("id"), k.upper()))
-        if not (doc.get("supports") or []):
+        if not (doc.get("supports") or []) and not mesh_only:
             raise AnalysisError("no supports")
-        if self.atype != "static":
+        if self.atype != "static" and not mesh_only:
             beams = [m.get("name") or m.get("id") for m in doc.get("members") or [] if (m.get("kind") or "beam") == "beam"]
             fas = [f.get("name") or f.get("id") for f in doc.get("fasteners") or []]
             if beams or fas:
@@ -893,7 +1377,13 @@ class Model(object):
         for p in doc.get("points") or []:
             self._ref_point_nodes(p)
         for s in doc.get("supports") or []:
-            self._support(s)
+            if mesh_only:
+                try:
+                    self._support(s)
+                except AnalysisError as err:
+                    self.warnings.append("support %s left out: %s" % (s.get("name") or s.get("id"), err))
+            else:
+                self._support(s)
         self.elem_nodes = set()
         for info in self.members + self.fasteners:
             for e, n1, n2 in info["elems"]:
@@ -904,15 +1394,45 @@ class Model(object):
             self._fastener_connections(info)
         for p in doc.get("points") or []:
             self._ref_point_links(p)
+        for fn, key in ((constraints.springs, "springs"), (constraints.joints, "joints"), (constraints.equations, "equations")):
+            try:
+                fn(self, doc)
+            except (constraints.ConstraintError, AnalysisError) as err:
+                if not mesh_only:
+                    raise AnalysisError(str(err))
+                self.warnings.append("%s left out: %s" % (key, err))
         for ld in doc.get("loads") or []:
-            self._load(ld)
+            self._vis = {}
+            try:
+                self._load(ld)
+            except AnalysisError as err:
+                if not mesh_only:
+                    raise
+                self.warnings.append("load %s left out: %s" % (ld.get("name") or ld.get("id"), err))
+                continue
+            finally:
+                vis, self._vis = self._vis, None
+            self.load_vis.append({"id": ld.get("id"), "name": ld.get("name") or ld.get("id"), "type": ld.get("type") or "force",
+                                  "nodal": vis, "value": ld.get("value")})
+        self._rp_check(mesh_only)
         self._member_loads()
         if self.doc.get("bonded", True):
             self._ties()
             self._member_plate_ties()
+        self._contacts(mesh_only)
+        if self.atype == "static" and self.nonlinear():
+            u1 = [i["name"] for i in self.members if i["kind"] == "beam"] + [f["name"] for f in self.fasteners]
+            if u1:
+                msg = ("nonlinear solve (contact, plastic or hyperelastic material, large deformation): beams and fasteners "
+                       "(U1 elements, linear only) are not supported: %s" % ", ".join(u1[:4]) + (", ..." if len(u1) > 4 else ""))
+                if not mesh_only:
+                    raise AnalysisError(msg)
+                self.warnings.append(msg)
+        if mesh_only:
+            return
         if self.atype == "modal":
             mats = doc.get("materials") or {}
-            bad = [n for n in self.mat_names if not float((mats.get(n) or {}).get("rho") or 0) > 0]
+            bad = [n for n in self.mat_names if not float(material_values(mats.get(n)).get("rho") or 0) > 0]
             if bad:
                 raise AnalysisError("modal analysis: material %s has no density" % ", ".join(bad))
         if self.atype == "buckling":
@@ -1034,32 +1554,37 @@ class Model(object):
 
     def _ref_point_nodes(self, p):
         """Reference point: a node for the translations (REF NODE) and a node whose translations are the rotations
-        (ROT NODE) of a CalculiX *RIGID BODY."""
+        (ROT NODE of a CalculiX *RIGID BODY)."""
         name = p.get("name") or p.get("id")
         xyz = p.get("xyz")
         if not xyz or len(xyz) != 3:
             raise AnalysisError("reference point %s has no coordinates" % name)
-        if not (p.get("faces") or []):
-            raise AnalysisError("reference point %s: pick the faces it is rigidly connected to" % name)
+        if constraints.coupling_of(p) != "none" and not (p.get("faces") or p.get("edges") or p.get("nsets")):
+            raise AnalysisError("reference point %s: pick the faces, edges or node sets it is coupled to (or Coupling none)" % name)
         xyz = np.asarray(xyz, float)
         ref, rot = self.new_node(xyz), self.new_node(xyz)
         self.rp_rot_nodes.add(rot)
-        self.rps[str(p.get("id"))] = {"name": name, "ref": ref, "rot": rot, "xyz": xyz, "nodes": [], "joints": []}
+        self.rps[str(p.get("id"))] = {"name": name, "ref": ref, "rot": rot, "xyz": xyz, "nodes": [], "joints": [],
+                                      "coupling": constraints.coupling_of(p)}
 
     def _ref_point_links(self, p):
-        """Rigid connection of a reference point: the nodes of its faces (*RIGID BODY; supported nodes and nodes
-        already constrained are left out) and the member ends at the point (translations and, at a beam end,
-        rotations equal to those of the reference point)."""
+        """Coupling of a reference point (constraints.py): rigid (equations of the rigid motion of the nodes of its
+        faces, edges and node sets; supported nodes and nodes already constrained are left out), kinematic (the
+        chosen components), distributing (RBE3 equations) or none; and the member ends at the point (translations
+        and, at a beam end, rotations equal to those of the reference point)."""
         rp = self.rps[str(p.get("id"))]
-        nodes = set()
-        for fr in p.get("faces") or []:
-            nodes.update(self.face(fr)["nodes"])
-        left = [n for n in nodes if self.spc.get(n) or (n, 1) in self.dependent]
-        nodes = sorted(n for n in nodes if not self.spc.get(n) and (n, 1) not in self.dependent)
-        if left:
-            self.warnings.append("reference point %s: %d supported or constrained face node(s) left out of the rigid "
-                                 "connection" % (rp["name"], len(left)))
-        self._rigid_set(rp, nodes)
+        mode = constraints.coupling_of(p)
+        what = "reference point %s" % rp["name"]
+        if mode != "none":
+            try:
+                w = constraints.target_nodes(self, p)
+                if mode == "distributing":
+                    rp["nodes"] = constraints.distributing(self, rp, w, constraints._flags(p.get("dofs")), what)
+                else:                   # rigid: all six components (linear equations of the rigid motion)
+                    dofs = [1] * 6 if mode == "rigid" else constraints._flags(p.get("dofs"))
+                    rp["nodes"] = constraints.kinematic(self, rp, w, dofs, what)
+            except constraints.ConstraintError as e:
+                raise AnalysisError(str(e))
         tol = max(self.ptol, 1e-6 * self.diag)
         joints = sorted(set(info["joint"][e] for info in self.members for e in ("a", "b")
                             if np.linalg.norm(self.X[info["joint"][e]] - rp["xyz"]) <= tol))
@@ -1067,9 +1592,37 @@ class Model(object):
             for d in (1, 2, 3):
                 self.add_eq([(j, d, 1.0), (rp["ref"], d, -1.0)])
             if j in self.rot_nodes:
+                self.rot_used.add(rp["rot"])
                 for d in (1, 2, 3):
                     self.add_eq([(j, d + 3, 1.0), (rp["rot"], d, -1.0)])
         rp["joints"] = joints
+
+    def _rp_check(self, mesh_only):
+        """Rotation nodes of reference points that nothing uses are held (no stiffness); a reference point that
+        nothing connects to the model stops the solve."""
+        if not self.rps:
+            return
+        used = set()
+        for ln in self.equations:
+            v = [x.strip() for x in ln.split(",")]
+            if len(v) >= 3:
+                used.update(int(float(v[k])) for k in range(0, len(v) - 2, 3))
+        for sp in self.user_springs:
+            used.update(sp["elem"][1:])
+        for ns, ref, rot in self.rigid:
+            used.update((ref, rot))
+        for cl in self.cloads:
+            used.update(n for n, d in cl)
+        used.update(n for n, ds in self.spc.items() if ds)
+        for rp in self.rps.values():
+            if rp["rot"] not in used and rp["rot"] not in self.rot_used:
+                self.extra_fix.append((rp["rot"], 1, 3))
+            if rp["ref"] not in used:
+                msg = "reference point %s is not connected to the model (coupling, member end, spring, joint, equation or support)" % rp["name"]
+                if mesh_only:
+                    self.warnings.append(msg)
+                else:
+                    raise AnalysisError(msg)
 
     def _rigid_set(self, rp, nodes):
         """*RIGID BODY of the nodes on the reference point rp."""
@@ -1105,7 +1658,12 @@ class Model(object):
         trans = None
         values = {}                     # dof -> prescribed displacement (mm; rad for rotations)
         fl6 = list(s.get("dofs") or [1, 1, 1, 0, 0, 0]) + [0] * 6
-        if "edge" in tgt or ("point" not in tgt and "member" not in tgt and typ != "normal" and self.face(tgt)["shell"]):
+        tgt = single_target(tgt)
+        if is_multi(tgt):
+            if typ == "normal":
+                raise AnalysisError("support %s: the normal support takes one planar face" % name)
+            return self._support_nodes(s, name, tgt, typ)
+        if "edge" in tgt or "nset" in tgt or ("point" not in tgt and "member" not in tgt and typ != "normal" and self.face(tgt)["shell"]):
             return self._support_nodes(s, name, tgt, typ)
         if "point" not in tgt and "member" not in tgt and typ in ("dofs", "displacement") and any(fl6[3:6]):
             # rotations on a face: the face is rigidly coupled (kinematic coupling) to a node at its weighted centre
@@ -1201,9 +1759,18 @@ class Model(object):
         """Support on an edge or on a face of a shell: the translations of all its nodes and the rotations of its
         shell nodes (solid nodes have no rotations). Types fixed (all six), pinned (translations), xsymm / ysymm /
         zsymm (symmetry about the plane normal to x / y / z), dofs, displacement."""
-        if "edge" in tgt:
+        if is_multi(tgt):
+            nodes = self.node_set(dict({k: tgt.get(k) or [] for k in MULTI_KEYS}, kind="selection", name="of support %s" % name))
+            centre = np.mean([self.X[n] for n in nodes], axis=0)
+        elif "edge" in tgt:
             ed = self.edge(tgt)
             nodes, centre = ed["nodes"], ed["centre"]
+        elif "nset" in tgt:
+            ns = next((x for x in self.doc.get("nsets") or [] if str(x.get("id")) == str(tgt["nset"])), None)
+            if ns is None:
+                raise AnalysisError("support %s: node set not found" % name)
+            nodes = self.node_set(ns)
+            centre = np.mean([self.X[n] for n in nodes], axis=0)
         else:
             face = self.face(tgt)
             nodes = face["nodes"]
@@ -1224,13 +1791,13 @@ class Model(object):
                 vv = (list(s.get("value") or []) + [0.0] * 6)[:6]
                 values = {d: float(vv[d - 1] or 0) for d in dofs}
         else:
-            raise AnalysisError("support %s: type %s is not available on an edge" % (name, typ))
+            raise AnalysisError("support %s: type %s is not available on an edge or a node set" % (name, typ))
         if not dofs:
             raise AnalysisError("support %s fixes no degree of freedom" % name)
         rn = [n for n in nodes if n in self.shell_nodes]
         td = [d for d in dofs if d <= 3]
         rd = [d for d in dofs if d > 3] if rn else []
-        if not rn and any(d > 3 for d in dofs):
+        if not rn and any(d > 3 for d in dofs) and typ != "fixed":
             self.warnings.append("support %s: rotations left out (the nodes are nodes of solid elements)" % name)
         if not td and not rd:
             raise AnalysisError("support %s fixes no degree of freedom of its nodes" % name)
@@ -1334,14 +1901,65 @@ class Model(object):
         typ = ld.get("type") or "force"
         tgt = ld.get("target") or {}
         val = ld.get("value")
+        if typ == "pressure":
+            if isinstance(val, (list, tuple)) or not isinstance(val, (int, float, str, type(None))):
+                raise AnalysisError("load %s: a pressure is one value (MPa), not %s" % (name, val))
+            try:
+                val = float(val or 0)
+            except ValueError:
+                raise AnalysisError("load %s: pressure %r is not a number" % (name, val))
+        elif typ != "gravity" or val is not None:
+            if not isinstance(val, (list, tuple)) or len(val) != 3:
+                raise AnalysisError("load %s: the value of a %s load is three components (x, y, z), not %s" % (name, typ, val))
+            try:
+                val = [float(x) for x in val]
+            except (TypeError, ValueError):
+                raise AnalysisError("load %s: the components %s are not numbers" % (name, val))
         if typ == "gravity":
             g = np.asarray(val or [0, 0, -9810.0], float)
             self.grav = g if self.grav is None else self.grav + g
             self._body_weight(g)
             for info in self.members:
-                rho = float(((self.doc.get("materials") or {}).get(info["material"]) or {}).get("rho") or 0) * 1e-12
+                rho = float(material_values((self.doc.get("materials") or {}).get(info["material"])).get("rho") or 0) * 1e-12
                 info["q"] = info["q"] + rho * info["sec"]["A"] * g
             self.loads.append({"l": ld, "name": name, "type": typ})
+            return
+        tgt = single_target(tgt)
+        if is_multi(tgt):
+            fr, er, br = (list(tgt.get(k) or []) for k in MULTI_KEYS)
+            if br:
+                raise AnalysisError("load %s: a load takes faces or edges, not bodies" % name)
+            if fr and er:
+                raise AnalysisError("load %s: faces and edges together; a load takes faces or edges" % name)
+            if er:
+                if typ != "line":
+                    raise AnalysisError("load %s: edges take a line load (N/mm)" % name)
+                q = np.asarray(val, float)
+                length = 0.0
+                for r in er:
+                    ed = self.edge(r)
+                    length += ed["length"]
+                    for n in ed["nodes"]:
+                        for d in range(3):
+                            if q[d]:
+                                self.cload(n, d + 1, q[d] * ed["w"][n])
+                self.loads.append({"l": ld, "name": name, "type": typ, "total": q * length})
+                return
+            if typ == "pressure":
+                tot = np.zeros(3)
+                for r in fr:
+                    tot += self._pressure(r, float(val or 0))
+                self.loads.append({"l": ld, "name": name, "type": typ, "total": tot})
+                return
+            face = self.faces_merged(fr)
+            if typ == "moment":
+                c = self.distribute(face, M=np.asarray(val, float))
+                self.loads.append({"l": ld, "name": name, "type": typ, "moment": np.asarray(val, float), "point": c})
+            elif typ == "force":
+                self.distribute(face, F=np.asarray(val, float))
+                self.loads.append({"l": ld, "name": name, "type": typ, "total": np.asarray(val, float)})
+            else:
+                raise AnalysisError("load %s: faces take a force, a moment or a pressure" % name)
             return
         if typ == "line" and "edge" in tgt:
             ed = self.edge(tgt)
@@ -1391,21 +2009,7 @@ class Model(object):
             return
         face = self.face(tgt)
         if typ == "pressure":
-            p = float(val or 0)
-            tot = np.zeros(3)
-            for f in face["facets"]:
-                n, area = self.face_normal_out(tgt, f)
-                if len(f) == 6:
-                    nn, w = f[3:], [area / 3] * 3
-                elif len(f) == 8:              # consistent: corners -1/12, mid-side nodes 1/3
-                    nn, w = f, [-area / 12] * 4 + [area / 3] * 4
-                else:
-                    nc = 4 if len(f) in (4, 8) else 3
-                    nn, w = f[:nc], [area / nc] * nc
-                for k, wi in zip(nn, w):
-                    for d in range(3):
-                        self.cload(k, d + 1, -p * n[d] * wi)
-                tot += -p * n * area
+            tot = self._pressure(tgt, float(val or 0))
             self.loads.append({"l": ld, "name": name, "type": typ, "total": tot})
         elif typ == "moment":
             c = self.distribute(face, M=np.asarray(val, float))
@@ -1414,6 +2018,25 @@ class Model(object):
             v = np.asarray(val, float)
             self.distribute(face, F=v)
             self.loads.append({"l": ld, "name": name, "type": typ, "total": v})
+
+    def _pressure(self, tgt, p):
+        """Nodal loads of a pressure p (MPa, positive into the face) on a face; returns the total force."""
+        face = self.face(tgt)
+        tot = np.zeros(3)
+        for f in face["facets"]:
+            n, area = self.face_normal_out(tgt, f)
+            if len(f) == 6:
+                nn, w = f[3:], [area / 3] * 3
+            elif len(f) == 8:              # consistent: corners -1/12, mid-side nodes 1/3
+                nn, w = f, [-area / 12] * 4 + [area / 3] * 4
+            else:
+                nc = 4 if len(f) in (4, 8) else 3
+                nn, w = f[:nc], [area / nc] * nc
+            for k, wi in zip(nn, w):
+                for d in range(3):
+                    self.cload(k, d + 1, -p * n[d] * wi)
+            tot += -p * n * area
+        return tot
 
     def _body_weight(self, g):
         """Consistent nodal loads of the weight of the solid and plate elements (BODY_FRACTIONS; the volume from
@@ -1424,7 +2047,7 @@ class Model(object):
                    6: [(0, 1, 2, 3), (1, 2, 3, 4), (2, 3, 4, 5)]}
         for es, (typ, els) in self.elsets.items():
             mname = next(mn for e2, b, mn in self.body_sets if e2 == es)
-            rho = float(mats[mname].get("rho") or 0) * 1e-12
+            rho = float(material_values(mats[mname]).get("rho") or 0) * 1e-12
             if rho <= 0:
                 continue
             if typ in SHELL_ELEMS:
@@ -1477,7 +2100,7 @@ class Model(object):
             for si, s in enumerate(self.mesh["bodies"][pid]["surfaces"]):
                 sp = np.asarray(s["sample"], float)
                 for bid, mb in self.mesh["bodies"].items():
-                    if bid == pid or group[bid] == group[pid] or group[bid] == "shell":
+                    if bid == pid or group[bid] == group[pid] or group[bid] == "shell" or frozenset((bid, pid)) in self.contact_bodies:
                         continue
                     tol = max(1e-3 * self.diag, 0.51 * max(thick[pid], thick[bid]))
                     cands = []
@@ -1593,6 +2216,119 @@ class Model(object):
                 break
         return out
 
+    # ------------------------------------------------------------------ contact
+    def _node_elems(self):
+        ne = {}
+        for mb in self.mesh["bodies"].values():
+            for bl in mb["blocks"]:
+                for e in bl["elements"]:
+                    for n in e[1:]:
+                        ne.setdefault(n, []).append((e, bl["type"]))
+        return ne
+
+    def _surface_faces(self, facets, node_elem, toward):
+        """Element faces of mesh facets: [(elem, "S<k>" | "SPOS" | "SNEG")]. A shell facet is the shell element; its
+        side is the one whose normal points to toward (the centre of the other surface)."""
+        out = []
+        for f in facets:
+            nc = 4 if len(f) in (4, 8) else 3
+            cs = set(f[:nc])
+            for e, typ in node_elem.get(f[0], ()):
+                if not cs.issubset(set(e[1:1 + NCORNER[typ]])):
+                    continue
+                if typ in SHELL_ELEMS:
+                    if set(e[1:1 + NCORNER[typ]]) != cs:
+                        continue
+                    P = [self.X[n] for n in e[1:4]]
+                    nrm = np.cross(P[1] - P[0], P[2] - P[0])
+                    ctr = np.mean([self.X[n] for n in e[1:1 + NCORNER[typ]]], axis=0)
+                    out.append((e[0], "SPOS" if np.dot(nrm, toward - ctr) >= 0 else "SNEG"))
+                    break
+                for k, fn in enumerate(FACE_NODES[typ]):
+                    if set(e[i] for i in fn) == cs:
+                        out.append((e[0], "S%d" % (k + 1)))
+                        break
+                break
+        return out
+
+    def _contacts(self, mesh_only):
+        """Contact pairs (doc["contacts"]): penalty surface-to-surface or node-to-surface contact with friction, or
+        tied surfaces. Master: element faces of the master faces; slave: element faces (surface-to-surface) or the
+        nodes of the slave faces or of the slave node set."""
+        self.contact_defs = []
+        cs = self.doc.get("contacts") or []
+        if not cs:
+            return
+        node_elem = self._node_elems()
+        mats = self.doc.get("materials") or {}
+        emax = max([float(material_values(mats.get(n)).get("E") or 0) for n in self.mat_names] or [210000.0]) or 210000.0
+        for k, c in enumerate(cs):
+            name = c.get("name") or c.get("id") or str(k + 1)
+            try:
+                typ = c.get("type") or "surface"
+                if typ not in CONTACT_TYPES:
+                    raise AnalysisError("unknown type %s" % typ)
+                mref = [r for r in c.get("master") or [] if r]
+                sref = [r for r in c.get("slave") or [] if r]
+                if not mref:
+                    raise AnalysisError("no master faces")
+                mf = [self.face(r) for r in mref]
+                mfac = [f for x in mf for f in x["facets"]]
+                mnodes = set(n for x in mf for n in x["nodes"])
+                if c.get("slave_nset") and typ != "surface":
+                    ns_ = next((x for x in self.doc.get("nsets") or [] if str(x.get("id")) == str(c["slave_nset"])), None)
+                    if ns_ is None:
+                        raise AnalysisError("slave node set not found")
+                    snodes, sfac = set(self.node_set(ns_)), []
+                elif sref:
+                    sf = [self.face(r) for r in sref]
+                    sfac = [f for x in sf for f in x["facets"]]
+                    snodes = set(n for x in sf for n in x["nodes"])
+                else:
+                    raise AnalysisError("no slave faces" + (" (surface-to-surface takes slave faces; a node set slave: node-to-surface)" if c.get("slave_nset") else ""))
+                shared = mnodes & snodes
+                if shared:
+                    raise AnalysisError("the master and slave faces share %d node(s): the bodies are meshed together (Bonded contact between "
+                                        "touching bodies) or a face is on both sides" % len(shared))
+                mc = np.mean([self.X[n] for n in mnodes], axis=0)
+                sc = np.mean([self.X[n] for n in snodes], axis=0)
+                master = self._surface_faces(mfac, node_elem, sc)
+                if not master:
+                    raise AnalysisError("no element faces found on the master faces")
+                d = {"name": "C%d" % (k + 1), "label": str(name), "type": typ, "master": master,
+                     "friction": float(c.get("friction") or 0), "adjust": c.get("adjust"),
+                     "K": float(c.get("stiffness") or 0) or 10.0 * emax, "slave_nodes": sorted(snodes)}
+                if typ == "surface":
+                    d["slave"] = self._surface_faces(sfac, node_elem, mc)
+                    if not d["slave"]:
+                        raise AnalysisError("no element faces found on the slave faces")
+                else:
+                    self.nset("C%dSN" % (k + 1), sorted(snodes))
+                    d["tol"] = float(c.get("tol") or 0) or max(0.01 * self.diag, 1e-3)
+                if typ == "tied":
+                    for n in snodes:
+                        self.dependent.update((n, dd) for dd in (1, 2, 3))
+                self.contact_defs.append(d)
+            except AnalysisError as e:
+                if not mesh_only:
+                    raise AnalysisError("contact %s: %s" % (name, e))
+                self.warnings.append("contact %s left out: %s" % (name, e))
+
+    def nonlinear(self):
+        """Nonlinear static step: large deformation, contact (not tied), or a plastic or hyperelastic material used."""
+        mats = self.doc.get("materials") or {}
+        return bool(self.nlgeom() or any(d["type"] != "tied" for d in self.contact_defs) or
+                    any((material_values(mats.get(n)).get("law") or "elastic") != "elastic" for n in self.mat_names))
+
+    def nlgeom(self):
+        mats = self.doc.get("materials") or {}
+        return bool((self.doc.get("nonlinear") or {}).get("nlgeom") or
+                    any((material_values(mats.get(n)).get("law") or "elastic") == "hyper" for n in self.mat_names))
+
+    def plastic(self):
+        mats = self.doc.get("materials") or {}
+        return any((material_values(mats.get(n)).get("law") or "elastic") == "plastic" for n in self.mat_names)
+
     # ------------------------------------------------------------------ input file
     def write(self, path, title=""):
         L = ["** %s" % (title or "drawgen analysis"), "*HEADING", (title or "analysis")[:80]]
@@ -1624,6 +2360,9 @@ class Model(object):
         if springs:
             L.append("*ELEMENT, TYPE=SPRING1, ELSET=EPT")
             L += ["%d, %d" % (f["spring"], f["pt"]) for f in springs]
+        for sp in self.user_springs:
+            L.append("*ELEMENT, TYPE=%s, ELSET=%s" % (sp["type"], sp["elset"]))
+            L.append(", ".join(str(v) for v in sp["elem"]))
         if beams:
             L.append("*ELSET, ELSET=EU1")
             L += ids_lines(i["elset"] for i in beams)
@@ -1646,16 +2385,24 @@ class Model(object):
             L.append("%.12g, %.12g, %.12g, %.12g, %.12g, %.12g" % (a[0], a[1], a[2], b[0], b[1], b[2]))
         mats = self.doc.get("materials") or {}
         for name, mset in self.mat_names.items():
-            m = mats[name]
-            L += ["*MATERIAL, NAME=%s" % mset, "*ELASTIC", "%.12g, %.6g" % (float(m.get("E") or 210000), float(m.get("nu") if m.get("nu") is not None else 0.3))]
-            rho = float(m.get("rho") or 0) * 1e-12
-            if rho > 0:
-                L += ["*DENSITY", "%.6g" % rho]
+            try:
+                L += ["*MATERIAL, NAME=%s" % mset] + material_cards(mats[name])
+            except AnalysisError as e:
+                raise AnalysisError("%s %s" % (name, str(e)[len("material: "):] if str(e).startswith("material: ") else e))
         for es, bid, mname in self.body_sets:
             b = self.bodies[bid]
             if self.elsets[es][0] in SHELL_ELEMS:
-                L += ["*SHELL SECTION, ELSET=%s, MATERIAL=%s, OFFSET=%g" % (es, self.mat_names[mname], SHELL_OFFSET.get(b.get("offset"), 0.0)),
-                      "%.9g" % float(b["t"])]
+                nl = int(b.get("shell_layers") or 1)
+                if nl > 1 and self.elsets[es][0] == "S8R":
+                    L.append("*SHELL SECTION, ELSET=%s, COMPOSITE, OFFSET=%g" % (es, SHELL_OFFSET.get(b.get("offset"), 0.0)))
+                    L += ["%.9g, , %s" % (float(b["t"]) / nl, self.mat_names[mname])] * nl
+                else:
+                    if nl > 1 and es not in self._layer_warned:
+                        self._layer_warned.add(es)
+                        self.warnings.append("%s: %d layers need S8R shell elements (Mesh: Shell elements); %s written with one layer"
+                                             % (b["name"], nl, self.elsets[es][0]))
+                    L += ["*SHELL SECTION, ELSET=%s, MATERIAL=%s, OFFSET=%g" % (es, self.mat_names[mname], SHELL_OFFSET.get(b.get("offset"), 0.0)),
+                          "%.9g" % float(b["t"])]
             else:
                 L.append("*SOLID SECTION, ELSET=%s, MATERIAL=%s" % (es, self.mat_names[mname]))
         for info in beams:
@@ -1667,6 +2414,8 @@ class Model(object):
             L += ["*SOLID SECTION, ELSET=%s, MATERIAL=%s" % (info["elset"], info["mset"]), "%.9g" % info["sec"]["A"]]
         if springs:
             L += ["*SPRING, ELSET=EPT", "1", "%.6E" % SPRING_K]
+        for sp in self.user_springs:
+            L += ["*SPRING, ELSET=%s" % sp["elset"], ", ".join(str(d) for d in sp["dofs"]), "%.9E" % sp["k"]]   # a stiffness without a decimal point is not read
         if self.equations:
             L.append("*EQUATION")
             L += self.equations
@@ -1678,9 +2427,36 @@ class Model(object):
             L.append("*SURFACE, NAME=%sM, TYPE=ELEMENT" % t["name"])
             L += ["%d, S%d" % fm for fm in t["master"]]
             L += ["*TIE, NAME=%s, POSITION TOLERANCE=%.6g, ADJUST=NO" % (t["name"], t["tol"]), "%sS, %sM" % (t["name"], t["name"])]
+        for c in self.contact_defs:
+            nm = c["name"]
+            L.append("*SURFACE, NAME=%sM, TYPE=ELEMENT" % nm)
+            L += ["%d, %s" % fm for fm in c["master"]]
+            if c["type"] == "surface":
+                L.append("*SURFACE, NAME=%sS, TYPE=ELEMENT" % nm)
+                L += ["%d, %s" % fs for fs in c["slave"]]
+            else:
+                L += ["*SURFACE, NAME=%sS, TYPE=NODE" % nm, "%sSN" % nm]
+            if c["type"] == "tied":
+                L += ["*TIE, NAME=%sT, POSITION TOLERANCE=%.6g, ADJUST=YES" % (nm, c["tol"]), "%sS, %sM" % (nm, nm)]
+                continue
+            L += ["*SURFACE INTERACTION, NAME=%sI" % nm, "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR",
+                  "%.6g" % c["K"] if c["type"] == "surface" else "%.6g, %.6g" % (c["K"], 1e-5 * c["K"])]
+            if c["friction"] > 0:
+                L += ["*FRICTION", "%.6g, %.6g" % (c["friction"], 0.1 * c["K"])]
+            adj = ""
+            try:
+                if c.get("adjust") not in (None, "") and float(c["adjust"]) > 0:
+                    adj = ", ADJUST=%.6g" % float(c["adjust"])
+            except (TypeError, ValueError):
+                adj = ""
+            L += ["*CONTACT PAIR, INTERACTION=%sI, TYPE=%s%s" % (nm, "SURFACE TO SURFACE" if c["type"] == "surface" else "NODE TO SURFACE", adj),
+                  "%sS, %sM" % (nm, nm)]
+        if self.contact_defs and self.atype != "static":
+            raise AnalysisError("contact: modal and buckling analyses take no contact pairs")
         if self.atype != "static":
             buck = self.atype == "buckling"
             L += ["*STEP", "*BUCKLE" if buck else "*FREQUENCY", "%d" % self.nmodes, "*BOUNDARY"]
+            L += ["%d, %d, %d" % f for f in self.extra_fix]
             for sp in self.supports:
                 for d in sp["dofs"]:
                     v = sp["values"].get(d, 0.0) if buck else 0.0
@@ -1701,9 +2477,20 @@ class Model(object):
                 f.write("\n".join(L) + "\n")
             return
         steps = [0, 1] if springs else [1]
+        nonlin = self.nonlinear()
+        nl = self.doc.get("nonlinear") or {}
+        num = lambda k, d: float(nl.get(k)) if nl.get(k) not in (None, "") and float(nl.get(k)) > 0 else d
+        inc0, incmin, incmax = num("inc0", 0.1), num("incmin", 1e-5), num("incmax", 0.25)
+        maxinc, every = int(num("maxinc", 100)), int(num("every", 1))
+        freq = ", FREQUENCY=%d" % every if nonlin and every > 1 else ""
         for st in steps:
-            L += ["*STEP", "*STATIC"]
+            if nonlin:
+                L += ["*STEP%s, INC=%d" % (", NLGEOM" if self.nlgeom() else "", maxinc), "*STATIC",
+                      "%.6g, 1.0, %.6g, %.6g" % (min(inc0, 1.0), incmin, min(incmax, 1.0))]
+            else:
+                L += ["*STEP", "*STATIC"]
             L.append("*BOUNDARY, OP=NEW")
+            L += ["%d, %d, %d" % f for f in self.extra_fix]
             for sp in self.supports:
                 for d in sp["dofs"]:
                     v = sp["values"].get(d, 0.0) if st == 1 else 0.0     # prescribed displacements in the load step
@@ -1723,19 +2510,22 @@ class Model(object):
             for (n, d), v in sorted(cl.items()):
                 if v != 0:
                     L.append("%d, %d, %.12g" % (n, d, v))
-            L += ["*NODE FILE", "U", "*EL FILE", "S"]
+            L += ["*NODE FILE%s" % freq, "U", "*EL FILE%s" % freq, "S, PEEQ" if self.plastic() else "S"]
             if mnodes:
-                L += ["*NODE PRINT, NSET=NMEMB", "U"]
+                L += ["*NODE PRINT, NSET=NMEMB%s" % freq, "U"]
             if beams:
-                L += ["*EL PRINT, ELSET=EU1", "S"]
+                L += ["*EL PRINT, ELSET=EU1%s" % freq, "S"]
             if rods:
-                L += ["*EL PRINT, ELSET=EROD", "S"]
+                L += ["*EL PRINT, ELSET=EROD%s" % freq, "S"]
             for sp in self.supports:
-                L += ["*NODE PRINT, NSET=%s" % sp["nset"], "RF"]
+                L += ["*NODE PRINT, NSET=%s%s" % (sp["nset"], freq), "RF"]
                 if sp.get("rot"):
-                    L += ["*NODE PRINT, NSET=%s" % sp["rot"]["nset"], "RF"]
+                    L += ["*NODE PRINT, NSET=%s%s" % (sp["rot"]["nset"], freq), "RF"]
             if self.rps:
-                L += ["*NODE PRINT, NSET=NRP", "U"]
+                L += ["*NODE PRINT, NSET=NRP%s" % freq, "U"]
+            if self.doc.get("ip_output"):                  # integration point stresses (initial state of the Explicit tab)
+                for es, _bid, _m in self.body_sets:
+                    L += ["*EL PRINT, ELSET=%s%s" % (es, freq), "S, PEEQ" if self.plastic() else "S"]
             L.append("*END STEP")
         with open(path, "w") as f:
             f.write("\n".join(L) + "\n")
@@ -1767,7 +2557,90 @@ class Model(object):
 
 # --------------------------------------------------------------------------- result files
 
-def read_frd(path, want=("DISP", "STRESS")):
+def read_frd_incs(path, want=("DISP", "STRESS", "PE")):
+    """Result blocks of every increment of a .frd file: [(step, increment, time, {name: {node: [values]}})] in their
+    order (nonlinear steps write one set of blocks per output increment)."""
+    out = []
+    cur = None
+    key = None
+    with open(path, "r", errors="replace") as f:
+        for line in f:
+            if line.startswith("    1PSTEP"):
+                p = line.split()
+                try:
+                    key = (int(p[3]), int(p[2]))
+                except (ValueError, IndexError):
+                    key = None
+                continue
+            if line.startswith("  100C"):
+                try:
+                    t = float(line[12:24])
+                except ValueError:
+                    t = 0.0
+                if key is not None and (not out or out[-1][:2] != key):
+                    out.append((key[0], key[1], t, {}))
+                continue
+            if line.startswith(" -4"):
+                name = line[5:13].strip()
+                cur = out[-1][3].setdefault(name, {}) if out and name in want else None
+                continue
+            if cur is None:
+                continue
+            if line.startswith(" -1"):
+                try:
+                    nid = int(line[3:13])
+                    s = line[13:].rstrip("\n")
+                    cur[nid] = [float(s[k:k + 12]) for k in range(0, len(s), 12) if s[k:k + 12].strip()]
+                except ValueError:
+                    pass
+            elif line.startswith(" -3"):
+                cur = None
+    return out
+
+
+def read_dat_incs(path):
+    """Blocks of every increment of a .dat file: {(step, increment): {(kind, set): rows}} (rows as read_dat)."""
+    out = {}
+    step, inc = 0, 1
+    kind = None
+    with open(path, "r", errors="replace") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith("S T E P"):
+                step, inc, kind = int(s.split()[-1]), 1, None
+                continue
+            if s.startswith("INCREMENT"):
+                try:
+                    inc = int(s.split()[-1])
+                except ValueError:
+                    pass
+                kind = None
+                continue
+            m = re.match(r"(displacements|forces|stresses|total force)\b.*for set (\S+)", s)
+            if m:
+                k = {"total force": "total"}.get(m.group(1), m.group(1))
+                kind = (k, m.group(2))
+                out.setdefault((step, inc), {})[kind] = [] if k in ("stresses", "total") else {}
+                continue
+            if kind is None:
+                continue
+            parts = s.split()
+            blk = out[(step, inc)]
+            try:
+                if kind[0] == "stresses":
+                    blk[kind].append((int(parts[0]), int(parts[1]), [float(v) for v in parts[2:]]))
+                elif kind[0] == "total":
+                    blk[kind] = [float(v) for v in parts]
+                else:
+                    blk[kind][int(parts[0])] = [float(v) for v in parts[1:] if v != "L"]
+            except (ValueError, IndexError):
+                kind = None
+    return out
+
+
+def read_frd(path, want=("DISP", "STRESS", "PE")):
     """Nodal results of a .frd file: {step: {name: {node: [values]}}} for the result blocks in want."""
     out = {}
     step = 1
@@ -1801,12 +2674,14 @@ def read_frd(path, want=("DISP", "STRESS")):
 
 def read_frd_shell_map(path, model):
     """Expanded nodes of the shell nodes: {shell node: [expanded nodes]}. CalculiX writes a shell element to the .frd
-    as its expanded 3D element (same element number); the bottom and top layer nodes follow the order of the shell
-    nodes (SHELL_EXPANSION)."""
+    as its expanded 3D element (same element number; composite shells: one element per layer, numbered after all
+    elements of the input); the bottom and top nodes of each element follow the order of the shell nodes
+    (SHELL_EXPANSION)."""
     shells = {e[0]: (bl["type"], e[1:]) for mb in model.mesh["bodies"].values() for bl in mb["blocks"]
               if bl["type"] in SHELL_ELEMS for e in bl["elements"]}
     if not shells or not os.path.isfile(path):
         return {}
+    top = int(getattr(model, "next_elem", 0) or 0) or (max(shells) + 1)
     els, cur, inblock = {}, None, False
     with open(path, "r", errors="replace") as f:
         for line in f:
@@ -1819,18 +2694,30 @@ def read_frd_shell_map(path, model):
                 break
             if line.startswith(" -1"):
                 cur = int(line[3:13])
-                els[cur] = [] if cur in shells else None
+                els[cur] = [] if cur in shells or cur >= top else None
             elif line.startswith(" -2") and els.get(cur) is not None:
                 s = line.rstrip("\n")
                 els[cur] += [int(s[k:k + 10]) for k in range(3, len(s) - 9, 10) if s[k:k + 10].strip()]
+    # composite shells (*SHELL SECTION, COMPOSITE): CalculiX writes one expanded element per layer, numbered after
+    # all elements of the input, in the order of the shell elements and of the layers
+    layers = {}
+    for es, bid, _m in getattr(model, "body_sets", []):
+        nl = int(model.bodies[bid].get("shell_layers") or 1)
+        typ, elems = model.elsets.get(es, (None, []))
+        if typ == "S8R" and nl > 1:
+            for e in elems:
+                layers[e[0]] = nl
+    missing = sorted(e for e in shells if not els.get(e))
+    extra = iter(sorted(e for e in els if e >= top and els[e]))
+    stack = {e: [els[e]] for e in shells if els.get(e)}
+    for e in missing:
+        stack[e] = [els.get(next(extra, None)) or [] for _ in range(layers.get(e, 1))]
     out = {}
     for eid, (typ, nn) in shells.items():
-        x = els.get(eid)
-        if not x:
-            continue
-        for i, (a, b) in enumerate(SHELL_EXPANSION[typ]):
-            if i < len(nn) and b < len(x):
-                out.setdefault(nn[i], set()).update((x[a], x[b]))
+        for x in stack.get(eid) or []:
+            for i, (a, b) in enumerate(SHELL_EXPANSION[typ]):
+                if i < len(nn) and b < len(x):
+                    out.setdefault(nn[i], set()).update((x[a], x[b]))
     return {n: sorted(v) for n, v in out.items()}
 
 
@@ -1839,8 +2726,12 @@ def shell_results(blocks, smap):
     tensor of the layer with the larger von Mises stress. blocks: {name: {node: values}} (in place)."""
     if not smap:
         return
-    U, S = blocks.get("DISP"), blocks.get("STRESS")
+    U, S, PE = blocks.get("DISP"), blocks.get("STRESS"), blocks.get("PE")
     for n, xs in smap.items():
+        if PE is not None:
+            v = [PE[x][0] for x in xs if x in PE]
+            if v:
+                PE[n] = [max(v)]
         if U is not None:
             v = [U[x] for x in xs if x in U]
             if v:
@@ -1929,18 +2820,24 @@ def read_dat(path):
                 step = int(s.split()[-1])
                 kind = None
                 continue
-            m = re.match(r"(displacements|forces|stresses|total force)\b.*for set (\S+)", s)
+            m = re.match(r"(displacements|forces|stresses|total force|equivalent plastic strain)\b.*for set (\S+)", s)
             if m:
-                k = {"total force": "total"}.get(m.group(1), m.group(1))
+                k = {"total force": "total", "equivalent plastic strain": "peeq"}.get(m.group(1), m.group(1))
                 kind = (k, m.group(2))
-                out.setdefault(step, {})[kind] = [] if k in ("stresses", "total") else {}
+                out.setdefault(step, {})[kind] = [] if k in ("stresses", "total", "peeq") else {}
                 continue
             if kind is None:
                 continue
             parts = s.split()
             try:
-                if kind[0] == "stresses":
-                    out[step][kind].append((int(parts[0]), int(parts[1]), [float(v) for v in parts[2:]]))
+                if kind[0] in ("stresses", "peeq"):
+                    vals = []
+                    for v in parts[2:]:                     # shell rows end with the name of the expanded element
+                        try:
+                            vals.append(float(v))
+                        except ValueError:
+                            break
+                    out[step][kind].append((int(parts[0]), int(parts[1]), vals))
                 elif kind[0] == "total":
                     out[step][kind] = [float(v) for v in parts]
                 else:
@@ -1964,27 +2861,55 @@ def _beam_local(c):
 
 
 class Results(object):
-    """Results of a solved model: states "preload" (step 1, fasteners with preload), "loads" and "total"."""
+    """Results of a solved model: states "preload" (step 1, fasteners with preload), "loads" and "total". A nonlinear
+    solve: "total" (end of the last step), "preload", and one state "i<k>" per output increment (incs: read_frd_incs,
+    dat_incs: read_dat_incs), the loads of an increment scaled by its step time."""
 
-    def __init__(self, model, frd, dat):
+    def __init__(self, model, frd, dat, incs=None, dat_incs=None):
         self.m = model
         steps = sorted(dat)
         if not steps:
             raise AnalysisError("the solver wrote no results")
         pre = len(steps) == 2
-        self.state_steps = {"total": steps}
-        if pre:
-            self.state_steps.update(preload=[steps[0]], loads=[steps[1]])
+        self.nonlinear = bool(incs)
+        self.kidx = {steps[0]: 0, steps[1]: 1} if pre else {}
+        self.kscale = {}
+        self.increments = []
+        if self.nonlinear:
+            self.state_steps = {"total": [steps[-1]]}
+            if pre:
+                self.state_steps["preload"] = [steps[0]]
+            frd, dat = dict(frd), dict(dat)
+            sel = list(range(len(incs)))
+            if len(sel) > MAX_INC_STATES:
+                sel = sorted(set([int(round(i * (len(incs) - 1) / float(MAX_INC_STATES - 1))) for i in range(MAX_INC_STATES)]))
+            for j, i in enumerate(sel):
+                stp, inc, t, blocks = incs[i]
+                lab = "i%d" % (j + 1)
+                frd[lab] = blocks
+                dat[lab] = (dat_incs or {}).get((stp, inc)) or {}
+                self.state_steps[lab] = [lab]
+                self.kidx[lab] = 0 if (pre and stp == steps[0]) else 1
+                self.kscale[lab] = float(t)
+                self.increments.append({"state": lab, "step": stp, "inc": inc, "time": float(t), "preload": bool(pre and stp == steps[0])})
+        else:
+            self.state_steps = {"total": steps}
+            if pre:
+                self.state_steps.update(preload=[steps[0]], loads=[steps[1]])
         self.frd, self.dat = frd, dat
         self.U = {}
         self.S = {}
+        self.PE = {}
         for st, ss in self.state_steps.items():
-            U, S = {}, {}
+            U, S, PE = {}, {}, {}
             for k in ss:
                 for n, v in ((frd.get(k) or {}).get("DISP") or {}).items():
                     U[n] = U.get(n, 0) + np.asarray(v[:3])
                 for n, v in ((frd.get(k) or {}).get("STRESS") or {}).items():
                     S[n] = S.get(n, 0) + np.asarray(v[:6])
+                for n, v in ((frd.get(k) or {}).get("PE") or {}).items():
+                    PE[n] = float(v[0]) if v else 0.0
+            self.PE[st] = PE
             Um = {}
             for k in ss:
                 for n, v in ((dat.get(k) or {}).get(("displacements", "NMEMB")) or {}).items():
@@ -2015,7 +2940,7 @@ class Results(object):
         """Per element: section forces at s = 0, L/4, L/2, 3L/4, L (local: N, V1, V2, T, M1, M2)."""
         ef = self._elem_forces(steps, "EU1")
         rows = []
-        q = info["q"] if with_q else np.zeros(3)
+        q = info["q"] * float(with_q)
         t, e1, e2 = info["t"], info["e1"], info["e2"]
         R = np.vstack([t, e1, e2])
         for e, n1, n2 in info["elems"]:
@@ -2055,7 +2980,7 @@ class Results(object):
                    "L": info["L"], "states": {}}
             for st, steps in self.state_steps.items():
                 if info["kind"] == "beam":
-                    rows = self._beam_rows(info, steps, with_q=(st != "preload"))
+                    rows = self._beam_rows(info, steps, with_q=self._qf(st, steps))
                 else:
                     rows = []
                     sig = {}
@@ -2133,15 +3058,15 @@ class Results(object):
                 if sp.get("point"):
                     # reference point: force from the REF node, moment from the ROT node (loads at held DOFs removed)
                     for k in steps:
-                        cl = self.m.cloads[self.load_index(k)]
+                        cl, f_ = self.m.cloads[self.load_index(k)], self.sc(k)
                         dk = self.dat.get(k) or {}
                         for n, v in (dk.get(("forces", sp["nset"])) or {}).items():
-                            F += np.array([v[i] - cl.get((n, i + 1), 0.0) if (i + 1) in sp["dofs"] else 0.0 for i in range(3)])
+                            F += np.array([v[i] - f_ * cl.get((n, i + 1), 0.0) if (i + 1) in sp["dofs"] else 0.0 for i in range(3)])
                         for n, v in (dk.get(("forces", sp["rot"]["nset"])) or {}).items():
-                            Mo += np.array([v[i] - cl.get((n, i + 1), 0.0) if (i + 1) in sp["rot"]["dofs"] else 0.0 for i in range(3)])
+                            Mo += np.array([v[i] - f_ * cl.get((n, i + 1), 0.0) if (i + 1) in sp["rot"]["dofs"] else 0.0 for i in range(3)])
                 elif sp["member"]:
                     n = nodes[0]
-                    acc = self._node_elem_forces(steps, with_q=(st != "preload"))
+                    acc = self._node_elem_forces(steps, with_q=self._qf(st, steps))
                     f, m = acc.get(n, [np.zeros(3), np.zeros(3)])
                     # rods at the node
                     for i, info in enumerate(self.m.members):
@@ -2155,11 +3080,11 @@ class Results(object):
                                 f = f - N * info["t"]
                     P = np.zeros(6)
                     for k in steps:
-                        idx = self.load_index(k)
+                        idx, f_ = self.load_index(k), self.sc(k)
                         for d in range(6):
-                            P[d] += self.m.cloads[idx].get((n, d + 1), 0.0)
+                            P[d] += f_ * self.m.cloads[idx].get((n, d + 1), 0.0)
                             if idx == 1:
-                                P[d] -= self.m.eq_loads.get((n, d + 1), 0.0)
+                                P[d] -= f_ * self.m.eq_loads.get((n, d + 1), 0.0)
                     F = -P[:3] - f
                     Mo = -P[3:] - m
                     fixed = sp["dofs"]
@@ -2168,11 +3093,11 @@ class Results(object):
                 else:
                     # RF of the solver is the internal nodal force; loads applied at the fixed DOFs go to the support
                     for k in steps:
-                        cl = self.m.cloads[self.load_index(k)]
+                        cl, f_ = self.m.cloads[self.load_index(k)], self.sc(k)
                         rf = (self.dat.get(k) or {}).get(("forces", sp["nset"])) or {}
                         for n, v in rf.items():
                             v = np.asarray(v[:3], float)
-                            p = np.array([cl.get((n, d), 0.0) for d in (1, 2, 3)])
+                            p = f_ * np.array([cl.get((n, d), 0.0) for d in (1, 2, 3)])
                             if sp["trans"] is not None:
                                 a, b = sp["trans"]
                                 v = np.array([v[0] - np.dot(p, a), 0.0, 0.0])
@@ -2192,20 +3117,30 @@ class Results(object):
         tot = np.zeros(3)
         pts = set(f["pt"] for f in self.m.fasteners)
         for k in steps:
-            idx = self.load_index(k)
+            idx, f_ = self.load_index(k), self.sc(k)
             for (n, d), v in self.m.cloads[idx].items():
                 if d <= 3 and n not in pts and n not in self.m.rp_rot_nodes:
-                    tot[d - 1] += v
+                    tot[d - 1] += f_ * v
         return tot
 
     def load_index(self, k):
-        """Load set of a solver step: 0 preload, 1 loads."""
-        steps = self.state_steps["total"]
-        return 0 if (len(steps) == 2 and k == steps[0]) else 1
+        """Load set of a solver step or increment state: 0 preload, 1 loads."""
+        return self.kidx.get(k, 1)
+
+    def sc(self, k):
+        """Load factor of a solver step (1) or of an increment state (its step time)."""
+        return self.kscale.get(k, 1.0)
+
+    def _qf(self, st, steps):
+        """Factor of the member line loads of a state: 0 in the preload step."""
+        if st == "preload" or not steps or self.load_index(steps[0]) == 0:
+            return 0.0
+        return self.sc(steps[0])
 
     # ------------------------------------------------------------------ summaries
     def body_max(self, st):
-        """Per body: max displacement magnitude and max von Mises stress with their node positions."""
+        """Per body: max displacement magnitude, the ux, uy, uz of largest magnitude (signed), max von Mises stress
+        with their node positions."""
         out = []
         for bid, mb in self.m.mesh["bodies"].items():
             nodes = set()
@@ -2214,20 +3149,26 @@ class Results(object):
                     nodes.update(e[1:])
             U, S = self.U[st], self.S[st]
             umax, un, smax, sn = 0.0, None, 0.0, None
+            ucomp = [0.0, 0.0, 0.0]                  # component of largest magnitude (signed)
             for n in nodes:
                 u = U.get(n)
                 if u is not None:
                     v = float(np.linalg.norm(u[:3]))
                     if v > umax:
                         umax, un = v, n
+                    for i in range(3):
+                        if abs(float(u[i])) > abs(ucomp[i]):
+                            ucomp[i] = float(u[i])
                 s = S.get(n)
                 if s is not None:
                     v = von_mises(s)
                     if v > smax:
                         smax, sn = v, n
-            out.append({"id": bid, "name": self.m.bodies[bid]["name"], "umax": umax,
+            PEs = (getattr(self, "PE", {}) or {}).get(st) or {}
+            out.append({"id": bid, "name": self.m.bodies[bid]["name"], "umax": umax, "ucomp": ucomp,
                         "upos": self.m.X[un].tolist() if un else None, "smax": smax,
-                        "spos": self.m.X[sn].tolist() if sn else None})
+                        "spos": self.m.X[sn].tolist() if sn else None,
+                        "pemax": max([PEs.get(n, 0.0) for n in nodes] or [0.0]) if PEs else None})
         return out
 
     def payload(self):
@@ -2272,12 +3213,46 @@ class Results(object):
                     else:
                         a, b, c = [ix(n) for n in f[:3]]
                         tris.append((a, b, c))
-            bodies.append({"id": bid, "name": m.bodies[bid]["name"], "start": start, "count": len(tris) - start})
+            mbd = m.bodies[bid]
+            shell = bool(mb["blocks"]) and all(bl["type"] in SHELL_ELEMS for bl in mb["blocks"])
+            bodies.append({"id": bid, "name": mbd["name"], "start": start, "count": len(tris) - start,
+                           "t": float(mbd.get("t") or 0) if shell else None,          # shell thickness (mm), offset in t
+                           "offset": SHELL_OFFSET.get(mbd.get("offset"), 0.0) if shell else None})
         lines = []
         for info in m.members:
             lines.append({"kind": info["kind"], "name": info["name"], "segs": [[ix(a), ix(b)] for e, a, b in info["elems"]]})
         for info in m.fasteners:
             lines.append({"kind": "fastener", "name": info["name"], "segs": [[ix(a), ix(b)] for e, a, b in info["elems"]]})
+        bcs = []
+        for sp in m.supports:
+            s0 = sp.get("s") or {}
+            rot = sp.get("rot") or {}
+            rnodes = set(sp.get("rnset") and m.nsets.get(sp["rnset"]) or ([rot["node"]] if rot.get("node") is not None else []))
+            bcs.append({"id": s0.get("id"), "name": sp["name"], "nodes": [ix(n) for n in sp["nodes"]], "dofs": sorted(sp["dofs"]),
+                        "rnodes": [ix(n) for n in sorted(rnodes)], "rdofs": sorted(d - 3 if d > 3 else d for d in (sp.get("rdofs") or rot.get("dofs") or [])),
+                        "prescribed": any(abs(v) > 0 for v in list((sp.get("values") or {}).values()) + list((sp.get("rvalues") or {}).values())
+                                          + list((rot.get("values") or {}).values())),
+                        "normal": sp.get("trans") is not None})
+        loadv = []
+        for lv in getattr(m, "load_vis", []):
+            per = {}
+            for (n, d), v in ({} if lv["type"] == "gravity" else lv["nodal"]).items():
+                per.setdefault(n, [0.0] * 6)[d - 1] += v
+            f = [(ix(n), q[:3]) for n, q in per.items() if any(abs(x) > 0 for x in q[:3])]
+            mo = [(ix(n), q[3:]) for n, q in per.items() if any(abs(x) > 0 for x in q[3:])]
+            loadv.append({"id": lv["id"], "name": lv["name"], "type": lv["type"],
+                          "value": lv["value"] if lv["type"] == "gravity" else None,
+                          "f": [[i] + [float(x) for x in q] for i, q in f], "m": [[i] + [float(x) for x in q] for i, q in mo]})
+        rpv = []
+        for pid, rp in getattr(m, "rps", {}).items():
+            if pid.startswith("_sup_"):
+                continue
+            ns = list(rp.get("nodes") or [])
+            k = max(1, len(ns) // 400 + 1)
+            rpv.append({"id": pid, "name": rp["name"], "node": ix(rp["ref"]), "nodes": [ix(n) for n in ns[::k]]})
+        links = [{"id": v["id"], "kind": "spring", "a": ix(v["a"]), "b": ix(v["b"]) if v["b"] is not None else None}
+                 for v in getattr(m, "spring_vis", [])]
+        links += [{"id": v["id"], "kind": "joint", "a": ix(v["a"]), "b": ix(v["b"])} for v in getattr(m, "joint_vis", [])]
         nodes = sorted(idx, key=lambda n: idx[n])
         body_nodes = set(n for mb in m.mesh["bodies"].values() for bl in mb["blocks"] for e in bl["elements"] for n in e[1:])
         b64 = lambda a, t: base64.b64encode(np.ascontiguousarray(a, dtype=t).tobytes()).decode("ascii")
@@ -2309,10 +3284,33 @@ class Results(object):
             states[st] = {"U": b64(U, np.float32), "vm": b64(vm, np.float32), "lvm": b64(lvm, np.float32),
                           "umax": float(np.linalg.norm(U, axis=1).max()) if len(U) else 0.0,
                           "vmmax": float(max(vm.max() if len(vm) else 0.0, lvm.max() if len(lvm) else 0.0))}
+            PEs = getattr(self, "PE", {}).get(st) or {}
+            if PEs:
+                pe = np.asarray([PEs.get(n, 0.0) if n in body_nodes else 0.0 for n in nodes], float)
+                states[st]["pe"] = b64(pe, np.float32)
+                states[st]["pemax"] = float(pe.max()) if len(pe) else 0.0
         return {"count": len(nodes), "pos": b64(np.asarray(pos) if pos else np.zeros((0, 3)), np.float32),
                 "tri": b64(np.asarray(tris) if tris else np.zeros((0, 3)), np.uint32), "bodies": bodies,
                 "edges": b64(np.asarray(sorted(edges)) if edges else np.zeros((0, 2)), np.uint32),
-                "lines": lines, "states": states}
+                "lines": lines, "states": states, "bcs": bcs, "loads": loadv, "rps": rpv, "links": links}
+
+    def history(self):
+        """Nonlinear solve: per output increment the step time, max |u|, max von Mises, max equivalent plastic strain,
+        the reaction of each support and the displacement of each reference point."""
+        rows = []
+        bnodes = set(n for mb in self.m.mesh["bodies"].values() for bl in mb["blocks"] for e in bl["elements"] for n in e[1:])
+        for inc in getattr(self, "increments", []):
+            st = inc["state"]
+            U, S, PE = self.U[st], self.S[st], self.PE.get(st) or {}
+            rows.append({"state": st, "step": inc["step"], "inc": inc["inc"], "time": inc["time"], "preload": inc["preload"],
+                         "umax": max([float(np.linalg.norm(u[:3])) for u in U.values()] or [0.0]),
+                         "vmmax": max([von_mises(v) for n, v in S.items() if n in bnodes] or [0.0]),
+                         "pemax": max(list(PE.values()) or [0.0]),
+                         "reactions": [[float(x) for x in r["states"][st]["F"]] for r in self.reactions],
+                         "points": [[float(x) for x in (U.get(rp["ref"]) if U.get(rp["ref"]) is not None else np.zeros(3))[:3]]
+                                    for pid, rp in self.m.rps.items() if not pid.startswith("_sup_")]})
+        return {"rows": rows, "supports": [r["name"] for r in self.reactions],
+                "points": [rp["name"] for pid, rp in self.m.rps.items() if not pid.startswith("_sup_")]}
 
     def tables(self):
         """Result tables for the client (per state)."""
@@ -2420,9 +3418,25 @@ def report(res, meta):
     L += ["%-14s%s" % ("Analysis", ATYPE_NAMES[m.atype] + ("" if m.atype == "static" else ", %d modes requested" % m.nmodes)), ""]
     L += [_rule("="), "1  MODEL", _rule("=")]
     L += ["", "1.1  Materials"]
-    L += _table(["Name", "E (MPa)", "nu", "rho (kg/m^3)"],
-                [[n, _g(float(v.get("E") or 0), 6), _g(float(v.get("nu") or 0), 3), _g(float(v.get("rho") or 0), 5)]
-                 for n, v in (doc.get("materials") or {}).items() if n in m.mat_names], [30, 16, 10, 16])
+    LAWN = {"elastic": "elastic", "plastic": "plastic", "hyper": "hyperelastic"}
+    mrows = []
+    for n, v0 in (doc.get("materials") or {}).items():
+        if n not in m.mat_names:
+            continue
+        v = material_values(v0)
+        law = LAWN.get(v.get("law") or "elastic", "elastic")
+        if law == "plastic":
+            law += " (%s)" % ("kinematic" if v.get("hardening") == "kinematic" else "isotropic")
+        mrows.append([n, _g(float(v.get("E") or 0), 6), _g(float(v.get("nu") or 0), 3), _g(float(v.get("rho") or 0), 5), law])
+    L += _table(["Name", "E (MPa)", "nu", "rho (kg/m^3)", "Law"], mrows, [30, 14, 8, 14, 30])
+    for n, v0 in (doc.get("materials") or {}).items():
+        v = material_values(v0)
+        if n in m.mat_names and (v.get("law") or "elastic") == "plastic":
+            L += ["", "%s: hardening table%s" % (n, " (library %s)" % v["library"] if v.get("library") else "")]
+            L += _table(["Yield stress (MPa)", "Plastic strain"], [[_g(a, 6), _g(b, 6)] for a, b in v.get("plastic") or []], [24, 20])
+        if n in m.mat_names and (v.get("law") or "elastic") == "hyper":
+            L += ["", "%s: %s, C10 %s MPa, C01 %s MPa, D1 %s 1/MPa" % (n, "Mooney-Rivlin" if v.get("hyper") == "mooney" else "Neo-Hooke",
+                                                                      _g(float(v.get("C10") or 0)), _g(float(v.get("C01") or 0)), _g(float(v.get("D1") or 0)))]
     L += ["", "1.2  Bodies"]
     rows = []
     for bid, mb in m.mesh["bodies"].items():
@@ -2441,6 +3455,19 @@ def report(res, meta):
     if m.ties:
         L.append("Plates and bodies of other mesh groups tied to touching bodies: %d tie constraint(s)." % len(m.ties))
     L.append("Bonded contact between touching solid bodies: %s." % ("yes (shared nodes)" if doc.get("bonded", True) else "no"))
+    if m.contact_defs:
+        L += ["", "Contact pairs"]
+        TN = {"surface": "surface-to-surface", "node": "node-to-surface", "tied": "tied"}
+        L += _table(["Pair", "Type", "Master faces", "Slave", "Friction", "K (N/mm^3)"],
+                    [[c["label"], TN[c["type"]], str(len(c["master"])),
+                      ("%d faces" % len(c["slave"])) if c.get("slave") else "%d nodes" % len(c["slave_nodes"]),
+                      _g(c["friction"]) if c["type"] != "tied" else "-", _g(c["K"]) if c["type"] != "tied" else "-"] for c in m.contact_defs],
+                    [24, 22, 14, 14, 10, 12])
+    if m.atype == "static" and m.nonlinear():
+        nl = doc.get("nonlinear") or {}
+        L += ["", "Nonlinear static step%s: initial increment %s, increments %s to %s, at most %s increments, output every %s." % (
+            " with large deformation (NLGEOM)" if m.nlgeom() else "", _g(float(nl.get("inc0") or 0.1)), _g(float(nl.get("incmin") or 1e-5)),
+            _g(float(nl.get("incmax") or 0.25)), int(nl.get("maxinc") or 100), int(nl.get("every") or 1))]
     if m.members:
         L += ["", "1.3  Members"]
         rows = []
@@ -2467,11 +3494,29 @@ def report(res, meta):
                             for d in ((s.get("rot") or {}).get("dofs") or [])]),
                   str(len(s["nodes"]))] for s in m.supports], [26, 14, 40, 10])
     if m.rps:
-        L += ["", "Reference points (*RIGID BODY: the connected face nodes move rigidly with the point; a face support "
-                  "with rotations uses a point at the face centre)"]
-        L += _table(["Point", "x (mm)", "y (mm)", "z (mm)", "Face nodes", "Member ends"],
-                    [[rp["name"][:30]] + [_g(float(v), 6) for v in rp["xyz"]] + [str(len(rp["nodes"])), str(len(rp["joints"]))]
-                     for rp in m.rps.values()], [32, 12, 12, 12, 12, 12])
+        L += ["", "Reference points (coupling: rigid, kinematic, distributing or none)"]
+        L += _table(["Point", "x (mm)", "y (mm)", "z (mm)", "Coupling", "Nodes", "Member ends"],
+                    [[rp["name"][:24]] + [_g(float(v), 6) for v in rp["xyz"]] + [rp.get("coupling") or "rigid", str(len(rp["nodes"])), str(len(rp["joints"]))]
+                     for rp in m.rps.values()], [24, 11, 11, 11, 14, 10, 13])
+    cdoc = m.doc
+    if cdoc.get("springs") or cdoc.get("joints") or cdoc.get("equations"):
+        L += ["", "Springs, joints and equations"]
+        rows = []
+        for sp in cdoc.get("springs") or []:
+            k = (list(sp.get("k") or []) + [0] * 6)[:6]
+            rows.append([(sp.get("name") or "")[:24], "spring" + ("" if sp.get("b") else " to ground"),
+                         " ".join("%s=%s" % (constraints.DOF_NAMES[i], _g(float(k[i]), 4)) for i in range(6) if float(k[i] or 0) > 0)])
+        for j in cdoc.get("joints") or []:
+            rows.append([(j.get("name") or "")[:24], "joint " + (j.get("type") or "ball"),
+                         "axis (%s)" % ", ".join(_g(float(v), 4) for v in (j.get("axis") or [0, 0, 1])) if j.get("type") == "hinge" else ""])
+        pname = {str(p.get("id")): p.get("name") or p.get("id") for p in cdoc.get("points") or []}
+        endtxt = lambda e: pname.get(str((e or {}).get("point")), "?") if (e or {}).get("point") is not None else \
+            "(%s)" % ", ".join(_g(float(v), 4) for v in ((e or {}).get("at") or []))
+        for q in cdoc.get("equations") or []:
+            rows.append([(q.get("name") or "")[:24], "equation", (" + ".join("%s %s %s" % (_g(float(t.get("coef") or 0), 4), endtxt(t.get("end")),
+                                                                                         constraints.DOF_NAMES[int(t.get("dof") or 1) - 1])
+                                                                        for t in q.get("terms") or []) + " = 0")[:52]])
+        L += _table(["Name", "Kind", "Definition"], rows, [26, 18, 52])
     L += ["", "1.6  Loads"]
     rows = []
     for ld in m.loads:
@@ -2569,9 +3614,11 @@ def _ccx_errors(text):
     return out
 
 
-def run(doc, asm, sources, workdir, ccx, progress=None, mesh_only=False, meta=None, procs=None):
+def run(doc, asm, sources, workdir, ccx, progress=None, mesh_only=False, meta=None, procs=None, mesh=None, keep=False):
     """Meshes, writes the input file, runs CalculiX and reads the results. Returns {"payload", "tables", "report",
-    "summary", "files"}; with mesh_only the mesh payload and the model summary."""
+    "summary", "files"}; with mesh_only the mesh payload and the model summary. mesh: a femesh output to use instead
+    of meshing (the bodies of the document must be in it; other bodies of it are left out). keep: the result also
+    holds "model" (the Model) and "frd" (the result blocks of the .frd)."""
     from build123d import export_brep
     from . import femesh
     say = progress or (lambda *a: None)
@@ -2587,30 +3634,56 @@ def run(doc, asm, sources, workdir, ccx, progress=None, mesh_only=False, meta=No
     bodies = geometry(doc, asm, sources)
     mopt = doc.get("mesh") or {}
     job = {"size": float(mopt.get("size") or 0), "bonded": bool(doc.get("bonded", True)), "bodies": [],
+           "apart": sorted(set(x for p in contact_body_pairs(doc, bodies) for x in p)),
            "mesh": {k: mopt.get(k) for k in ("size_min", "curvature", "algorithm", "optimize", "strategy", "tet_type", "hex_type",
-                                             "shell_type", "shell_algorithm")
+                                             "shell_type", "shell_algorithm", "shell_structured", "shell_min_div", "shell_size_mode",
+                                             "fuzzy")
                     if mopt.get(k) is not None}}
-    for b in bodies:
+    for b in (bodies if mesh is None else []):
         p = os.path.join(workdir, "body_%s.brep" % re.sub(r"[^A-Za-z0-9]+", "_", b["id"]))
         export_brep(b["shape"], p)
         job["bodies"].append({"id": b["id"], "brep": p, "mode": b["mode"], "size": b["size"], "layers": b["layers"],
                               "normal": b.get("normal"), "strategy": b.get("strategy"), "t": b.get("t")})
-    say("mesh", "Meshing %d bodies" % len(bodies))
     t0 = time.time()
-    mesh = femesh.run(job) if bodies else {"nodes": {"ids": [], "xyz": []}, "bodies": {}, "warnings": []}
+    if mesh is not None:
+        missing = [b["name"] for b in bodies if b["id"] not in mesh["bodies"]]
+        if missing:
+            raise AnalysisError("not in the given mesh: %s" % ", ".join(missing))
+        ids = set(b["id"] for b in bodies)
+        mesh = dict(mesh, bodies={k: v for k, v in mesh["bodies"].items() if k in ids})
+    else:
+        say("mesh", "Meshing %d bodies" % len(bodies))
+        mesh = femesh.run(job) if bodies else {"nodes": {"ids": [], "xyz": []}, "bodies": {}, "warnings": []}
     say("model", "Building the model")
+
+    def summ(M):
+        nel = sum(len(bl["elements"]) for b in mesh["bodies"].values() for bl in b["blocks"]) + \
+            sum(len(i["elems"]) for i in M.members + M.fasteners)
+        return {"nodes": len(M.X), "elements": nel, "mesh_time": round(time.time() - t0, 2),
+                "bodies": [{"id": bid, "name": M.bodies[bid]["name"],
+                            "elements": sum(len(bl["elements"]) for bl in mb["blocks"]),
+                            "types": [bl["type"] for bl in mb["blocks"]]} for bid, mb in mesh["bodies"].items()],
+                "ties": len(M.ties), "warnings": M.warnings, "shell": mesh.get("shell_report"),
+                "contacts": len(M.contact_defs)}
+    publish = getattr(progress, "mesh_ready", None)
     M = Model(doc, bodies, mesh)
-    M.build()
+    try:
+        M.build(mesh_only=mesh_only)
+    except AnalysisError:
+        if publish is not None and not mesh_only:        # the mesh with the items that could be applied
+            try:
+                Mm = Model(doc, bodies, mesh)
+                Mm.build(mesh_only=True)
+                publish({"payload": mesh_payload(Mm), "summary": summ(Mm)})
+            except Exception:
+                pass
+        raise
     inp = os.path.join(workdir, "job.inp")
     M.write(inp, meta.get("name") or "analysis")
-    nel = sum(len(bl["elements"]) for b in mesh["bodies"].values() for bl in b["blocks"]) + \
-        sum(len(i["elems"]) for i in M.members + M.fasteners)
-    meta.update(nodes=len(M.X), elements=nel, inp=inp)
-    summary = {"nodes": len(M.X), "elements": nel, "mesh_time": round(time.time() - t0, 2),
-               "bodies": [{"id": bid, "name": M.bodies[bid]["name"],
-                           "elements": sum(len(bl["elements"]) for bl in mb["blocks"]),
-                           "types": [bl["type"] for bl in mb["blocks"]]} for bid, mb in mesh["bodies"].items()],
-               "ties": len(M.ties), "warnings": M.warnings}
+    summary = summ(M)
+    meta.update(nodes=len(M.X), elements=summary["elements"], inp=inp)
+    if publish is not None and not mesh_only:
+        publish({"payload": mesh_payload(M), "summary": summary})
     if mesh_only:
         return {"payload": mesh_payload(M), "summary": summary, "files": {"inp": inp}}
     if not ccx:
@@ -2620,6 +3693,10 @@ def run(doc, asm, sources, workdir, ccx, progress=None, mesh_only=False, meta=No
     env["OMP_NUM_THREADS"] = str(procs or max(1, (os.cpu_count() or 2)))
     env["CCX_NPROC_STIFFNESS"] = env["OMP_NUM_THREADS"]
     log = os.path.join(workdir, "solver.log")
+    try:
+        os.remove(os.path.join(workdir, "spooles.out"))
+    except OSError:
+        pass
     t1 = time.time()
     with open(log, "w") as lf:
         p = subprocess.Popen([ccx, "-i", "job"], cwd=workdir, stdout=lf, stderr=subprocess.STDOUT, env=env,
@@ -2631,6 +3708,12 @@ def run(doc, asm, sources, workdir, ccx, progress=None, mesh_only=False, meta=No
         text = f.read()
     if "Job finished" not in text:
         errs = _ccx_errors(text)
+        try:
+            with open(os.path.join(workdir, "spooles.out"), "r", errors="replace") as f:
+                if "singular" in f.read():
+                    errs.insert(0, "the stiffness matrix is singular (a body, reference point or component without support or stiffness)")
+        except OSError:
+            pass
         raise AnalysisError("solver failed: %s (see %s)" % ("; ".join(errs[:3]) or (text.strip().splitlines() or ["no output"])[-1], log))
     summary["solve_time"] = round(time.time() - t1, 2)
     say("results", "Reading the results")
@@ -2640,7 +3723,13 @@ def run(doc, asm, sources, workdir, ccx, progress=None, mesh_only=False, meta=No
         for blocks in frd.values():
             shell_results(blocks, smap)
         dat = read_dat(os.path.join(workdir, "job.dat"))
-        res = Results(M, frd, dat)
+        if M.nonlinear():
+            incs = read_frd_incs(os.path.join(workdir, "job.frd"))
+            for _s, _i, _t, blocks in incs:
+                shell_results(blocks, smap)
+            res = Results(M, frd, dat, incs, read_dat_incs(os.path.join(workdir, "job.dat")))
+        else:
+            res = Results(M, frd, dat)
     else:
         modes = read_frd_modes(os.path.join(workdir, "job.frd"))
         for b in modes:
@@ -2652,10 +3741,18 @@ def run(doc, asm, sources, workdir, ccx, progress=None, mesh_only=False, meta=No
     with open(rp, "w", encoding="utf-8") as f:
         f.write(rep)
     summary["atype"] = M.atype
+    summary["nonlinear"] = bool(M.atype == "static" and M.nonlinear())
+    summary["contacts"] = [{"name": c["label"], "type": c["type"], "master": len(c["master"]),
+                            "slave": len(c.get("slave") or c["slave_nodes"])} for c in M.contact_defs]
     out = {"payload": res.payload(), "tables": res.tables(), "summary": summary, "states": list(res.state_steps),
+           "history": res.history() if M.atype == "static" and getattr(res, "nonlinear", False) else None,
+           "increments": getattr(res, "increments", None) or None,
            "atype": M.atype, "modes": res.modes() if M.atype != "static" else None,
            "files": {"inp": inp, "report": rp, "frd": os.path.join(workdir, "job.frd"), "dat": os.path.join(workdir, "job.dat"),
                      "log": log}}
+    if keep:
+        out["model"] = M
+        out["frd"] = frd if M.atype == "static" else None
     return out
 
 

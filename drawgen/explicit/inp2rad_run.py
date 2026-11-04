@@ -1,7 +1,9 @@
 """Runs inp2rad.py unchanged as a script: python inp2rad_run.py <inp2rad.py> <input.inp> [inp2rad arguments].
 
 inp2rad.py imports tkinter at the top. When tkinter is not installed, a stub module is put in its place (the
-batch mode with a file argument opens no dialog)."""
+batch mode with a file argument opens no dialog). After inp2rad, the Radioss cards of the SHINYCAD constraints
+(**RAD lines of the .inp: couplings, springs, joints, equations; radcards.py) go into the _0000.rad."""
+import os
 import runpy
 import sys
 import types
@@ -25,4 +27,19 @@ if __name__ == "__main__":
         _stub_tkinter()
     script = sys.argv[1]
     sys.argv = [script] + sys.argv[2:]
-    runpy.run_path(script, run_name="__main__")
+    code = 0
+    try:
+        runpy.run_path(script, run_name="__main__")
+    except SystemExit as e:
+        code = e.code
+    inp = next((a for a in sys.argv[1:] if a.lower().endswith(".inp")), None)
+    if inp and not code:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import radcards
+        try:
+            n = radcards.apply(inp)
+            if n:
+                print("SHINYCAD constraints: %d card lines written into the _0000.rad" % n)
+        except FileNotFoundError as e:
+            print("SHINYCAD constraints not written: %s" % e)
+    sys.exit(code)

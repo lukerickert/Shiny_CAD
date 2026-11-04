@@ -1260,6 +1260,10 @@ def _import(f):
     comp, named = model.step_solids(path)       # solid indices as in the Add STEP list of the Assembly tab
     solids = [s for _, s in named]
     if not solids:
+        surfs = model.step_surfaces(path)
+        if surfs:
+            raise ValueError("the STEP file has no solids, only surfaces (%d components: %s): use the Import surface "
+                             "feature" % (len(surfs), ", ".join(n for n, _s in surfs[:6]) + (" ..." if len(surfs) > 6 else "")))
         raise ValueError("the STEP file has no solids")
     want = f.get("part")
     if want not in (None, ""):

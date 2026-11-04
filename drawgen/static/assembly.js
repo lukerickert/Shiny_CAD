@@ -1075,14 +1075,44 @@ function view(name) {
 
 function scheduleBuild() { clearTimeout(AS.timer); AS.timer = setTimeout(build, 150); }
 
+/** Key of the part and STEP files of the components (server: cache keys of the sources), or null. */
+async function sourcesKey() {
+  if (!AS.asm) return "";
+  try { return (await (await postJSON("/api/geometry/state", { components: (AS.asm.components || []).map(c => ({ source: c.source })) })).json()).key || ""; }
+  catch (e) { return null; }
+}
+/** A changed part or STEP file of a component marks Refresh orange. */
+async function checkSources() {
+  if (!AS.asm || $("#tab-asm").hidden || AS.srcKey === undefined || AS.srcKey === null) return;
+  const k = await sourcesKey();
+  if (k === null) return;
+  setStale(k !== AS.srcKey);
+}
+function setStale(stale) {
+  const b = $("#as-refresh");
+  if (!b || stale === !!AS.srcStale) return;
+  AS.srcStale = stale;
+  b.classList.toggle("cm-stale", stale);
+  b.title = stale ? "A part or STEP file of the assembly has changed: Refresh builds the components again" : "Build the components again from the saved parts and STEP files";
+  if (stale) status("A part or STEP file of the assembly has changed: Refresh builds the components again");
+}
+async function refresh() {
+  await build();
+  setStale(false);
+  status("Components built again from the saved parts and STEP files");
+}
+
 async function build() {
   const seq = ++AS.seq;
   $("#as-info").textContent = "Building...";
+  const key = await sourcesKey();
   try {
     const r = await postJSON("/api/assembly/build", { assembly: AS.asm, explode: $("#as-explode").checked, have: [...MESHES.keys()],
                                                        interference: $("#as-interf").checked, density: numv($("#density").value) || 0 });
     const j = await r.json();
     if (seq !== AS.seq) return;
+    AS.srcKey = key;
+    setStale(false);
     takeMeshes(j);
     AS.errors = {};
     for (const c of j.components) if (c.error) AS.errors[c.id] = c.error;
@@ -1858,6 +1888,9 @@ window.asmShown = function () {
   $("#as-sec-flip").onchange = () => { updateSection(); render3(); };
   $("#as-sec-pos").oninput = () => { updateSection(); render3(); };
   $("#as-add-part").onclick = addPart;
+  $("#as-refresh").onclick = refresh;
+  window.addEventListener("focus", checkSources);
+  setInterval(checkSources, 4000);
   $("#as-add-step").onclick = addStep;
   document.querySelectorAll("#as-tb-mates button[data-mate]").forEach(b => { b.onclick = () => addMate(b.dataset.mate); });
   $("#as-solve").onclick = () => solveMates(false);

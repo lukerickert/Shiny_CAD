@@ -6,6 +6,7 @@ The **Assembly** tab places components and builds the assembly from them. The **
 
 | Control | Function |
 |---|---|
+| **Refresh** | Builds the components again from the saved parts and STEP files, keeping the unsaved positions and mates. The server compares the part and STEP files of the components with those of the last build when the window gets the focus and every 4 s; a change marks **Refresh** orange |
 | **Add part** | Adds a component from a saved part of the project. The component follows later changes to the part. The component holds the solid and the surface bodies of the part that are not hidden (curve bodies left out); the surface bodies are drawn translucent in their colour of the Part tab and are picked like the faces of the solid (mates, measure, drag). A part with surface bodies only has volume 0 |
 | **Add STEP** | Adds a component from a STEP file by path. With several solids in the file: all solids as separate components (one component per solid, at the positions in the file), all solids as one component, or one solid. The file is read once for all its components. A component of the whole file also holds the faces of the STEP components without solids, one surface body per STEP component (named from its label); a surface STEP file is one component of surface bodies |
 | **Duplicate**, **Delete** | Copy or remove the selected component |

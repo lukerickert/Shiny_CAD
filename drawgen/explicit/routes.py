@@ -19,7 +19,8 @@ import uuid
 from flask import jsonify, request
 
 from . import constants as C
-from . import deck, host, model_inp, modes, results
+from . import deck, host, initstate, model_inp, modes, results, rivet
+from . import launcher as tools
 
 EXT = ".exp.json"
 TEST_MODES = ["Standard Assembly Impact", "Add Infinite Rigid Floor (Drop Test)"]
@@ -128,6 +129,14 @@ def register(web):
         threading.Thread(target=work, daemon=True).start()
         return jid
 
+    # job queue of the last session (ORC**3: restored at startup)
+    try:
+        _q = (web.load_config().get("explicit") or {}).get("job_queue") or []
+    except (OSError, ValueError):
+        _q = []
+    WS.job_queue[:] = [str(x) for x in _q if isinstance(x, str)]
+    QUEUE_SAVED = [list(WS.job_queue)]
+
     # ------------------------------------------------------------------ documents and settings
     @app.route("/api/explicit/meta", methods=["GET"])
     def xp_meta():
@@ -146,6 +155,9 @@ def register(web):
             "contact_modes": list(C.CONTACT_MODES), "contact_help": C.CONTACT_HELP, "contact_hint": C.CONTACT_HINT,
             "rbv_modes": list(C.RBV_MODES), "rbv_help": C.RBV_HELP, "rbv_hint": C.RBV_HINT,
             "fail_models": [C.FAIL_EPS, C.FAIL_JC, C.FAIL_TENS], "fail_help": C.FAIL_HELP, "fail_hint": C.FAIL_HINT,
+            "tie_doc": C.TIE_DOC, "contact_doc": C.CONTACT_DOC, "rbv_doc": C.RBV_DOC, "fail_doc": C.FAIL_DOC,
+            "travel_doc": C.TRAVEL_DOC, "travel_mm": list(C.TRAVEL_MM), "inertia_doc": C.INERTIA_DOC,
+            "rivet": {"components": rivet.COMPONENTS, "axes": rivet.AXIS_CHOICES, "import_error": rivet.IMPORT_ERROR},
             "lhu_easings": list(C.LHU_EASINGS), "defaults": host.DEFAULTS, "deck_default": deck.DEFAULT, "env_keys": list(host.ENV_KEYS),
             "slots_default": host.DEFAULT_SLOTS, "local": host.LOCAL, "remote": host.REMOTE,
             "version": "%s %s" % (C.WORKSPACE_NAME, C.WORKSPACE_VERSION)})
@@ -229,6 +241,43 @@ def register(web):
                                    progress=prog)
         return jsonify({"job": start_job(fn)})
 
+    @app.route("/api/explicit/initial_state", methods=["GET", "POST"])
+    def xp_initial_state():
+        """GET ?name= -> {"state": summary | {"stale"} | null}. POST {"name", "doc"} -> {"job"}: static solve (CalculiX)
+        of the Analysis document doc.initial_state.analysis on the mesh of model/<name>.inp (initstate.py)."""
+        if request.method == "GET":
+            name = request.args.get("name") or "explicit"
+            return jsonify({"state": initstate.status(model_inp_path(name))})
+        req = request.get_json(force=True) or {}
+        name = req.get("name") or "explicit"
+        doc = req.get("doc") or {}
+        cfg = doc.get("initial_state") or {}
+        src = doc.get("source") or {}
+        if src.get("kind") not in (None, "shinycad"):
+            return err("the initial state needs the ShinyCAD geometry as source")
+        if not cfg.get("analysis"):
+            return err("choose the Analysis document of the static solve")
+        try:
+            with open(web._fea_doc_path(cfg["analysis"]), "r", encoding="utf-8") as f:
+                adoc = json.load(f)
+        except (OSError, ValueError) as e:
+            return err("cannot read analysis %s: %s" % (cfg["analysis"], e))
+        adoc.setdefault("name", cfg["analysis"])
+        ccx = web._ccx_path()
+        if not ccx:
+            return err("CalculiX (ccx) not found: set the solver path in the Analysis tab")
+        sources = web._asm_sources()
+
+        def fn(prog):
+            asm = web._fea_asm({"source": {"type": src.get("type") or "assembly", "name": src.get("name")}})
+            wd = os.path.join(proj_dir(name), "model", "initial")
+            try:
+                return initstate.solve(doc, adoc, asm, sources, model_inp_path(name), wd, ccx,
+                                       mode=cfg.get("materials") or "elastic", progress=prog)
+            except initstate.InitError as e:
+                raise ValueError(str(e))
+        return jsonify({"job": start_job(fn)})
+
     @app.route("/api/explicit/deck/check", methods=["POST"])
     def xp_deck_check():
         """{"deck"} -> parts (polygons of the plates), sections, errors and warnings of the deck generator model."""
@@ -237,7 +286,7 @@ def register(web):
     @app.route("/api/explicit/deck/step", methods=["POST"])
     def xp_deck_step():
         """{"name", "doc"} -> {"job"}: STEP of the deck structure in the step folder of the project
-        (<name>_deck.step, <name>_deck_model.json) and the ShinyCAD part <name>_deck (one surface body per component)."""
+        (<name>_deck.step, <name>_deck_model.json, <name>_deck_properties.txt) and the ShinyCAD part <name>_deck (one surface body per component)."""
         req = request.get_json(force=True)
         name = web.safe_name(req.get("name") or "explicit")
         doc = req.get("doc") or {}
@@ -288,6 +337,7 @@ def register(web):
             m = meshview.read_inp(path)
             pl = meshview.payload(m["xyz"], m["cells"])
             pl["part_names"] = ["%s (%s)" % p for p in m["parts"]]
+            pl["part_thick"] = m["part_thick"]
             return {"payload": pl, "summary": {"nodes": int(len(m["xyz"])), "elements": int(sum(len(c[1]) for c in m["cells"])),
                                                "parts": [{"elset": p[0], "type": p[1]} for p in m["parts"]]}}
         return jsonify({"job": start_job(fn)})
@@ -334,15 +384,30 @@ def register(web):
 
     @app.route("/api/explicit/run/settings", methods=["POST"])
     def xp_run_settings():
-        """Settings of the last build of a run (run.json)."""
-        d = (request.get_json(force=True) or {}).get("path") or ""
-        try:
-            with open(os.path.join(d, "run.json"), "r") as f:
-                meta = json.load(f)
-            snap = meta["builds"][-1]["settings"]
-        except Exception:
-            return err("no recorded build settings in this run")
-        return jsonify({"settings": snap})
+        """{"path"}: settings of the last build of a run (run.json); {"orc3": true}: the build settings of the ORC**3
+        configuration (%APPDATA%\\ORC3\\workspace_config.json). Older keys: host.migrate (legacy)."""
+        req = request.get_json(force=True) or {}
+        if req.get("orc3"):
+            orc = os.path.join(os.environ.get("APPDATA") or "", "ORC3", "workspace_config.json")
+            if not (os.environ.get("APPDATA") and os.path.isfile(orc)):
+                return err("no ORC**3 configuration (%%APPDATA%%\\ORC3\\workspace_config.json)")
+            try:
+                with open(orc, "r") as f:
+                    snap = json.load(f)
+            except (OSError, ValueError) as e:
+                return err("cannot read %s: %s" % (orc, e))
+        else:
+            d = req.get("path") or ""
+            try:
+                with open(os.path.join(d, "run.json"), "r") as f:
+                    meta = json.load(f)
+                snap = meta["builds"][-1]["settings"]
+            except Exception:
+                return err("no recorded build settings in this run")
+        snap, notes = host.migrate(snap, legacy=True)
+        for n in notes:
+            WS.log_msg("SNAPSHOT NOTE: %s" % n)
+        return jsonify({"settings": snap, "notes": notes})
 
     @app.route("/api/explicit/open_folder", methods=["POST"])
     def xp_open_folder():
@@ -429,6 +494,14 @@ def register(web):
     def xp_status():
         since = int(request.args.get("since") or 0)
         out = WS.status()
+        out["history"] = history_rows()[:50]
+        q = list(WS.job_queue)
+        if q != QUEUE_SAVED[0]:
+            QUEUE_SAVED[0] = q
+            try:
+                save_explicit_key("job_queue", q)
+            except (OSError, ValueError):
+                pass
         out["log"] = WS.log_since(since)
         out["log_seq"] = WS.log_seq
         return jsonify(out)
@@ -447,13 +520,16 @@ def register(web):
         req = request.get_json(force=True) or {}
         prepare(req)
         op, job, folder = req.get("op"), req.get("job") or "", req.get("folder") or ""
+        if op == "plot_ke" and not job and os.path.isdir(folder):
+            WS.run_task("Plot KE", WS._plot_ke_manual, folder, "")
+            return jsonify({"ok": True})
         if op not in ("macro", "extract") and (not job or not os.path.isdir(folder)):
             return err("choose a job with an existing run folder")
         if op == "salvage":
             WS.log_msg(f"\n--- SALVAGING RESULTS: {job} ---")
             WS.run_task("Salvage", WS._salvage_thread, job, folder)
         elif op == "plot_ke":
-            WS.run_task("Plot KE", WS._plot_ke, folder, job, True, True)
+            WS.run_task("Plot KE", WS._plot_ke_manual, folder, job)
         elif op == "assets":
             WS._write_pv_assets(folder, job)
         elif op == "extract":
@@ -532,5 +608,319 @@ def register(web):
                 f.seek(size - n)
             data = f.read().decode("utf-8", "replace")
         return jsonify({"text": data, "size": size, "cut": size > n})
+
+    # ------------------------------------------------------------------ Tools (ORC**3 Tools tab)
+    def tools_state():
+        path = tools.tools_file(web.CONFIG_PATH)
+        user, hidden, ferr = tools.load_tools_file(path)
+        return path, user, hidden, ferr
+
+    def tool_args():
+        try:
+            env = web.load_config().get("explicit") or {}
+        except (OSError, ValueError):
+            env = {}
+        a = env.get("tool_args")
+        if not isinstance(a, dict):
+            a = {}
+            orc = os.path.join(os.environ.get("APPDATA") or "", "ORC3", "workspace_config.json")
+            if os.environ.get("APPDATA") and os.path.isfile(orc):
+                try:
+                    with open(orc, "r") as f:
+                        a = dict(json.load(f).get("tool_args") or {})
+                except (OSError, ValueError):
+                    a = {}
+        return a
+
+    def save_explicit_key(key, value):
+        cfg = web.load_config()
+        cur = cfg.get("explicit") if isinstance(cfg.get("explicit"), dict) else {}
+        cur[key] = value
+        cfg["explicit"] = cur
+        web.save_config(cfg)
+
+    def tools_payload():
+        path, user, hidden, ferr = tools_state()
+        args = tool_args()
+        rows = tools.all_tools(user, hidden)
+        for t in rows:
+            t["args"] = args.get(t["key"], t.get("default_args", ""))
+        return {"tools": rows, "file": path.replace("\\", "/"), "file_error": ferr, "hidden": sorted(hidden),
+                "args_doc": tools.TOOLS_ARGS_DOC, "builtin_group": tools.TOOLS_BUILTIN_GROUP,
+                "user_group": tools.TOOLS_USER_GROUP}
+
+    @app.route("/api/explicit/tools", methods=["GET"])
+    def xp_tools():
+        return jsonify(tools_payload())
+
+    @app.route("/api/explicit/tools", methods=["POST"])
+    def xp_tools_op():
+        """{"op": launch | args | add | remove | restore | reload | open_file, "key", "args", "path", "title", "kind"}
+        (launch: also the document fields of prepare())."""
+        req = request.get_json(force=True) or {}
+        op = req.get("op")
+        path, user, hidden, ferr = tools_state()
+        allt = {t["key"]: t for t in tools.all_tools(user, hidden)}
+        key = req.get("key") or ""
+        if op in ("launch", "args"):
+            if key not in allt:
+                return err("unknown tool %s" % key)
+            a = tool_args()
+            a[key] = str(req.get("args") or "")
+            save_explicit_key("tool_args", a)
+            if op == "args":
+                return jsonify({"ok": True})
+            prepare(req)
+            envp = dict(os.environ)
+            envp["RIVET_CAL_CONFIG"] = rivet.write_ws_config(WS, os.path.join(explicit_root(), "workspace_config.json"))
+            ok, msg = tools.launch(allt[key], a[key], WS.inp_path.get(), WS.out_dir.get(), WS.project_dir.get(),
+                                   WS.log_msg, env=envp)
+            WS.log_msg(msg)
+            if not ok:
+                return err(msg)
+            return jsonify({"ok": True, "message": msg})
+        if op == "add":
+            try:
+                t = tools.new_user_tool(req.get("path"), req.get("title"), req.get("kind"), set(allt), user)
+            except ValueError as e:
+                return err("Tools: %s - nothing added" % e)
+            user.append(t)
+            WS.log_msg("Tools: added '%s' -> %s  [written to %s]" % (t["title"], t["script"], os.path.basename(path)))
+        elif op == "remove":
+            t = allt.get(key)
+            if not t:
+                return err("unknown tool %s" % key)
+            if t["builtin"]:
+                hidden.add(key)
+                WS.log_msg("Tools: '%s' hidden (built-in; Show hidden -> Restore)." % t["title"])
+            else:
+                user[:] = [u for u in user if u.get("key") != key]
+                a = tool_args()
+                if a.pop(key, None) is not None:
+                    save_explicit_key("tool_args", a)
+                WS.log_msg("Tools: removed '%s' from the list (the file was not deleted)." % t["title"])
+        elif op == "restore":
+            hidden.discard(key)
+            WS.log_msg("Tools: '%s' restored." % (allt.get(key) or {}).get("title", key))
+        elif op == "reload":
+            if ferr:
+                WS.log_msg("Tools: %s" % ferr)
+            WS.log_msg("Tools: reloaded %s - %d own script(s), %d built-in(s) hidden." % (os.path.basename(path), len(user), len(hidden)))
+            return jsonify(tools_payload())
+        elif op == "open_file":
+            if not os.path.isfile(path):
+                e = tools.save_tools_file(path, user, hidden)
+                if e:
+                    return err("Tools: could not write %s (%s)" % (path, e))
+                WS.log_msg("Tools: created %s (format: the _readme block at the top)." % os.path.basename(path))
+            try:
+                if sys.platform.startswith("win"):
+                    os.startfile(path)  # noqa
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", path])
+                else:
+                    subprocess.Popen(["xdg-open", path])
+                WS.log_msg("Tools: opened %s. Save the edits, then press Reload list." % path)
+            except Exception as e:
+                WS.log_msg("Tools: could not open %s (%s); press Reload list after editing." % (path, e))
+            return jsonify(tools_payload())
+        else:
+            return err("unknown operation %s" % op)
+        e = tools.save_tools_file(path, user, hidden)
+        if e:
+            WS.log_msg("Tools: could NOT write %s (%s)." % (os.path.basename(path), e))
+            return err("could not write %s: %s" % (path, e))
+        return jsonify(tools_payload())
+
+    # ------------------------------------------------------------------ concentrated mass (ORC**3 Inertia tab)
+    @app.route("/api/explicit/inertia", methods=["POST"])
+    def xp_inertia():
+        """{"path"} -> {"state": off | missing | ready | invalid | error, "text"}: the payload summary."""
+        path = ((request.get_json(force=True) or {}).get("path") or "").strip().strip('"')
+        if not path:
+            return jsonify({"state": "off", "text": "Concentrated mass: OFF (no payload selected).\n\n"
+                                                    "The build will not inject a concentrated-mass /RBODY."})
+        if not os.path.isfile(path):
+            return jsonify({"state": "missing", "text": "FILE NOT FOUND:\n  %s\n\nPick a valid inertia_calc.py JSON, or clear the field." % path})
+        try:
+            pay, src = WS._resolve_inertia_payload(path)
+        except ValueError as e:
+            return jsonify({"state": "error", "text": "NOT USABLE:\n  %s" % e})
+        except Exception as e:
+            return jsonify({"state": "error", "text": "COULD NOT READ PAYLOAD:\n  %s" % e})
+        m = pay["mass"]
+        cg = [pay["cx"], pay["cy"], pay["cz"]]
+        J = [pay[k] for k in ("Jxx", "Jyy", "Jzz", "Jxy", "Jyz", "Jxz")]
+        off = max(abs(J[3]), abs(J[4]), abs(J[5]))
+        diag = max(abs(J[0]), abs(J[1]), abs(J[2])) or 1.0
+        ok = m > 0 and J[0] > 0 and J[1] > 0 and J[2] > 0
+        L = ["Source : %s  (%s)" % (os.path.basename(path), src), "",
+             "mass   : %.6g" % m, "CG     : [%.6g, %.6g, %.6g]" % tuple(cg), "",
+             "inertia tensor (about CG):",
+             "   Jxx %14.6g   Jxy %14.6g" % (J[0], J[3]),
+             "   Jyy %14.6g   Jyz %14.6g" % (J[1], J[4]),
+             "   Jzz %14.6g   Jxz %14.6g" % (J[2], J[5]), "",
+             "max product / diagonal : %.1f%%  (%s)" % (100 * off / diag, "full tensor written" if off / diag > 0.05 else "near-principal"), "",
+             "STATUS : READY - one free-node /RBODY is injected at Build." if ok else
+             "STATUS : INVALID - mass and all three diagonal inertias must be > 0 (singular tensor -> Error 274)."]
+        return jsonify({"state": "ready" if ok else "invalid", "text": "\n".join(L), "payload": pay})
+
+    # ------------------------------------------------------------------ Rivet (ORC**3 Rivet tab)
+    @app.route("/api/explicit/rivet", methods=["POST"])
+    def xp_rivet():
+        """{"op": rings | columns | extract | load_fd, "path" (load_fd), document fields of prepare()}."""
+        req = request.get_json(force=True) or {}
+        prepare(req)
+        op = req.get("op")
+        try:
+            if op == "rings":
+                return jsonify(rivet.rings(WS))
+            if op == "columns":
+                return jsonify(rivet.columns(WS))
+            if op == "extract":
+                return jsonify({"curve": rivet.extract(WS)})
+            if op == "load_fd":
+                p = (req.get("path") or "").strip().strip('"')
+                c = rivet.load_fd(p)
+                WS.log_msg("Rivet: loaded %s" % p)
+                return jsonify({"curve": c})
+        except (rivet.RivetError, OSError, ValueError, KeyError) as e:
+            what = {"rings": "gauge rings failed", "columns": "could not list columns", "extract": "extraction failed",
+                    "load_fd": "could not load %s" % os.path.basename(req.get("path") or "")}.get(op, op)
+            WS.log_msg("Rivet: %s - %s" % (what, e))
+            return err("Rivet: %s - %s" % (what, e))
+        return err("unknown operation %s" % op)
+
+    # ------------------------------------------------------------------ run history, Env switch, CSV, PNG
+    @app.route("/api/explicit/history", methods=["POST"])
+    def xp_history():
+        """{"op": load | open | remove | clear, "index" (position in the run_history list), "job", "folder"}."""
+        req = request.get_json(force=True) or {}
+        WS.set_history_path(os.path.join(explicit_root(), "run_history.json"))
+        op = req.get("op")
+        if op in ("load", "open"):
+            folder = (req.get("folder") or "").strip()
+            job = req.get("job") or ""
+            if not folder or not os.path.isdir(folder):
+                WS.log_msg("Run history: folder not found on disk: %s" % (folder or "(blank)"))
+                return err("folder not found on disk: %s" % (folder or "(blank)"))
+            if op == "open":
+                try:
+                    open_path(folder)
+                except Exception as e:
+                    return err("could not open %s: %s" % (folder, e))
+                return jsonify({"ok": True})
+            deck = os.path.join(folder, "%s_0000.rad" % job)
+            WS.job_folders[job] = folder
+            if os.path.isfile(deck):
+                WS.log_msg("Run history: loaded '%s' - Target .rad and Output Dir set to %s." % (job, folder))
+                return jsonify({"rad_target": deck.replace("\\", "/"), "out_dir": folder.replace("\\", "/")})
+            WS.log_msg("Run history: %s not found in the folder - Target .rad unchanged; Output Dir set to %s."
+                       % (os.path.basename(deck), folder))
+            return jsonify({"rad_target": None, "out_dir": folder.replace("\\", "/")})
+        if op == "remove":
+            i = int(req.get("index", -1))
+            if 0 <= i < len(WS.run_history):
+                e = WS.run_history.pop(i)
+                WS.log_msg("Run history: removed '%s' (%s)." % (e.get("job", ""), e.get("date", "")))
+                WS._history_save()
+        elif op == "clear":
+            n = len(WS.run_history)
+            WS.run_history.clear()
+            WS._history_save()
+            WS.log_msg("Run history: cleared %d entries (files on disk untouched)." % n)
+        else:
+            return err("unknown operation %s" % op)
+        return jsonify({"history": history_rows()})
+
+    def history_rows():
+        n = len(WS.run_history)
+        return [dict(e, index=n - 1 - k) for k, e in enumerate(reversed(WS.run_history))]
+
+    @app.route("/api/explicit/env_switch", methods=["POST"])
+    def xp_env_switch():
+        """{"old", "new", "rad_target", "out_dir"}: remembers the Target .rad and Output Dir of the old Env (config.json >
+        "explicit" > "env_dirs"), returns those remembered for the new Env (null: none) and logs where the Target .rad
+        runs on the remote Env (ORC**3 _on_run_target_changed)."""
+        req = request.get_json(force=True) or {}
+        old, new = req.get("old") or "", req.get("new") or ""
+        try:
+            cfg = web.load_config().get("explicit") or {}
+        except (OSError, ValueError):
+            cfg = {}
+        dirs = cfg.get("env_dirs") if isinstance(cfg.get("env_dirs"), dict) else {}
+        if old:
+            dirs[old] = {"rad_target": (req.get("rad_target") or "").strip(), "out_dir": (req.get("out_dir") or "").strip()}
+        save_explicit_key("env_dirs", dirs)
+        mem = dirs.get(new) or {}
+        out, swapped = {"rad_target": None, "out_dir": None}, []
+        if mem.get("rad_target"):
+            out["rad_target"] = mem["rad_target"]
+            swapped.append("Target .rad -> %s" % mem["rad_target"])
+        if mem.get("out_dir"):
+            out["out_dir"] = mem["out_dir"]
+            swapped.append("Output dir -> %s" % mem["out_dir"])
+        if swapped:
+            WS.log_msg("Env switched to %s: %s" % (new, "; ".join(swapped)))
+        else:
+            WS.log_msg("Env switched to %s (no dirs remembered for it yet - current paths kept; remembered per Env from now on)." % new)
+        if new == host.REMOTE:
+            env, _s = load_env()
+            WS.apply(env)
+            fp = (out["rad_target"] or req.get("rad_target") or "").strip()
+            if fp:
+                run_folder = os.path.dirname(fp)
+                jobname = os.path.basename(fp).replace("_0000.rad", "")
+                mapped = WS._map_to_linux(run_folder)
+                if mapped:
+                    WS.log_msg("  Remote resolution: runs IN PLACE at %s (share-mapped)." % mapped)
+                else:
+                    WS.log_msg("  Remote resolution: SCP transfer to %s (folder not on a mapped share; results copied back on completion)."
+                               % WS._remote_workdir(run_folder, jobname))
+        return jsonify(out)
+
+    @app.route("/api/explicit/results_csv", methods=["POST"])
+    def xp_results_csv():
+        """{"path"} -> {"job", "t", "ke", "ie", "note", "csv"}: a results CSV (<job>_Results.csv or <job>T01.csv)."""
+        p = ((request.get_json(force=True) or {}).get("path") or "").strip().strip('"')
+        if not os.path.isfile(p):
+            return err("file not found: %s" % p)
+        job = os.path.basename(p)
+        if job.endswith("_Results.csv"):
+            job = job[:-len("_Results.csv")]
+        else:
+            import re as _re
+            job = _re.sub(r"T\d{2}.*\.csv$", "", job, flags=_re.I) or os.path.splitext(job)[0]
+        try:
+            t, ke, ie, note = WS._parse_th_csv(p)
+        except Exception as e:
+            WS.log_msg("Results: could not parse %s: %s" % (os.path.basename(p), e))
+            return err("could not parse %s: %s" % (os.path.basename(p), e))
+        if note:
+            WS.log_msg("Results: %s" % note)
+        return jsonify({"job": job, "t": t, "ke": ke, "ie": ie, "note": note, "csv": p.replace("\\", "/")})
+
+    @app.route("/api/explicit/save_png", methods=["POST"])
+    def xp_save_png():
+        """{"path", "data": base64 PNG}: writes the plot image."""
+        req = request.get_json(force=True) or {}
+        p = (req.get("path") or "").strip().strip('"')
+        if not p:
+            return err("no file name")
+        if not p.lower().endswith(".png"):
+            p += ".png"
+        import base64
+        data = req.get("data") or ""
+        if "," in data[:80]:
+            data = data.split(",", 1)[1]
+        try:
+            raw = base64.b64decode(data)
+            os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True)
+            with open(p, "wb") as f:
+                f.write(raw)
+        except Exception as e:
+            return err("save failed: %s" % e)
+        WS.log_msg("Plot saved to %s" % p)
+        return jsonify({"path": p})
 
     return WS

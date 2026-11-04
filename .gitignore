@@ -17,3 +17,7 @@ config.local.json
 /*.step
 /*.stp
 /*.inp
+# Tools list of this PC (Explicit tab) and Job audit reports
+tools.json
+drawgen/explicit/job_audit.txt
+drawgen/explicit/job_audit.csv

@@ -1,5 +1,6 @@
-"""Results of an explicit run for the 3D view of the Explicit tab: the animation frames (.vtk.series / <job>_<n>.vtk
-written by anim_to_vtk), the fields of the frames and the KE/IE curves.
+"""Results of an explicit run for the 3D view of the Explicit tab: the animation frames (the animation files
+<job>A001, <job>A002, ... read directly, else .vtk.series / <job>_<n>.vtk written by anim_to_vtk), the fields of the
+frames and the KE/IE curves.
 
 frames(folder, job) -> [{"time", "file"}]
 geometry(folder, job) -> view data of the first frame (meshview.payload) and the fields
@@ -15,9 +16,10 @@ from collections import OrderedDict
 
 import numpy as np
 
-from . import meshview
+from . import anim, meshview
 
 SKIP = ("NODE_ID", "ELEMENT_ID", "NODE_IDS", "ELEMENT_IDS")
+TENSOR_COMP = {"xx": 0, "yy": 4, "zz": 8, "xy": 1, "yz": 5, "xz": 2}
 _LOCK = threading.Lock()
 _GEO = OrderedDict()          # (folder, job, file, mtime) -> geometry record
 _FRM = OrderedDict()          # (file, mtime) -> read_vtk result
@@ -27,10 +29,28 @@ def _b64(a, t):
     return base64.b64encode(np.ascontiguousarray(a, dtype=t).tobytes()).decode("ascii")
 
 
-def frames(folder, job):
-    """Frames of a job: the .vtk.series entries, else the <job>_<n>.vtk files in number order."""
-    sp = os.path.join(folder, "%s.vtk.series" % job)
+def anim_files(folder, job):
+    """Animation files <job>A<n> of a job: [(n, path)] in number order."""
     out = []
+    pat = re.compile(r"^%sA(\d{3,})$" % re.escape(job))
+    for p in glob.glob(os.path.join(glob.escape(folder), glob.escape(job) + "A[0-9]*")):
+        m = pat.match(os.path.basename(p))
+        if m and os.path.isfile(p) and os.path.getsize(p) > 0:
+            out.append((int(m.group(1)), p))
+    return sorted(out)
+
+
+def frames(folder, job):
+    """Frames of a job: the animation files <job>A<n> (time of the file header), else the .vtk.series entries, else
+    the <job>_<n>.vtk files in number order."""
+    out = []
+    for _n, p in anim_files(folder, job):
+        t = anim.anim_time(p)
+        if t is not None:
+            out.append({"time": t, "file": p})
+    if out:
+        return out
+    sp = os.path.join(folder, "%s.vtk.series" % job)
     if os.path.isfile(sp):
         try:
             with open(sp, "r") as f:
@@ -61,6 +81,10 @@ def jobs(folder):
         names.add(os.path.basename(p)[:-len("_0000.rad")])
     for p in glob.glob(os.path.join(folder, "*_Results.csv")):
         names.add(os.path.basename(p)[:-len("_Results.csv")])
+    for p in glob.glob(os.path.join(glob.escape(folder), "*A[0-9][0-9][0-9]*")):
+        m = re.match(r"^(.+)A\d{3,}$", os.path.basename(p))
+        if m:
+            names.add(m.group(1))
     return sorted(names)
 
 
@@ -70,7 +94,7 @@ def _read(path):
         if key in _FRM:
             _FRM.move_to_end(key)
             return _FRM[key]
-    v = meshview.read_vtk(path)
+    v = anim.read_anim(path) if not path.lower().endswith(".vtk") and anim.is_anim(path) else meshview.read_vtk(path)
     with _LOCK:
         _FRM[key] = v
         while len(_FRM) > 6:
@@ -96,12 +120,18 @@ def field_list(v):
             elif nc == 9:
                 out.append({"key": "%s|%s|eps1" % (loc, name), "label": name + " max principal", "loc": loc})
                 out.append({"key": "%s|%s|min" % (loc, name), "label": name + " min principal", "loc": loc})
+                for c in TENSOR_COMP:
+                    out.append({"key": "%s|%s|%s" % (loc, name, c), "label": "%s %s" % (name, c), "loc": loc})
     return out
 
 
-def _values(v, key, order):
+DISP_FIELDS = [{"key": "point|@disp|mag", "label": "Displacement |v|", "loc": "point"}] + \
+    [{"key": "point|@disp|%d" % i, "label": "Displacement %s" % c, "loc": "point"} for i, c in enumerate("xyz")]
+
+
+def _values(v, key, order, disp=None):
     loc, name, op = key.split("|")
-    a = (v.get(loc) or {}).get(name)
+    a = disp if name == "@disp" else (v.get(loc) or {}).get(name)
     if a is None:
         return None, loc
     a = np.asarray(a, float)
@@ -111,11 +141,14 @@ def _values(v, key, order):
         val = np.linalg.norm(a.reshape(-1, 3), axis=1)
     elif op in ("0", "1", "2"):
         val = a.reshape(-1, 3)[:, int(op)]
-    elif op == "eps1":
-        val = meshview.eps1(a)
-    elif op == "min":
-        M = a.reshape(-1, 3, 3)
-        val = np.linalg.eigvalsh(0.5 * (M + np.transpose(M, (0, 2, 1))))[:, 0]
+    elif op in ("eps1", "min"):
+        a = a.reshape(-1, 9)
+        val = np.full(len(a), np.nan)
+        ok = np.isfinite(a).all(axis=1)
+        if ok.any():
+            val[ok] = meshview.eps1(a[ok]) if op == "eps1" else meshview.eig_min(a[ok])
+    elif op in TENSOR_COMP:
+        val = a.reshape(-1, 9)[:, TENSOR_COMP[op]]
     else:
         return None, loc
     if loc == "cell":
@@ -161,18 +194,61 @@ def geometry(folder, job, rigid=None):
             m = rn[conn].all(axis=1)
             rigid_mask[k:k + len(conn)] |= m
             k += len(conn)
-    out = {"payload": pl, "fields": field_list(v), "frames": [{"time": e["time"], "name": os.path.basename(e["file"])} for e in fr],
+    fields = field_list(v)
+    if d is None:
+        fields = DISP_FIELDS + fields
+    # parts (PART_ID of the cells): index of each payload cell into the part list, nodes of each part
+    pc = np.asarray(pid).reshape(-1)[order] if pid is not None else np.zeros(len(order), np.int64)
+    ids = sorted(int(x) for x in np.unique(pc)) if len(pc) else []
+    names = dict(v.get("part_names") or {})
+    if not all(names.get(i) for i in ids):
+        for i, t in _rad_part_names(folder, job).items():
+            names.setdefault(i, t)
+    pidx = np.searchsorted(np.asarray(ids, np.int64), pc).astype(np.int32) if ids else np.zeros(len(pc), np.int32)
+    pl["part"] = _b64(pidx, np.int32)
+    pnodes = [[] for _ in ids]
+    k = 0
+    for _kind, conn, _p in cells:
+        conn = np.asarray(conn)
+        for j in range(len(ids)):
+            m = pidx[k:k + len(conn)] == j
+            if m.any():
+                pnodes[j].append(conn[m].reshape(-1))
+        k += len(conn)
+    pnodes = [np.unique(np.concatenate(a)) if a else np.zeros(0, np.int64) for a in pnodes]
+    out = {"payload": pl, "fields": fields, "frames": [{"time": e["time"], "name": os.path.basename(e["file"])} for e in fr],
            "rigid_cells": int(rigid_mask.sum()), "has_disp": d is not None,
-           "has_erosion": "EROSION_STATUS" in (v.get("cell") or {})}
+           "has_erosion": "EROSION_STATUS" in (v.get("cell") or {}),
+           "parts": [{"id": i, "name": names.get(i) or "PART %d" % i, "cells": int((pidx == j).sum()), "nodes": int(len(pnodes[j]))}
+                     for j, i in enumerate(ids)]}
     with _LOCK:
-        _GEO[key] = {"out": out, "order": order, "rigid": rigid_mask, "cells": cells, "xyz0": xyz0}
+        _GEO[key] = {"out": out, "order": order, "rigid": rigid_mask, "cells": cells, "xyz0": xyz0, "pidx": pidx, "pnodes": pnodes}
         while len(_GEO) > 4:
             _GEO.popitem(last=False)
     return out
 
 
+def _rad_part_names(folder, job):
+    """{part id: title} of the /PART cards of the starter deck <job>_0000.rad of the folder."""
+    out = {}
+    p = os.path.join(folder, "%s_0000.rad" % job)
+    if not os.path.isfile(p):
+        return out
+    try:
+        with open(p, "r", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return out
+    for i, ln in enumerate(lines[:-1]):
+        m = re.match(r"/PART/(\d+)\s*$", ln.strip())
+        if m:
+            out[int(m.group(1))] = lines[i + 1].strip()
+    return out
+
+
 def frame(folder, job, k, field, rigid=None):
-    """Data of frame k: {"time", "pos" (deformed), "disp", "values", "loc", "min", "max", "active"} (base64)."""
+    """Data of frame k: {"time", "pos" (deformed), "disp", "values", "loc", "min", "max", "active"} (base64) and
+    "parts": per part of geometry() {"umax", "ucomp" [dx, dy, dz of largest magnitude], "min", "max" of the field}."""
     geometry(folder, job, rigid)
     fr = frames(folder, job)
     if not fr:
@@ -188,16 +264,34 @@ def frame(folder, job, k, field, rigid=None):
     d = _disp(v)
     if d is not None and k > 0 and len(xyz) == len(g["xyz0"]) and np.allclose(xyz, g["xyz0"]) and np.abs(d).max() > 0:
         xyz = g["xyz0"] + d                       # POINTS undeformed: deformed = undeformed + displacement
+    if d is None and len(xyz) == len(g["xyz0"]):
+        d = xyz - g["xyz0"]                       # no displacement vector: deformed - first frame
     out = {"index": k, "time": fr[k]["time"] if fr[k]["time"] is not None else v.get("time"), "count": int(len(xyz)),
            "pos": _b64(xyz, np.float32)}
     if d is not None:
         out["disp"] = _b64(d, np.float32)
+    val = loc = None
     if field:
-        val, loc = _values(v, field, order)
+        val, loc = _values(v, field, order, d)
         if val is not None:
             fin = val[np.isfinite(val)]
             out.update(values=_b64(val, np.float32), loc=loc, min=float(fin.min()) if len(fin) else 0.0,
                        max=float(fin.max()) if len(fin) else 0.0)
+    # per part: max |d|, the dx, dy, dz of largest magnitude (signed), range of the field
+    parts = []
+    for j, nodes in enumerate(g.get("pnodes") or []):
+        e = {}
+        if d is not None and len(nodes) and len(d) == len(xyz):
+            dn = np.asarray(d, float)[nodes]
+            e["umax"] = float(np.linalg.norm(dn, axis=1).max())
+            e["ucomp"] = [float(dn[np.abs(dn[:, i]).argmax(), i]) for i in range(3)]
+        if val is not None:
+            vv = val[g["pidx"] == j] if loc == "cell" else (val[nodes] if len(nodes) and len(val) > nodes.max() else val[:0])
+            vv = vv[np.isfinite(vv)]
+            if len(vv):
+                e["min"], e["max"] = float(vv.min()), float(vv.max())
+        parts.append(e)
+    out["parts"] = parts
     er = (v.get("cell") or {}).get("EROSION_STATUS")
     if er is not None:
         act = (np.asarray(er, float).reshape(-1)[order] >= 0.5) | g["rigid"]

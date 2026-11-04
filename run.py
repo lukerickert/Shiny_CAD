@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 """Starts SHINYCAD at http://localhost:<port> and opens the browser: the system default, or the command in
 config.local.json "browser" (Options dialog, or --browser): an executable path, optionally with {url} where the address goes,
-for example "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe" --app={url}."""
+for example "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe" --app={url}.
+
+Batch mode (no server, no browser; drawgen/batch.py):
+    run.py --batch analysis <name> [--project <project>] [--mesh-only]
+    run.py --batch explicit <name> [--project <project>] [--rad] [--radv 2025 | 2023]"""
 import argparse
 import atexit
 import json
@@ -42,7 +46,17 @@ def main():
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--browser", default=cfg.get("browser") or "", help="browser command; {url} is replaced by the address")
     ap.add_argument("--open", default="", help="document file (.scpart, .scasm, ...) opened in the program")
+    ap.add_argument("--batch", nargs=2, metavar=("KIND", "NAME"), help="analysis | explicit and the document name: mesh or "
+                    "solve the analysis, or write the model .inp of the explicit document, without the server")
+    ap.add_argument("--project", default="", help="batch: the project of the document (default: the open project)")
+    ap.add_argument("--mesh-only", action="store_true", help="batch analysis: mesh and write job.inp without solving")
+    ap.add_argument("--rad", action="store_true", help="batch explicit: also the OpenCourant decks (inp2rad)")
+    ap.add_argument("--radv", type=int, default=2025, choices=[2023, 2025], help="batch explicit: deck format")
     a = ap.parse_args()
+    if a.batch:
+        os.environ.setdefault("DRAWGEN_PART_WORKER", "0")
+        from drawgen import batch
+        return batch.run(a.batch[0], a.batch[1], project=a.project or None, mesh_only=a.mesh_only, rad=a.rad, radv=a.radv)
     url = "http://localhost:%d" % a.port
     if a.open:
         from urllib.parse import quote

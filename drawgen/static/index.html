@@ -543,6 +543,7 @@
           </div>
         </div>
         <div class="toolbar">
+          <button type="button" id="as-refresh" data-icon="cam_refresh" title="Build the components again from the saved parts and STEP files">Refresh</button>
           <button type="button" id="as-add-part" data-icon="as_part" title="Add a saved part of the project">Add part</button>
           <button type="button" id="as-add-step" data-icon="import" title="Add a STEP file">Add STEP</button>
           <button type="button" id="as-dup" data-icon="copy" title="Copy the selected component">Duplicate</button>
@@ -633,6 +634,7 @@
         </div>
         <label class="inline" title="Geometry of the analysis: a saved assembly or part">Geometry<select id="fa-source"></select></label>
         <div class="toolbar">
+          <button type="button" id="fa-update" data-icon="cam_refresh" title="Load the geometry again (after a change of the assembly or its parts)">Update</button>
           <button type="button" id="fa-mesh" data-icon="fa_mesh" title="Mesh the bodies and show the mesh">Mesh</button>
           <button type="button" id="fa-solve" data-icon="fa_solve" class="primary" title="Mesh, solve with CalculiX and show the results">Solve</button>
           <button type="button" id="fa-cancel" data-icon="fa_stop" title="Stop the solver" disabled>Stop</button>
@@ -657,39 +659,39 @@
         </div>
         <div class="toolbar" id="fa-resbar">
           <label class="inline">Show<select id="fa-show"><option value="model">Model</option><option value="mesh">Mesh</option><option value="results">Results</option></select></label>
-          <label class="inline">Result<select id="fa-field"><option value="vm">von Mises stress</option><option value="u">Displacement |u|</option><option value="ux">ux</option><option value="uy">uy</option><option value="uz">uz</option></select></label>
+          <label class="inline">Result<select id="fa-field"><option value="vm">von Mises stress</option><option value="u">Displacement |u|</option><option value="ux">ux</option><option value="uy">uy</option><option value="uz">uz</option><option value="peeq">PEEQ (equivalent plastic strain)</option></select></label>
           <label class="inline">State<select id="fa-state"></select></label>
           <label class="inline" title="Deformation scale (empty: automatic, largest displacement 5 % of the model size)">Scale<input type="text" id="fa-scale" class="numf" style="width:60px" placeholder="auto"></label>
           <label class="check inline"><input type="checkbox" id="fa-undef"> Undeformed</label>
         </div>
         <label class="check inline"><input type="checkbox" id="fa-edges" checked> Edges</label>
+        <label class="check inline" title="Shell elements drawn with their thickness and offset (Show Mesh and Results)"><input type="checkbox" id="fa-thick"> Shell thickness</label>
+        <label class="check inline" title="Supports (cones along the held components, cubes for held rotations) and loads (arrows at the loaded nodes) in Show Mesh and Results"><input type="checkbox" id="fa-bcs" checked> Supports and loads</label>
         <label class="check inline"><input type="checkbox" id="fa-axes" checked> Axes</label>
+        <span id="fa-selbar" class="vs-bar"></span>
         <span id="fa-info" class="hint"></span>
       </div>
       <div class="ann-body">
         <div id="fa-view"><div id="fa-legend" class="fa-legend" hidden></div></div>
         <div id="fa-split" class="fa-split" title="Drag to change the width of the panel"></div>
         <div class="ann-props" id="fa-panel">
-          <h2>Settings</h2>
-          <div id="fa-settings"></div>
-          <h2 class="sk-h">Materials</h2>
-          <div id="fa-mats"></div>
-          <h2 class="sk-h">Bodies</h2>
-          <div id="fa-bodies"></div>
-          <h2 class="sk-h">Members</h2>
-          <div id="fa-members"></div>
-          <h2 class="sk-h">Plates</h2>
-          <div id="fa-plates"></div>
-          <h2 class="sk-h">Fasteners</h2>
-          <div id="fa-fasts"></div>
-          <h2 class="sk-h">Reference points</h2>
-          <div id="fa-rps"></div>
-          <h2 class="sk-h">Supports</h2>
-          <div id="fa-sups"></div>
-          <h2 class="sk-h">Loads</h2>
-          <div id="fa-loads"></div>
-          <h2 class="sk-h">Results</h2>
-          <div id="fa-results"><p class="hint">Solve to see the results.</p></div>
+          <div id="fa-panels"></div>
+          <section class="fa-card" id="fa-settings-card"><h2>Settings</h2><div id="fa-settings"></div></section>
+          <section class="fa-card" id="fa-mats-card"><h2>Materials</h2><div id="fa-mats"></div></section>
+          <section class="fa-card" id="fa-bodies-card"><h2>Bodies</h2><div id="fa-bodies"></div></section>
+          <section class="fa-card" id="fa-sections-card"><h2>Sections</h2><div id="fa-sections"></div></section>
+          <section class="fa-card" id="fa-nsets-card"><h2>Node sets</h2><div id="fa-nsets"></div></section>
+          <section class="fa-card" id="fa-members-card"><h2>Members</h2><div id="fa-members"></div></section>
+          <section class="fa-card" id="fa-plates-card"><h2>Plates</h2><div id="fa-plates"></div></section>
+          <section class="fa-card" id="fa-fasts-card"><h2>Fasteners</h2><div id="fa-fasts"></div></section>
+          <section class="fa-card" id="fa-rps-card"><h2>Reference points</h2><div id="fa-rps"></div></section>
+          <section class="fa-card" id="fa-springs-card"><h2>Springs</h2><div id="fa-springs"></div></section>
+          <section class="fa-card" id="fa-joints-card"><h2>Joints</h2><div id="fa-joints"></div></section>
+          <section class="fa-card" id="fa-eqs-card"><h2>Equations</h2><div id="fa-eqs"></div></section>
+          <section class="fa-card" id="fa-contacts-card"><h2>Contact</h2><div id="fa-contacts"></div></section>
+          <section class="fa-card" id="fa-sups-card"><h2>Supports</h2><div id="fa-sups"></div></section>
+          <section class="fa-card" id="fa-loads-card"><h2>Loads</h2><div id="fa-loads"></div></section>
+          <section class="fa-card" id="fa-results-card"><h2>Results</h2><div id="fa-results"><p class="hint">Solve to see the results.</p></div></section>
         </div>
       </div>
     </div>
@@ -708,6 +710,7 @@
         </div>
         <label class="inline" title="Geometry of the model: a saved assembly or part (Model: Source)">Geometry<select id="xp-source"></select></label>
         <div class="toolbar">
+          <button type="button" id="xp-update" data-icon="cam_refresh" title="Load the geometry again (after a change of the assembly or its parts)">Update</button>
           <button type="button" id="xp-model-btn" data-icon="fa_mesh" title="Mesh the bodies and shells, write the model .inp and show the mesh">Mesh</button>
           <button type="button" id="xp-supbtn" data-icon="fa_sup" title="Support: click a face of a deformable body">Support</button>
           <button type="button" id="xp-build" data-icon="xp_build" title="Build the OpenCourant deck (inp2rad and the Build settings)">Build</button>
@@ -734,9 +737,13 @@
           <label class="check inline"><input type="checkbox" id="xp-undef"> Undeformed</label>
         </div>
         <label class="check inline"><input type="checkbox" id="xp-edges" checked> Edges</label>
+        <label class="check inline" title="Shell elements drawn with their thickness and offset (Show Mesh; from the model .inp)"><input type="checkbox" id="xp-thick"> Shell thickness</label>
+        <label class="check inline" title="Supports at the mesh nodes in Show Mesh (cones along the held components, cubes for held rotations)"><input type="checkbox" id="xp-bcs" checked> Supports</label>
         <label class="check inline"><input type="checkbox" id="xp-axes" checked> Axes</label>
+        <span id="xp-selbar" class="vs-bar"></span>
         <span id="xp-info" class="hint"></span>
       </div>
+      <div id="xp-statusbar" class="xp-statusbar" title="Inputs of the deck build; click an item for its panel"></div>
       <div class="ann-body">
         <div id="xp-view"><div id="xp-legend" class="fa-legend" hidden></div><div class="xp-strip"><span id="xp-busy"></span> <span id="xp-last"></span></div></div>
         <div id="xp-split" class="fa-split" title="Drag to change the width of the panel"></div>
@@ -744,8 +751,10 @@
           <details id="xp-sec-model" open><summary class="sk-h">Model</summary><div id="xp-model"></div></details>
           <details id="xp-sec-runs" open><summary class="sk-h">Runs</summary><div id="xp-runs"></div></details>
           <details id="xp-sec-build" open><summary class="sk-h">Build</summary><div id="xp-buildp"></div></details>
+          <details id="xp-sec-rivet"><summary class="sk-h">Rivet</summary><div id="xp-rivet"></div></details>
           <details id="xp-sec-solve" open><summary class="sk-h">Solve</summary><div id="xp-solvep"></div></details>
           <details id="xp-sec-results" open><summary class="sk-h">Results</summary><div id="xp-results"></div></details>
+          <details id="xp-sec-tools"><summary class="sk-h">Tools</summary><div id="xp-tools"></div></details>
           <details id="xp-sec-console" open><summary class="sk-h">Console</summary><div id="xp-console"></div></details>
         </div>
       </div>

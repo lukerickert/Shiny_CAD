@@ -11,13 +11,17 @@ document (<name>.exp.json).
 import glob
 import json
 import os
+import re
+import subprocess
 import threading
 import traceback
 from datetime import datetime
 
-from .constants import (CONTACT_T7, LHU_EASINGS, RBV_NONE, TIE_AUTO, _DMM_BAD, _DMM_WARN, _ERR_BAD, _ERR_WARN,
-                        _fmt_secs)
-from .modes import MODE_IMPACT
+from .constants import (CONTACT_MODES, CONTACT_NONE, CONTACT_T7, LHU_EASINGS, RBV_EXPL, RBV_MODES, RBV_NONE, TIE_AUTO,
+                        TIE_GLOBAL, TIE_MODES, TIE_NONE, TIE_SCOPED, _DMM_BAD, _DMM_WARN, _ERR_BAD, _ERR_WARN, _fmt_secs,
+                        NO_WINDOW)
+from .modes import ANALYSIS_MODES, MODE_ALL
+from .rivet import KEYS as RIVET_KEYS
 from .build import BuildMixin
 from .materials import MaterialsMixin
 from .runs import RunMixin
@@ -30,9 +34,9 @@ HISTORY_MAX = 200
 # solver packages unpacked next to the program: <program>/solvers/<package>/exec
 SOLVERS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "solvers")
 
-# ORC**3 defaults (workspace.py with an empty configuration), except the analysis type and the server fields
+# ORC**3 defaults (workspace.py with an empty configuration), except the server fields
 DEFAULTS = {
-    "analysis_mode": MODE_IMPACT,
+    "analysis_mode": MODE_ALL,
     "project_dir": "", "run_desc": "", "run_notes": "",
     "inp_path": "", "downgrade_quad": False, "out_dir": "",
     "test_mode": "Standard Assembly Impact", "floor_z": "0.0", "fric": "0.2", "tstop": "0.1",
@@ -46,16 +50,59 @@ DEFAULTS = {
     "rigid_vel_mode": RBV_NONE, "rigid_vel": "", "rigid_rp_target": "", "rigid_part": "", "point_mass_json": "",
     "lhu_peak": "-0.1", "lhu_dir": "Z", "lhu_rampup": "1.0", "lhu_hold": "0.5", "lhu_rampdn": "1.0",
     "lhu_settle": "1.0", "lhu_easing": LHU_EASINGS[0], "lhu_npramp": "50",
-    "rad_target": "", "plot_ke": True, "extract_strains": True, "pv_images": True,
+    "rad_target": "", "plot_ke": True, "extract_strains": True, "pv_images": True, "vtk_convert": True,
+    "init_state": False, "init_geometry": True, "init_stress": True, "init_peeq": True,
     # machine settings (ENV_KEYS)
     "run_target": LOCAL, "ssh_threads": "4", "ssh_host": "", "ssh_port": "22", "stream_remote": True,
     "remote_env": "", "remote_exec": "", "remote_scratch": "", "share_map": "",
     "pvbatch_path": "", "paraview_path": "", "or_exec": "",
 }
+DEFAULTS.update(RIVET_KEYS)
 ENV_KEYS = ("run_target", "ssh_threads", "ssh_host", "ssh_port", "stream_remote", "remote_env", "remote_exec",
             "remote_scratch", "share_map", "pvbatch_path", "paraview_path", "or_exec")
 DEFAULT_SLOTS = [["None (Use PrePoMax Data)", "MAT1"], ["None (Use PrePoMax Data)", "MAT2"],
                  ["None (Use PrePoMax Data)", "MAT3"]]
+
+
+_OLD_MATERIALS = {"Aluminium 6061-T6 (Johnson-Cook, Lesuer)": "Aluminium 6061-T6 (Johnson-Cook)"}
+
+
+def migrate(settings, legacy=False):
+    """Settings of an older ORC**3 configuration or run.json snapshot in the current keys (ORC**3 workspace.py and
+    cmd_load_run_settings): auto_tie / tie_pairs / tie_dist -> tie_mode; self_contact -> contact_mode; rigid_vel without
+    a valid rigid_vel_mode -> rigid_vel_mode; renamed library materials; an unknown analysis_mode -> Advanced.
+    legacy: an ORC**3 file (missing keys are migrated); else only legacy keys and unknown values are.
+    Returns (settings, notes)."""
+    s = dict(settings or {})
+    notes = []
+    if (legacy or "tie_mode" in s or "auto_tie" in s) and s.get("tie_mode") not in TIE_MODES:
+        if s.get("auto_tie", True):
+            s["tie_mode"] = TIE_AUTO
+        elif (s.get("tie_pairs") or "").strip():
+            s["tie_mode"] = TIE_SCOPED
+        else:
+            try:
+                td = float(s.get("tie_dist", "0") or 0)
+            except (TypeError, ValueError):
+                td = 0.0
+            s["tie_mode"] = TIE_GLOBAL if td > 0 else TIE_NONE
+        notes.append("Tie Mode %s (from the older tie settings)" % s["tie_mode"])
+    if (legacy or "contact_mode" in s or "self_contact" in s) and s.get("contact_mode") not in CONTACT_MODES:
+        s["contact_mode"] = CONTACT_T7 if s.get("self_contact", True) else CONTACT_NONE
+        notes.append("Contact %s (from Self Contact)" % s["contact_mode"])
+    if (legacy or "rigid_vel_mode" in s or "rigid_mode" in s) and s.get("rigid_vel_mode") not in RBV_MODES:
+        s["rigid_vel_mode"] = RBV_EXPL if (s.get("rigid_vel") or "").strip() else RBV_NONE
+        notes.append("Driver %s (from the older rigid-body settings)" % s["rigid_vel_mode"])
+        if (s.get("rigid_mode") or "").startswith("Rigidify"):
+            notes.append("that build used the old Rigidify-part mode; enter the part in Rigidify part(s) and choose a Driver")
+    if "analysis_mode" in s and s["analysis_mode"] not in ANALYSIS_MODES:
+        s["analysis_mode"] = MODE_ALL
+    for k in ("mat1", "mat2", "mat3"):
+        if s.get(k) in _OLD_MATERIALS:
+            s[k] = _OLD_MATERIALS[s[k]]
+    if isinstance(s.get("mat_slots"), list):
+        s["mat_slots"] = [[_OLD_MATERIALS.get(a, a), b] for a, b in s["mat_slots"] if isinstance(a, str)]
+    return s, notes
 
 
 class Var(object):
@@ -114,7 +161,8 @@ class Workspace(BuildMixin, MaterialsMixin, RunMixin, SolveMixin, PostMixin):
 
     # ------------------------------------------------------------------ settings
     def apply(self, settings):
-        """Set the settings present in the dict (unknown keys are ignored)."""
+        """Set the settings present in the dict (unknown keys are ignored; older keys: migrate())."""
+        settings, _notes = migrate(settings)
         for k, v in (settings or {}).items():
             if k in DEFAULTS:
                 getattr(self, k).set(_coerce(k, v))
@@ -299,6 +347,44 @@ class Workspace(BuildMixin, MaterialsMixin, RunMixin, SolveMixin, PostMixin):
         env.setdefault("KMP_STACKSIZE", "400m")
         env.setdefault("OMP_STACKSIZE", "400m")
         return env
+
+    # ------------------------------------------------------------------ Plot KE (ORC**3 _plot_ke_manual)
+    def _plot_ke_manual(self, folder, job=""):
+        """KE plot of a results folder: the results CSV of the job (else the newest *_Results.csv of the folder);
+        without a CSV the CSV is rebuilt from the T-file with th_to_csv first."""
+        if job and self._find_th_csv(folder, job)[0]:
+            return self._plot_ke(folder, job, True, True)
+        csvs = sorted(glob.glob(os.path.join(folder, "*_Results.csv")), key=os.path.getmtime)
+        if job:
+            csvs = [c for c in csvs if os.path.basename(c) == job + "_Results.csv"]
+        if not csvs:
+            tfiles = [t for t in sorted(glob.glob(os.path.join(folder, (job or "*") + "T[0-9][0-9]")), key=os.path.getmtime)
+                      if "." not in os.path.basename(t)]
+            if not tfiles:
+                self.log_msg("KE plot: no *_Results.csv and no T-file found in the folder - run the job first.")
+                return
+            tname = os.path.basename(tfiles[-1])
+            jobname = re.sub(r"T\d{2}$", "", tname)
+            exe = self._or_exe("th_to_csv")
+            self.log_msg(f"KE plot: no CSV found - rebuilding from {tname} via {os.path.basename(exe)} ...")
+            try:
+                proc = subprocess.run([exe, tname], cwd=folder, capture_output=True, text=True,
+                                      creationflags=NO_WINDOW, env=self._or_env())
+            except FileNotFoundError:
+                self.log_msg(f"KE plot: {os.path.basename(exe)} not found - cannot rebuild the CSV. Set the OpenCourant "
+                             "exec folder (Solve) or add it to PATH.")
+                return
+            except Exception as e:
+                self.log_msg(f"KE plot: th_to_csv failed: {e}")
+                return
+            if not (proc.stdout or "").strip():
+                self.log_msg(f"KE plot: th_to_csv printed no output. stderr: {(proc.stderr or '').strip()[:300]}")
+            if not self._finalize_results_csv(folder, jobname, proc.stdout):
+                return
+            self.log_msg(f"KE plot: rebuilt {jobname}_Results.csv")
+            csvs = [os.path.join(folder, f"{jobname}_Results.csv")]
+        jobname = os.path.basename(csvs[-1])[:-len("_Results.csv")]
+        self._plot_ke(folder, jobname, open_after=True, force=True)
 
     # ------------------------------------------------------------------ commands
     def execute_build(self):

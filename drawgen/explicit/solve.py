@@ -545,7 +545,8 @@ class SolveMixin:
         return (
             f"{ex}/starter_linux64_gf -i {jobname}_0000.rad -np 1 && "
             f"{ex}/engine_linux64_gf -i {jobname}_0001.rad -nt {cores} && "
-            f"for f in {jobname}A[0-9]*; do suff=$(echo $f | sed \'s/{jobname}A//\'); {ex}/anim_to_vtk_linux64_gf $f > {jobname}_$suff.vtk; done && "
+            + (f"for f in {jobname}A[0-9]*; do suff=$(echo $f | sed \'s/{jobname}A//\'); {ex}/anim_to_vtk_linux64_gf $f > {jobname}_$suff.vtk; done && "
+               if self.vtk_convert.get() else "") +
             f"{ex}/th_to_csv_linux64_gf {jobname}T01 > \"{jobname}_Results.csv\"; "
             f"if [ -f {helper} ]; then python3 {helper} {jobname} {anim_dt}; fi"
         )
@@ -719,10 +720,7 @@ class SolveMixin:
             self._finalize_results_csv(run_folder, jobname, None)
 
             self.log_msg(f"--- Remote job {jobname} finished. Open {jobname}.vtk.series in ParaView. ---")
-            self._plot_ke(run_folder, jobname)
-            self._write_pv_assets(run_folder, jobname)
-            self._extract_principal_strains(run_folder)
-            self._render_pv_images(run_folder, jobname)
+            self._post_steps(run_folder, jobname)
             self._status_touch(jobname, status="Done", eta=None)
         except Exception as e:
             self._status_touch(jobname, status="Failed", note=str(e)[:120])
@@ -735,8 +733,8 @@ class SolveMixin:
         host = self.ssh_host.get().strip()
         patterns = [f"{jobname}_[0-9]*.out"]
         if not outs_only:
-            patterns = [f"{jobname}_[0-9]*.vtk", f"{jobname}.vtk.series",
-                        f"{jobname}T01*", f"{jobname}_Results.csv"] + patterns
+            frames = [f"{jobname}_[0-9]*.vtk", f"{jobname}.vtk.series"] if self.vtk_convert.get() else [f"{jobname}A[0-9]*"]
+            patterns = frames + [f"{jobname}T01*", f"{jobname}_Results.csv"] + patterns
         self.log_msg(f"> {jobname}: copying results back from {workdir} ...")
         got = 0
         for pat in patterns:
@@ -748,7 +746,7 @@ class SolveMixin:
             except Exception as e:
                 self.log_msg(f"> {jobname}: copy-back of {pat} failed: {e}")
         if got:
-            self.log_msg(f"> {jobname}: results copied to {run_folder} (A-files left on the server).")
+            self.log_msg(f"> {jobname}: results copied to {run_folder}" + (" (A-files left on the server)." if self.vtk_convert.get() else "."))
         else:
             self.log_msg(f"> {jobname}: WARNING - nothing copied back from {workdir}; "
                          "check the tsp output above and the workdir contents on the server.")
@@ -924,56 +922,59 @@ class SolveMixin:
                 return
 
             self._status_touch(jobname, status="Post-processing", eta=None)
-            self.log_msg("> Directing Fallback Layout: Translating Animation Decks to Sequential .vtk...")
-            try:
-                anim_files = glob.glob(os.path.join(run_folder, f"{jobname}A[0-9]*"))
-                if anim_files:
-                    anim_list = [os.path.basename(f) for f in anim_files]
-                    frames = []  # (step_int, out_name)
-                    for anim_file in anim_list:
-                        match = re.search(r'A(\d+)$', anim_file)
-                        if match:
-                            step_num = match.group(1)
-                            out_name = f"{jobname}_{step_num}.vtk"
-                            step_int = int(step_num)
-                        else:
-                            out_name = f"{anim_file}.vtk"
-                            step_int = None
+            if not self.vtk_convert.get():
+                self.log_msg("> Convert to VTK off: no .vtk frames. The 3D view of the Results reads the animation files directly.")
+            else:
+                self.log_msg("> Directing Fallback Layout: Translating Animation Decks to Sequential .vtk...")
+                try:
+                    anim_files = glob.glob(os.path.join(run_folder, f"{jobname}A[0-9]*"))
+                    if anim_files:
+                        anim_list = [os.path.basename(f) for f in anim_files]
+                        frames = []  # (step_int, out_name)
+                        for anim_file in anim_list:
+                            match = re.search(r'A(\d+)$', anim_file)
+                            if match:
+                                step_num = match.group(1)
+                                out_name = f"{jobname}_{step_num}.vtk"
+                                step_int = int(step_num)
+                            else:
+                                out_name = f"{anim_file}.vtk"
+                                step_int = None
 
-                        # Binary mode: subprocess writes the tool's raw bytes to the
-                        # fd. Text mode would still be byte-clean here (the child
-                        # bypasses Python's encoder), but "wb" states the intent and
-                        # rules out any newline/encoding translation on a refactor.
-                        out_path = os.path.join(run_folder, out_name)
-                        with open(out_path, "wb") as out:
-                            subprocess.run([self._or_exe("anim_to_vtk"), anim_file], cwd=run_folder, stdout=out, creationflags=NO_WINDOW, env=self._or_env())
+                            # Binary mode: subprocess writes the tool's raw bytes to the
+                            # fd. Text mode would still be byte-clean here (the child
+                            # bypasses Python's encoder), but "wb" states the intent and
+                            # rules out any newline/encoding translation on a refactor.
+                            out_path = os.path.join(run_folder, out_name)
+                            with open(out_path, "wb") as out:
+                                subprocess.run([self._or_exe("anim_to_vtk"), anim_file], cwd=run_folder, stdout=out, creationflags=NO_WINDOW, env=self._or_env())
 
-                        # Valid legacy VTK starts with "# vtk". Anything else (e.g. a
-                        # UTF-16 BOM 0xFF 0xFE from a shell '>' redirect) makes
-                        # ParaView reject the file with "no reader found". Catch it at
-                        # write time, name the cause, and drop the file so it cannot
-                        # poison the .vtk.series.
-                        with open(out_path, "rb") as _vf:
-                            if _vf.read(5) != b"# vtk":
-                                self.log_msg(f"> VTK WARNING: {out_name} has a bad header - not clean "
-                                             f"ASCII VTK (likely encoding/BOM). Removing it; do not "
-                                             f"convert with a PowerShell '>' redirect.")
-                                try: os.remove(out_path)
-                                except Exception: pass
-                                continue
+                            # Valid legacy VTK starts with "# vtk". Anything else (e.g. a
+                            # UTF-16 BOM 0xFF 0xFE from a shell '>' redirect) makes
+                            # ParaView reject the file with "no reader found". Catch it at
+                            # write time, name the cause, and drop the file so it cannot
+                            # poison the .vtk.series.
+                            with open(out_path, "rb") as _vf:
+                                if _vf.read(5) != b"# vtk":
+                                    self.log_msg(f"> VTK WARNING: {out_name} has a bad header - not clean "
+                                                 f"ASCII VTK (likely encoding/BOM). Removing it; do not "
+                                                 f"convert with a PowerShell '>' redirect.")
+                                    try: os.remove(out_path)
+                                    except Exception: pass
+                                    continue
 
-                        if step_int is not None:
-                            frames.append((step_int, out_name))
+                            if step_int is not None:
+                                frames.append((step_int, out_name))
 
-                    # Declare the series explicitly so ParaView groups the frames
-                    self._write_vtk_series(run_folder, jobname, frames)
-                else:
-                    self.log_msg("> No animation files found for conversion.")
-            except FileNotFoundError:
-                self.log_msg("> VTK WARNING: anim_to_vtk_win64 not found on PATH - skipping VTK conversion. "
-                             "CSV export, KE plot and strain extraction continue.")
-            except Exception as e:
-                self.log_msg(f"> VTK conversion error: {e} - continuing with CSV export.")
+                        # Declare the series explicitly so ParaView groups the frames
+                        self._write_vtk_series(run_folder, jobname, frames)
+                    else:
+                        self.log_msg("> No animation files found for conversion.")
+                except FileNotFoundError:
+                    self.log_msg("> VTK WARNING: anim_to_vtk_win64 not found on PATH - skipping VTK conversion. "
+                                 "CSV export, KE plot and strain extraction continue.")
+                except Exception as e:
+                    self.log_msg(f"> VTK conversion error: {e} - continuing with CSV export.")
 
             self.log_msg("> Exporting Time History to CSV...")
             try:
@@ -992,10 +993,7 @@ class SolveMixin:
 
             self.log_msg(f"Local Task Complete: {jobname}")
             self.log_msg(f"Data exported to: {os.path.join(run_folder, f'{jobname}_Results.csv')}")
-            self._plot_ke(run_folder, jobname)
-            self._write_pv_assets(run_folder, jobname)
-            self._extract_principal_strains(run_folder)
-            self._render_pv_images(run_folder, jobname)
+            self._post_steps(run_folder, jobname)
             self._status_touch(jobname, status="Done", eta=None)
         except Exception as e:
             self._status_touch(jobname, status="Failed", note=str(e)[:120])

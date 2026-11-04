@@ -804,7 +804,13 @@ def dialog():
             "scpart": [("ShinyCAD part", "*.scpart")], "scasm": [("ShinyCAD assembly", "*.scasm")],
             "scsketch": [("ShinyCAD sketch", "*.scsketch")], "scfea": [("ShinyCAD analysis", "*.scfea")],
             "scexp": [("ShinyCAD explicit analysis", "*.scexp")], "sccam": [("ShinyCAD CAM", "*.sccam")],
-            "nc": [("G-code", "*.nc *.ngc *.gcode *.tap"), ("All files", "*.*")]}.get(filt, [("All files", "*.*")])
+            "nc": [("G-code", "*.nc *.ngc *.gcode *.tap"), ("All files", "*.*")],
+            "json": [("JSON", "*.json"), ("All files", "*.*")],
+            "csv": [("CSV files", "*.csv"), ("Results CSV", "*_Results.csv"), ("All files", "*.*")],
+            "fdcsv": [("F-d CSV", "*_fd.csv"), ("All CSV", "*.csv"), ("All files", "*.*")],
+            "png": [("PNG image", "*.png")],
+            "py": [("Python", "*.py *.pyw"), ("All files", "*.*")],
+            "rad": [("RADIOSS Deck", "*_0000.rad"), ("All files", "*.*")]}.get(filt, [("All files", "*.*")])
     try:
         path = dialogs.ask(req.get("kind") or "open", req.get("title") or "", req.get("initial") or "", pats, req.get("save_name") or "")
     except Exception as e:
@@ -2327,6 +2333,42 @@ def fea_plates():
     return jsonify({"plates": analysis.plate_views(doc, asm, _asm_sources())})
 
 
+@app.route("/api/analysis/shell_groups", methods=["POST"])
+def fea_shell_groups():
+    """{"source": {"type", "name"}, "angle": deg} -> {"groups": [{"name", "faces", "area"}]}: the faces of the
+    surface bodies of the geometry grouped by plane or cylinder (analysis.shell_groups)."""
+    req = request.get_json(force=True) or {}
+    try:
+        asm = _fea_asm({"source": req.get("source") or {}})
+        return jsonify({"groups": analysis.shell_groups(asm, _asm_sources(), float(req.get("angle") or 1.0))})
+    except (OSError, ValueError, analysis.AnalysisError) as e:
+        return error("groups: %s" % e)
+
+
+@app.route("/api/analysis/contact_search", methods=["POST"])
+def fea_contact_search():
+    """{"analysis": doc, "gap": mm} -> {"pairs": [{"bodies": [master body, slave body], "names", "master": [refs],
+    "slave": [refs]}]}: faces of different bodies within gap of each other (analysis.contact_search)."""
+    req = request.get_json(force=True) or {}
+    doc = req.get("analysis") or {}
+    try:
+        gap = float(req.get("gap") or 0.1)
+        bodies = analysis.geometry(doc, _fea_asm(doc), _asm_sources())
+        names = {b["id"]: b["name"] for b in bodies}
+        pairs = analysis.contact_search(bodies, gap)
+        for p in pairs:
+            p["names"] = [names.get(b, b) for b in p["bodies"]]
+        return jsonify({"pairs": pairs})
+    except (OSError, ValueError, analysis.AnalysisError) as e:
+        return error("contact search: %s" % e)
+
+
+@app.route("/api/analysis/material_library", methods=["GET"])
+def fea_material_library():
+    """ORC**3 material library: [{"name", "E", "nu", "rho" (kg/m^3), "plastic": [[stress, plastic strain]]}]."""
+    return jsonify(analysis.library_list())
+
+
 @app.route("/api/analysis/solver", methods=["GET"])
 def fea_solver():
     try:
@@ -2363,6 +2405,10 @@ class _Progress(object):
 
     def __call__(self, stage, message=""):
         self.job["stage"], self.job["message"] = stage, message
+
+    def mesh_ready(self, data):
+        """Mesh view data of a solve run ({"payload", "summary"}), sent once with the next job poll."""
+        self.job["mesh"] = data
 
     def __setattr__(self, k, v):
         object.__setattr__(self, k, v)
@@ -2427,6 +2473,8 @@ def fea_job(jid):
     if j is None:
         return error("unknown job", 404)
     out = {k: j[k] for k in ("state", "stage", "message", "error", "name", "started")}
+    if j.get("mesh") is not None:
+        out["mesh"] = j.pop("mesh")
     if j["state"] == "done":
         out["result"] = j["result"]
         ANALYSIS_JOBS.pop(jid, None)
@@ -2829,6 +2877,38 @@ def _cam_run(doc, upto=None, cancel=None):
     stock0, chain = _cam_chain(d, bits, cancel)
     res = cam.run(d, shape, bits, upto=upto, shape_key=key + chain, cancel=cancel, stock0=stock0)
     return d, shape, bits, res
+
+
+@app.route("/api/geometry/state", methods=["POST"])
+def geometry_state():
+    """State of the geometry of an analysis or explicit document without a build: {"source": {"type": "assembly" |
+    "part", "name"}} -> {"key"}: sha1 of the assembly file and the cache keys of the sources of its components (part
+    file, imported files, STEP file). The client compares it with the key of the loaded geometry (Update geometry).
+    {"components": [{"source"}]} -> {"key"}: sha1 of the cache keys of those sources (Assembly tab, Refresh)."""
+    req = request.get_json(force=True) or {}
+    srcs = _asm_sources()
+    h = hashlib.sha1()
+    if isinstance(req.get("components"), list):
+        # the sources of the components of an assembly being edited (Assembly tab, Refresh): no assembly file
+        for c in req["components"]:
+            h.update(repr(srcs.key((c or {}).get("source") or {})).encode("utf-8"))
+        return jsonify({"key": h.hexdigest()})
+    src = req.get("source") or {}
+    if not src.get("name"):
+        return jsonify({"key": ""})
+    try:
+        if (src.get("type") or "assembly") == "part":
+            comps = [{"source": {"type": "part", "name": src["name"]}}]
+        else:
+            with open(_asm_path(src["name"]), "rb") as f:
+                raw = f.read()
+            h.update(raw)
+            comps = json.loads(raw.decode("utf-8")).get("components") or []
+    except (OSError, ValueError) as e:
+        return error("cannot read %s %s: %s" % (src.get("type") or "assembly", src["name"], e), 404)
+    for c in comps:
+        h.update(repr(srcs.key(c.get("source") or {})).encode("utf-8"))
+    return jsonify({"key": h.hexdigest()})
 
 
 @app.route("/api/cam/part_state", methods=["POST"])

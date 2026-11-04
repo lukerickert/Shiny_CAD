@@ -4,7 +4,7 @@
 run(job) meshes in a subprocess (python -m drawgen.femesh <job.json> <out.json>) and returns the mesh:
 
 job:
-  {"size": mm, "bonded": bool,
+  {"size": mm, "bonded": bool, "apart": [body ids not fragmented with the others (contact pairs)],
    "mesh": {"size_min": mm, "curvature": elements per 360 deg (0: off), "algorithm": "delaunay" | "frontal" | "hxt",
             "optimize": bool, "strategy": "tet" | "hex" | "hexsub" (default of the solid bodies),
             "tet_type": "C3D10" | "C3D4", "hex_type": "C3D8I" | "C3D8" | "C3D8R" | "C3D20" | "C3D20R"},
@@ -30,7 +30,10 @@ different strategies and plates are tied (analysis.Model._ties).
 Plates: the largest planar face is meshed with quadrangles and the mesh is extruded through the thickness
 (C3D8I, C3D6 for the triangles left), "layers" elements through the thickness; the plate must be a prism of that face.
 Shells: the faces of all shell bodies are meshed together in a model of their own; with "bonded" they are
-fragmented, so shells that touch or cross share their nodes on the common lines. Quadrangles (S4, S4R; S8R second
+fragmented (general fuse, "fuzzy" mm the tolerance), so shells that touch or cross share their nodes on the common
+lines. "shell_structured" (default true): structured quadrangles on axis-aligned rectangles (_structured, with
+"shell_min_div" and "shell_size_mode" "local" | "grid"). out["shell_report"]: element quality (gamma), edge lengths,
+structured and free faces, per body the elements and structured faces. Quadrangles (S4, S4R; S8R second
 order) with triangles (S3; S6 with S8R) where the quadrangle mesh leaves them, or triangles only ("tri"). The surfaces
 of a shell body are its faces; their facets are the shell elements. A face shared by two shell bodies (coincident
 faces) belongs to the body listed first.
@@ -87,6 +90,7 @@ GMSH_ELEMS = {
 ALGO3D = {"delaunay": 1, "frontal": 4, "hxt": 10}
 SHELL_TYPES = ("S4", "S4R", "S8R", "S3")
 SHELL_ALGOS = {"quasi": 11, "frontal": 8, "delaunay": 6, "tri": 6}
+SHELL_ALGO_NAMES = {"quasi": "Quasi-structured quadrangles", "frontal": "Frontal-Delaunay for quadrangles"}
 HEX_TYPES = ("C3D8I", "C3D8", "C3D8R", "C3D20", "C3D20R")
 TET_TYPES = ("C3D10", "C3D4")
 
@@ -124,11 +128,11 @@ def _mesh(job):
         gmsh.option.setNumber("General.Verbosity", 2)
         gmsh.option.setNumber("Geometry.OCCImportLabels", 0)
         gmsh.model.add("analysis")
-        occ = gmsh.model.occ
         size = float(job.get("size") or 0)
         opts = job.get("mesh") or {}
         warnings = []
         solids, plates, hexes, shells = [], [], {}, []
+        shell_report = None
         for b in job["bodies"]:
             if b.get("mode") == "plate":
                 plates.append(b)
@@ -142,7 +146,7 @@ def _mesh(job):
         bodies = {}
         diag = _diag(job)
         if solids:
-            vol_of = _import(gmsh, solids, job.get("bonded"))
+            vol_of = _import(gmsh, solids, job.get("bonded"), job.get("apart") or ())
             h = size or diag / 20.0
             _common_options(gmsh, opts, h)
             order = 1 if opts.get("tet_type") == "C3D4" else 2
@@ -168,7 +172,7 @@ def _mesh(job):
         for st, group in sorted(hexes.items()):
             nid, eid = _hex_group(gmsh, st, group, job, opts, size or diag / 20.0, nid, eid, out_nodes, bodies, warnings)
         if shells:
-            nid, eid = _shell_group(gmsh, shells, job, opts, size or diag / 20.0, nid, eid, out_nodes, bodies, warnings)
+            nid, eid, shell_report = _shell_group(gmsh, shells, job, opts, size or diag / 20.0, nid, eid, out_nodes, bodies, warnings)
         for b in plates:
             nid, eid, res = _plate(gmsh, b, size, nid, eid, out_nodes)
             res["group"] = "plate:%s" % b["id"]
@@ -177,7 +181,7 @@ def _mesh(job):
         xyz = []
         for i in ids:
             xyz.extend(out_nodes[i])
-        return {"nodes": {"ids": ids, "xyz": xyz}, "bodies": bodies, "warnings": warnings}
+        return {"nodes": {"ids": ids, "xyz": xyz}, "bodies": bodies, "warnings": warnings, "shell_report": shell_report}
     finally:
         gmsh.finalize()
 
@@ -197,9 +201,9 @@ def _diag(job):
         gmsh.model.setCurrent("analysis")
 
 
-def _import(gmsh, group, bonded):
-    """Imports the bodies of a group into the current model; with bonded the solids are fragmented (shared faces).
-    Returns {body id: [volume tags]}."""
+def _import(gmsh, group, bonded, apart=()):
+    """Imports the bodies of a group into the current model; with bonded the solids are fragmented (shared faces),
+    except the bodies in apart (contact pairs: meshed with their own nodes). Returns {body id: [volume tags]}."""
     occ = gmsh.model.occ
     vol_of = {}
     for b in group:
@@ -208,11 +212,12 @@ def _import(gmsh, group, bonded):
         if not vol_of[b["id"]]:
             raise RuntimeError("body %s has no solid" % b["id"])
     occ.synchronize()
-    if bonded and len(group) > 1:
-        inp = [(3, t) for b in group for t in vol_of[b["id"]]]
+    frag = [b for b in group if b["id"] not in set(apart)]
+    if bonded and len(frag) > 1:
+        inp = [(3, t) for b in frag for t in vol_of[b["id"]]]
         _, omap = occ.fragment(inp, [])
         k = 0
-        for b in group:
+        for b in frag:
             new = []
             for _ in vol_of[b["id"]]:
                 new += [t for d, t in omap[k] if d == 3]
@@ -255,7 +260,7 @@ def _hex_group(gmsh, st, group, job, opts, h, nid, eid, out_nodes, bodies, warni
     from . import fea
     gmsh.model.add("hex_%s" % st)
     try:
-        vol_of = _import(gmsh, group, job.get("bonded"))
+        vol_of = _import(gmsh, group, job.get("bonded"), job.get("apart") or ())
         order = 2 if opts.get("hex_type") in ("C3D20", "C3D20R") else 1
         hh = h * (2.0 if st == "hexsub" else 1.0)          # subdivision halves the edge length
         _common_options(gmsh, opts, hh)
@@ -311,8 +316,203 @@ def _shell_type(gtype, opts):
     return {2: "S3", 16: "S8R", 9: "S6"}.get(gtype)
 
 
+def _ceil_div(length, size, min_div):
+    return max(min_div, int(math.ceil(length / size - 1e-9)))
+
+
+class Grid(object):
+    """Break coordinates per axis and the divisions of an interval between two of them (ceil(interval / size) per
+    interval, at least min_div; step2shell)."""
+
+    def __init__(self, breaks, size, min_div):
+        self.breaks = [sorted(set(b)) for b in breaks]
+        self.min_div = min_div
+        self.sizes = [[size] * max(len(b) - 1, 0) for b in self.breaks]   # size per interval (grid mode)
+
+    def _index(self, ax, v, tol):
+        xs = self.breaks[ax]
+        lo, hi = 0, len(xs) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if abs(xs[mid] - v) <= tol:
+                return mid
+            if xs[mid] < v:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return None
+
+    def set_size(self, ax, a, b, tol, value):
+        """Grid mode: the intervals between a and b take the smaller of their size and value."""
+        i, j = self._index(ax, min(a, b), tol), self._index(ax, max(a, b), tol)
+        if i is None or j is None or j <= i:
+            return
+        for k in range(i, j):
+            self.sizes[ax][k] = min(self.sizes[ax][k], value)
+
+    def divisions(self, ax, a, b, tol, size, grid=False):
+        i, j = self._index(ax, min(a, b), tol), self._index(ax, max(a, b), tol)
+        if i is None or j is None or j <= i:
+            return None
+        xs = self.breaks[ax]
+        return sum(_ceil_div(xs[k + 1] - xs[k], self.sizes[ax][k] if grid else size, self.min_div) for k in range(i, j))
+
+
+def _merge_breaks(values, tol):
+    out = []
+    for v in sorted(values):
+        if not out or v - out[-1] > tol:
+            out.append(v)
+    return out
+
+
+def _dist(a, b):
+    return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+
+
+def _on_segment(p, a, b, tol):
+    ab = [b[k] - a[k] for k in range(3)]
+    l2 = sum(c * c for c in ab)
+    if l2 <= 0:
+        return False
+    t = sum((p[k] - a[k]) * ab[k] for k in range(3)) / l2
+    if t < -1e-6 or t > 1 + 1e-6:
+        return False
+    return _dist([a[k] + t * ab[k] for k in range(3)], p) <= tol
+
+
+def _structured(gmsh, surfs, surf_size, h, opts, tol, f):
+    """Structured quadrangles on axis-aligned rectangles (step2shell): the break coordinates of all curve ends along
+    x, y and z form an interval grid; every straight axis-aligned curve gets ceil(interval / size) divisions per
+    interval (at least "shell_min_div"), size the smallest of the shells of its faces ("shell_size_mode" "local"), or
+    every interval the smallest size of the curves spanning it ("grid"). A face with one boundary loop of straight
+    axis-aligned curves and 4 corners, no curve ending inside it and equal divisions on opposite sides is meshed
+    transfinite. Returns (structured surfaces, number of free surfaces)."""
+    min_div = max(1, int(opts.get("shell_min_div") or 1))
+    grid_mode = opts.get("shell_size_mode") == "grid"
+    occ = gmsh.model.occ
+    curve_faces = {}
+    for st in surfs:
+        for _d, c in gmsh.model.getBoundary([(2, st)], combined=False, oriented=False):
+            curve_faces.setdefault(abs(c), set()).add(st)
+    ends, axis = {}, {}
+    for c in curve_faces:
+        pts = [t for d, t in gmsh.model.getBoundary([(1, c)], combined=False, oriented=True) if d == 0]
+        ends[c] = [list(gmsh.model.getValue(0, abs(t), [])) for t in pts]
+        if len(ends[c]) == 2 and gmsh.model.getType(1, c) == "Line":
+            d = [ends[c][1][k] - ends[c][0][k] for k in range(3)]
+            L = math.sqrt(sum(x * x for x in d)) or 1.0
+            for k in range(3):
+                if abs(abs(d[k]) / L - 1.0) < 1e-6:
+                    axis[c] = k
+    breaks = [[], [], []]
+    for c, e in ends.items():
+        for p in e:
+            for k in range(3):
+                breaks[k].append(p[k])
+    grid = Grid([_merge_breaks(b, tol * 10) for b in breaks], h, min_div)
+    csize = {c: min(surf_size.get(st, h) for st in fs) for c, fs in curve_faces.items()}
+    if grid_mode:
+        for c, k in axis.items():
+            grid.set_size(k, ends[c][0][k], ends[c][1][k], tol * 10, csize[c])
+    div = {}
+    for c, k in axis.items():
+        n = grid.divisions(k, ends[c][0][k], ends[c][1][k], tol * 10, csize[c], grid_mode)
+        if n:
+            div[c] = n
+            gmsh.model.mesh.setTransfiniteCurve(c, n + 1)
+    tf, nfree = set(), 0
+    for st in surfs:
+        try:
+            loops, loop_curves = occ.getCurveLoops(st)
+        except Exception:
+            loops, loop_curves = [], []
+        cs = [abs(c) for c in (loop_curves[0] if len(loops) == 1 else [])]
+        if len(loops) != 1 or not cs or any(c not in axis for c in cs):
+            nfree += 1
+            continue
+        # directed segments of the loop and the corners where the direction changes
+        segs, cur = [], None
+        for i, c in enumerate(cs):                       # chained by their end points
+            a, b = ends[c]
+            if cur is None:
+                nxt = ends[cs[(i + 1) % len(cs)]]
+                if min(_dist(a, q) for q in nxt) < min(_dist(b, q) for q in nxt):
+                    a, b = b, a
+            elif _dist(a, cur) > _dist(b, cur):
+                a, b = b, a
+            segs.append((a, b))
+            cur = b
+        dirs = []
+        for a, b in segs:
+            d = [b[k] - a[k] for k in range(3)]
+            L = math.sqrt(sum(x * x for x in d)) or 1.0
+            dirs.append([x / L for x in d])
+        corners = [segs[i][0] for i in range(len(segs)) if sum(dirs[i - 1][k] * dirs[i][k] for k in range(3)) < math.cos(math.radians(30))]
+        if len(corners) != 4:
+            nfree += 1
+            continue
+        allc = [abs(c) for _d, c in gmsh.model.getBoundary([(2, st)], combined=False, oriented=False)]
+        sums, ok = [0, 0, 0, 0], True
+        for c in allc:
+            side = next((i for i in range(4) if all(_on_segment(p, corners[i], corners[(i + 1) % 4], tol * 100) for p in ends[c])), None)
+            if side is None or c not in div:
+                ok = False
+                break
+            sums[side] += div[c]
+        if not ok or sums[0] != sums[2] or sums[1] != sums[3]:
+            nfree += 1
+            continue
+        pts = [t for d, t in gmsh.model.getBoundary([(2, st)], combined=False, oriented=False, recursive=True) if d == 0]
+        ctags = []
+        for cp in corners:
+            best = min(pts, key=lambda t: _dist(gmsh.model.getValue(0, t, []), cp))
+            if _dist(gmsh.model.getValue(0, best, []), cp) > tol * 100 or best in ctags:
+                ctags = None
+                break
+            ctags.append(best)
+        if not ctags:
+            nfree += 1
+            continue
+        try:
+            gmsh.model.mesh.setTransfiniteSurface(st, "Left", ctags)
+            tf.add(st)
+        except Exception:
+            nfree += 1
+    # the quasi-structured algorithm halves the size it reads from the curve meshes: curves of free faces only get
+    # their divisions at twice the size
+    if f > 1.0:
+        for c, k in axis.items():
+            if c in div and not (curve_faces[c] & tf):
+                n = grid.divisions(k, ends[c][0][k], ends[c][1][k], tol * 10, f * csize[c], grid_mode)
+                if n:
+                    gmsh.model.mesh.setTransfiniteCurve(c, n + 1)
+    return tf, nfree
+
+
+def _quality(gmsh, surfs):
+    """Element quality (gmsh gamma: 1 for a square) and element edge lengths of the surface elements."""
+    tags = []
+    for st in surfs:
+        et, eg, _en = gmsh.model.mesh.getElements(2, st)
+        for tg in eg:
+            tags.extend(int(t) for t in tg)
+    out = {"min_quality": None, "mean_quality": None, "below_03": 0, "min_edge": None, "max_edge": None}
+    if not tags:
+        return out
+    q = gmsh.model.mesh.getElementQualities(tags, "gamma")
+    out.update(min_quality=float(min(q)), mean_quality=float(sum(q) / len(q)), below_03=int(sum(1 for v in q if v < 0.3)))
+    try:
+        out.update(min_edge=float(min(gmsh.model.mesh.getElementQualities(tags, "minEdge"))),
+                   max_edge=float(max(gmsh.model.mesh.getElementQualities(tags, "maxEdge"))))
+    except Exception:
+        pass
+    return out
+
+
 def _shell_group(gmsh, group, job, opts, h, nid, eid, out_nodes, bodies, warnings):
-    """Shell mesh of the shell bodies in a model of their own; nodes and elements renumbered after nid / eid."""
+    """Shell mesh of the shell bodies in a model of their own; nodes and elements renumbered after nid / eid.
+    Returns (nid, eid, report)."""
     gmsh.model.add("shells")
     occ = gmsh.model.occ
     try:
@@ -323,11 +523,17 @@ def _shell_group(gmsh, group, job, opts, h, nid, eid, out_nodes, bodies, warning
             if not surf_of[b["id"]]:
                 raise RuntimeError("shell %s has no faces" % b["id"])
         occ.synchronize()
-        if job.get("bonded") and sum(len(v) for v in surf_of.values()) > 1:
-            inp = [(2, t) for b in group for t in surf_of[b["id"]]]
+        fuzzy = float(opts.get("fuzzy") or 0)
+        fgroup = [b for b in group if b["id"] not in set(job.get("apart") or ())]
+        if job.get("bonded") and sum(len(surf_of[b["id"]]) for b in fgroup) > 1:
+            # general fuse of all shell faces: faces split where they cross, edges shared where they touch; fuzzy:
+            # the tolerance of the boolean operation (mm); shells of contact pairs are left out
+            if fuzzy > 0:
+                gmsh.option.setNumber("Geometry.ToleranceBoolean", fuzzy)
+            inp = [(2, t) for b in fgroup for t in surf_of[b["id"]]]
             _, omap = occ.fragment(inp, [])
             k = 0
-            for b in group:
+            for b in fgroup:
                 new = []
                 for _ in surf_of[b["id"]]:
                     new += [t for d, t in omap[k] if d == 2]
@@ -340,8 +546,25 @@ def _shell_group(gmsh, group, job, opts, h, nid, eid, out_nodes, bodies, warning
             seen.update(surf_of[b["id"]])
         algo = str(opts.get("shell_algorithm") or "quasi")
         tri = algo == "tri" or opts.get("shell_type") == "S3"
+        surf_size = {}
+        for b in group:
+            if b.get("size"):
+                for st in surf_of[b["id"]]:
+                    surf_size[st] = float(b["size"])
+        allsurf = sorted(seen)
+        xmin, ymin, zmin, xmax, ymax, zmax = gmsh.model.getBoundingBox(-1, -1)
+        tol = max(math.sqrt((xmax - xmin) ** 2 + (ymax - ymin) ** 2 + (zmax - zmin) ** 2) * 1e-6, 1e-6)
+        tf, nfree = set(), len(allsurf)
+        if opts.get("shell_structured", True) and not tri:
+            tf, nfree = _structured(gmsh, allsurf, surf_size, h, opts, tol, 1.0)
+            if tf and algo == "quasi":
+                # the quasi-structured algorithm meshes all faces of the model (transfinite faces too): with
+                # structured faces the free faces are meshed with Frontal-Delaunay for quadrangles
+                algo = "frontal"
         # the quasi-structured quadrangle algorithm makes elements of about half the size it reads
         f = 2.0 if algo == "quasi" and not tri else 1.0
+        if f > 1.0 and opts.get("shell_structured", True) and not tri:
+            _structured(gmsh, allsurf, surf_size, h, opts, tol, f)       # the curve divisions at twice the size
         gmsh.option.setNumber("Mesh.MeshSizeMax", h * f)
         gmsh.option.setNumber("Mesh.MeshSizeMin", (float(opts.get("size_min") or 0) or h / 5.0) * f)
         gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 1)
@@ -350,6 +573,7 @@ def _shell_group(gmsh, group, job, opts, h, nid, eid, out_nodes, bodies, warning
         gmsh.option.setNumber("Mesh.Algorithm", SHELL_ALGOS.get("delaunay" if tri else algo, 11))
         gmsh.option.setNumber("Mesh.RecombineAll", 0 if tri else 1)
         gmsh.option.setNumber("Mesh.RecombinationAlgorithm", 1)
+        gmsh.option.setNumber("Mesh.Smoothing", 2)
         gmsh.option.setNumber("Mesh.ElementOrder", 1)
         gmsh.option.setNumber("Mesh.SecondOrderIncomplete", 1)
         for b in group:
@@ -357,6 +581,17 @@ def _shell_group(gmsh, group, job, opts, h, nid, eid, out_nodes, bodies, warning
                 pts = gmsh.model.getBoundary([(2, t) for t in surf_of[b["id"]]], combined=False, recursive=True)
                 gmsh.model.mesh.setSize([p for p in pts if p[0] == 0], float(b["size"]) * f)
         gmsh.model.mesh.generate(2)
+        if SHELL_ALGOS.get("delaunay" if tri else algo, 11) != 6:
+            # faces where the quadrangle algorithm returned the boundary triangulation without inside nodes
+            # (Frontal-Delaunay for quadrangles on some cylindrical faces): meshed again with Delaunay, recombined
+            bad = _failed_faces(gmsh, allsurf, surf_size, h, f)
+            if bad:
+                for st in bad:
+                    gmsh.model.mesh.setAlgorithm(2, st, 6)
+                gmsh.model.mesh.clear()
+                gmsh.model.mesh.generate(2)
+                warnings.append("shell faces %s: elements longer than 3 x the element size with %s; meshed with "
+                                "Delaunay, recombined" % (", ".join(str(t) for t in bad), SHELL_ALGO_NAMES.get(algo, algo)))
         if opts.get("shell_type") == "S8R" and not tri:
             gmsh.model.mesh.setOrder(2)
         ntags, coords, _ = gmsh.model.mesh.getNodes()
@@ -365,6 +600,8 @@ def _shell_group(gmsh, group, job, opts, h, nid, eid, out_nodes, bodies, warning
             nid += 1
             nmap[int(t)] = nid
             out_nodes[nid] = (coords[3 * i], coords[3 * i + 1], coords[3 * i + 2])
+        report = _quality(gmsh, allsurf)
+        report.update(structured=len(tf), free=nfree, faces=len(allsurf), bodies=[])
         for b in group:
             blocks = {}
             surfs = []
@@ -386,9 +623,28 @@ def _shell_group(gmsh, group, job, opts, h, nid, eid, out_nodes, bodies, warning
                 raise RuntimeError("shell %s: no elements (the faces are covered by another shell)" % b["id"])
             bodies[b["id"]] = {"blocks": [{"type": t, "elements": els} for t, els in blocks.items()], "surfaces": surfs,
                                "group": "shell", "thickness": float(b.get("t") or 0)}
-        return nid, eid
+            report["bodies"].append({"id": b["id"], "elements": sum(len(v) for v in blocks.values()),
+                                     "structured": len(set(surf_of[b["id"]]) & tf), "faces": len(surf_of[b["id"]])})
+        return nid, eid, report
     finally:
         gmsh.model.remove()
+        gmsh.option.setNumber("Geometry.ToleranceBoolean", 0)
+
+
+def _failed_faces(gmsh, surfs, surf_size, h, f):
+    """Faces with an element edge longer than 3 x the element size of the face (h, or the size of its shell, times
+    f) or without elements."""
+    bad = []
+    for st in surfs:
+        _et, eg, _en = gmsh.model.mesh.getElements(2, st)
+        tags = [int(t) for g in eg for t in g]
+        if not tags:
+            bad.append(st)
+            continue
+        size = surf_size.get(st, h) * f
+        if max(gmsh.model.mesh.getElementQualities(tags, "maxEdge")) > 3.0 * size:
+            bad.append(st)
+    return bad
 
 
 def _surface(gmsh, st, nodes, nsample=25, nmap=lambda n: n):

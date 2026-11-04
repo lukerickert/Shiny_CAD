@@ -430,6 +430,7 @@ def test_surface_bodies_in_analysis_explicit_and_assembly_views(page, client):
     page.mouse.move(xy[0] + 3, xy[1] + 2)
     assert page.evaluate("!!window.__fea.FA.three.hover")
     page.mouse.click(xy[0] + 3, xy[1] + 2)
+    page.keyboard.press("Enter")
     page.wait_for_function("(() => { const s = window.__fea.FA.doc.supports[0]; return s && s.target && s.target.edge !== undefined; })()")
     sup = page.evaluate("window.__fea.FA.doc.supports[0].target")
     er = page.evaluate("window.__fea.FA.geo.components[1].erefs[%d]" % sup["edge"])
@@ -454,6 +455,7 @@ def test_surface_bodies_in_analysis_explicit_and_assembly_views(page, client):
     page.click("#xp-supbtn")
     xy = page.evaluate("(a) => (%s)([window.__xp.XP.three, a])" % scr, [40, 10, 30])
     page.mouse.click(xy[0] + 2, xy[1] + 3)
+    page.keyboard.press("Enter")
     page.wait_for_function("window.__xp.XP.doc.supports.length === 1 && window.__xp.XP.doc.supports[0].target.edge !== undefined")
     page.select_option(".xp-sups [data-spre]", "xsymm")
     assert page.evaluate("window.__xp.XP.doc.supports[0].dofs") == [1, 0, 0, 0, 1, 1]
@@ -476,6 +478,424 @@ def test_surface_bodies_in_analysis_explicit_and_assembly_views(page, client):
     assert page.evaluate("window.__asm.comp('2').pos") == [100, 0, 10]
     page.keyboard.press("Escape")
     assert page.evaluate("window.__asm.AS.move2") is None
+
+
+def test_sections_and_node_sets_panels(page, client):
+    """Girder of surface parts in the Analysis tab: By geometry makes PLATE_Z0 and WEB_Y50; Select faces and New from
+    selection move a deck face to a new section; a node set by plane with a support on it; Select edges and a node
+    set of the selected edge; Mesh shows the shell report; with CalculiX the solve gives one body per section. The
+    Explicit tab shows the same panels."""
+    def surf(fid, name, plane, w, h):
+        from conftest import rect
+        return {"id": fid, "name": name, "type": "surf_sketch", "kind": "planar", "plane": plane, "offset": 0,
+                "sketch": {"entities": rect(w, h)}}
+    client.put("/api/part/file/ui_gd_deck", json={"name": "ui_gd_deck", "version": 2, "next": 2, "features": [surf("s1", "Deck", "XY", 200, 100)]})
+    client.put("/api/part/file/ui_gd_web", json={"name": "ui_gd_web", "version": 2, "next": 2, "features": [surf("w", "Web", "XZ", 400, 40)]})
+    client.put("/api/assembly/file/ui_gd", json={"name": "ui_gd", "next": 4, "components": [
+        {"id": "1", "name": "deck", "source": {"type": "part", "name": "ui_gd_deck"}, "pos": [0, 0, 0], "rot": [0, 0, 0]},
+        {"id": "3", "name": "deck2", "source": {"type": "part", "name": "ui_gd_deck"}, "pos": [200, 0, 0], "rot": [0, 0, 0]},
+        {"id": "2", "name": "web", "source": {"type": "part", "name": "ui_gd_web"}, "pos": [0, 50, 0], "rot": [180, 0, 0]}]})
+    scr = ("([T, p]) => { const r = T.renderer.domElement.getBoundingClientRect();"
+           " const v = new (Object.getPrototypeOf(T.camera.position).constructor)(...p).project(T.camera);"
+           " return [r.left + (v.x + 1) / 2 * r.width, r.top + (1 - v.y) / 2 * r.height]; }")
+    tab(page, "fea")
+    page.wait_for_function("window.__fea && window.__fea.FA.doc")
+    page.evaluate("() => { const s = document.getElementById('fa-source'); s.insertAdjacentHTML('beforeend', '<option value=\"assembly:ui_gd\">ui_gd</option>'); s.value = 'assembly:ui_gd'; s.dispatchEvent(new Event('change')); }")
+    page.wait_for_function("window.__fea.FA.geo && window.__fea.FA.geo.components.length === 3 && window.__fea.FA.three.group.children.length")
+    wait_text(page, "#fa-sections", "0 of 3 shell face(s) in sections")
+    page.click("#fa-sections [data-sm=geom]")
+    page.wait_for_function("window.__fea.FA.doc.sections.length === 2")
+    assert page.evaluate("window.__fea.FA.doc.sections.map(s => [s.name, s.faces.length])") == [["PLATE_Z0", 2], ["WEB_Y50", 1]]
+    assert page.locator("#fa-sections tr[data-sec]").count() == 2
+    page.fill("#fa-sections tr[data-sec] >> nth=0 >> [data-sk=t]", "8")
+    page.dispatch_event("#fa-sections tr[data-sec] >> nth=0 >> [data-sk=t]", "change")
+    fsel = "#fa-sections tr[data-sec] >> nth=1 >> [data-sk=material]"
+    page.wait_for_function("document.querySelector('#fa-sections [data-sk=material] option[value^=\"lib:\"]')")
+    flabels = page.eval_on_selector(fsel, "e => [...e.options].map(o => [o.value, o.textContent])")
+    assert flabels[0][1].startswith("(default: ") and " - " in flabels[1][1]
+    flib = next(v for v, t in flabels if v.startswith("lib:"))
+    page.select_option(fsel, flib)
+    fd = page.evaluate("window.__fea.FA.doc")
+    fm = fd["sections"][1]["material"]
+    assert fd["materials"][fm]["library"] == flib[4:] and fd["materials"][fm]["law"] == "plastic"
+    page.select_option(fsel, "")
+    # Layers (S8R composite shells): disabled with S4, set on a section with S8R
+    lsel = "#fa-sections tr[data-sec] >> nth=0 >> [data-sk=layers]"
+    assert page.is_disabled(lsel)
+    page.select_option("#fs-shtype", "S8R")
+    assert page.is_enabled(lsel)
+    page.fill(lsel, "3")
+    page.dispatch_event(lsel, "change")
+    assert page.evaluate("window.__fea.FA.doc.sections[0].layers") == 3
+    page.select_option("#fs-shtype", "S4")
+    assert page.evaluate("window.__fea.FA.doc.sections[0].t") == 8
+    # Select faces: the deck of component 3, then New from selection
+    page.click("#fa-sections [data-sm=selfaces]")
+    assert page.evaluate("[...window.__fea.SH.sel.types]") == ["faces"]
+    xy = page.evaluate("(a) => (%s)([window.__fea.FA.three, a])" % scr, [300, 20, 0])
+    page.mouse.move(xy[0], xy[1])
+    page.mouse.click(xy[0], xy[1])
+    page.wait_for_function("window.__fea.SH.sel.faces.size === 1")
+    assert page.evaluate("[...window.__fea.SH.sel.faces]") == ["3:0"]
+    page.keyboard.press("Escape")
+    assert page.evaluate("[...window.__fea.SH.sel.types]") == []
+    page.click("#fa-sections [data-sm=new]")
+    assert page.evaluate("window.__fea.FA.doc.sections.map(s => [s.name, s.faces.map(f => f.comp + ':' + f.face)])") == [
+        ["PLATE_Z0", ["1:0"]], ["WEB_Y50", ["2:0"]], ["SECTION_3", ["3:0"]]]
+    # node set by plane x = 0 and a support on it
+    page.click("#fa-nsets [data-na=plane]")
+    assert page.evaluate("window.__fea.FA.doc.nsets[0]")["kind"] == "plane"
+    page.click("#fa-nsets tr[data-ns] >> nth=0 >> [data-nk=sup]")
+    ns_id = page.evaluate("window.__fea.FA.doc.nsets[0].id")
+    assert page.evaluate("window.__fea.FA.doc.supports[0].target") == {"nset": ns_id}
+    assert "node set" in page.inner_text("#fa-sups")
+    # Select edges: the edge x = 400 of the deck of component 3 and a node set of it
+    page.click("#fa-nsets [data-na=seledges]")
+    xy = page.evaluate("(a) => (%s)([window.__fea.FA.three, a])" % scr, [400, 20, 0])
+    page.mouse.move(xy[0] + 2, xy[1] + 1)
+    page.mouse.click(xy[0] + 2, xy[1] + 1)
+    page.wait_for_function("window.__fea.SH.sel.edges.size === 1")
+    page.keyboard.press("Escape")
+    page.click("#fa-nsets [data-na=edges]")
+    e = page.evaluate("window.__fea.FA.doc.nsets[1]")
+    assert e["kind"] == "edges" and len(e["edges"]) == 1 and e["edges"][0]["comp"] == "3"
+    er = page.evaluate("window.__fea.FA.geo.components.find(c => c.id === '3').erefs[%d]" % e["edges"][0]["edge"])
+    assert er["kind"] == "line" and abs(er["c"][0] - 200) < 1e-6
+    # a pressure load picked again on a face keeps one value (MPa)
+    page.click("#fa-add-load")
+    xy = page.evaluate("(a) => (%s)([window.__fea.FA.three, a])" % scr, [100, 20, 0])
+    page.mouse.move(xy[0], xy[1])
+    page.mouse.click(xy[0], xy[1])
+    page.keyboard.press("Enter")
+    page.wait_for_function("window.__fea.FA.doc.loads.length === 1 && window.__fea.FA.doc.loads[0].target && window.__fea.FA.doc.loads[0].target.face !== undefined")
+    page.select_option("#fld-type", "pressure")
+    page.click("#fld-pick")
+    page.mouse.move(xy[0] + 1, xy[1])
+    page.mouse.click(xy[0] + 1, xy[1])
+    page.keyboard.press("Enter")
+    time.sleep(0.3)
+    ld = page.evaluate("window.__fea.FA.doc.loads[0]")
+    assert ld["type"] == "pressure" and ld["value"] == 0.1 and ld["target"]["face"] is not None
+    page.evaluate("() => { window.__fea.FA.doc.loads = []; }")
+    # Mesh with Section sizes Grid: the shell report
+    page.evaluate("() => { window.__fea.FA.doc.mesh = { size: 10, shell_size_mode: 'grid' }; }")
+    page.click("#fa-mesh")
+    wait_text(page, "#fa-results", "face(s) structured, 0 free", timeout=180000)
+    assert "element quality (gamma) min 1" in page.inner_text("#fa-results")
+    # Show Mesh after Mesh, with the support on the node set at its nodes (cones along ux uy uz, cubes for rotations)
+    assert page.evaluate("document.getElementById('fa-show').value") == "mesh"
+    glyphs = ("() => { const out = {}; window.__fea.FA.three.group.traverse(o => { if (o.isInstancedMesh && o.userData.kind) "
+              "out[o.userData.kind + ':' + o.userData.id] = (out[o.userData.kind + ':' + o.userData.id] || 0) + o.count; }); return out; }")
+    g = page.evaluate(glyphs)
+    sid = page.evaluate("window.__fea.FA.doc.supports[0].id")
+    assert g.get("support:" + sid, 0) >= 11 * 3, g
+    page.uncheck("#fa-bcs")
+    assert page.evaluate(glyphs) == {}
+    page.check("#fa-bcs")
+    page.select_option("#fa-show", "model")
+    assert ("support:" + sid) in page.evaluate(glyphs)
+    if os.environ.get("DRAWGEN_SHOTS"):
+        page.screenshot(path=os.path.join(os.environ["DRAWGEN_SHOTS"], "fea_sections.png"))
+    from test_analysis import CCX
+    if CCX is not None:
+        page.evaluate("() => window.__fea.FA.doc.loads.push({ id: 'lg', name: 'g', type: 'gravity', value: [0, 0, -9810] })")
+        page.click("#fa-solve")
+        page.wait_for_function("window.__fea.FA.res && window.__fea.FA.res.tables", timeout=180000)
+        assert [b["name"] for b in page.evaluate("window.__fea.FA.res.tables.total.bodies")] == ["PLATE_Z0", "WEB_Y50", "SECTION_3"]
+        # results of chosen bodies: ux uy uz of each body, a body not shown is not drawn; Show selected
+        b0 = page.evaluate("window.__fea.FA.res.tables.total.bodies[0]")
+        assert len(b0["ucomp"]) == 3 and abs(b0["ucomp"][2]) == pytest.approx(b0["umax"], rel=0.2)
+        tris = "(() => { let n = 0; window.__fea.FA.three.group.traverse(o => { if (o.isMesh && o.userData.kind === 'mesh') n += o.geometry.index.count; }); return n; })()"
+        n_all = page.evaluate(tris)
+        page.uncheck("#fa-results [data-bshow='%s']" % b0["id"])
+        assert 0 < page.evaluate(tris) < n_all and "1 body(ies) hidden" in page.inner_text("#fa-results")
+        page.evaluate("() => { const S = window.__fea.SH.sel; S.faces.clear(); S.bodies.clear(); S.faces.add('3:0'); }")
+        page.click("#fr-bsel")
+        assert sorted(page.evaluate("[...window.__fea.FA.bodyHide]")) == sorted(b["id"] for b in page.evaluate("window.__fea.FA.res.tables.total.bodies") if b["name"] != "SECTION_3")
+        page.click("#fr-ball")
+        assert page.evaluate(tris) == n_all
+    # Explicit tab: the panels with the shells
+    tab(page, "xp")
+    page.wait_for_function("window.__xp && window.__xp.XP.doc && window.__xp.XP.meta")
+    page.select_option("#xp-source", "assembly:ui_gd")
+    page.wait_for_function("window.__xp.XP.geo && window.__xp.XP.geo.components.length === 3 && document.querySelector('#xp-sections [data-sm=geom]')")
+    page.click("#xp-sections [data-sm=geom]")
+    page.wait_for_function("(window.__xp.XP.doc.sections || []).length === 2")
+    mats = page.evaluate("Object.keys(window.__xp.XP.doc.materials)")
+    page.select_option("#xp-sections tr[data-sec] [data-sk=material]", mats[-1])
+    assert page.evaluate("window.__xp.XP.doc.sections[0].material") == mats[-1]
+    assert page.input_value("#xp-sections tr[data-sec] [data-sk=material]") == mats[-1]
+    # labels: model name with the library entry or the values; a library entry adds a model material
+    sel = "#xp-sections tr[data-sec] [data-sk=material]"
+    labels = page.eval_on_selector(sel, "e => [...e.options].map(o => [o.value, o.textContent])")
+    assert labels[0][0] == "" and labels[0][1].startswith("(default: ")
+    assert any(v == mats[-1] and t.startswith(mats[-1] + " - ") for v, t in labels)
+    lib = next(v for v, t in labels if v.startswith("lib:"))
+    page.select_option(sel, lib)
+    d = page.evaluate("window.__xp.XP.doc")
+    new = d["sections"][0]["material"]
+    assert new not in mats and d["materials"][new]["library"] == lib[4:] and d["materials"][new]["rho"] > 1000
+    assert page.input_value(sel) == new and lib[4:] in page.eval_on_selector(sel, "e => e.options[e.selectedIndex].textContent")
+    page.click("#xp-nsets [data-na=section_edges]")
+    assert page.evaluate("window.__xp.XP.doc.nsets[0]")["body"] == "sec:" + page.evaluate("window.__xp.XP.doc.sections[0].id")
+
+
+def test_reference_points_springs_joints_and_equations(page, client):
+    """Analysis tab, shell plate 100 x 20 mm: a reference point picked at a vertex, then between two picked vertices,
+    coupled rigidly to the picked edge; a point offset from it; a point at the centre of the circle through three
+    typed points (deleted again); a spring, a ball joint and an equation; solve with the clamped edge x = 0 and a
+    force on the first point. Explicit tab: Mesh, a reference point picked at a mesh node in Show Mesh, a support
+    on it."""
+    from conftest import rect
+    client.put("/api/part/file/ui_rp_plate", json={"name": "ui_rp_plate", "version": 2, "next": 2, "features": [
+        {"id": "s1", "name": "Plate", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(100, 20)}}]})
+    client.put("/api/assembly/file/ui_rp", json={"name": "ui_rp", "next": 2, "components": [
+        {"id": "1", "name": "plate", "source": {"type": "part", "name": "ui_rp_plate"}, "pos": [0, 0, 0], "rot": [0, 0, 0]}]})
+    scr = ("([T, p]) => { const r = T.renderer.domElement.getBoundingClientRect();"
+           " const v = new (Object.getPrototypeOf(T.camera.position).constructor)(...p).project(T.camera);"
+           " return [r.left + (v.x + 1) / 2 * r.width, r.top + (1 - v.y) / 2 * r.height]; }")
+
+    def click3(T, pt, dx=0, dy=0):
+        xy = page.evaluate("(a) => (%s)([%s, a])" % (scr, T), pt)
+        page.mouse.move(xy[0] + dx, xy[1] + dy)
+        time.sleep(0.05)
+        page.mouse.click(xy[0] + dx, xy[1] + dy)
+        time.sleep(0.2)
+    tab(page, "fea")
+    page.wait_for_function("window.__fea && window.__fea.FA.doc")
+    page.evaluate("() => { const s = document.getElementById('fa-source'); s.insertAdjacentHTML('beforeend', '<option value=\"assembly:ui_rp\">ui_rp</option>'); s.value = 'assembly:ui_rp'; s.dispatchEvent(new Event('change')); }")
+    page.wait_for_function("window.__fea.FA.geo && window.__fea.FA.geo.components.length === 1 && window.__fea.FA.three.group.children.length")
+    page.click("[data-faview=iso]")
+    T = "window.__fea.FA.three"
+    pts = lambda: page.evaluate("window.__fea.FA.doc.points")
+    page.click("#fa-rps [data-rpa=add]")
+    click3(T, [100, 0, 0], 3, 2)
+    assert pts()[0]["xyz"] == [100, 0, 0]
+    page.select_option("#fa-rps [data-rp=m]", "between")
+    page.click("#fa-rps [data-pickpt='1']")
+    click3(T, [100, 20, 0], 2, 2)
+    assert pts()[0]["xyz"] == [100, 10, 0] and pts()[0]["place"]["m"] == "between"
+    page.select_option("#fa-rps [data-rp=coupling]", "rigid")
+    page.click("#fa-rps [data-rpa=edges]")
+    click3(T, [100, 5, 0], 2, 0)
+    page.keyboard.press("Enter")
+    e = pts()[0]["edges"]
+    er = page.evaluate("window.__fea.FA.geo.components[0].erefs[%d]" % e[0]["edge"])
+    assert len(e) == 1 and er["kind"] == "line" and abs(er["c"][0] - 100) < 1e-6
+    # second point: offset dz 30 from the first
+    page.click("#fa-rps [data-rpa=add]")
+    page.keyboard.press("Escape")
+    page.select_option("#fa-rps [data-slot='0']", pts()[0]["id"])
+    page.fill("#fa-rps [data-v3=d][data-i='2']", "30")
+    page.dispatch_event("#fa-rps [data-v3=d][data-i='2']", "change")
+    assert pts()[1]["xyz"] == [100, 10, 30]
+    # third point: circle through three typed points, then deleted
+    page.click("#fa-rps [data-rpa=add]")
+    page.keyboard.press("Escape")
+    page.select_option("#fa-rps [data-rp=m]", "circle3")
+    for i, q in enumerate([[0, 0, 0], [20, 0, 0], [10, 10, 0]]):
+        for k in range(3):
+            page.fill("#fa-rps [data-v3=pt%d][data-i='%d']" % (i, k), str(q[k]))
+            page.dispatch_event("#fa-rps [data-v3=pt%d][data-i='%d']" % (i, k), "change")
+    assert pts()[2]["xyz"] == [10, 0, 0]
+    page.click("#fa-rps [data-del=rp][data-id='%s']" % pts()[2]["id"])
+    assert len(pts()) == 2
+    # moving the first point moves the second (offset from it)
+    page.click("#fa-rps [data-pick=rp][data-id='%s']" % pts()[0]["id"])
+    page.fill("#fa-rps [data-rp=t]", "0.25")
+    page.dispatch_event("#fa-rps [data-rp=t]", "change")
+    assert pts()[0]["xyz"] == [100, 5, 0] and pts()[1]["xyz"] == [100, 5, 30]
+    page.click("#fa-springs [data-sa=add]")
+    page.click("#fa-joints [data-ja=add]")
+    page.click("#fa-eqs [data-qa=add]")
+    d = page.evaluate("window.__fea.FA.doc")
+    p1, p2 = d["points"][0]["id"], d["points"][1]["id"]
+    assert d["springs"][0]["a"] == {"point": p1} and d["springs"][0]["b"] is None
+    assert d["joints"][0]["a"] == {"point": p1} and d["joints"][0]["b"] == {"point": p2}
+    assert [t["end"] for t in d["equations"][0]["terms"]] == [{"point": p1}, {"point": p2}]
+    if os.environ.get("DRAWGEN_SHOTS"):
+        page.screenshot(path=os.path.join(os.environ["DRAWGEN_SHOTS"], "fea_refpoints.png"))
+    from test_analysis import CCX
+    if CCX is not None:
+        e0 = page.evaluate("window.__fea.FA.geo.components[0].erefs.findIndex(r => r && r.kind === 'line' && Math.abs(r.c[0]) < 1e-6)")
+        page.evaluate("""([p1, p2, e0]) => { const d = window.__fea.FA.doc;
+            d.equations = []; d.joints[0].type = 'weld';
+            d.supports.push({ id: 'sx', name: 'root', type: 'fixed', target: { comp: '1', edge: e0 } });
+            d.loads.push({ id: 'lx', name: 'F', type: 'force', target: { point: p1 }, value: [0, 0, -10] });
+            d.springs[0].a = { point: p2 }; d.springs[0].k = [0, 0, 1, 0, 0, 0]; }""", [p1, p2, e0])
+        page.click("#fa-solve")
+        page.wait_for_function("window.__fea.FA.res && window.__fea.FA.res.tables", timeout=180000)
+        P = page.evaluate("window.__fea.FA.res.tables.total.points")
+        assert [x["name"] for x in P] == ["RP 1", "RP 2"] and P[0]["u"][2] < 0
+    # Explicit: a point at a mesh node, a support on it
+    tab(page, "xp")
+    page.wait_for_function("window.__xp && window.__xp.XP.doc && window.__xp.XP.meta")
+    page.select_option("#xp-source", "assembly:ui_rp")
+    page.wait_for_function("window.__xp.XP.geo && window.__xp.XP.geo.components.length === 1 && window.__xp.XP.three.group.children.length")
+    page.evaluate("() => { window.__xp.XP.doc.mesh = { size: 10, shell_size_mode: 'grid' }; }")
+    page.click("#xp-model-btn")
+    page.wait_for_function("window.__xp.XP.mesh && document.getElementById('xp-show').value === 'mesh'", timeout=120000)
+    page.click("#xp-rps [data-rpa=add]")
+    click3("window.__xp.XP.three", [50, 10, 0], 3, 3)
+    xp = page.evaluate("window.__xp.XP.doc.points[0]")
+    assert xp["xyz"] == [50, 10, 0] and page.evaluate("document.getElementById('xp-show').value") == "mesh"
+    page.click("#xp-supbtn")
+    click3("window.__xp.XP.three", [50, 10, 0])
+    page.keyboard.press("Enter")
+    page.wait_for_function("window.__xp.XP.doc.supports.length === 1")
+    assert page.evaluate("window.__xp.XP.doc.supports[0].target") == {"point": xp["id"]}
+    assert "reference point RP 1" in page.inner_text(".xp-sups")
+
+
+def test_view_selection_types_box_and_targets(page, client):
+    """Selection toolbar of the 3D views (viewsel.js): a click toggles a face (Faces) or a surface body (Bodies); a box
+    dragged to the right takes the items fully inside, to the left the items inside or crossing; Ctrl deselects;
+    reference points by box; Support with two faces selected takes both ({"faces"}); Pick with nothing selected waits
+    for Done; Analysis: a force on two selected faces."""
+    def surf(fid, name, plane, w, h):
+        from conftest import rect
+        return {"id": fid, "name": name, "type": "surf_sketch", "kind": "planar", "plane": plane, "offset": 0,
+                "sketch": {"entities": rect(w, h)}}
+    client.put("/api/part/file/ui_vs_deck", json={"name": "ui_vs_deck", "version": 2, "next": 2, "features": [surf("s1", "Deck", "XY", 200, 100)]})
+    client.put("/api/part/file/ui_vs_web", json={"name": "ui_vs_web", "version": 2, "next": 2, "features": [surf("w", "Web", "XZ", 200, 40)]})
+    client.put("/api/assembly/file/ui_vs", json={"name": "ui_vs", "next": 3, "components": [
+        {"id": "1", "name": "deck", "source": {"type": "part", "name": "ui_vs_deck"}, "pos": [0, 0, 0], "rot": [0, 0, 0]},
+        {"id": "2", "name": "web", "source": {"type": "part", "name": "ui_vs_web"}, "pos": [0, 50, 0], "rot": [180, 0, 0]}]})
+    scr = ("([T, p]) => { const r = T.renderer.domElement.getBoundingClientRect();"
+           " const v = new (Object.getPrototypeOf(T.camera.position).constructor)(...p).project(T.camera);"
+           " return [r.left + (v.x + 1) / 2 * r.width, r.top + (1 - v.y) / 2 * r.height]; }")
+    tab(page, "xp")
+    page.wait_for_function("window.__xp && window.__xp.XP.doc && window.__xp.XP.meta")
+    page.select_option("#xp-source", "assembly:ui_vs")
+    page.wait_for_function("window.__xp.XP.geo && window.__xp.XP.geo.components.length === 2 && window.__xp.XP.three.group.children.length")
+    page.click("[data-xpview=top]")
+    T = "window.__xp.XP.three"
+    at = lambda p_: page.evaluate("(a) => (%s)([%s, a])" % (scr, T), p_)
+    sel = lambda: page.evaluate("(() => { const S = window.__xp.SH.sel; return {faces: [...S.faces].sort(), edges: [...S.edges], bodies: [...S.bodies], points: [...S.points]}; })()")
+
+    def drag(a, b, ctrl=False, shot=None):
+        page.mouse.move(a[0], a[1])
+        if ctrl:
+            page.keyboard.down("Control")
+        page.mouse.down()
+        page.mouse.move((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, steps=3)
+        page.mouse.move(b[0], b[1], steps=3)
+        if shot and os.environ.get("DRAWGEN_SHOTS"):
+            page.screenshot(path=os.path.join(os.environ["DRAWGEN_SHOTS"], shot))
+        page.mouse.up()
+        if ctrl:
+            page.keyboard.up("Control")
+    # Faces: a click selects, a second click deselects
+    page.click("#xp-selbar [data-vs=faces]")
+    assert page.evaluate("[...window.__xp.SH.sel.types]") == ["faces"]
+    xy = at([50, 20, 0])
+    page.mouse.click(xy[0], xy[1])
+    assert sel()["faces"] == ["1:0"] and "1 face(s)" in page.inner_text("#xp-selbar")
+    page.mouse.click(xy[0], xy[1])
+    assert sel()["faces"] == []
+    # Box: to the right around the whole model takes both faces; with Ctrl they leave the selection
+    page.click("#xp-selbar [data-vs=box]")
+    lo, hi = at([-20, 120, 0]), at([220, -20, 0])
+    drag(lo, hi)
+    assert sel()["faces"] == ["1:0", "2:0"]
+    drag(lo, hi, ctrl=True)
+    assert sel()["faces"] == []
+    # a small box inside the deck: to the right (inside) nothing, to the left (crossing) the deck face
+    a, b = at([20, 30, 0]), at([40, 10, 0])
+    drag(a, b)
+    assert sel()["faces"] == []
+    drag(b, a, shot="xp_box_crossing.png")
+    assert sel()["faces"] == ["1:0"]
+    if os.environ.get("DRAWGEN_SHOTS"):
+        page.screenshot(path=os.path.join(os.environ["DRAWGEN_SHOTS"], "xp_box_selected.png"))
+    page.click("#xp-selbar [data-vs=clear]")
+    # Bodies: a click selects the surface body of the face
+    page.click("#xp-selbar [data-vs=faces]")
+    page.click("#xp-selbar [data-vs=bodies]")
+    page.mouse.click(xy[0], xy[1])
+    assert sel()["bodies"] == ["1:s1"] and sel()["faces"] == []
+    # Suppress and Unsuppress the selected body
+    page.click("#xp-selbar [data-vs=sup]")
+    assert page.evaluate("window.__xp.XP.doc.shells['1:s1']") == {"mode": "off", "prev_off": "shell"}
+    page.click("#xp-selbar [data-vs=unsup]")
+    assert page.evaluate("window.__xp.XP.doc.shells['1:s1'].mode") == "shell"
+    # reference points by box
+    page.evaluate("window.__xp.XP.doc.points = [{id: 'p1', name: 'P1', xyz: [150, 80, 0], coupling: 'none'}]; window.__xp.renderModel(); window.__xp.draw();")
+    page.click("#xp-selbar [data-vs=bodies]")
+    page.click("#xp-selbar [data-vs=points]")
+    drag(at([140, 90, 0]), at([160, 70, 0]))
+    assert sel()["points"] == ["p1"]
+    page.click("#xp-selbar [data-vs=clear]")
+    # Support from a selection of two faces: one support on both
+    page.click("#xp-selbar [data-vs=points]")
+    page.click("#xp-selbar [data-vs=faces]")
+    drag(lo, hi)
+    page.click("#xp-supbtn")
+    t = page.evaluate("window.__xp.XP.doc.supports[0].target")
+    assert sorted(f["comp"] + ":" + str(f["face"]) for f in t["faces"]) == ["1:0", "2:0"] and "2 face(s)" in page.inner_text(".xp-sups")
+    assert sel()["faces"] == []
+    # Pick with nothing selected: clicks select until Done
+    page.click(".xp-sups [data-spick]")
+    assert "Done" in page.inner_text("#xp-selbar")
+    page.click("#xp-selbar [data-vs=box]")
+    page.mouse.click(xy[0], xy[1])
+    page.click("#xp-selbar [data-vs=done]")
+    assert page.evaluate("window.__xp.XP.doc.supports[0].target") == {"comp": "1", "face": 0}
+    assert not page.evaluate("window.__xp.SH.sel.collect")
+    # Analysis: a force on two selected faces
+    tab(page, "fea")
+    page.wait_for_function("window.__fea && window.__fea.FA.doc")
+    page.evaluate("() => { const s = document.getElementById('fa-source'); s.insertAdjacentHTML('beforeend', '<option value=\"assembly:ui_vs\">ui_vs</option>'); s.value = 'assembly:ui_vs'; s.dispatchEvent(new Event('change')); }")
+    page.wait_for_function("window.__fea.FA.geo && window.__fea.FA.geo.components.length === 2 && window.__fea.FA.three.group.children.length")
+    page.evaluate("() => { const S = window.__fea.SH.sel; S.faces.add('1:0'); S.faces.add('2:0'); }")
+    page.click("#fa-add-load")
+    ld = page.evaluate("window.__fea.FA.doc.loads[0]")
+    assert ld["type"] == "force" and len(ld["target"]["faces"]) == 2 and "2 face(s)" in page.inner_text("#fa-loads")
+
+
+def test_explicit_velocities_and_node_sets_of_bodies_and_faces(page, client):
+    """Explicit tab, a solid block and a rigid shell impactor: a node set of the block body (Bodies), a node set of a
+    solid face picked with Select faces, an initial and an imposed velocity on the rigid impactor (arrow in the view);
+    Mesh lists the node sets and the velocities."""
+    from conftest import part_rec, rect
+    client.put("/api/part/file/ui_v_blk", json=part_rec("ui_v_blk", [{"id": "f1", "name": "Extrude 1", "type": "extrude", "plane": "XY", "offset": 0,
+                                                                       "sketch": {"entities": rect(40, 40)}, "depth": 20}]))
+    client.put("/api/part/file/ui_v_tup", json={"name": "ui_v_tup", "version": 2, "next": 2, "features": [
+        {"id": "s1", "name": "Tup", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(20, 20)}}]})
+    client.put("/api/assembly/file/ui_v", json={"name": "ui_v", "next": 3, "components": [
+        {"id": "1", "name": "block", "source": {"type": "part", "name": "ui_v_blk"}, "pos": [0, 0, 0], "rot": [0, 0, 0]},
+        {"id": "2", "name": "tup", "source": {"type": "part", "name": "ui_v_tup"}, "pos": [10, 10, 30], "rot": [0, 0, 0]}]})
+    tab(page, "xp")
+    page.wait_for_function("window.__xp && window.__xp.XP.doc && window.__xp.XP.meta")
+    page.select_option("#xp-source", "assembly:ui_v")
+    page.wait_for_function("window.__xp.XP.geo && window.__xp.XP.geo.components.length === 2 && window.__xp.XP.three.group.children.length")
+    page.select_option(".xp-shells [data-hk=mode]", "rigid")
+    page.click("#xp-nsets [data-na=body]")
+    assert page.evaluate("window.__xp.XP.doc.nsets[0]")["bodies"] == ["1"]
+    assert page.locator("#xp-nsets [data-nb]").count() == 2
+    page.click("#xp-nsets [data-na=selfaces]")
+    scr = ("([T, p]) => { const r = T.renderer.domElement.getBoundingClientRect();"
+           " const v = new (Object.getPrototypeOf(T.camera.position).constructor)(...p).project(T.camera);"
+           " return [r.left + (v.x + 1) / 2 * r.width, r.top + (1 - v.y) / 2 * r.height]; }")
+    xy = page.evaluate("(a) => (%s)([window.__xp.XP.three, a])" % scr, [2, 2, 20])
+    page.mouse.move(xy[0], xy[1])
+    page.mouse.click(xy[0], xy[1])
+    page.wait_for_function("window.__xp.SH.sel.faces.size === 1")
+    page.keyboard.press("Escape")
+    page.click("#xp-nsets [data-na=faces]")
+    f = page.evaluate("window.__xp.XP.doc.nsets[1]")["faces"]
+    r = page.evaluate("window.__xp.XP.geo.components[0].refs[%d]" % f[0]["face"])
+    assert f[0]["comp"] == "1" and r["kind"] == "plane" and abs(r["c"][2] - 20) < 1e-6
+    page.click("#xp-vels [data-va=initial]")
+    page.click("#xp-vels [data-va=imposed]")
+    v = page.evaluate("window.__xp.XP.doc.velocities")
+    assert [(x["kind"], x["target"]) for x in v] == [("initial", {"body": "2:s1"}), ("imposed", {"body": "2:s1"})]
+    assert page.evaluate("(() => { let n = 0; window.__xp.XP.three.group.traverse(o => { if (o.type === 'ArrowHelper') n++; }); return n; })()") == 2
+    page.click("#xp-model-btn")
+    page.wait_for_function("window.__xp.XP.meshSummary && window.__xp.XP.meshSummary.velocities", timeout=120000)
+    s = page.evaluate("window.__xp.XP.meshSummary")
+    assert [n["name"] for n in s["nsets"]] == ["BODY_1", "NSET_2"] and len(s["velocities"]) == 2
+    assert "Velocities: Initial" in page.inner_text("#xp-model")
 
 
 def test_analysis_plate_by_points(page, client):
@@ -1022,6 +1442,49 @@ def test_drag_mated_component_keeps_mates(page, client):
     z2 = asm_state(page, "AS.asm.components.find(c => c.id === '%s').pos.slice()" % ids[n - 1])
     assert z2[:2] != z1[:2] and abs(z2[2] - z1[2]) < 1e-4
     assert asm_state(page, "AS.asm.components.find(c => c.id === '%s').pos.slice()" % ids[n - 2]) == f1
+
+
+def test_assembly_refresh_changed_part(page, client):
+    """Refresh of the Assembly tab: a part saved after the build marks Refresh orange; Refresh builds the components
+    again from the saved part (the new size) and clears the mark."""
+    client.put("/api/part/file/ui_rf", json=plate("ui_rf", 40.0, 20.0, 5.0, 0.0))
+    tab(page, "asm")
+    add_part(page, "ui_rf")
+    page.wait_for_function("window.__asm.AS.result && window.__asm.AS.bbox && Math.abs(window.__asm.AS.bbox[3] - window.__asm.AS.bbox[0] - 40) < 0.5")
+    assert "cm-stale" not in (page.get_attribute("#as-refresh", "class") or "")
+    client.put("/api/part/file/ui_rf", json=plate("ui_rf", 60.0, 20.0, 5.0, 0.0))
+    page.evaluate("window.dispatchEvent(new Event('focus'))")
+    page.wait_for_function("document.getElementById('as-refresh').classList.contains('cm-stale')")
+    page.click("#as-refresh")
+    page.wait_for_function("Math.abs(window.__asm.AS.bbox[3] - window.__asm.AS.bbox[0] - 60) < 0.5")
+    page.wait_for_function("!document.getElementById('as-refresh').classList.contains('cm-stale')")
+
+
+def test_reference_point_pick_not_through_faces(page, client):
+    """A point picked on a face is not snapped to the edge of a plate hidden behind the face."""
+    def surf(fid, name, plane, w, h):
+        from conftest import rect
+        return {"id": fid, "name": name, "type": "surf_sketch", "kind": "planar", "plane": plane, "offset": 0,
+                "sketch": {"entities": rect(w, h)}}
+    client.put("/api/part/file/ui_hp_top", json={"name": "ui_hp_top", "version": 2, "next": 2, "features": [surf("s1", "Top", "XY", 200, 100)]})
+    client.put("/api/part/file/ui_hp_low", json={"name": "ui_hp_low", "version": 2, "next": 2, "features": [surf("s1", "Low", "XY", 40, 20)]})
+    client.put("/api/assembly/file/ui_hp", json={"name": "ui_hp", "next": 3, "components": [
+        {"id": "1", "name": "top", "source": {"type": "part", "name": "ui_hp_top"}, "pos": [0, 0, 0], "rot": [0, 0, 0]},
+        {"id": "2", "name": "low", "source": {"type": "part", "name": "ui_hp_low"}, "pos": [100, 10, -50], "rot": [0, 0, 0]}]})
+    scr = ("([T, p]) => { const r = T.renderer.domElement.getBoundingClientRect();"
+           " const v = new (Object.getPrototypeOf(T.camera.position).constructor)(...p).project(T.camera);"
+           " return [r.left + (v.x + 1) / 2 * r.width, r.top + (1 - v.y) / 2 * r.height]; }")
+    tab(page, "xp")
+    page.wait_for_function("window.__xp && window.__xp.XP.doc && window.__xp.XP.meta")
+    page.select_option("#xp-source", "assembly:ui_hp")
+    page.wait_for_function("window.__xp.XP.geo && window.__xp.XP.geo.components.length === 2 && window.__xp.XP.three.group.children.length")
+    page.click("[data-xpview=top]")
+    page.click("#xp-rps [data-rpa=add]")
+    xy = page.evaluate("(a) => (%s)([window.__xp.XP.three, a])" % scr, [100, 20, 0])
+    page.mouse.move(xy[0] + 2, xy[1])
+    page.mouse.click(xy[0] + 2, xy[1])
+    p = page.evaluate("window.__xp.XP.doc.points[0].xyz")
+    assert abs(p[2]) < 1e-6, p
 
 
 def test_assembly_space_hides_component(page, client):
@@ -1590,9 +2053,9 @@ def test_analysis_beam_drawing_repeats_properties(page, client):
 
 
 def test_analysis_reference_point(page, client):
-    """Ref. point: the first picked face sets the point (face centre) and is connected; Esc ends the face picking.
-    Support and Load with the reference point selected act on it; the support shows six components; the results
-    list the reference point."""
+    """Ref. point: the picked point sets the point; Coupling rigid and Add faces connect the picked face; Esc ends
+    the face picking. Support and Load with the reference point selected act on it; the support shows six
+    components; the results list the reference point."""
     from test_analysis import CCX, _two_plate_doc
     if CCX is None:
         pytest.skip("CalculiX (ccx) not found")
@@ -1608,16 +2071,19 @@ def test_analysis_reference_point(page, client):
     top_face = page.evaluate("""() => { const F = window.__fea.FA; const c = F.geo.components.find(x => x.id === 'c2');
         let i = -1; c.refs.forEach((r, k) => { if (r && r.kind === 'plane' && r.n[2] > 0.9 && (i < 0 || r.c[2] > c.refs[i].c[2])) i = k; });
         return {comp: 'c2', face: i, c: c.refs[i].c}; }""")
-    page.evaluate("(t) => window.__fea.FA.pick.cb({face: {comp: t.comp, face: t.face}, xyz: t.c, centre: t.c})", top_face)
-    page.wait_for_function("window.__fea.FA.pick")
-    page.keyboard.press("Escape")
+    page.evaluate("(t) => window.__fea.FA.pick.cb({xyz: t.c})", top_face)
+    page.select_option("#fa-rps [data-rp=coupling]", "rigid")
+    page.click("#fa-rps [data-rpa=faces]")
+    page.wait_for_function("window.__fea.SH.sel.collect")
+    page.evaluate("(t) => window.__fea.SH.sel.faces.add(t.comp + ':' + t.face)", top_face)
+    page.keyboard.press("Enter")
     rp = page.evaluate("window.__fea.FA.doc.points[0]")
     assert rp["xyz"] == top_face["c"] and len(rp["faces"]) == 1
     page.click("#fa-add-load")
     page.wait_for_function("window.__fea.FA.doc.loads.length === 1")
     assert page.evaluate("window.__fea.FA.doc.loads[0].target") == {"point": rp["id"]}
     page.evaluate("() => { const l = window.__fea.FA.doc.loads[0]; l.type = 'moment'; l.value = [0, 0, 10000]; }")
-    page.click("#fa-rps .fa-item")
+    page.click("#fa-rps .rp-item")
     page.click("#fa-add-sup")
     page.wait_for_function("window.__fea.FA.doc.supports.length === 2")
     page.select_option("#fsp-type", "dofs")
@@ -1800,11 +2266,19 @@ def test_explicit_tab_model_build_run_results(page, client, tmp_path):
     page.click("#xp-supbtn")
     box = page.locator("#xp-view > canvas").first.bounding_box()
     page.mouse.click(box["x"] + box["width"] / 2 - box["height"] * 0.3, box["y"] + box["height"] * 0.5 - box["height"] * 0.3)
+    page.keyboard.press("Enter")
     page.wait_for_function("window.__xp.XP.doc.supports.length === 1")
     assert "target" in page.inner_text(".xp-sups .xp-face")
     page.click("#xp-model-btn")
     page.wait_for_function("document.querySelector('#xp-show').value === 'mesh'", timeout=120000)
     assert page.evaluate("window.__xp.XP.meshSummary.supports") >= 1
+    # supports at the mesh nodes (cones), Supports off and on
+    cones = ("() => { let n = 0; window.__xp.XP.three.group.traverse(o => { if (o.isInstancedMesh && o.userData.kind === 'support') n += o.count; }); return n; }")
+    nb = len(page.evaluate("window.__xp.XP.mesh.bcs[0].nodes"))
+    assert nb > 0 and page.evaluate(cones) >= nb
+    page.uncheck("#xp-bcs")
+    assert page.evaluate(cones) == 0
+    page.check("#xp-bcs")
     page.fill("#xp-run-desc", "browser drop")
     page.click("#xp-run-new")
     page.wait_for_function("(window.__xp.XP.doc.settings.out_dir || '').includes('_r001_browser-drop')")
@@ -1830,6 +2304,14 @@ def test_explicit_tab_model_build_run_results(page, client, tmp_path):
     page.wait_for_function("window.__xp.XP.res.frame.index === 4")
     n4 = page.evaluate("(() => { let n = 0; window.__xp.XP.three.group.traverse(o => { if (o.isMesh && o.userData.kind === 'mesh') n += o.geometry.attributes.position.count; }); return n; })()")
     assert n0 - n4 == 12                         # top and bottom face of the eroded hexahedron: 4 triangles
+    # parts of the results: max |d| of the frame; a part not shown is not drawn
+    assert page.locator("#xp-parts [data-pshow]").count() == 1 and "1 part" in page.inner_text("#xp-parts")
+    assert page.evaluate("window.__xp.XP.res.frame.parts[0].umax") > 0
+    page.uncheck("#xp-parts [data-pshow='0']")
+    tris = "(() => { let n = 0; window.__xp.XP.three.group.traverse(o => { if (o.isMesh && o.userData.kind === 'mesh') n += o.geometry.attributes.position.count; }); return n; })()"
+    assert page.evaluate(tris) == 0 and "1 part(s) hidden" in page.inner_text("#xp-parts")
+    page.click("#xp-pall")
+    assert page.evaluate(tris) == n4
     # save, list in the File menu
     page.__dict__["_answer"] = "xpb_doc"
     file_menu(page, "#tab-xp")
@@ -5004,3 +5486,402 @@ def test_drawing_manual_centre_mark_and_line(page, client):
     page.mouse.up()
     f = page.evaluate("ED.d.maps.top[2]")
     page.wait_for_function("([c0, f]) => Math.abs(ED.anns[0].c[0] - c0[0] - 10 / f) < 0.5 && Math.abs(ED.anns[0].c[1] - c0[1]) < 0.5", arg=[c0, f])
+
+
+def test_explicit_mk2_functions(page, client, tmp_path):
+    """Explicit tab, ORC**3 MK2 functions: analysis types (Rivet section), Downgrade, Output Dir, travel table, "?"
+    pop-ups, Tie dist in Scoped, concentrated mass summary, Tools section, Rivet gauge rings and F-d curve, results
+    CSV, overlay, zoom, Save PNG, run history Load Selected."""
+    import math
+    from drawgen import web
+    tab(page, "xp")
+    page.wait_for_function("window.__xp && window.__xp.XP.doc && window.__xp.XP.meta && window.__xp.XP.tools")
+    dialog = {"path": ""}
+    page.route("**/api/dialog", lambda route: route.fulfill(status=200, content_type="application/json", body=json.dumps({"path": dialog["path"]})))
+    assert page.evaluate("document.querySelector('[data-s=analysis_mode]').value") == "Advanced (all features)"
+    assert page.is_visible("#xp-sec-rivet") and page.is_visible("[data-s=downgrade_quad]") and page.is_visible("[data-s=out_dir]")
+    page.select_option("[data-s=analysis_mode]", "Impact / drop test")
+    assert page.is_hidden("#xp-sec-rivet") and page.is_visible("[data-s=downgrade_quad]")
+    page.select_option("[data-s=analysis_mode]", "Rivet coupon calibration")
+    assert page.is_visible("#xp-sec-rivet") and page.locator("[data-s=point_mass_json]").count() == 0
+    page.select_option("[data-s=analysis_mode]", "Advanced (all features)")
+    # travel table of the Explicit driver
+    page.select_option("[data-s=rigid_vel_mode]", "Explicit (Vx Vy Vz below)")
+    page.fill("[data-s=rigid_vel]", "0 0 -5000")
+    page.fill("[data-s=tstop]", "0.01")
+    page.dispatch_event("[data-s=tstop]", "input")
+    t = page.inner_text("#xp-travel")
+    assert "|V| = 5000 mm/s" in t and "100 mm: 0.02 s (NOT reached)" in t and "covers 50 mm" in t
+    # "?" pop-up of the tie modes, the selected mode first
+    page.click("#xp-buildp [data-help='Tie modes (bonded connections)']")
+    assert page.is_visible("#xp-help") and "(selected)" in page.inner_text("#xp-help-b h3")
+    assert "Auto (*TIE from INP)" in page.inner_text("#xp-help-b h3")
+    page.click("#xp-help-close")
+    assert page.is_hidden("#xp-help")
+    page.select_option("[data-s=tie_mode]", "Scoped pairs (box below)")
+    assert page.is_disabled("[data-s=tie_dist]")
+    page.select_option("[data-s=tie_mode]", "Single global tie")
+    assert page.is_enabled("[data-s=tie_dist]")
+    # concentrated mass (External .inp source): Browse (file dialog) and the summary
+    page.select_option("#xp-kind", "inp")
+    page.wait_for_selector("#xp-buildp [data-browse-s=point_mass_json]")
+    pj = tmp_path / "imp.json"
+    pj.write_text(json.dumps({"mass": 0.5, "cx": 0, "cy": 0, "cz": 0, "Jxx": 10, "Jyy": 20, "Jzz": 30, "Jxy": 0, "Jyz": 0, "Jxz": 0}))
+    dialog["path"] = str(pj)
+    page.click("#xp-buildp [data-browse-s=point_mass_json]")
+    wait_text(page, "#xp-inertia", "STATUS : READY")
+    page.select_option("#xp-kind", "shinycad")
+    page.wait_for_function("!document.querySelector('#xp-buildp [data-browse-s=point_mass_json]')")
+    # Output Dir: Browse (folder)
+    dialog["path"] = str(tmp_path)
+    page.click("#xp-buildp [data-browse-s=out_dir]")
+    page.wait_for_function("arg => window.__xp.XP.doc.settings.out_dir === arg", arg=str(tmp_path).replace("\\", "/"))
+    # Tools section
+    page.click("#xp-sec-tools > summary")
+    assert page.locator("#xp-tools [data-tlaunch]").count() >= 16
+    assert "Inertia builder" in page.inner_text("#xp-tools")
+    page.click("#xp-tools [data-tremove='inp2unv']")
+    page.wait_for_function("window.__xp.XP.tools.hidden.includes('inp2unv')")
+    assert page.locator("#xp-tools [data-tlaunch='inp2unv']").count() == 0
+    page.check("#xp-tl-hidden")
+    page.click("#xp-tools [data-trestore='inp2unv']")
+    page.wait_for_function("!window.__xp.XP.tools.hidden.includes('inp2unv')")
+    page.click("#xp-tools [data-help='Job audit  (CLI)']")
+    assert "Audits every job" in page.inner_text("#xp-help-b")
+    page.click("#xp-help-close")
+    # Rivet: gauge rings on a deck, then the F-d curve
+    L = ["#RADIOSS STARTER", "/BEGIN", "rivet", "/NODE"]
+    nid = 0
+    for z in (1.0, -1.0):
+        for k in range(12):
+            nid += 1
+            a = math.radians(30 * k)
+            L.append("%10d%20.6f%20.6f%20.6f" % (nid, 6 * math.cos(a), 6 * math.sin(a), z))
+    deck = tmp_path / "cp_0000.rad"
+    deck.write_text("\n".join(L + ["/END"]) + "\n")
+    rows = ['"time","INTERNAL ENERGY","KINETIC ENERGY","P1 DX","P1 DY","P1 DZ","P2 DX","P2 DY","P2 DZ","RBODY 12 FX"']
+    for k in range(11):
+        rows.append("%g,%g,%g,%g,0,0,0,0,0,%g" % (k * 1e-4, 5.0 * k, 100.0 - 5.0 * k, 0.1 * k, max(100.0 * k if k <= 6 else 600.0 - 290.0 * (k - 6), 0.0)))
+    (tmp_path / "cp_Results.csv").write_text("\n".join(rows) + "\n")
+    page.fill("#xp-solvep [data-s=rad_target]", str(deck))
+    page.dispatch_event("#xp-solvep [data-s=rad_target]", "change")
+    page.click("#xp-sec-rivet > summary")
+    page.fill("[data-s=rv_maxnodes]", "4")
+    page.dispatch_event("[data-s=rv_maxnodes]", "change")
+    page.click("#xp-rv-rings")
+    page.wait_for_function("() => document.querySelector('#status-text').textContent.includes('Gauge rings: P1 4 nodes')")
+    assert (tmp_path / "gauge_rings.json").exists()
+    page.click("#xp-rv-cols-b")
+    page.wait_for_function("() => document.querySelectorAll('#xp-rv-cols option').length === 10")
+    page.fill("[data-s=rv_force_col]", "RBODY 12 FX")
+    page.dispatch_event("[data-s=rv_force_col]", "change")
+    page.select_option("[data-s=rv_component]", "x")
+    page.click("#xp-rv-extract")
+    wait_text(page, ".xp-rvsum", "Peak force        600")
+    assert page.locator("#xp-rvplot polyline").count() == 1 and page.locator("#xp-rvplot circle").count() == 1
+    dialog["path"] = str(tmp_path / "rv.png")
+    page.click("#xp-rv-png")
+    page.wait_for_function("() => document.querySelector('#status-text').textContent.includes('rv.png')")
+    assert (tmp_path / "rv.png").read_bytes().startswith(b"\x89PNG")
+    # Results: Load CSV of two jobs, overlay, zoom, Save PNG
+    other = tmp_path / "jo_Results.csv"
+    other.write_text('"time","INTERNAL ENERGY","KINETIC ENERGY"\n0,0,50\n0.001,10,40\n')
+    for p in (tmp_path / "cp_Results.csv", other):
+        dialog["path"] = str(p)
+        page.click("#xp-csvload")
+        page.wait_for_function("arg => window.__xp.XP.curveSel === arg", arg=p.name.replace("_Results.csv", ""))
+    assert page.locator("#xp-plot polyline").count() == 1
+    page.check("[data-pv=overlay]")
+    assert page.locator("#xp-plot polyline").count() == 2 and "2 jobs overlaid" in page.inner_text("#xp-plot")
+    bb = page.locator("#xp-plot svg").bounding_box()
+    page.mouse.move(bb["x"] + 100, bb["y"] + 40)
+    page.mouse.down()
+    page.mouse.move(bb["x"] + 200, bb["y"] + 120, steps=4)
+    page.mouse.up()
+    assert page.evaluate("!!window.__xp.XP.zoom.energy")
+    page.dblclick("#xp-plot svg")
+    assert page.evaluate("!window.__xp.XP.zoom.energy")
+    dialog["path"] = str(tmp_path / "ke")
+    page.click("#xp-pngsave")
+    page.wait_for_function("() => document.querySelector('#status-text').textContent.includes('ke.png')")
+    assert (tmp_path / "ke.png").read_bytes().startswith(b"\x89PNG")
+    # run history: Load Selected sets Target .rad and Output Dir
+    run = tmp_path / "hist"
+    run.mkdir()
+    (run / "hj_0000.rad").write_text("/BEGIN\n/END\n")
+    client.post("/api/explicit/history", json={"op": "clear"})
+    web.EXPLICIT._history_add("hj", "Done", str(run), "Local (Windows)")
+    page.evaluate("document.querySelector('#xp-solvep .xp-hist').open = true")
+    page.wait_for_selector("#xp-history tr[data-hj='hj']")
+    page.click("#xp-history tr[data-hj='hj']")
+    page.click("[data-hop=load]")
+    page.wait_for_function("arg => window.__xp.XP.doc.settings.rad_target === arg", arg=str(run / "hj_0000.rad").replace("\\", "/"))
+    assert page.evaluate("window.__xp.XP.doc.settings.out_dir") == str(run).replace("\\", "/")
+    client.post("/api/explicit/history", json={"op": "clear"})
+
+
+def test_shell_thickness_view(page, client):
+    """Analysis tab, Show Mesh with Shell thickness: the plate section (t 8 mm) drawn as a slab 8 mm thick, centred on
+    the mid-surface (offset mid) or on one side (offset positive); off: the mid-surface."""
+    from conftest import rect
+    client.put("/api/part/file/ui_th_plate", json={"name": "ui_th_plate", "version": 2, "next": 2, "features": [
+        {"id": "s1", "name": "Plate", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(100, 50)}}]})
+    client.put("/api/assembly/file/ui_th", json={"name": "ui_th", "next": 2, "components": [
+        {"id": "1", "name": "plate", "source": {"type": "part", "name": "ui_th_plate"}, "pos": [0, 0, 0], "rot": [0, 0, 0]}]})
+    tab(page, "fea")
+    page.wait_for_function("window.__fea && window.__fea.FA.doc")
+    page.evaluate("() => { const s = document.getElementById('fa-source'); s.insertAdjacentHTML('beforeend', '<option value=\"assembly:ui_th\">ui_th</option>'); s.value = 'assembly:ui_th'; s.dispatchEvent(new Event('change')); }")
+    page.wait_for_function("window.__fea.FA.geo && window.__fea.FA.geo.components.length === 1")
+    page.evaluate("() => { const FA = window.__fea.FA; FA.doc.sections = [{ id: '1', name: 'PLATE', faces: [{ comp: '1', face: 0 }], t: 8, offset: 'mid' }]; FA.doc.mesh = { size: 10 }; }")
+    zr = ("() => { let lo = 1e9, hi = -1e9, n = 0; window.__fea.FA.three.group.traverse(o => { if (o.isMesh && o.userData.kind === 'mesh') {"
+          " const p = o.geometry.attributes.position; n += p.count; for (let i = 0; i < p.count; i++) { lo = Math.min(lo, p.getZ(i)); hi = Math.max(hi, p.getZ(i)); } } }); return [lo, hi, n]; }")
+    page.click("#fa-mesh")
+    page.wait_for_function("document.getElementById('fa-show').value === 'mesh' && window.__fea.FA.mesh", timeout=180000)
+    lo, hi, n = page.evaluate(zr)
+    assert abs(lo) < 1e-6 and abs(hi) < 1e-6
+    assert page.evaluate("window.__fea.FA.mesh.bodies.map(b => [b.t, b.offset])") == [[8, 0]]
+    page.check("#fa-thick")
+    lo, hi, n2 = page.evaluate(zr)
+    assert abs(hi - lo - 8) < 1e-4 and abs(hi + lo) < 1e-4 and n2 > 2 * n - 1
+    page.evaluate("() => { window.__fea.FA.doc.sections[0].offset = 'positive'; }")
+    page.click("#fa-mesh")
+    page.wait_for_function("window.__fea.FA.mesh && window.__fea.FA.mesh.bodies[0].offset === 0.5", timeout=180000)
+    lo, hi, _n = page.evaluate(zr)
+    assert abs(hi - lo - 8) < 1e-4 and (abs(lo) < 1e-4 or abs(hi) < 1e-4)
+    page.uncheck("#fa-thick")
+    lo, hi, _n = page.evaluate(zr)
+    assert abs(lo) < 1e-6 and abs(hi) < 1e-6
+
+
+def test_update_geometry_after_assembly_change(page, client):
+    """Analysis and Explicit tabs: a change of the assembly (a component moved) and of a part (a new size) marks
+    Update; Update loads the geometry again and clears the mark and the mesh."""
+    from conftest import rect
+
+    def put_part(w):
+        client.put("/api/part/file/ui_up_plate", json={"name": "ui_up_plate", "version": 2, "next": 2, "features": [
+            {"id": "s1", "name": "Plate", "type": "surf_sketch", "kind": "planar", "plane": "XY", "offset": 0, "sketch": {"entities": rect(w, 50)}}]})
+
+    def put_asm(x):
+        client.put("/api/assembly/file/ui_up", json={"name": "ui_up", "next": 2, "components": [
+            {"id": "1", "name": "plate", "source": {"type": "part", "name": "ui_up_plate"}, "pos": [x, 0, 0], "rot": [0, 0, 0]}]})
+    put_part(100)
+    put_asm(0)
+    for pre, ns in (("fa", "__fea.FA"), ("xp", "__xp.XP")):
+        k0 = client.post("/api/geometry/state", json={"source": {"type": "assembly", "name": "ui_up"}}).get_json()["key"]
+        tab(page, "fea" if pre == "fa" else "xp")
+        page.wait_for_function("window.%s && window.%s.doc" % (ns.split(".")[0], ns))
+        page.evaluate("() => { const s = document.getElementById('%s-source'); s.insertAdjacentHTML('beforeend', '<option value=\"assembly:ui_up\">ui_up</option>'); s.value = 'assembly:ui_up'; s.dispatchEvent(new Event('change')); }" % pre)
+        page.wait_for_function("window.%s.geo && window.%s.geo.components.length === 1 && window.%s.geoKey" % (ns, ns, ns))
+        assert page.evaluate("window.%s.geoKey" % ns) == k0
+        assert not page.evaluate("document.getElementById('%s-update').classList.contains('cm-stale')" % pre)
+        put_asm(30 if pre == "fa" else 60)
+        page.evaluate("window.dispatchEvent(new Event('focus'))")
+        page.wait_for_function("document.getElementById('%s-update').classList.contains('cm-stale')" % pre, timeout=15000)
+        page.click("#%s-update" % pre)
+        page.wait_for_function("!document.getElementById('%s-update').classList.contains('cm-stale')" % pre, timeout=60000)
+        assert page.evaluate("window.%s.asm.components[0].pos[0]" % ns) == (30 if pre == "fa" else 60)
+        assert page.evaluate("window.%s.mesh" % ns) is None
+        put_part(120 if pre == "fa" else 140)                   # a part change also marks Update
+        page.evaluate("window.dispatchEvent(new Event('focus'))")
+        page.wait_for_function("document.getElementById('%s-update').classList.contains('cm-stale')" % pre, timeout=15000)
+        page.click("#%s-update" % pre)
+        page.wait_for_function("!document.getElementById('%s-update').classList.contains('cm-stale')" % pre, timeout=60000)
+
+
+def test_analysis_contact_and_plastic_material(page, client, web):
+    """Analysis tab: a block on a block; Search finds the contact pair (master: the larger face), friction typed;
+    material law plastic from the ORC**3 library (hardening table), Nonlinear step settings; Solve: increments in
+    State, PEEQ field, load history plot and a click on a point shows that increment."""
+    from test_analysis import CCX, _stack
+    if CCX is None:
+        pytest.skip("CalculiX (ccx) not found")
+    asm, F = _stack(client, web, "ui_ct")
+    client.put("/api/assembly/file/ui_ct", json=dict(asm, name="ui_ct", next=3))
+    doc = {"name": "ui_ct", "source": {"type": "assembly", "name": "ui_ct"}, "materials": {"Steel": {"E": 210000, "nu": 0.3, "rho": 7850}},
+           "default_material": "Steel", "mesh": {"size": 5}, "bonded": True, "bodies": {}, "members": [], "plates": [], "fasteners": [], "loads": [],
+           "supports": [{"id": "s1", "name": "base", "target": F["lo_bot"], "type": "fixed"},
+                        {"id": "s2", "name": "press", "target": F["hi_top"], "type": "displacement", "dofs": [1, 1, 1, 0, 0, 0], "value": [0, 0, -0.03, 0, 0, 0]}],
+           "next": 10}
+    client.put("/api/analysis/file/ui_ct", json=doc)
+    tab(page, "fea")
+    page.wait_for_function("window.__fea && window.__fea.FA.doc")
+    page.evaluate("window.__feaLoadNamed('ui_ct')")
+    page.wait_for_function("window.__fea.FA.geo && window.__fea.FA.geo.components.length === 2 && window.__fea.FA.matlib && window.__fea.FA.matlib.length")
+    # contact: Search
+    page.fill("#fc-gap", "0.2")
+    page.dispatch_event("#fc-gap", "change")
+    page.click("#fc-search")
+    page.wait_for_function("(window.__fea.FA.doc.contacts || []).length === 1")
+    c = page.evaluate("window.__fea.FA.doc.contacts[0]")
+    assert c["master"] == [F["lo_top"]] and c["slave"] == [F["hi_bot"]] and c["type"] == "surface"
+    page.click("#fa-contacts .fa-item")
+    page.fill("#fc-mu", "0.2")
+    page.dispatch_event("#fc-mu", "change")
+    assert page.evaluate("window.__fea.FA.doc.contacts[0].friction") == 0.2
+    page.click("#fc-search")                                   # the same pair is not added twice
+    page.wait_for_function("document.querySelector('#status-text').textContent.includes('0 added')")
+    # material: library S355 sets plastic with its table
+    page.select_option("#fa-mats tr[data-n='Steel'] [data-k=library]", "Steel S355 (DNVGL 19-Point Standard)")
+    m = page.evaluate("window.__fea.FA.doc.materials.Steel")
+    assert m["law"] == "plastic" and m["plastic"][0] == [355, 0] and len(m["plastic"]) == 19
+    assert page.is_visible("#fa-mats textarea[data-mk=plastic]")
+    page.select_option("#fa-mats tr[data-n='Steel'] [data-k=law]", "plastic:kinematic")
+    assert page.evaluate("window.__fea.FA.doc.materials.Steel.hardening") == "kinematic"
+    page.select_option("#fa-mats tr[data-n='Steel'] [data-k=law]", "plastic:isotropic")
+    assert "(used:" in page.inner_text("#fa-settings")
+    page.fill("#fa-settings [data-nl=incmax]", "0.25")
+    page.dispatch_event("#fa-settings [data-nl=incmax]", "change")
+    assert page.evaluate("window.__fea.FA.doc.nonlinear.incmax") == 0.25
+    page.click("#fa-solve")
+    page.wait_for_function("window.__fea.FA.res && window.__fea.FA.res.tables && window.__fea.FA.res.history", timeout=300000)
+    opts = page.evaluate("[...document.querySelectorAll('#fa-state option')].map(o => o.value)")
+    assert opts[0] == "total" and opts[1] == "i1" and len(opts) >= 5
+    assert "End of the step" in page.inner_text("#fa-state")
+    assert page.locator("#fr-hplot circle").count() == len(opts) - 1
+    page.select_option("#fr-hy", "r1_2")
+    page.locator("#fr-hplot circle").nth(1).click()
+    assert page.evaluate("document.querySelector('#fa-state').value") == "i2"
+    page.select_option("#fa-field", "peeq")
+    assert "PEEQ" in page.inner_text("#fa-legend")
+    if os.environ.get("DRAWGEN_SHOTS"):
+        page.evaluate("document.getElementById('fa-results-card').scrollIntoView()")
+        page.screenshot(path=os.path.join(os.environ["DRAWGEN_SHOTS"], "fea_nonlinear.png"))
+        page.click("#fa-contacts .fa-item")
+        page.evaluate("document.getElementById('fa-mats-card').scrollIntoView()")
+        page.screenshot(path=os.path.join(os.environ["DRAWGEN_SHOTS"], "fea_mats.png"))
+        page.evaluate("document.getElementById('fa-contacts-card').scrollIntoView()")
+        page.screenshot(path=os.path.join(os.environ["DRAWGEN_SHOTS"], "fea_contacts.png"))
+
+
+def test_explicit_status_bar_popups_masses_and_panels(page, client):
+    """Explicit tab: status bar items (geometry, materials, bodies, mesh, supports, loading, masses, deck); the Materials
+    pop-up changes the Materials table of the Model panel and the reverse; Bodies pop-up; point and distributed mass
+    (face picked) in the Masses pop-up, the sphere and face in the view; Panels row hides Springs and Masses (status
+    item opens the pop-up); Analysis tab Panels row hides the Joints card."""
+    from conftest import part_rec, rect
+    client.put("/api/part/file/ui_m_blk", json=part_rec("ui_m_blk", [{"id": "f1", "name": "Extrude 1", "type": "extrude", "plane": "XY", "offset": 0,
+                                                                       "sketch": {"entities": rect(40, 40)}, "depth": 20}]))
+    client.put("/api/assembly/file/ui_m", json={"name": "ui_m", "next": 2, "components": [
+        {"id": "1", "name": "block", "source": {"type": "part", "name": "ui_m_blk"}, "pos": [0, 0, 0], "rot": [0, 0, 0]}]})
+    tab(page, "xp")
+    page.wait_for_function("window.__xp && window.__xp.XP.doc && window.__xp.XP.meta")
+    page.select_option("#xp-source", "assembly:ui_m")
+    page.wait_for_function("window.__xp.XP.geo && window.__xp.XP.geo.components.length === 1 && window.__xp.XP.three.group.children.length")
+    st = lambda k: page.get_attribute("#xp-statusbar [data-st=%s]" % k, "class")
+    assert "ok" in st("geo") and "ok" in st("bodies") and "bad" in st("mesh") and "warn" in st("sups")
+    assert page.locator("#xp-statusbar [data-st]").count() >= 8
+    # Materials pop-up <-> panel
+    page.click("#xp-statusbar [data-st=mats]")
+    page.wait_for_selector("#xp-pop:not([hidden]) .xp-mats")
+    page.select_option("#xp-pop tr[data-m] [data-mk=library]", "")
+    assert page.input_value("#xp-model tr[data-m] [data-mk=library]") == ""
+    page.fill("#xp-pop tr[data-m] [data-mk=E]", "70000")
+    page.dispatch_event("#xp-pop tr[data-m] [data-mk=E]", "change")
+    assert page.input_value("#xp-model tr[data-m] [data-mk=E]") == "70000"
+    page.fill("#xp-model tr[data-m] [data-mk=nu]", "0.33")
+    page.dispatch_event("#xp-model tr[data-m] [data-mk=nu]", "change")
+    assert page.input_value("#xp-pop tr[data-m] [data-mk=nu]") == "0.33"
+    page.fill("#xp-pop tr[data-m] [data-mk=rho]", "0")
+    page.dispatch_event("#xp-pop tr[data-m] [data-mk=rho]", "change")
+    assert "bad" in st("mats")
+    page.fill("#xp-pop tr[data-m] [data-mk=rho]", "2700")
+    page.dispatch_event("#xp-pop tr[data-m] [data-mk=rho]", "change")
+    assert "ok" in st("mats")
+    nm = page.locator("#xp-model tr[data-m]").count()
+    page.click("#xp-pop [data-xpmat=add]")
+    assert page.locator("#xp-model tr[data-m]").count() == nm + 1 and page.locator("#xp-pop tr[data-m]").count() == nm + 1
+    # Bodies pop-up
+    page.click("#xp-statusbar [data-st=bodies]")
+    page.select_option("#xp-pop tr[data-b] [data-bk=role]", "off")
+    assert "bad" in st("bodies") and page.input_value("#xp-model tr[data-b] [data-bk=role]") == "off"
+    page.select_option("#xp-pop tr[data-b] [data-bk=role]", "deformable")
+    # masses: a reference point, a point mass on it, a distributed mass on a picked face
+    page.evaluate("window.__xp.XP.doc.points = [{id: 'p1', name: 'P1', xyz: [20, 20, 30], coupling: 'none'}]; window.__xp.renderModel(); window.__xp.draw();")
+    page.click("#xp-statusbar [data-st=masses]")
+    page.wait_for_selector("#xp-pop:not([hidden]) [data-ma=point]")
+    page.click("#xp-pop [data-ma=point]")
+    page.click("#xp-pop [data-ma=distributed]")
+    ms = page.evaluate("window.__xp.XP.doc.masses")
+    assert ms[0]["target"] == {"point": "p1"} and ms[1]["target"] == {"faces": []}
+    page.click("#xp-pop [data-mface]")
+    scr = ("([T, p]) => { const r = T.renderer.domElement.getBoundingClientRect();"
+           " const v = new (Object.getPrototypeOf(T.camera.position).constructor)(...p).project(T.camera);"
+           " return [r.left + (v.x + 1) / 2 * r.width, r.top + (1 - v.y) / 2 * r.height]; }")
+    xy = page.evaluate("(a) => (%s)([window.__xp.XP.three, a])" % scr, [12, 14, 20])
+    page.mouse.click(xy[0], xy[1])
+    page.keyboard.press("Enter")
+    page.wait_for_function("window.__xp.XP.doc.masses[1].target.faces.length === 1")
+    assert page.locator("#xp-model .xp-mass").count() == 2 and "warn" in st("masses")
+    assert "Mesh to check" in page.inner_text("#xp-statusbar [data-st=masses]")
+    page.select_option("#xp-pop [data-mass=%s] [data-mk2=mode]" % ms[1]["id"], "area")
+    if os.environ.get("DRAWGEN_SHOTS"):
+        page.screenshot(path=os.path.join(os.environ["DRAWGEN_SHOTS"], "xp_status_masses.png"))
+    assert "kg/m^2" in page.inner_text("#xp-pop [data-mass=%s]" % ms[1]["id"])
+    assert page.evaluate("(() => { let n = 0; window.__xp.XP.three.group.traverse(o => { if (o.geometry && o.geometry.type === 'SphereGeometry') n++; }); return n; })()") == 1
+    page.click("#xp-model-btn")
+    page.wait_for_function("window.__xp.XP.meshSummary && window.__xp.XP.meshSummary.total_kg > 0", timeout=120000)
+    t = page.inner_text("#xp-statusbar [data-st=masses]")
+    assert "ok" in st("masses") and "model" in t and "kg" in t and "Mass: model" in page.inner_text("#xp-model")
+    assert "ok" in st("mesh")
+    page.fill("#xp-pop [data-mass=%s] [data-mk2=m]" % ms[0]["id"], "160")
+    page.dispatch_event("#xp-pop [data-mass=%s] [data-mk2=m]" % ms[0]["id"], "change")
+    assert "warn" in st("mesh") and "changed since Mesh" in page.inner_text("#xp-statusbar [data-st=mesh]") and "Mesh to check" in page.inner_text("#xp-statusbar [data-st=masses]")
+    page.fill("#xp-pop [data-mass=%s] [data-mk2=m]" % ms[0]["id"], "1")
+    page.dispatch_event("#xp-pop [data-mass=%s] [data-mk2=m]" % ms[0]["id"], "change")
+    assert "ok" in st("mesh")
+    # Panels row
+    page.keyboard.press("Escape")
+    assert page.is_hidden("#xp-pop")
+    page.uncheck("#xp-panels [data-ptog=springs]")
+    page.uncheck("#xp-panels [data-ptog=masses]")
+    assert page.locator("#xp-springs").count() == 0 and page.locator("#xp-masses").count() == 0
+    assert "Masses (2)" in page.inner_text("#xp-panels") and sorted(page.evaluate("window.__xp.XP.doc.panels_hidden")) == ["masses", "springs"]
+    page.click("#xp-statusbar [data-st=masses]")
+    page.wait_for_selector("#xp-pop:not([hidden]) .xp-mass")
+    page.keyboard.press("Escape")
+    assert page.is_hidden("#xp-pop")
+    # rigid parts and concentrated mass of the Build panel: not for a ShinyCAD model
+    assert page.locator("#xp-buildp [data-s=rigid_part]").count() == 0 and page.locator("#xp-buildp [data-s=point_mass_json]").count() == 0
+    # Analysis tab
+    tab(page, "fea")
+    page.wait_for_function("window.__fea && window.__fea.FA.doc")
+    page.wait_for_selector("#fa-panels [data-ptog=joints]")
+    page.uncheck("#fa-panels [data-ptog=joints]")
+    assert page.is_hidden("#fa-joints-card") and page.evaluate("window.__fea.FA.doc.panels_hidden") == ["joints"]
+    page.check("#fa-panels [data-ptog=joints]")
+    assert page.is_visible("#fa-joints-card")
+
+
+def test_explicit_initial_state_panel(page, client):
+    """Explicit tab, Initial state (static): an Analysis document chosen, Solve static (Mesh first, CalculiX on the
+    Explicit mesh), the result line, Use in Build and the status bar item; the pop-up of the item."""
+    from conftest import part_rec, rect
+    from drawgen import analysis
+    if not analysis.find_ccx(os.environ.get("DRAWGEN_CCX", "")):
+        pytest.skip("CalculiX (ccx) not found")
+    client.put("/api/part/file/ui_is_blk", json=part_rec("ui_is_blk", [{"id": "f1", "name": "Extrude 1", "type": "extrude", "plane": "XY", "offset": 0,
+                                                                         "sketch": {"entities": rect(40, 40)}, "depth": 20}]))
+    client.put("/api/assembly/file/ui_is", json={"name": "ui_is", "next": 2, "components": [
+        {"id": "1", "name": "block", "source": {"type": "part", "name": "ui_is_blk"}, "pos": [0, 0, 0], "rot": [0, 0, 0]}]})
+    c = client.post("/api/assembly/build", json={"assembly": client.get("/api/assembly/file/ui_is").get_json()}).get_json()["components"][0]
+    face = lambda ax, v: next(i for i, r in enumerate(c["refs"]) if r and r["kind"] == "plane" and abs(r["c"][ax] - v) < 1e-6 and abs(abs(r["n"][ax]) - 1) < 1e-6)
+    client.put("/api/analysis/file/ui_is_pre", json={"name": "ui_is_pre", "source": {"type": "assembly", "name": "ui_is"},
+                                                     "supports": [{"id": "a", "name": "base", "target": {"comp": "1", "face": face(2, 0)}, "type": "fixed"}],
+                                                     "loads": [{"id": "p", "name": "p", "type": "pressure", "target": {"comp": "1", "face": face(2, 20)}, "value": 5.0}]})
+    tab(page, "xp")
+    page.wait_for_function("window.__xp && window.__xp.XP.doc && window.__xp.XP.meta")
+    page.select_option("#xp-source", "assembly:ui_is")
+    page.wait_for_function("window.__xp.XP.geo && window.__xp.XP.geo.components.length === 1")
+    page.wait_for_function("document.querySelector('#xp-init [data-ik=analysis] option[value=ui_is_pre]')")
+    page.select_option("#xp-init [data-ik=analysis]", "ui_is_pre")
+    assert page.evaluate("window.__xp.XP.doc.initial_state.analysis") == "ui_is_pre"
+    page.click("#xp-init [data-isolve]")
+    page.wait_for_function("document.querySelector('#xp-init .xp-init-st').textContent.includes('max displacement')", timeout=180000)
+    assert "ui_is_pre" in page.inner_text("#xp-init .xp-init-st")
+    page.check("#xp-init [data-s=init_state]")
+    assert "ok" in page.get_attribute("#xp-statusbar [data-st=init]", "class")
+    page.click("#xp-statusbar [data-st=init]")
+    page.wait_for_selector("#xp-pop:not([hidden]) [data-isolve]")
+    assert "max displacement" in page.inner_text("#xp-pop")
+    page.keyboard.press("Escape")

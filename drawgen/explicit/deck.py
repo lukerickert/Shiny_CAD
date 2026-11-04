@@ -116,9 +116,75 @@ def parts(m):
     return deck_mesh.model_parts(m)
 
 
+def claimed(ps, tol=1e-6):
+    """Polygons of the parts as the STEP fuse and the mesh resolve them: of coplanar axis-aligned rectangles, a part
+    later in the list claims the region it shares with an earlier part (a top flange cuts the deck plate). Returns
+    [(part name, [rectangles])], the rectangles merged along rows of the grid of all rectangle edges of a plane."""
+    planes = {}
+    for k, (name, polys) in enumerate(ps):
+        for poly in polys:
+            P = [tuple(float(c) for c in q) for q in poly]
+            ax = next((a for a in range(3) if max(q[a] for q in P) - min(q[a] for q in P) < tol), None)
+            if ax is None or len(P) != 4:
+                planes.setdefault(("other", k, len(planes)), []).append((k, P, None))
+                continue
+            o = [a for a in range(3) if a != ax]
+            box = (min(q[o[0]] for q in P), max(q[o[0]] for q in P), min(q[o[1]] for q in P), max(q[o[1]] for q in P))
+            planes.setdefault((ax, round(P[0][ax], 6)), []).append((k, P, box))
+    out = [[] for _ in ps]
+    for key, items in planes.items():
+        if key[0] == "other":
+            for k, P, _b in items:
+                out[k].append([list(q) for q in P])
+            continue
+        ax, val = key
+        o = [a for a in range(3) if a != ax]
+        us = sorted(set(round(b[0], 6) for _k, _P, b in items) | set(round(b[1], 6) for _k, _P, b in items))
+        vs = sorted(set(round(b[2], 6) for _k, _P, b in items) | set(round(b[3], 6) for _k, _P, b in items))
+        rows = []
+        for j in range(len(vs) - 1):
+            vc = 0.5 * (vs[j] + vs[j + 1])
+            row = []
+            for i in range(len(us) - 1):
+                uc = 0.5 * (us[i] + us[i + 1])
+                own = None
+                for k, _P, b in items:
+                    if b[0] - tol <= uc <= b[1] + tol and b[2] - tol <= vc <= b[3] + tol and (own is None or k >= own):
+                        own = k
+                row.append(own)
+            rows.append(row)
+        strips = {}                                        # (owner, u0, u1) -> [(v0, v1)] merged along v
+        for j, row in enumerate(rows):
+            i = 0
+            while i < len(row):
+                if row[i] is None:
+                    i += 1
+                    continue
+                i2 = i
+                while i2 + 1 < len(row) and row[i2 + 1] == row[i]:
+                    i2 += 1
+                key2 = (row[i], us[i], us[i2 + 1])
+                lst = strips.setdefault(key2, [])
+                if lst and abs(lst[-1][1] - vs[j]) < tol:
+                    lst[-1] = (lst[-1][0], vs[j + 1])
+                else:
+                    lst.append((vs[j], vs[j + 1]))
+                i = i2 + 1
+        for (k, u0, u1), spans in strips.items():
+            for v0, v1 in spans:
+                quad = []
+                for u, v in ((u0, v0), (u1, v0), (u1, v1), (u0, v1)):
+                    q = [0.0, 0.0, 0.0]
+                    q[ax], q[o[0]], q[o[1]] = val, u, v
+                    quad.append(q)
+                out[k].append(quad)
+    return [(name, out[k]) for k, (name, _p) in enumerate(ps)]
+
+
 def check(deck):
     """Geometry and sections of the deck part, without meshing:
-    {"parts": [{"name", "polys"}], "sections": [{"set", "param", "t"}], "errors", "warnings", "inp_errors"}."""
+    {"parts": [{"name", "polys"}], "view": parts with the shared regions claimed by the later part (claimed),
+    "sections": [{"set", "param", "t"}], "errors", "warnings", "inp_errors"}."""
     from . import deck_mesh
     try:
         m = model(deck)
@@ -133,6 +199,7 @@ def check(deck):
     warnings += ["one section per name: " + c for c in conflicts]
     inp_errors = ["%s: thickness %s is 0 mm" % (s, p) for s, (p, t) in thick.items() if t <= 0]
     return {"parts": [{"name": n, "polys": [[list(map(float, q)) for q in poly] for poly in pl]} for n, pl in ps],
+            "view": [{"name": n, "polys": pl} for n, pl in claimed(ps)],
             "sections": [{"set": s, "param": p, "t": t} for s, (p, t) in thick.items()],
             "errors": errors, "warnings": warnings, "inp_errors": inp_errors}
 
@@ -264,6 +331,7 @@ def build(doc, inp_path, title="", progress=None, timeout=1800):
     mm = meshview.read_inp(inp_path)
     pl = meshview.payload(mm["xyz"], mm["cells"])
     pl["part_names"] = ["%s (%s)" % p for p in mm["parts"]]
+    pl["part_thick"] = mm["part_thick"]
     warnings = list(c["warnings"])
     if res["longest_edge"] > size * 1.001:
         warnings.append("an element edge of %.1f mm exceeds the max element size %g mm (a face meshed unstructured)"
@@ -279,7 +347,8 @@ def build(doc, inp_path, title="", progress=None, timeout=1800):
 
 def step(doc, out, progress=None):
     """STEP of the deck structure (deck_stepgen.build: fuse, group per part name, sewn shells, one named component per
-    part) and <stem>_model.json beside it. Returns the component names."""
+    part), <stem>_model.json and <stem>_properties.txt (report) beside it.
+    Returns {"step", "components", "report", "log"}."""
     import contextlib
     import io
     from . import deck_stepgen
@@ -297,7 +366,169 @@ def step(doc, out, progress=None):
     with contextlib.redirect_stdout(log):
         names = deck_stepgen.build(ps, out, L=m["L"], B=m["B"], beams=beams, snipe=m["snipe"], deck_name=m["deck_name"],
                                    deck_t=m["deck_t"])
-    return {"step": out, "components": names, "log": log.getvalue().splitlines()}
+    rep = (out[:-5] if out.lower().endswith(".step") else out) + "_properties.txt"
+    say("report", "Writing the properties report")
+    with open(rep, "w", encoding="utf-8") as f:
+        f.write(report(doc, step_path=out, components=names))
+    return {"step": out, "components": names, "report": rep, "log": log.getvalue().splitlines()}
+
+
+# --------------------------------------------------------------------------- properties report
+
+def section_props(b):
+    """Section of a beam from the beam table, midsurface dimensions, deck plate not included:
+    {"type", "designation", "A" mm^2, "zc" mm (centroid, deck midplane z = 0), "I" mm^4 (about the centroid)}."""
+    h, tw, tf = float(b["h"]), float(b["t_web"]), float(b["t_flange"])
+    bt, bb = float(b["bf_top"]), float(b["bf_bot"])
+    g = "%g" % h + "x%g" % tw
+    if bt > 0 and bb > 0:
+        typ, des = "I", "I %s/%gx%g/%gx%g" % (g, bt, tf, bb, tf)
+    elif bb > 0:
+        typ, des = "T", "T %s/%gx%g" % (g, bb, tf)
+    elif bt > 0:
+        typ, des = "flat bar + top flange", "FB %s + %gx%g" % (g, bt, tf)
+    else:
+        typ, des = "flat bar", "FB " + g
+    parts_ = [(h * tw, -h / 2.0, tw * h ** 3 / 12.0), (bt * tf, 0.0, bt * tf ** 3 / 12.0),
+              (bb * tf, -h, bb * tf ** 3 / 12.0)]
+    A = sum(a for a, _z, _i in parts_)
+    zc = sum(a * z for a, z, _i in parts_) / A if A > 0 else 0.0
+    I = sum(i + a * (z - zc) ** 2 for a, z, i in parts_)
+    return {"type": typ, "designation": des, "A": A, "zc": zc, "I": I}
+
+
+def _poly_area(P):
+    """Area of a planar polygon in 3D (Newell), mm^2."""
+    n = [0.0, 0.0, 0.0]
+    for i in range(len(P)):
+        a, b = P[i], P[(i + 1) % len(P)]
+        n[0] += (a[1] - b[1]) * (a[2] + b[2])
+        n[1] += (a[2] - b[2]) * (a[0] + b[0])
+        n[2] += (a[0] - b[0]) * (a[1] + b[1])
+    return 0.5 * (n[0] ** 2 + n[1] ** 2 + n[2] ** 2) ** 0.5
+
+
+def _material(doc, deck):
+    """(material name, library entry or "", rho Mg/mm^3 or None)."""
+    from .model_inp import ModelError, material_values
+    mname = deck.get("material") or doc.get("default_material") or next(iter(doc.get("materials") or {}), None)
+    if not mname:
+        return "", "", None
+    try:
+        _E, _nu, rho, lib = material_values(doc, mname)
+    except ModelError:
+        return mname, "", None
+    return mname, lib, rho
+
+
+def report(doc, step_path="", components=None, title=""):
+    """Text report of the deck structure: panel, edge supports, beam locations and sections, section properties,
+    element sets with thicknesses, and every plate of every component (location and area). 96 columns."""
+    import datetime
+    from . import deck_mesh
+    W = 96
+    deck = dict(DEFAULT, **(doc.get("deck") or {}))
+    m = model(deck)
+    L_, B_ = m["L"], m["B"]
+    mname, lib, rho = _material(doc, deck)
+    ps = parts(m)
+    view = claimed(ps)
+    thick, conflicts = deck_mesh.section_thicknesses(m, [n for n, _p in ps])
+    edges = dict({k: "free" for k in EDGE_KEYS}, **(deck.get("edges") or {}))
+    out = []
+    rule = lambda c="-": out.append(c * W)
+
+    def head(t):
+        out.append("")
+        rule()
+        out.append(t)
+        rule()
+
+    rule("=")
+    out.append("DECK STRUCTURE - %s" % (title or os.path.splitext(os.path.basename(step_path))[0] or "deck"))
+    rule("=")
+    out.append("Generated   : %s" % datetime.datetime.now().isoformat(timespec="seconds"))
+    if step_path:
+        out.append("STEP        : %s" % step_path)
+    out.append("Units       : mm, mm^2, mm^4, kg")
+    out.append("Coordinates : deck plate midplane z = 0, beams below it (z < 0), panel x 0 to %g, y 0 to %g" % (L_, B_))
+    out.append("Dimensions  : midsurface dimensions (plate thicknesses are section properties)")
+
+    head("PANEL")
+    out.append("Deck plate         : %s" % m["deck_name"])
+    out.append("X distance L       : %g mm" % L_)
+    out.append("Y distance B       : %g mm" % B_)
+    out.append("Deck thickness     : %g mm" % m["deck_t"])
+    out.append("Flange snipe       : %g mm" % m["snipe"])
+    out.append("Material           : %s%s" % (mname or "(none)", " (%s)" % lib if lib else ""))
+    if rho:
+        out.append("Density            : %g kg/m^3" % (rho * 1e12))
+    out.append("Max element size   : %g mm" % _num(deck.get("size") or 100.0, "Max element size"))
+    out.append("Element type       : %s" % ("S3" if deck.get("tri") else (deck.get("shell") or "S4")))
+
+    head("EDGE SUPPORTS")
+    where = {"x0": "x = 0", "xL": "x = %g" % L_, "y0": "y = 0", "yB": "y = %g" % B_}
+    nset = {"x0": "EDGE_X0", "xL": "EDGE_XL", "y0": "EDGE_Y0", "yB": "EDGE_YB"}
+    out.append("%-6s %-12s %-10s %-10s %s" % ("Edge", "Plane", "Node set", "Support", "Fixed dofs"))
+    for k in EDGE_KEYS:
+        s = edges.get(k) or "free"
+        d = EDGE_DOFS.get(s)
+        out.append("%-6s %-12s %-10s %-10s %s" % (k, where[k], nset[k], s, "%d-%d" % d if d else "-"))
+
+    head("BEAMS (location of the web midplane; web from z = 0 to z = -h)")
+    out.append("%-3s %-12s %-4s %-25s %7s %7s %7s %7s %6s %8s" % (
+        "#", "Name", "Axis", "Web line", "h", "bf_top", "bf_bot", "t_web", "t_fl", "Section"))
+    for i, b in enumerate(m["beams"]):
+        line = ("y = %g, x 0 to %g" % (b["pos"], L_)) if b["axis"] == "x" else ("x = %g, y 0 to %g" % (b["pos"], B_))
+        out.append("%-3d %-12s %-4s %-25s %7g %7g %7g %7g %6g %8s" % (
+            i + 1, b["name"][:12], b["axis"], line, b["h"], b["bf_top"], b["bf_bot"], b["t_web"], b["t_flange"],
+            section_props(b)["designation"].split(" ")[0]))
+    if not m["beams"]:
+        out.append("(no beams)")
+    out.append("bf_top: flange in the deck plane z = 0; bf_bot: flange at z = -h; t_fl: both flanges.")
+    out.append("Section: FB flat bar, T flange at z = -h, I both flanges.")
+
+    head("SECTION PROPERTIES (deck plate not included; zc from the deck midplane)")
+    out.append("%-12s %-34s %11s %9s %13s %10s" % ("Name", "Designation", "A mm^2", "zc mm", "I mm^4", "kg/m"))
+    seen = set()
+    for b in m["beams"]:
+        sp = section_props(b)
+        key = (b["name"], sp["designation"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append("%-12s %-34s %11.1f %9.2f %13.5e %10s" % (
+            b["name"][:12], sp["designation"][:34], sp["A"], sp["zc"], sp["I"],
+            "%.2f" % (sp["A"] * rho * 1e6) if rho else "-"))
+
+    head("ELEMENT SETS AND SHELL SECTIONS")
+    out.append("%-22s %-22s %8s %7s %12s %10s" % ("Element set", "Parameter", "t mm", "Plates", "Area mm^2", "Mass kg"))
+    tot_a, tot_m = 0.0, 0.0
+    for n, polys in view:
+        p, t = thick.get(n, ("-", 0.0))
+        a = sum(_poly_area(q) for q in polys)
+        mass = a * t * rho * 1e3 if rho else None
+        tot_a += a
+        tot_m += mass or 0.0
+        out.append("%-22s %-22s %8g %7d %12.0f %10s" % (n[:22], p[:22], t, len(polys), a, "%.1f" % mass if rho else "-"))
+    out.append("%-22s %-22s %8s %7s %12.0f %10s" % ("Total", "", "", "", tot_a, "%.1f" % tot_m if rho else "-"))
+    for c in conflicts:
+        out.append("one section per name: " + c)
+    if components:
+        out.append("STEP components: " + ", ".join(components))
+
+    head("PLATES (regions of each element set, top flanges cut from the deck plate)")
+    out.append("%-19s %4s %9s %9s %9s %9s %9s %9s %11s" % (
+        "Element set", "#", "x min", "x max", "y min", "y max", "z min", "z max", "Area mm^2"))
+    for n, polys in view:
+        for j, q in enumerate(polys):
+            rng = []
+            for a in range(3):
+                rng += [min(v[a] for v in q), max(v[a] for v in q)]
+            out.append("%-19s %4d %9.1f %9.1f %9.1f %9.1f %9.1f %9.1f %11.0f" % ((n[:19], j + 1) + tuple(rng) +
+                                                                            (_poly_area(q),)))
+    out.append("")
+    return "\n".join(out)
 
 
 def part_record(name, step_path, components):
