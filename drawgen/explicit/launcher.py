@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Tools section of the Explicit tab (ORC**3 Tools tab): the companion scripts of the workspace, the model-generation
+"""Tools section of the Explicit tab: the companion scripts of the workspace, the model-generation
 scripts of the SCRIPTS_AND_MACROS folder and the scripts of the user.
 
-Built-in tools: TOOLS (the ORC**3 list; script paths relative to this folder, _REPO = the SCRIPTS_AND_MACROS folder,
+Built-in tools: TOOLS (the built-in list; script paths relative to this folder, _REPO = the SCRIPTS_AND_MACROS folder,
 three levels above drawgen/explicit). User tools and the keys of hidden built-in tools: tools.json next to the
-ShinyCAD config.json (format: TOOLS_FILE_README; on first use the ORC**3 %APPDATA%\\ORC3\\tools.json is copied).
+ShinyCAD config.json (format: TOOLS_FILE_README).
 
 Launch (launch()): empty box -> the auto_arg of the tool ("inp": Source .inp, "dir": Output Dir, else Project Dir);
 kind "gui" -> detached process; "cli" on Windows -> own console window (cmd /k); "cli" elsewhere -> output captured
@@ -15,7 +15,6 @@ import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import threading
@@ -129,7 +128,7 @@ TOOLS = [
      "desc": "The raw .inp -> .rad converter the Build pipeline drives. Run it "
              "standalone to debug a conversion in isolation.",
      "doc": (
-        "The Abaqus/CalculiX .inp -> OpenRadioss .rad translator. The Build tab "
+        "The Abaqus/CalculiX .inp -> OpenCourant .rad translator. The Build tab "
         "runs it automatically (with card injection on top), so launching it here "
         "is for DEBUGGING a conversion in isolation.\n"
         "\n"
@@ -146,7 +145,7 @@ TOOLS = [
              "Same code the Build tab's downgrade checkbox runs.",
      "doc": (
         "Downgrades a CalculiX/PrePoMax .inp from 2nd-order (quadratic) to "
-        "1st-order (linear) elements so inp2rad / OpenRadioss can read it. The "
+        "1st-order (linear) elements so inp2rad / OpenCourant can read it. The "
         "'Downgrade 2nd-order -> linear' checkbox on the Build tab runs this same "
         "module in-process (with prune disabled).\n"
         "\n"
@@ -397,7 +396,7 @@ TOOLS = [
      "desc": "Shrink an .inp/.rad deck for upload: bulk blocks (nodes/elements/"
              "sets) truncated, everything else byte-for-byte.",
      "doc": (
-        "Shrinks an Abaqus .inp or OpenRadioss .rad deck so it can be shared/"
+        "Shrinks an Abaqus .inp or OpenCourant .rad deck so it can be shared/"
         "uploaded, while staying READABLE as a model description.\n"
         "\n"
         "* Only bulk blocks are truncated (nodes, elements, group/surface "
@@ -438,20 +437,12 @@ TOOLS.insert(5, {"key": "rad_preview", "no_args": True, "script": "rad_preview.p
                     "file is converted to legacy ASCII VTK with anim_to_vtk_win64, and ParaView is launched on the result.\n"
                     "* The original run folder is not written to.\n"
                     "* starter_win64, engine_win64 and anim_to_vtk_win64 must be on PATH. The paraview.exe path is "
-                    "read from %APPDATA%\\ORC3\\workspace_config.json.")})
+                    "read from %APPDATA%\\drawgen\\rad_preview.json.")})
 
 
 def tools_file(config_path):
-    """tools.json next to the ShinyCAD config.json; the ORC**3 tools.json is copied there once."""
-    p = os.path.join(os.path.dirname(os.path.abspath(config_path)), "tools.json")
-    if not os.path.isfile(p) and os.environ.get("APPDATA"):
-        orc = os.path.join(os.environ["APPDATA"], "ORC3", "tools.json")
-        if os.path.isfile(orc):
-            try:
-                shutil.copy2(orc, p)
-            except OSError:
-                pass
-    return p
+    """tools.json next to the ShinyCAD config.json."""
+    return os.path.join(os.path.dirname(os.path.abspath(config_path)), "tools.json")
 
 
 def load_tools_file(path):

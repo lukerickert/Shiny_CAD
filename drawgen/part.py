@@ -1262,8 +1262,8 @@ def _import(f):
     if not solids:
         surfs = model.step_surfaces(path)
         if surfs:
-            raise ValueError("the STEP file has no solids, only surfaces (%d components: %s): use the Import surface "
-                             "feature" % (len(surfs), ", ".join(n for n, _s in surfs[:6]) + (" ..." if len(surfs) > 6 else "")))
+            raise ValueError("the STEP file has no solids, only surfaces (%d components: %s): Import as surfaces makes one "
+                             "Import surface feature per component" % (len(surfs), ", ".join(n for n, _s in surfs[:6]) + (" ..." if len(surfs) > 6 else "")))
         raise ValueError("the STEP file has no solids")
     want = f.get("part")
     if want not in (None, ""):
@@ -1302,11 +1302,13 @@ def _periodic_span_face(fc):
     samples = [[], []]
     from OCP.TopoDS import TopoDS
     F = TopoDS.Face(fc.wrapped)
+    pr = GeomAPI_ProjectPointOnSurf()
+    pr.Init(surf, *surf.Bounds(), 1e-7)
     for e in fc.edges():
         if e.length < 1e-9 or BRep_Tool.IsClosed_s(TopoDS.Edge(e.wrapped), F):     # seam edges: both sides
             continue
         for t in (0.05, 0.27, 0.5, 0.73, 0.95):
-            pr = GeomAPI_ProjectPointOnSurf(e.position_at(t).to_pnt(), surf)
+            pr.Perform(e.position_at(t).to_pnt())
             if not pr.NbPoints():
                 return None
             u, v = pr.LowerDistanceParameters()
@@ -6410,7 +6412,8 @@ def find_edges(shape, refs):
 # --------------------------------------------------------------------------- display and references
 
 def round_info(sh):
-    """Radius (mm) and angular span (deg) of a circular edge or a cylindrical face; None for other geometry."""
+    """Radius (mm), angular span (deg), centre "c" (a point of the axis, mm) and axis direction "ax" of a circular
+    edge or a cylindrical face; None for other geometry."""
     from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
     from OCP.GeomAbs import GeomAbs_Circle, GeomAbs_Cylinder
     w = sh.wrapped
@@ -6418,13 +6421,17 @@ def round_info(sh):
         a = BRepAdaptor_Curve(w)
         if a.GetType() != GeomAbs_Circle:
             return None
-        r, span = a.Circle().Radius(), abs(a.LastParameter() - a.FirstParameter())
+        g = a.Circle()
+        r, span = g.Radius(), abs(a.LastParameter() - a.FirstParameter())
     else:
         a = BRepAdaptor_Surface(w, True)
         if a.GetType() != GeomAbs_Cylinder:
             return None
-        r, span = a.Cylinder().Radius(), abs(a.LastUParameter() - a.FirstUParameter())
-    return {"r": round(r, 5), "span": round(math.degrees(min(span, 2 * math.pi)), 3)}
+        g = a.Cylinder()
+        r, span = g.Radius(), abs(a.LastUParameter() - a.FirstUParameter())
+    p, d = g.Location(), g.Axis().Direction()
+    return {"r": round(r, 5), "span": round(math.degrees(min(span, 2 * math.pi)), 3),
+            "c": [round(p.X(), 6), round(p.Y(), 6), round(p.Z(), 6)], "ax": [round(d.X(), 9), round(d.Y(), 9), round(d.Z(), 9)]}
 
 
 _MESH_FACES = _ShapeCache(60000, budget=1500000)   # face -> (triangulation key, nodes, triangles, edge polylines); budget: nodes + triangles
@@ -6773,11 +6780,16 @@ def _edge_refs(body, plane, edges=None):
         try:
             n = 2 if e.geom_type.name == "LINE" else 32
             pts = [L(e.position_at(i / n)) for i in range(n + 1)]
+            ztol = 1e-4 * max(1.0, e.length) + 1e-6
             if n == 2:
                 if math.hypot(pts[-1].X - pts[0].X, pts[-1].Y - pts[0].Y) > 1e-9:
                     out.append({"t": "line", "x1": pts[0].X, "y1": pts[0].Y, "x2": pts[-1].X, "y2": pts[-1].Y, "kind": "proj"})
+                else:
+                    continue
             else:
                 out.append(_curve_ref([(p.X, p.Y) for p in pts], "proj", 1e-3 * max(1.0, e.length)))
+            if max(p.Z for p in pts) < -ztol:
+                out[-1]["behind"] = True
         except Exception:
             continue
     return out
@@ -6957,6 +6969,66 @@ def _ref_key(r):
     return (t, id(r))
 
 
+def _ref_samples(r):
+    """Three points (sketch coordinates) of a reference entity: the ends and the middle."""
+    t = r.get("t")
+    if t == "line":
+        return [(r["x1"], r["y1"]), ((r["x1"] + r["x2"]) / 2, (r["y1"] + r["y2"]) / 2), (r["x2"], r["y2"])]
+    if t in ("circle", "arc"):
+        a0, a1 = (0.0, 360.0) if t == "circle" else (float(r["a0"]), float(r["a1"]))
+        span = (a1 - a0) % 360 or 360.0
+        angs = [a0 + span * k / 4 for k in (0, 1, 2, 3)] if t == "circle" else [a0, a0 + span / 2, a0 + span]
+        return [(r["cx"] + r["r"] * math.cos(math.radians(a)), r["cy"] + r["r"] * math.sin(math.radians(a))) for a in angs]
+    if t == "poly":
+        q = r.get("pts") or []
+        return [tuple(q[0]), tuple(q[len(q) // 2]), tuple(q[-1])] if q else []
+    return []
+
+
+def tag_behind(refs, shape, plane):
+    """Marks the projected reference entities (kind proj / hidden) that lie behind the sketch plane ("behind":
+    True): every sample point of the entity lies on the projection of edges of the shape that are all behind the
+    plane (local z below -tol, the viewer is along the plane normal). Points on the projection of an edge in front
+    of or on the plane keep the entity in front."""
+    import numpy as np
+    cand = [r for r in refs if r.get("kind") in ("proj", "hidden")]
+    if not cand or shape is None:
+        return refs
+    segs = []
+    try:
+        for e in shape.edges():
+            n = 1 if e.geom_type.name == "LINE" else 24
+            pts = [plane.to_local_coords(e.position_at(i / n)) for i in range(n + 1)]
+            for a, b in zip(pts, pts[1:]):
+                segs.append((a.X, a.Y, a.Z, b.X, b.Y, b.Z))
+    except Exception:
+        return refs
+    if not segs:
+        return refs
+    S = np.asarray(segs, float)
+    A, B, wa, wb = S[:, 0:2], S[:, 3:5], S[:, 2], S[:, 5]
+    size = float(np.ptp(np.vstack([A, B]), axis=0).max()) or 1.0
+    tol, ztol = 1e-3 * size + 1e-6, 1e-4 * size + 1e-6
+    D = B - A
+    L2 = np.maximum((D * D).sum(axis=1), 1e-30)
+    for r in cand:
+        pts = _ref_samples(r)
+        if not pts:
+            continue
+        behind = True
+        for p in pts:
+            P = np.asarray(p, float)
+            t = np.clip(((P - A) * D).sum(axis=1) / L2, 0.0, 1.0)
+            dist = np.linalg.norm(A + D * t[:, None] - P, axis=1)
+            near = dist <= tol
+            if not near.any() or float((wa + (wb - wa) * t)[near].max()) >= -ztol:
+                behind = False
+                break
+        if behind:
+            r["behind"] = True
+    return refs
+
+
 def _section_refs_of(shape, plane, project, is_solid, proj_shape=None):
     """Section (kind section) and projection (kind proj / hidden) of one shape onto the sketch plane. The
     projection is of proj_shape when given (the shape cut at the plane)."""
@@ -6968,7 +7040,7 @@ def _section_refs_of(shape, plane, project, is_solid, proj_shape=None):
             # a rough mesh body: its section only (the projection of every triangle edge is no use for tracing)
             ps = proj_shape if proj_shape is not None else shape
             if not getattr(shape, "_mesh", False) and (is_solid or len(ps.faces()) <= 3000):
-                out += projected_refs(ps, plane) if is_solid else _edge_refs(ps, plane)
+                out += tag_behind(projected_refs(ps, plane), ps, plane) if is_solid else _edge_refs(ps, plane)
         except Exception:
             pass
     sec = BRepAlgoAPI_Section(shape.wrapped, plane.wrapped)

@@ -1,0 +1,83 @@
+================================================================================================
+INPUT FILE: job.inp
+================================================================================================
+Path      : /mnt/user-data/uploads/LITA_CAD/WHEEL_COVER/analysis/analysis/job.inp
+Size      : 55119.8 kB, 953787 lines (with the include files)
+Modified  : 2026-11-06 10:28
+Heading   : analysis
+
+NODES
+------------------------------------------------------------------------------------------------
+Count 597941, numbers 1 to 597941
+Extent (mm): x -29.889 to 29.889, y -29.889 to 29.889, z 0 to 16.5; size 59.778 x 59.777 x 16.5; diagonal 86.133
+Coincident nodes 3436; nodes in no element 0; elements with missing nodes 0
+
+ELEMENT TYPES (355062 elements)
+------------------------------------------------------------------------------------------------
+Type           Count           Numbers                Family       Order       Nodes        Read
+------------------------------------------------------------------------------------------------
+C3D10         355062     137851-492912                 solid   quadratic          10         yes
+C3D10: quadratic tetrahedron solid, 10 nodes; full integration
+
+MESH QUALITY
+------------------------------------------------------------------------------------------------
+C3D10 (355062): edge 2.7792e-04 to 2.0833 mm (mean 0.53855); aspect ratio max 4023, mean 1.878, above 10: 47; volume 2.3154e-05 to 0.57508 mm^3, total 10535 mm^3, inverted 0
+
+ELEMENT SETS
+------------------------------------------------------------------------------------------------
+Name                       Elements             Types  Section      Material  Vol mm^3   Mass kg
+------------------------------------------------------------------------------------------------
+B1_1                         355062      C3D10:355062    solid      M1_STEEL     10535  0.082697
+Total mass of the element sets with a section and a density: 0.082697 kg, centre of mass (-0.081482, -0.6639, 4.4759) mm
+
+NODE SETS
+------------------------------------------------------------------------------------------------
+Name                            Nodes  Generated                           Extent x / y / z (mm)
+------------------------------------------------------------------------------------------------
+NALL                           597941                -29.889..29.889 / -29.889..29.889 / 0..16.5
+SUP1                             2920                       -7.5..7.5 / 24.79..25.9 / 6.5..16.35
+
+MATERIALS
+------------------------------------------------------------------------------------------------
+M1_STEEL: E 2.1e+05 MPa, nu 0.3; density 7.8500e-09 (file) = 7850 kg/m^3
+    ELASTIC; DENSITY
+
+SECTIONS
+------------------------------------------------------------------------------------------------
+Element set                     Kind        Material  Elements Thickness              Parameters
+------------------------------------------------------------------------------------------------
+B1_1                           solid        M1_STEEL    355062         -                        
+
+STEPS
+------------------------------------------------------------------------------------------------
+1. Step 1: STATIC 
+   *BOUNDARY 3 line(s) on SUP1; *CLOAD 575 line(s), total F (0, 0, -1000) N, M (0, 0, 0) N mm; *DLOAD 0; *DSLOAD 0
+   *NODE FILE : U
+   *EL FILE : S
+   *NODE PRINT NSET=SUP1: RF
+
+KEYWORDS
+------------------------------------------------------------------------------------------------
+Keyword                                      Count   Read by the program
+------------------------------------------------------------------------
+*HEADING                                         1                    no
+*NODE                                            1                   yes
+*ELEMENT                                         1                   yes
+*NSET                                            1                   yes
+*MATERIAL                                        1                   yes
+*ELASTIC                                         1                   yes
+*DENSITY                                         1                   yes
+*SOLID SECTION                                   1                   yes
+*STEP                                            1                    no
+*STATIC                                          1                    no
+*BOUNDARY                                        1                    no
+*CLOAD                                           1                    no
+*NODE FILE                                       1                    no
+*EL FILE                                         1                    no
+*NODE PRINT                                      1                    no
+*END STEP                                        1                    no
+
+CHECKS
+------------------------------------------------------------------------------------------------
+- 3436 coincident node(s) (distance below 1e-6 x the model diagonal)
+- keywords not used by the program (supports, loads and steps are set in the tab): *HEADING, *STEP, *STATIC, *BOUNDARY, *CLOAD, *NODE FILE, *EL FILE, *NODE PRINT, *END STEP

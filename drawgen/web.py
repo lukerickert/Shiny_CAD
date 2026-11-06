@@ -799,6 +799,7 @@ def dialog():
             "model": [("STEP and STL files", "*.step *.stp *.stl"), ("STEP files", "*.step *.stp"), ("STL files", "*.stl"), ("All files", "*.*")],
             "dxf": [("DXF files", "*.dxf"), ("All files", "*.*")],
             "inp": [("Abaqus input", "*.inp"), ("All files", "*.*")],
+            "mesh": [("CalculiX input or Radioss deck", "*.inp *.rad"), ("Abaqus input", "*.inp"), ("Radioss deck", "*.rad"), ("All files", "*.*")],
             "image": [("Images", "*.png *.jpg *.jpeg *.gif *.webp *.bmp *.tif *.tiff"), ("All files", "*.*")],
             "shinycad": [("ShinyCAD documents", "*.scpart *.scasm *.scsketch *.scfea *.scexp *.sccam"), ("All files", "*.*")],
             "scpart": [("ShinyCAD part", "*.scpart")], "scasm": [("ShinyCAD assembly", "*.scasm")],
@@ -1770,6 +1771,22 @@ def part_face_groups():
         return error("face groups failed: %s" % e, 500)
 
 
+@app.route("/api/part/step_info", methods=["POST"])
+def part_step_info():
+    """{"path"} -> {"solids": number of solids, "surfaces": [names of the components with faces and no solid]} of a
+    STEP file (Import geometry of a surface STEP file: Import surface features)."""
+    from . import model
+    path = ((request.get_json(force=True) or {}).get("path") or "").strip().strip('"')
+    if not os.path.isfile(path) or path.lower().endswith(".stl"):
+        return jsonify({"solids": None, "surfaces": []})
+    try:
+        named = model.step_solids(path)[1]
+        names = [n for n, _s in model.step_surfaces(path)]
+    except Exception as e:
+        return error("cannot read %s: %s" % (os.path.basename(path), e))
+    return jsonify({"solids": len(named), "surfaces": names})
+
+
 @app.route("/api/part/refs", methods=["POST"])
 @in_part_worker
 def part_refs():
@@ -2275,7 +2292,7 @@ def _fea_workdir(name):
 def _fea_asm(doc):
     """Assembly of the analysis geometry: the saved assembly, or one component for a part."""
     src = doc.get("source") or {}
-    if not src.get("name"):
+    if not src.get("name") or src.get("type") == "inp":
         return {"components": []}
     if src.get("type") == "part":
         return {"components": [{"id": "1", "name": src.get("name"), "source": {"type": "part", "name": src.get("name")},
@@ -2333,6 +2350,61 @@ def fea_plates():
     return jsonify({"plates": analysis.plate_views(doc, asm, _asm_sources())})
 
 
+@app.route("/api/analysis/inp_geometry", methods=["POST"])
+def fea_inp_geometry():
+    """{"path"} -> view data of a CalculiX .inp (inpmodel.view): {"components", "materials", "bodies", "shells",
+    "nsets", "warnings", "nodes", "elements"}."""
+    from . import inpmodel
+    path = ((request.get_json(force=True) or {}).get("path") or "").strip().strip('"')
+    try:
+        return jsonify(inpmodel.view(path))
+    except (inpmodel.InpError, OSError, ValueError, KeyError, IndexError) as e:
+        return error("inp: %s" % e)
+
+
+@app.route("/api/inp/info", methods=["POST"])
+def inp_info():
+    """{"path", "report": bool} -> the contents of a .inp or .rad file (inpinfo.inspect); with "report": {"text"}
+    (inpinfo.report)."""
+    from . import inpinfo, inpmodel
+    req = request.get_json(force=True) or {}
+    path = (req.get("path") or "").strip().strip('"')
+    try:
+        info = inpinfo.inspect(path)
+        return jsonify({"text": inpinfo.report(info), "name": info["file"]["name"]} if req.get("report") else info)
+    except (inpmodel.InpError, OSError, ValueError, KeyError, IndexError) as e:
+        return error("inp: %s" % e)
+
+
+@app.route("/api/inp/query", methods=["POST"])
+def inp_query():
+    """{"path", "what", "by", ...} -> nodes or elements of a .inp or .rad file (inpquery.query)."""
+    from . import inpmodel, inpquery
+    req = request.get_json(force=True) or {}
+    path = (req.get("path") or "").strip().strip('"')
+    try:
+        return jsonify(inpquery.query(path, req))
+    except (inpmodel.InpError, inpquery.QueryError, OSError, ValueError, KeyError, IndexError, TypeError) as e:
+        return error("search: %s" % e)
+
+
+@app.route("/api/inp/text", methods=["POST"])
+def inp_text():
+    """{"path", "start", "count"} -> lines of the file; {"path", "find": {"text", "from", "back", "kind"}} -> {"line"}
+    (inptext)."""
+    from . import inptext
+    req = request.get_json(force=True) or {}
+    path = (req.get("path") or "").strip().strip('"')
+    if not os.path.isfile(path):
+        return error("file not found: %s" % path)
+    try:
+        if req.get("find"):
+            return jsonify(inptext.find(path, req["find"]))
+        return jsonify(inptext.lines(path, req.get("start") or 1, min(int(req.get("count") or 200), 5000)))
+    except (OSError, ValueError, TypeError) as e:
+        return error("file text: %s" % e)
+
+
 @app.route("/api/analysis/shell_groups", methods=["POST"])
 def fea_shell_groups():
     """{"source": {"type", "name"}, "angle": deg} -> {"groups": [{"name", "faces", "area"}]}: the faces of the
@@ -2353,7 +2425,11 @@ def fea_contact_search():
     doc = req.get("analysis") or {}
     try:
         gap = float(req.get("gap") or 0.1)
-        bodies = analysis.geometry(doc, _fea_asm(doc), _asm_sources())
+        if (doc.get("source") or {}).get("type") == "inp":
+            from . import inpmodel
+            bodies = inpmodel.analysis_input(doc)[0]
+        else:
+            bodies = analysis.geometry(doc, _fea_asm(doc), _asm_sources())
         names = {b["id"]: b["name"] for b in bodies}
         pairs = analysis.contact_search(bodies, gap)
         for p in pairs:
@@ -2365,7 +2441,7 @@ def fea_contact_search():
 
 @app.route("/api/analysis/material_library", methods=["GET"])
 def fea_material_library():
-    """ORC**3 material library: [{"name", "E", "nu", "rho" (kg/m^3), "plastic": [[stress, plastic strain]]}]."""
+    """Material library: [{"name", "E", "nu", "rho" (kg/m^3), "plastic": [[stress, plastic strain]]}]."""
     return jsonify(analysis.library_list())
 
 
@@ -2405,6 +2481,10 @@ class _Progress(object):
 
     def __call__(self, stage, message=""):
         self.job["stage"], self.job["message"] = stage, message
+
+    def live(self, data):
+        """Run monitor data of the running solve (analysis.live_state), sent with the job polls."""
+        self.job["live"] = data
 
     def mesh_ready(self, data):
         """Mesh view data of a solve run ({"payload", "summary"}), sent once with the next job poll."""
@@ -2473,6 +2553,8 @@ def fea_job(jid):
     if j is None:
         return error("unknown job", 404)
     out = {k: j[k] for k in ("state", "stage", "message", "error", "name", "started")}
+    if j["state"] in ("running", "error") and j.get("live") is not None:
+        out["live"] = j["live"]
     if j.get("mesh") is not None:
         out["mesh"] = j.pop("mesh")
     if j["state"] == "done":
@@ -2516,6 +2598,17 @@ def fea_report(name):
     if not os.path.isfile(p):
         return error("no report for %s" % name, 404)
     return send_file(p, mimetype="text/plain", as_attachment=bool(request.args.get("download")), download_name=fn)
+
+
+@app.route("/api/analysis/log/<name>", methods=["GET"])
+def fea_log(name):
+    """The solver output (solver.log) of the run folder of the analysis; ?download=1 as a file."""
+    d = _fea_workdir(name)
+    p = os.path.join(d, "solver.log")
+    if not os.path.isfile(p):
+        return error("no solver output for %s" % name, 404)
+    return send_file(p, mimetype="text/plain", as_attachment=bool(request.args.get("download")),
+                     download_name=safe_name(name) + "_solver.log")
 
 
 @app.route("/api/analysis/open_folder", methods=["POST"])
@@ -2894,6 +2987,13 @@ def geometry_state():
             h.update(repr(srcs.key((c or {}).get("source") or {})).encode("utf-8"))
         return jsonify({"key": h.hexdigest()})
     src = req.get("source") or {}
+    if src.get("type") == "inp":
+        try:
+            st = os.stat(src.get("path") or "")
+            h.update(repr((os.path.abspath(src["path"]), st.st_mtime, st.st_size)).encode("utf-8"))
+        except OSError as e:
+            return error("cannot read %s: %s" % (src.get("path"), e), 404)
+        return jsonify({"key": h.hexdigest()})
     if not src.get("name"):
         return jsonify({"key": ""})
     try:

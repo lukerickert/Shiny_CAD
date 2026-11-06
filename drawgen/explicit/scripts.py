@@ -199,7 +199,7 @@ try:
         if E.ndim == 2 and E.shape[1] == 6:
             # symmetric Voigt xx yy zz xy yz xz with ENGINEERING shear (gamma):
             # tensor shear = gamma/2. Best-effort path for converter builds
-            # that write 6 components; the primary OpenRadioss output is 9.
+            # that write 6 components; the primary OpenCourant output is 9.
             n = E.shape[0]
             M = np.zeros((n, 3, 3), dtype=float)
             M[:, 0, 0] = E[:, 0]; M[:, 1, 1] = E[:, 1]; M[:, 2, 2] = E[:, 2]
@@ -359,7 +359,7 @@ except Exception:
 
 
 _PV_SESSION_SCRIPT = r'''"""Auto-generated ParaView session for __JOB__
-(OpenRadioss Unified Workspace). Safe to re-generate; do not hand-edit -
+(SHINYCAD Explicit tab). Safe to re-generate; do not hand-edit -
 values come from __JOB___pv.json next to this file.
 
 Interactive session :  paraview --script=__JOB___pv.py
@@ -566,7 +566,7 @@ if structural is None:
 else:
     print("rigid-body links hidden: kept %d element cells." % n_cells(structural))
 
-# ---- erosion: OpenRadioss keeps deleted elements as zero-value ghosts ------
+# ---- erosion: OpenCourant keeps deleted elements as zero-value ghosts ------
 main = structural
 _eroded_hidden = False
 active = cell_threshold(structural, "EROSION_STATUS", EROSION_KEEP, 1.0,
@@ -920,7 +920,7 @@ if os.environ.get("PV_RENDER_PNGS"):
     print("PV render complete.")
 '''
 
-_PV_MACRO_SCRIPT = r'''"""Eps1_View - ParaView macro (OpenRadioss Unified Workspace, v20.73).
+_PV_MACRO_SCRIPT = r'''"""Eps1_View - ParaView macro (SHINYCAD Explicit tab).
 Adds the max-principal-TOTAL-strain (eps1) Programmable Filter to the ACTIVE
 source - shells AND solids - drops the rigid-body link lines, hides eroded
 elements, and colours by the best available field (eps1_solid > eps1_membrane >

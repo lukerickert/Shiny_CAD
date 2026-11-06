@@ -1,7 +1,8 @@
 """Abaqus .inp of the ShinyCAD model of an explicit document, for the deck build (inp2rad).
 
 Explicit document (<name>.exp.json), model part:
-  {"source": {"kind": "shinycad", "type": "assembly" | "part", "name"} | {"kind": "inp", "inp": path},
+  {"source": {"kind": "shinycad", "type": "assembly" | "part", "name"} | {"kind": "shinycad", "type": "inp", "path",
+              "name"} (a meshed CalculiX .inp as the geometry: its elements, inpmodel.py) | {"kind": "inp", "inp": path},
    "materials": {name: {"library": MATERIAL_LIBRARY key or "", "E": MPa, "nu", "rho": kg/m^3}},
    "default_material": name,
    "mesh": {"size": mm, "size_min": mm, "curvature", "algorithm", "optimize", "strategy": "tet" | "hex" | "hexsub",
@@ -20,7 +21,12 @@ Explicit document (<name>.exp.json), model part:
    "points", "springs", "joints", "equations": reference points and constraints (drawgen/constraints.py),
    "velocities": [{"id", "name", "target": {"body": body id} | {"point": id} | {"nset": id},
                    "kind": "initial" | "imposed", "v": [vx, vy, vz] mm/s, "w": [wx, wy, wz] rad/s (imposed),
-                   "dofs": [6 flags] (imposed), "ramp": s (imposed: 0 to the value in ramp s, then constant)}],
+                   "dofs": [6 flags] (imposed), "ramp": s (imposed: 0 to the value in ramp s, then constant),
+                   "amplitude": id of "amplitudes" (imposed: the value times the factor of the amplitude, in place of the ramp)}],
+   "amplitudes": [{"id", "name", "points": [[t (s, from the start of the run), factor], ...]}]   linear between the points,
+                 constant after the last one,
+   "refine": [{"id", "name", "faces": [face refs], "size": mm}]   mesh refinement regions (analysis.refine_boxes),
+   "surfaces": [{"id", "name", "faces": [face refs]}]   named face groups; a support or mass target {"surface": id},
    "masses": [{"id", "name", "kind": "point", "target": {"point": id}, "m": kg} |
               {"id", "name", "kind": "distributed", "target": {"faces": [face references]} | {"body": body id} |
                {"nset": id}, "mode": "total" | "area", "m": kg (total) | kg/m^2 (area, faces only)}]}
@@ -98,10 +104,10 @@ def _geometry_doc(doc):
             "members": [], "materials": {}, "default_material": None}
 
 
-def _mesh_group(group, doc, opts, size, bonded, workdir, tag):
+def _mesh_group(group, doc, opts, size, bonded, workdir, tag, refine=None):
     from build123d import export_brep
     from .. import femesh
-    job = {"size": size, "bonded": bonded, "bodies": [], "mesh": opts}
+    job = {"size": size, "bonded": bonded, "bodies": [], "mesh": opts, "refine": refine or []}
     for b in group:
         p = os.path.join(workdir, "%s_%s.brep" % (tag, safe(b["id"])))
         export_brep(b["shape"], p)
@@ -149,9 +155,10 @@ def _body_mass(doc, b):
         return 0.0
     rho = material_values(doc, name)[2]
     try:
+        shape = b.get("shape")          # None: a body of an .inp source (inpmodel: "area", "volume")
         if b.get("mode") == "shell":
-            return float(b["shape"].area) * float(b.get("t") or 0) * rho
-        return float(b["shape"].volume) * rho
+            return float(shape.area if shape is not None else b.get("area") or 0) * float(b.get("t") or 0) * rho
+        return float(shape.volume if shape is not None else b.get("volume") or 0) * rho
     except Exception:
         return 0.0
 
@@ -255,6 +262,119 @@ def _masses(doc, M, mesh, bodies):
     return out
 
 
+TH_NODE = {"U": ["DX", "DY", "DZ"], "V": ["VX", "VY", "VZ"], "A": ["AX", "AY", "AZ"], "RF": ["REACX", "REACY", "REACZ"]}
+TH_PART = {"ENER": ["IE"], "EKIN": ["KE"]}
+TH_INTER = ["FNX", "FNY", "FNZ", "FTX", "FTY", "FTZ"]
+TH_SECT = ["FNX", "FNY", "FNZ", "FTX", "FTY", "FTZ", "MX", "MY", "MZ"]
+GENERAL_CONTACT = 9999999           # /INTER number of the general contact of the build (build.py)
+
+
+def _plane_nodes(M, nodes):
+    """Three nodes of a set spanning the largest triangle (first node, farthest node, largest area)."""
+    ns = sorted(nodes)
+    P = np.array([M.X[n] for n in ns], float)
+    a = 0
+    b = int(np.argmax(np.linalg.norm(P - P[a], axis=1)))
+    c = int(np.argmax(np.linalg.norm(np.cross(P - P[a], P[b] - P[a]), axis=1)))
+    return [ns[a], ns[b], ns[c]]
+
+
+def _history(doc, M, cards, body_nodes, rp_node, bname, bodies):
+    """Time history requests of the document (analysis "history") as /TH/NODE and /TH/PART cards (**RAD lines): node
+    requests U, V, A, RF on the nodes of the target (node names H<k>N<node>); element requests ENER, EKIN of the parts of
+    the target bodies; contact requests: the general contact interface of the build (/TH/INTER); section requests:
+    /SECT of the nodes of the faces and the solid elements of their bodies with a face on them (/TH/SECTIO). Title of
+    a group: SC_H<k>/<request id>/<kind>/<name>. Returns [{"name", "kind", "n", "vars", "left_out"}]."""
+    from .. import analysis
+    out = []
+    for k, h in enumerate(doc.get("history") or []):
+        name = h.get("name") or h.get("id") or "history %d" % (k + 1)
+        what = "history %s" % name
+        kind = h.get("kind") or "node"
+        q = [x for x in (h.get("quantities") or []) if x]
+        t = h.get("target") or {}
+        title = "SC_H%d/%s/%s/%s" % (k + 1, h.get("id") or k + 1, kind, safe(name, 50))
+        if kind == "contact":
+            cards.thinter(title, TH_INTER, [GENERAL_CONTACT])
+            out.append({"name": name, "kind": kind, "n": 1, "vars": TH_INTER, "left_out": [x for x in q if x != "CF"]})
+            continue
+        if kind == "section":
+            refs = [r for r in (t.get("faces") or ([t] if "face" in t else [])) if r]
+            if not refs:
+                raise ModelError("%s: no faces (pick faces of solid bodies)" % what)
+            nodes, elems = set(), set()
+            try:
+                for r in refs:
+                    f = M.face(r)
+                    bid = M.face_body.get((str(r.get("comp")), int(r.get("face", -1))))
+                    nodes.update(f["nodes"])
+                    corner = [set(fc[:4 if len(fc) in (4, 8) else 3]) for fc in f["facets"]]
+                    for bl in M.mesh["bodies"][bid]["blocks"]:
+                        if bl["type"] in analysis.SHELL_ELEMS:
+                            raise ModelError("%s: face %s is a shell (section forces of solid bodies)" % (what, r.get("face")))
+                        for e in bl["elements"]:
+                            en = set(e[1:])
+                            if any(c <= en for c in corner):
+                                elems.add(e[0])
+            except analysis.AnalysisError as e:
+                raise ModelError("%s: %s" % (what, e))
+            if not elems:
+                raise ModelError("%s: no elements on the faces" % what)
+            sf = cards.sect(title, _plane_nodes(M, nodes), nodes, elems)
+            cards.thsect(title, TH_SECT, [sf])
+            out.append({"name": name, "kind": kind, "n": len(elems), "vars": TH_SECT, "left_out": [x for x in q if x != "SOF"]})
+            continue
+        if kind == "node":
+            vs = [v for x in q for v in TH_NODE.get(x, [])]
+            left = [x for x in q if x not in TH_NODE]
+            try:
+                if t.get("nset") is not None:
+                    ns_ = next((x for x in doc.get("nsets") or [] if str(x.get("id")) == str(t["nset"])), None)
+                    if ns_ is None:
+                        raise ModelError("%s: node set not found" % what)
+                    nodes = set(M.node_set(ns_))
+                elif t.get("point") is not None:
+                    if str(t["point"]) not in rp_node:
+                        raise ModelError("%s: reference point not found" % what)
+                    nodes = {rp_node[str(t["point"])]}
+                elif analysis.is_multi(t):
+                    nodes = set(M.node_set(dict({x: t.get(x) or [] for x in analysis.MULTI_KEYS}, kind="selection", name="of " + what)))
+                elif "comp" in t:
+                    nodes = set(M.edge(t)["nodes"] if "edge" in t else M.face(t)["nodes"])
+                else:
+                    raise ModelError("%s: no target" % what)
+            except analysis.AnalysisError as e:
+                raise ModelError("%s: %s" % (what, e))
+            if not nodes:
+                raise ModelError("%s: no nodes" % what)
+            if not vs:
+                raise ModelError("%s: no quantity of the explicit solver (displacement, velocity, acceleration, reaction force)" % what)
+            cards.thnod(title, vs, nodes, "H%d" % (k + 1))
+            out.append({"name": name, "kind": kind, "n": len(nodes), "vars": vs, "left_out": left})
+        else:
+            vs = [v for x in q for v in TH_PART.get(x, [])]
+            left = [x for x in q if x not in TH_PART]
+            parts = []
+            for bid in t.get("bodies") or []:
+                bid = str(bid)
+                if bid in body_nodes and bid in bname:
+                    parts.append("B_" + bname[bid])
+                for sid, _key in _in_sections(bodies, bid):
+                    if "B_" + bname[sid] not in parts:
+                        parts.append("B_" + bname[sid])
+                if bid not in body_nodes and not _in_sections(bodies, bid):
+                    raise ModelError("%s: body %s is not meshed (off)" % (what, bid))
+            if t.get("elements"):
+                left.append("mesh elements (bodies only)")
+            if not parts:
+                raise ModelError("%s: choose bodies (the explicit solver gives the energies of parts)" % what)
+            if not vs:
+                raise ModelError("%s: no quantity of the explicit solver (internal energy, kinetic energy)" % what)
+            cards.thpart(title, vs, parts)
+            out.append({"name": name, "kind": kind, "n": len(parts), "vars": vs, "left_out": left})
+    return out
+
+
 def file_md5(path):
     import hashlib
     h = hashlib.md5()
@@ -297,12 +417,26 @@ def build(doc, asm, sources, workdir, inp_path, title="", progress=None):
     from . import meshview
     say = progress or (lambda *a: None)
     os.makedirs(workdir, exist_ok=True)
-    gdoc = _geometry_doc(doc)
-    say("geometry", "Placing the bodies")
     try:
-        bodies = analysis.geometry(gdoc, asm, sources)
+        doc = analysis.resolve_surfaces(doc)                 # {"surface": id} targets: the faces of the surface
     except analysis.AnalysisError as e:
         raise ModelError(str(e))
+    gdoc = _geometry_doc(doc)
+    inp_src = (doc.get("source") or {}).get("type") == "inp"
+    inp_mesh = None
+    if inp_src:                     # a meshed CalculiX .inp as the geometry: its nodes and elements (inpmodel)
+        from .. import inpmodel
+        say("geometry", "Reading the .inp")
+        try:
+            bodies, inp_mesh = inpmodel.analysis_input(dict(gdoc, source=doc.get("source")))
+        except (inpmodel.InpError, OSError) as e:
+            raise ModelError("inp: %s" % e)
+    else:
+        say("geometry", "Placing the bodies")
+        try:
+            bodies = analysis.geometry(gdoc, asm, sources)
+        except analysis.AnalysisError as e:
+            raise ModelError(str(e))
     if not bodies:
         raise ModelError("no bodies")
     role = {cid: (b.get("role") or "deformable") for cid, b in (doc.get("bodies") or {}).items()}
@@ -325,14 +459,17 @@ def build(doc, asm, sources, workdir, inp_path, title="", progress=None):
     meshes = []
     say("mesh", "Meshing %d bodies" % len(bodies))
     try:
-        if deform:
-            meshes.append(_mesh_group(deform, doc, opts, size, bool(doc.get("bonded", True)), workdir, "d"))
-        if rigid:
-            meshes.append(_mesh_group(rigid, doc, opts, size, False, workdir, "r"))
+        refine = [] if inp_src else analysis.refine_boxes(doc, bodies)     # mesh refinement regions (picked faces)
+        if inp_src:
+            meshes.append(inp_mesh)
+        elif deform:
+            meshes.append(_mesh_group(deform, doc, opts, size, bool(doc.get("bonded", True)), workdir, "d", refine))
+        if rigid and not inp_src:
+            meshes.append(_mesh_group(rigid, doc, opts, size, False, workdir, "r", refine))
     except RuntimeError as e:
         raise ModelError(str(e))
     shell_report = next((m.get("shell_report") for m in meshes if m.get("shell_report")), None)
-    mesh = _merge(meshes)
+    mesh = inp_mesh if inp_src else _merge(meshes)
     M = analysis.Model(gdoc, bodies, mesh)
     names = {b["id"]: b["name"] for b in bodies}
     used = set()
@@ -381,11 +518,15 @@ def build(doc, asm, sources, workdir, inp_path, title="", progress=None):
     rp_xyz = {str(p.get("id")): np.asarray(p["xyz"], float) for p in doc.get("points") or []}
     rigid_mass = []                                 # mass of each rigid body (kg): material and added masses
     for b in rigid:
-        c = b["shape"].center()
-        com, mtot = np.array([c.X, c.Y, c.Z]) * 0.0, 0.0
+        if b.get("shape") is not None:
+            c = b["shape"].center()
+            c = np.array([c.X, c.Y, c.Z])
+        else:
+            c = np.asarray(b.get("centre") or [0.0, 0.0, 0.0], float)
+        com, mtot = c * 0.0, 0.0
         mb = _body_mass(doc, b)
         if mb > 0:
-            com, mtot = np.array([c.X, c.Y, c.Z]) * mb, mb
+            com, mtot = c * mb, mb
         for _m, nm in mass_rows:
             for n, m in nm.items():
                 if isinstance(n, tuple):
@@ -403,7 +544,7 @@ def build(doc, asm, sources, workdir, inp_path, title="", progress=None):
         rigid_mass.append({"id": b["id"], "name": b["name"], "kg": mtot * 1e3, "added_kg": (mtot - max(mb, 0.0)) * 1e3,
                            "shell": b.get("mode") == "shell"})
         ref_nodes[b["id"]] = next_node
-        X[next_node] = com / mtot if mtot > 0 else np.array([c.X, c.Y, c.Z])
+        X[next_node] = com / mtot if mtot > 0 else c
         next_node += 1
     rp_node = {}                                    # reference point id -> node
     for p in doc.get("points") or []:
@@ -500,7 +641,7 @@ def build(doc, asm, sources, workdir, inp_path, title="", progress=None):
             elif t.get("point") is not None:
                 if str(t["point"]) not in rp_node:
                     raise analysis.AnalysisError("reference point not found")
-                dofs0 = (list(s.get("dofs") or [1, 1, 1]) + [0, 0, 0])[:6]
+                dofs0 = analysis.support_dofs(s)
                 main = on_rigid(str(t["point"]), all(dofs0[3:]), True, "support %s" % sname)
                 nodes = [main if main is not None else rp_node[str(t["point"])]]
             elif t.get("nset") is not None:
@@ -519,7 +660,10 @@ def build(doc, asm, sources, workdir, inp_path, title="", progress=None):
         ns = "SUP_%d_%s" % (k + 1, safe(s.get("name") or "support", 30).upper())
         L.append("*NSET, NSET=%s" % ns)
         L += ids_lines(nodes)
-        dofs = (list(s.get("dofs") or [1, 1, 1]) + [0, 0, 0])[:6]
+        try:
+            dofs = analysis.support_dofs(s)
+        except analysis.AnalysisError as e:
+            raise ModelError(str(e))
         sup_rows += ["%s, %d, %d" % (ns, d + 1, d + 1) for d in range(3) if dofs[d]]
         held.update((n, d + 1, sname) for n in nodes for d in range(3) if dofs[d])
         rn = [n for n in nodes if n in M.shell_nodes or n in rp_node.values() or n in ref_nodes.values()]
@@ -686,7 +830,21 @@ def build(doc, asm, sources, workdir, inp_path, title="", progress=None):
         L += ids_lines(target)
         tr = float(v.get("ramp") or 0)
         amp = "VA_%d" % (k + 1)
-        pts = ([(0.0, 0.0), (tr, 1.0)] if tr > 0 else [(0.0, 1.0)]) + [(max(tr, 0.0) + 1e3, 1.0)]
+        if v.get("amplitude"):
+            a = next((x for x in doc.get("amplitudes") or [] if str(x.get("id")) == str(v["amplitude"])), None)
+            if a is None:
+                raise ModelError("%s: amplitude %s not found" % (what, v["amplitude"]))
+            try:
+                pts = sorted((float(t), float(f)) for t, f in a.get("points") or [])
+            except (TypeError, ValueError):
+                raise ModelError("%s: amplitude %s: a point is not two numbers" % (what, a.get("name")))
+            if not pts:
+                raise ModelError("%s: amplitude %s has no points" % (what, a.get("name")))
+            if pts[0][0] > 0:
+                pts.insert(0, (0.0, pts[0][1]))
+            pts.append((pts[-1][0] + 1e3, pts[-1][1]))          # constant after the last point (a /FUNCT is extrapolated)
+        else:
+            pts = ([(0.0, 0.0), (tr, 1.0)] if tr > 0 else [(0.0, 1.0)]) + [(max(tr, 0.0) + 1e3, 1.0)]
         imp_rows.append((amp, pts, ["%s, %d, %d, %.9g" % (ns, d + 1, d + 1, (vv + w)[d]) for d in range(6) if f[d]]))
     nset_names = {}
     for ns_ in doc.get("nsets") or []:
@@ -727,7 +885,8 @@ def build(doc, asm, sources, workdir, inp_path, title="", progress=None):
         L += vel_rows
     for amp, pts, rows in imp_rows:
         L.append("*AMPLITUDE, NAME=%s" % amp)
-        L.append(", ".join("%.9g, %.9g" % q for q in pts))
+        for i in range(0, len(pts), 4):
+            L.append(", ".join("%.9g, %.9g" % q for q in pts[i:i + 4]))
         L.append("*BOUNDARY, AMPLITUDE=%s , TYPE=VELOCITY" % amp)       # the blank ends the name for inp2rad
         L += rows
     mass_summary = []
@@ -739,6 +898,7 @@ def build(doc, asm, sources, workdir, inp_path, title="", progress=None):
         cards.admas("MASS " + safe(mm.get("name") or mm.get("id"), 30).upper(), nodes_m)
         mass_summary.append({"name": mm.get("name") or mm.get("id"), "kind": mm.get("kind") or "point",
                              "kg": sum(nodes_m.values()) * 1e3, "nodes": len(nodes_m)})
+    hist_summary = _history(doc, M, cards, body_nodes, rp_node, bname, bodies)
     if cards.lines:
         L.append("** Radioss cards of the reference point couplings, springs, joints, equations and masses (written into the "
                  "_0000.rad after inp2rad: radcards.py)")
@@ -748,7 +908,7 @@ def build(doc, asm, sources, workdir, inp_path, title="", progress=None):
     save_mesh(inp_path, mesh, {b["id"]: role.get(b["id"], "deformable") for b in bodies})
 
     # view data
-    cells = []
+    cells, cids = [], []
     nodes_sorted = sorted(X)
     idx = {n: i for i, n in enumerate(nodes_sorted)}
     xyz = np.array([X[n] for n in nodes_sorted], float)
@@ -761,7 +921,8 @@ def build(doc, asm, sources, workdir, inp_path, title="", progress=None):
             nc = meshview.NCORNER[kind]
             conn = np.array([[idx[n] for n in e[1:1 + nc]] for e in bl["elements"]], np.int64).reshape(-1, nc)
             cells.append((kind, conn, np.full(len(conn), k, np.int64)))
-    pl = meshview.payload(xyz, cells)
+            cids.append([e[0] for e in bl["elements"]])
+    pl = meshview.payload(xyz, cells, node_ids=nodes_sorted, cell_ids=cids)
     pl["part_names"] = [names[b["id"]] for b in bodies]
     pl["bcs"] = [dict(v, nodes=[idx[n] for n in v["nodes"] if n in idx], rnodes=[idx[n] for n in v["rnodes"] if n in idx]) for v in bc_vis]
     pl["part_thick"] = [[float(b["t"]), {"positive": 0.5, "negative": -0.5}.get(b.get("offset"), 0.0)] if b.get("mode") == "shell" and b.get("t") else None
@@ -780,6 +941,6 @@ def build(doc, asm, sources, workdir, inp_path, title="", progress=None):
                    for p in doc.get("points") or []],
         "springs": len(spring_ends), "equations": neq,
         "velocities": [{"name": v.get("name"), "kind": v.get("kind") or "initial"} for v in doc.get("velocities") or []],
-        "masses": mass_summary, "rigid_mass": rigid_mass,
+        "masses": mass_summary, "rigid_mass": rigid_mass, "history": hist_summary,
         "total_kg": sum(_body_mass(doc, b) for b in bodies if mesh["bodies"].get(b["id"])) * 1e3 + sum(x["kg"] for x in mass_summary)}
     return {"inp": inp_path, "payload": pl, "summary": summary}

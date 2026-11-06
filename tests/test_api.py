@@ -503,6 +503,32 @@ def test_part_refs_cut(client):
     assert len([x for x in same if x.get("kind") == "hidden"]) == 4
 
 
+def test_part_refs_behind_the_plane(client):
+    """Projected reference geometry behind the sketch plane is marked "behind": a sketch on XY 10 mm above the plate
+    (all the plate behind), 10 mm below it (all in front), at mid-thickness (the top edges in front cover the
+    bottom edges); an earlier sketch below the plane is behind."""
+    from conftest import plate
+    p = plate("bh")
+    refs = lambda off: client.post("/api/part/refs", json={"part": dict(p, features=p["features"] + [
+        {"id": "s9", "name": "Sketch 9", "type": "sketch", "plane": "XY", "offset": off, "sketch": {"entities": []}}]),
+        "index": len(p["features"]), "path": False, "section": None}).get_json()
+    above = [x for x in refs(30) if x.get("kind") in ("proj", "hidden")]
+    assert above and all(x.get("behind") for x in above)
+    assert not any(x.get("behind") for x in refs(-10))
+    mid = [x for x in refs(10) if x.get("kind") == "proj"]
+    assert mid and not any(x.get("behind") for x in mid)
+    rect = [{"id": "e%d" % i, "t": "line", "layer": "0", "x1": a, "y1": b, "x2": c, "y2": d}
+            for i, (a, b, c, d) in enumerate([(0, 0, 40, 0), (40, 0, 40, 20), (40, 20, 0, 20), (0, 20, 0, 0)])]
+    q = {"name": "t", "version": 2, "features": [
+        {"id": "s1", "name": "Sketch 1", "type": "sketch", "plane": "XY", "offset": 0, "sketch": {"entities": rect}},
+        {"id": "s2", "name": "Sketch 2", "type": "sketch", "plane": "XY", "offset": 5, "sketch": {"entities": []}},
+        {"id": "s3", "name": "Sketch 3", "type": "sketch", "plane": "XY", "offset": -5, "sketch": {"entities": []}}]}
+    get = lambda i: [x for x in client.post("/api/part/refs", json={"part": q, "index": i, "path": False, "section": None}).get_json() if x.get("src") == "sketch"]
+    assert len(get(1)) == 4 and all(x.get("behind") for x in get(1))
+    q["features"][1], q["features"][2] = q["features"][2], q["features"][1]
+    assert len(get(1)) == 4 and not any(x.get("behind") for x in get(1))
+
+
 def test_part_face_groups(client):
     """Connected groups of picked faces of a plate: top and bottom are two groups, top and a side one group."""
     from conftest import plate

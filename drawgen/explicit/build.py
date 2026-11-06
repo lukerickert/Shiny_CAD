@@ -1,4 +1,4 @@
-"""Deck build of the explicit analysis (ORC**3 workspace_build.py): the .inp -> OpenRadioss .rad translation
+"""Deck build of the explicit analysis: the .inp -> OpenCourant .rad translation
 with inp2rad, card injection, ties, contact, rigidify, and _build_thread.
 
 BuildMixin of the headless workspace (host.Workspace). The settings are self.<name> objects with get()/set()
@@ -899,15 +899,21 @@ class BuildMixin:
         out_lines = []
         part_ids = []
         skip = False
-        for line in rad_lines:
+        for li, line in enumerate(rad_lines):
             clean_line = line.strip().upper()
             if line.startswith(f"safe_{model_name}"): 
                 line = line.replace(f"safe_{model_name}", model_name)
             if clean_line.startswith('/PART/'):
                 try: part_ids.append(int(clean_line.split('/')[2]))
                 except: pass
-            
-            if clean_line.startswith('/SURF/') or clean_line.startswith('/INTER/') or clean_line.startswith('/GRNOD/SURF/') or clean_line.startswith('/TH/'): 
+            # the time history groups of the history requests (SC_H titles, radcards.py) are kept
+            sc_th = clean_line.startswith('/TH/') and li + 1 < len(rad_lines) and rad_lines[li + 1].startswith("SC_H")
+            if sc_th and clean_line.startswith('/TH/INTER/') and self.contact_mode.get() not in (CONTACT_T7, CONTACT_T19, CONTACT_T24):
+                self.log_msg("History output %s left out: Contact is None (no general contact interface)" % rad_lines[li + 1].strip())
+                skip = True
+            elif sc_th:
+                skip = False
+            elif clean_line.startswith('/SURF/') or clean_line.startswith('/INTER/') or clean_line.startswith('/GRNOD/SURF/') or clean_line.startswith('/TH/'): 
                 skip = True
             elif skip and clean_line.startswith('/') and not clean_line.startswith('//'): 
                 skip = False
@@ -948,7 +954,7 @@ class BuildMixin:
                     name_u = name.upper()
                     mat_names_found.append(f"  ID {mat_id}: '{name}'")
                     mapping = None
-                    for _mv, _nv in self._mat_slots():     # first slot with the model name wins (ORC**3: MAT1, MAT2, MAT3)
+                    for _mv, _nv in self._mat_slots():     # first slot with the model name wins
                         _t = _nv.get().strip().upper()
                         if _t and name_u == _t and _mv.get() in MATERIAL_LIBRARY:
                             mapping = MATERIAL_LIBRARY[_mv.get()]
@@ -1544,7 +1550,7 @@ class BuildMixin:
                 # v20.64: drive the single /RBODY main node with a smooth
                 # load-hold-unload profile - imposed displacement (/IMPDISP)
                 # or force (/CLOAD). Same single-/RBODY requirement as Explicit.
-                # Card layouts verified against the OpenRadioss readers:
+                # Card layouts verified against the OpenCourant readers:
                 # /IMPDISP shares the /IMPVEL layout; /CLOAD has an extra
                 # Itypfun column (funct Dir skew sensor grnod Itypfun Asc Fsc).
                 is_force = (vmode == RBV_PROFILE_F)
@@ -1623,7 +1629,7 @@ class BuildMixin:
             n_frames = 100
         anim_dt = tstop / n_frames
 
-        # v20.65: mass-scaling floor. DTmin > 0 activates OpenRadioss constant-
+        # v20.65: mass-scaling floor. DTmin > 0 activates OpenCourant constant-
         # timestep mass scaling (mass added to sub-floor nodes); DTmin = 0 keeps
         # the raw mesh-limited timestep (pre-v20.65 behaviour).
         try:

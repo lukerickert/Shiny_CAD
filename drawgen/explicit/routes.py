@@ -1,12 +1,11 @@
 """Server routes of the Explicit tab (/api/explicit/*): explicit documents, the model .inp of the ShinyCAD source and
 of the deck generator source, the deck STEP and part, run folders, deck build, solve (local, remote), job status and console, post-processing, results of the 3D view.
 
-Folders: <project>/explicit/<document>/        project dir of the run manager (ORC**3 Project Dir)
+Folders: <project>/explicit/<document>/        project dir of the run manager
              model/<document>.inp              .inp written from the ShinyCAD model or the deck generator
              runs/<date>_rNNN_<slug>/           run folders (run.json, model/, <job>_bNN/ build folders)
          <project>/explicit/run_history.json    finished jobs
-Machine settings (host.ENV_KEYS): config.json > "explicit"; on first use the ORC**3 configuration
-(%APPDATA%\\ORC3\\workspace_config.json) is read for them.
+Machine settings (host.ENV_KEYS): config.json > "explicit".
 """
 import json
 import os
@@ -60,16 +59,7 @@ def register(web):
         env = cfg.get("explicit")
         if not isinstance(env, dict):
             env = {}
-            orc = os.path.join(os.environ.get("APPDATA") or "", "ORC3", "workspace_config.json")
-            if os.environ.get("APPDATA") and os.path.isfile(orc):
-                try:
-                    with open(orc, "r") as f:
-                        o = json.load(f)
-                    env = {k: o[k] for k in host.ENV_KEYS if k in o}
-                    env["_from"] = orc
-                except (OSError, ValueError):
-                    env = {}
-        return {k: env.get(k, host.DEFAULTS[k]) for k in host.ENV_KEYS}, env.get("_from")
+        return {k: env.get(k, host.DEFAULTS[k]) for k in host.ENV_KEYS}, None
 
     def save_env(env):
         cfg = web.load_config()
@@ -129,7 +119,7 @@ def register(web):
         threading.Thread(target=work, daemon=True).start()
         return jid
 
-    # job queue of the last session (ORC**3: restored at startup)
+    # job queue of the last session
     try:
         _q = (web.load_config().get("explicit") or {}).get("job_queue") or []
     except (OSError, ValueError):
@@ -140,11 +130,13 @@ def register(web):
     # ------------------------------------------------------------------ documents and settings
     @app.route("/api/explicit/meta", methods=["GET"])
     def xp_meta():
+        from .. import matcurve
         lib = {}
         for k, v in C.MATERIAL_LIBRARY.items():
             if v:
                 lib[k] = {"law": str(v.get("law", "LAW36")).upper(), "E": v.get("E"), "nu": v.get("nu"),
-                          "rho": v.get("rho") * 1e12 if v.get("rho") else None}
+                          "rho": v.get("rho") * 1e12 if v.get("rho") else None,
+                          "curves": matcurve.library(k)}
         return jsonify({
             "library": lib, "library_none": "None (Use PrePoMax Data)",
             "analysis_modes": list(modes.ANALYSIS_MODES), "mode_help": modes.MODE_HELP,
@@ -160,7 +152,7 @@ def register(web):
             "rivet": {"components": rivet.COMPONENTS, "axes": rivet.AXIS_CHOICES, "import_error": rivet.IMPORT_ERROR},
             "lhu_easings": list(C.LHU_EASINGS), "defaults": host.DEFAULTS, "deck_default": deck.DEFAULT, "env_keys": list(host.ENV_KEYS),
             "slots_default": host.DEFAULT_SLOTS, "local": host.LOCAL, "remote": host.REMOTE,
-            "version": "%s %s" % (C.WORKSPACE_NAME, C.WORKSPACE_VERSION)})
+            "version": C.WORKSPACE_VERSION})
 
     @app.route("/api/explicit/list", methods=["GET"])
     def xp_list():
@@ -201,7 +193,7 @@ def register(web):
                 import shutil as _sh
                 found = _sh.which(exe)
             exes[n] = {"exe": exe, "found": found}
-        return jsonify({"env": env, "from_orc3": src, "executables": exes,
+        return jsonify({"env": env, "executables": exes,
                         "pvbatch": WS._find_pvbatch(), "paraview": WS._find_paraview()})
 
     @app.route("/api/explicit/env", methods=["PUT"])
@@ -229,7 +221,7 @@ def register(web):
                 return deck.build(doc, model_inp_path(name), title="SHINYCAD %s (deck generator)" % name, progress=prog)
             return jsonify({"job": start_job(fn_deck)})
         if not src.get("name"):
-            return err("choose the geometry (assembly or part)")
+            return err("choose the geometry (assembly, part or CalculiX .inp)")
         sources = web._asm_sources()
 
         def fn(prog):
@@ -326,7 +318,7 @@ def register(web):
 
     @app.route("/api/explicit/inp_view", methods=["POST"])
     def xp_inp_view():
-        """{"path"} -> {"job"}: view data of the mesh of an .inp."""
+        """{"path"} -> {"job"}: view data of the mesh of an .inp or of a Radioss starter deck (.rad)."""
         path = ((request.get_json(force=True) or {}).get("path") or "").strip().strip('"')
         if not os.path.isfile(path):
             return err("file not found: %s" % path)
@@ -334,8 +326,8 @@ def register(web):
         def fn(prog):
             from . import meshview
             prog("read", "Reading %s" % os.path.basename(path))
-            m = meshview.read_inp(path)
-            pl = meshview.payload(m["xyz"], m["cells"])
+            m = meshview.read_rad(path) if path.lower().endswith(".rad") else meshview.read_inp(path)
+            pl = meshview.payload(m["xyz"], m["cells"], node_ids=m["node_ids"], cell_ids=m["elem_ids"])
             pl["part_names"] = ["%s (%s)" % p for p in m["parts"]]
             pl["part_thick"] = m["part_thick"]
             return {"payload": pl, "summary": {"nodes": int(len(m["xyz"])), "elements": int(sum(len(c[1]) for c in m["cells"])),
@@ -384,26 +376,15 @@ def register(web):
 
     @app.route("/api/explicit/run/settings", methods=["POST"])
     def xp_run_settings():
-        """{"path"}: settings of the last build of a run (run.json); {"orc3": true}: the build settings of the ORC**3
-        configuration (%APPDATA%\\ORC3\\workspace_config.json). Older keys: host.migrate (legacy)."""
+        """{"path"}: settings of the last build of a run (run.json). Older keys: host.migrate (legacy)."""
         req = request.get_json(force=True) or {}
-        if req.get("orc3"):
-            orc = os.path.join(os.environ.get("APPDATA") or "", "ORC3", "workspace_config.json")
-            if not (os.environ.get("APPDATA") and os.path.isfile(orc)):
-                return err("no ORC**3 configuration (%%APPDATA%%\\ORC3\\workspace_config.json)")
-            try:
-                with open(orc, "r") as f:
-                    snap = json.load(f)
-            except (OSError, ValueError) as e:
-                return err("cannot read %s: %s" % (orc, e))
-        else:
-            d = req.get("path") or ""
-            try:
-                with open(os.path.join(d, "run.json"), "r") as f:
-                    meta = json.load(f)
-                snap = meta["builds"][-1]["settings"]
-            except Exception:
-                return err("no recorded build settings in this run")
+        d = req.get("path") or ""
+        try:
+            with open(os.path.join(d, "run.json"), "r") as f:
+                meta = json.load(f)
+            snap = meta["builds"][-1]["settings"]
+        except Exception:
+            return err("no recorded build settings in this run")
         snap, notes = host.migrate(snap, legacy=True)
         for n in notes:
             WS.log_msg("SNAPSHOT NOTE: %s" % n)
@@ -560,6 +541,16 @@ def register(web):
         if parsed:
             t, ke, ie, note = parsed
             out["energy"] = {"t": t, "ke": ke, "ie": ie, "note": note, "csv": os.path.basename(csv_path)}
+        if job:
+            from . import thist
+            try:
+                th = thist.series(folder, job, csv_path)
+            except (OSError, ValueError) as e:
+                th = {"time_history": [], "note": "time history: %s" % e}
+            if th:
+                out["time_history"] = th["time_history"]
+                if th.get("note"):
+                    out["th_note"] = th["note"]
         sp = os.path.join(folder, "principal_strains_summary.csv")
         if os.path.isfile(sp):
             import csv as _csv
@@ -573,6 +564,30 @@ def register(web):
             if job and os.path.isfile(p):
                 out["outs"][k] = os.path.getsize(p)
         return jsonify(out)
+
+    @app.route("/api/explicit/monitor", methods=["GET"])
+    def xp_monitor():
+        """?job= -> {"job", "status", "t", "dt", "err", "dmm", "nc"}: the cycle lines of the engine output of the job
+        (run monitor; kept while the program runs)."""
+        job = request.args.get("job") or ""
+        rec = WS.job_status.get(job)
+        if rec is None:
+            return err("unknown job: %s" % job)
+        tr = list(rec.get("trace") or [])
+        return jsonify({"job": job, "status": rec.get("status"), "tstop": rec.get("tstop"),
+                        "t": [x[0] for x in tr], "dt": [x[1] for x in tr], "err": [x[2] for x in tr],
+                        "dmm": [x[3] for x in tr], "nc": [x[4] for x in tr]})
+
+    @app.route("/api/explicit/probe", methods=["POST"])
+    def xp_probe():
+        """{"folder", "job", "field", "probes": [{"point", "cell"}]} -> {"time", "loc", "values"} (results.probe)."""
+        req = request.get_json(force=True) or {}
+        folder, job = req.get("folder") or "", req.get("job") or ""
+        try:
+            rigid = WS._harvest_rigid_pids(folder, job)
+            return jsonify(results.probe(folder, job, req.get("field") or "", req.get("probes") or [], rigid))
+        except (OSError, ValueError, KeyError) as e:
+            return err(str(e))
 
     @app.route("/api/explicit/geometry", methods=["POST"])
     def xp_geometry():
@@ -609,7 +624,7 @@ def register(web):
             data = f.read().decode("utf-8", "replace")
         return jsonify({"text": data, "size": size, "cut": size > n})
 
-    # ------------------------------------------------------------------ Tools (ORC**3 Tools tab)
+    # ------------------------------------------------------------------ Tools
     def tools_state():
         path = tools.tools_file(web.CONFIG_PATH)
         user, hidden, ferr = tools.load_tools_file(path)
@@ -621,16 +636,7 @@ def register(web):
         except (OSError, ValueError):
             env = {}
         a = env.get("tool_args")
-        if not isinstance(a, dict):
-            a = {}
-            orc = os.path.join(os.environ.get("APPDATA") or "", "ORC3", "workspace_config.json")
-            if os.environ.get("APPDATA") and os.path.isfile(orc):
-                try:
-                    with open(orc, "r") as f:
-                        a = dict(json.load(f).get("tool_args") or {})
-                except (OSError, ValueError):
-                    a = {}
-        return a
+        return a if isinstance(a, dict) else {}
 
     def save_explicit_key(key, value):
         cfg = web.load_config()
@@ -732,7 +738,7 @@ def register(web):
             return err("could not write %s: %s" % (path, e))
         return jsonify(tools_payload())
 
-    # ------------------------------------------------------------------ concentrated mass (ORC**3 Inertia tab)
+    # ------------------------------------------------------------------ concentrated mass
     @app.route("/api/explicit/inertia", methods=["POST"])
     def xp_inertia():
         """{"path"} -> {"state": off | missing | ready | invalid | error, "text"}: the payload summary."""
@@ -765,7 +771,7 @@ def register(web):
              "STATUS : INVALID - mass and all three diagonal inertias must be > 0 (singular tensor -> Error 274)."]
         return jsonify({"state": "ready" if ok else "invalid", "text": "\n".join(L), "payload": pay})
 
-    # ------------------------------------------------------------------ Rivet (ORC**3 Rivet tab)
+    # ------------------------------------------------------------------ Rivet
     @app.route("/api/explicit/rivet", methods=["POST"])
     def xp_rivet():
         """{"op": rings | columns | extract | load_fd, "path" (load_fd), document fields of prepare()}."""
@@ -841,7 +847,7 @@ def register(web):
     def xp_env_switch():
         """{"old", "new", "rad_target", "out_dir"}: remembers the Target .rad and Output Dir of the old Env (config.json >
         "explicit" > "env_dirs"), returns those remembered for the new Env (null: none) and logs where the Target .rad
-        runs on the remote Env (ORC**3 _on_run_target_changed)."""
+        runs on the remote Env."""
         req = request.get_json(force=True) or {}
         old, new = req.get("old") or "", req.get("new") or ""
         try:

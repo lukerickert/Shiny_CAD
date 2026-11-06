@@ -123,10 +123,11 @@ function initThree() {
     clicks = clicks.filter(t => now - t < 600); clicks.push(now);
     if (clicks.length >= 3) { clicks = []; if (PT.cmd && canFinish(feat(PT.cmd.id))) finishCommand(true); }
   });
-  let moveReq = null;
+  let moveReq = null, lastMove = null;
   renderer.domElement.addEventListener("pointermove", e => {
+    lastMove = e;                      // the hover of the last position of the frame
     if (moveReq) return;
-    moveReq = requestAnimationFrame(() => { moveReq = null; hoverView(e); });
+    moveReq = requestAnimationFrame(() => { moveReq = null; hoverView(lastMove); });
   });
   renderer.domElement.addEventListener("pointerleave", () => { setHover(null); });
   new ResizeObserver(resize3).observe(box);
@@ -966,8 +967,170 @@ function activeKinds() {
   return all.length ? all : null;
 }
 
+// ------------------------------------------------------------------ 3D sketch (Curve through points with "space")
+// Points picked in space: vertices, points of the curve, edge midpoints, centres of circular edges, centre lines
+// (axes of circular edges and cylindrical faces), points on edges, the 3D snap grid (a plane through the anchor
+// point: the last point of the curve, else the origin) and, with Shift, the line along the grid normal through the
+// anchor. X, Y, Z: grid normal; Backspace: removes the last point.
+
+const GRID_PLANES = { z: "XY", y: "XZ", x: "YZ" };
+const AXV = { x: [1, 0, 0], y: [0, 1, 0], z: [0, 0, 1] };
+/** The 3D sketch whose Points step is active, or null. */
+function spaceFeat() {
+  const c = PT.cmd;
+  if (!c) return null;
+  const f = feat(c.id);
+  if (!f || f.type !== "curve_points" || !f.space) return null;
+  const st = commandSteps(f)[c.step];
+  return st && st.key === "points" ? f : null;
+}
+function niceStep(v) {
+  const e = Math.pow(10, Math.floor(Math.log10(v)));
+  return [1, 2, 5, 10].map(k => k * e).find(x => x >= v) || 10 * e;
+}
+/** Grid of a 3D sketch: {axis, step (mm), anchor}. */
+function spaceGrid(f) {
+  const g = f.grid || {};
+  const bb = PT.mesh && PT.mesh.bbox;
+  const size = bb ? Math.hypot(bb[3] - bb[0], bb[4] - bb[1], bb[5] - bb[2]) : 100;
+  const pts = (f.points || []).map(pointOf).filter(Boolean);
+  return { axis: g.axis || "z", step: +g.step > 0 ? +g.step : niceStep(Math.max(size, 1) / 40), anchor: pts.length ? pts[pts.length - 1] : [0, 0, 0], pts };
+}
+const vec3 = a => new THREE.Vector3(a[0], a[1], a[2]);
+/** Closest points of the ray and the line p + s d: s on the line. */
+function rayLineS(ray, p, d) {
+  const w0 = ray.origin.clone().sub(p), a = ray.direction.dot(ray.direction), b = ray.direction.dot(d), c = d.dot(d);
+  const dd = ray.direction.dot(w0), e = d.dot(w0), den = a * c - b * b;
+  return Math.abs(den) < 1e-12 ? 0 : (a * e - b * dd) / den;
+}
+/** Snap of the cursor in a 3D sketch: a hit {kind: "point", vertex: true, point, snap}. */
+function snap3d(e, f) {
+  const t = PT.three, r = t.renderer.domElement.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  const nd = new THREE.Vector2((mx / r.width) * 2 - 1, -(my / r.height) * 2 + 1);
+  const rc = new THREE.Raycaster();
+  rc.setFromCamera(nd, t.camera);
+  const scr = q => { const v = vec3(q).project(t.camera); return Math.hypot((v.x + 1) / 2 * r.width - mx, (1 - v.y) / 2 * r.height - my); };
+  const G = spaceGrid(f), n = vec3(AXV[G.axis]), A = vec3(G.anchor);
+  const hit = (point, snap) => ({ kind: "point", vertex: true, point: point.map(v => Math.round(v * 1e6) / 1e6), snap });
+  const roundS = s => Math.round(s / G.step) * G.step;
+  // Shift: along the grid normal through the anchor
+  if (e.shiftKey) {
+    const sN = roundS(rayLineS(rc.ray, A, n));
+    return Object.assign(hit(A.clone().addScaledVector(n, sN).toArray(), "along " + G.axis.toUpperCase()), { line: [G.anchor, A.clone().addScaledVector(n, sN).toArray()] });
+  }
+  // vertices and point features (not behind a face), the points of the curve
+  const v = pickAt(e, ["point"]);
+  if (v) return Object.assign(v, { snap: v.vertex ? "vertex" : "point feature" });
+  for (const q of G.pts) if (scr(q) < 8) return hit(q, "point of the curve");
+  // edge midpoints, centres of circular edges (8 px)
+  let best = null, bd = 8;
+  const keys = (PT.mesh && PT.mesh.edge_keys) || [];
+  for (const k of keys) {
+    if (!k) continue;
+    if (k.mid && !k.round) { const d = scr(k.mid); if (d < bd) { bd = d; best = hit(k.mid, "midpoint"); } }
+    if (k.round && k.round.c) { const d = scr(k.round.c); if (d < bd) { bd = d; best = hit(k.round.c, "centre"); } }
+  }
+  if (best) return best;
+  // centre lines: the axes of circular edges and cylindrical faces (6 px of the line)
+  const axes = [];
+  for (const k of keys.concat((PT.mesh && PT.mesh.face_keys) || [])) if (k && k.round && k.round.c && k.round.ax) axes.push(k.round);
+  for (const q of axes) {
+    const c = vec3(q.c), d = vec3(q.ax).normalize();
+    const sA = rayLineS(rc.ray, c, d), pt = c.clone().addScaledVector(d, roundS(sA)), raw = c.clone().addScaledVector(d, sA);
+    const dd = scr(raw.toArray());
+    if (dd < 6 && dd < bd) { bd = dd; best = Object.assign(hit(pt.toArray(), "centre line"), { line: [c.clone().addScaledVector(d, -G.step * 20).toArray(), c.clone().addScaledVector(d, G.step * 20).toArray()] }); }
+  }
+  if (best) return best;
+  // a point on an edge or a curve body
+  const eh = pickAt(e, ["edge", "sedge", "curve"]);
+  if (eh && eh.line && eh.point) return hit(eh.point, "on edge");
+  // the grid: the ray on the plane through the anchor
+  const den = rc.ray.direction.dot(n);
+  if (Math.abs(den) < 1e-9) return null;
+  const s0 = A.clone().sub(rc.ray.origin).dot(n) / den;
+  const P = rc.ray.origin.clone().addScaledVector(rc.ray.direction, s0).sub(A);
+  const u = G.axis === "x" ? [1, 2] : G.axis === "y" ? [0, 2] : [0, 1];
+  const q = P.toArray();
+  for (const i of u) q[i] = roundS(q[i]);
+  return hit(A.clone().add(vec3(q)).toArray(), "grid " + GRID_PLANES[G.axis]);
+}
+/** Grid, cursor point, rubber band from the last point and snap line of the 3D sketch (overlay of the view). */
+function drawSpace(f, h) {
+  const t = PT.three;
+  if (!t) return;
+  if (!t.space) { t.space = new THREE.Group(); t.space.renderOrder = 30; t.scene.add(t.space); }
+  const grp = t.space;
+  for (const o of [...grp.children]) { grp.remove(o); if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); }
+  if (!f) { render3(); return; }
+  const G = spaceGrid(f), N = 10, u = G.axis === "x" ? [1, 2] : G.axis === "y" ? [0, 2] : [0, 1];
+  const pos = [], axisPos = [];
+  for (let k = -N; k <= N; k++) {
+    for (const [i, j] of [[u[0], u[1]], [u[1], u[0]]]) {
+      const a = G.anchor.slice(), b = G.anchor.slice();
+      a[i] += k * G.step; b[i] += k * G.step; a[j] -= N * G.step; b[j] += N * G.step;
+      (k === 0 ? axisPos : pos).push(...a, ...b);
+    }
+  }
+  const lines = (arr, color, opacity, dashed) => {
+    if (!arr.length) return;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.Float32BufferAttribute(arr, 3));
+    const m = dashed ? new THREE.LineDashedMaterial({ color, dashSize: G.step / 2, gapSize: G.step / 3, depthTest: false, transparent: true, opacity })
+      : new THREE.LineBasicMaterial({ color, depthTest: false, transparent: true, opacity });
+    const l = new THREE.LineSegments(g, m);
+    if (dashed) l.computeLineDistances();
+    l.renderOrder = 30;
+    grp.add(l);
+  };
+  lines(pos, 0x868e96, 0.35);
+  lines(axisPos, 0x1f5fae, 0.6);
+  // the curve so far and the rubber band
+  const pts = G.pts, poly = [];
+  for (let k = 0; k + 1 < pts.length; k++) poly.push(...pts[k], ...pts[k + 1]);
+  lines(poly, 0x6a1b9a, 1);
+  if (h && h.point) {
+    if (pts.length) lines([...pts[pts.length - 1], ...h.point], 0xe8590c, 1, true);
+    if (h.line) lines([...h.line[0], ...h.line[1]], 0x0b7a75, 0.9, true);
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.Float32BufferAttribute(h.point, 3));
+    const pm = new THREE.Points(g, new THREE.PointsMaterial({ color: 0xe8590c, size: 10, sizeAttenuation: false, depthTest: false }));
+    pm.renderOrder = 31;
+    grp.add(pm);
+  }
+  render3();
+}
+
+/** Grid and typed point controls of the Points step of a 3D sketch. */
+function spaceHtml(f) {
+  const G = spaceGrid(f);
+  return `<div class="grid2">` + select("pf-sgax", "Grid plane", [["z", "XY (normal Z, key Z)"], ["y", "XZ (normal Y, key Y)"], ["x", "YZ (normal X, key X)"]], G.axis) +
+    num("pf-sgstep", "Grid step (mm; empty: automatic " + pfmt(spaceGrid(Object.assign({}, f, { grid: { axis: G.axis } })).step) + ")", (f.grid || {}).step || "") + `</div>` +
+    `<p class="hint">Grid through (${G.anchor.map(v => pfmt(v, 3)).join(", ")}) mm. Point x y z (mm)${G.pts.length ? "; Relative: from the last point" : ""}:</p>` +
+    `<div class="row wrap"><input type="text" id="pf-sxyz" placeholder="x, y, z" style="width:140px">` + (G.pts.length ? `<label class="check inline"><input type="checkbox" id="pf-srel"${PT.spaceRel ? " checked" : ""}> Relative</label>` : "") +
+    `<button type="button" id="pf-sadd">Add point</button></div>`;
+}
+function bindSpace(f, box) {
+  const ax = box.querySelector("#pf-sgax"), st = box.querySelector("#pf-sgstep"), xyz = box.querySelector("#pf-sxyz"), rel = box.querySelector("#pf-srel");
+  if (ax) ax.onchange = () => { f.grid = Object.assign({}, f.grid, { axis: ax.value }); renderCommand(); drawSpace(f, null); };
+  if (st) st.onchange = () => { const v = numv(st.value); f.grid = Object.assign({}, f.grid); if (v > 0) f.grid.step = v; else delete f.grid.step; renderCommand(); drawSpace(f, null); };
+  if (rel) rel.onchange = () => { PT.spaceRel = rel.checked; };
+  const add = () => {
+    const v = xyz.value.split(/[,;\s]+/).filter(Boolean).map(numv);
+    if (v.length !== 3 || !v.every(isFinite)) { msgPart("Point: three numbers x, y, z (mm)", true); return; }
+    const G = spaceGrid(f), q = PT.spaceRel && G.pts.length ? v.map((c, i) => G.anchor[i] + c) : v;
+    f.points = (f.points || []).concat([q.map(c => Math.round(c * 1e6) / 1e6)]);
+    PT.dirty = true; changedPart(); renderCommand(); drawSpace(f, null);
+  };
+  box.querySelector("#pf-sadd").onclick = add;
+  xyz.onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); add(); } };
+}
+
 function hoverView(e) {
   if (!PT.three || !PT.part) return;
+  const sf = spaceFeat();
+  if (sf) { const h = snap3d(e, sf); PT.spaceHover = h; setHover(h, e); drawSpace(sf, h); return; }
+  if (PT.three.space && PT.three.space.children.length) drawSpace(null);
   setHover(pickAt(e, activeKinds()), e);
 }
 
@@ -1007,6 +1170,7 @@ function hoverText(h) {
     const near = ax && h.id === ax.f.sketch_ref && h.point ? nearestSketchLine(feat(h.id), axisLines(ax.f, ax.constrOnly), h.point) : null;
     return near && near.dist <= planeSize() * 0.02 ? lineLabel(near.e) + " of " + itemName(h.id) : itemName(h.id);
   }
+  if (h.kind === "point" && h.snap) { const q = h.point || []; return h.snap[0].toUpperCase() + h.snap.slice(1) + " (" + q.map(v => pfmt(v, 3)).join(", ") + ") mm"; }
   if (h.kind === "point") { const q = h.point || []; return (h.vertex ? "Vertex" : itemName(h.id)) + " (" + q.map(v => pfmt(v, 2)).join(", ") + ") mm"; }
   if (h.kind === "axis") return itemName(h.id);
   if (h.kind === "plane") return BASE_PLANES[h.id] ? "Reference plane " + BASE_PLANES[h.id] : itemName(h.id);
@@ -1017,7 +1181,8 @@ function hoverText(h) {
 /** Click in the view: feeds the active command step, or selects the owner of the element in the tree. */
 function clickView(e) {
   const kinds = activeKinds();
-  const h = pickAt(e, kinds);
+  const sf = spaceFeat();
+  const h = sf ? snap3d(e, sf) : pickAt(e, kinds);
   if (PT.measure && !PT.cmd) { if (h) measureClick(h); return; }
   const c = PT.cmd;
   if (c && (c.pick || kinds)) {
@@ -2160,8 +2325,19 @@ function createSketchUnderlay(model, frame, upto) {
   const group = new THREE.Group();
   scene.add(group);
   const clip = new THREE.Plane();
-  let cut = null, capObj = null, visible = true, W = 0, H = 0, capSeq = 0;
-  const mats = [];
+  let cut = null, capObj = null, visible = true, W = 0, H = 0, capSeq = 0, behind = "dim", isolate = false;
+  const mats = [], backMats = [];
+  // behind the sketch plane (local z below -tol): a copy of each mesh drawn at 10 % opacity ("dim"), or not drawn
+  // ("hide"); Isolate: only a slab of +-tol around the plane
+  const add = (obj, mat) => {
+    group.add(obj);
+    const bm = mat.clone();
+    bm.transparent = true; bm.opacity = 0.1; bm.depthWrite = false;
+    backMats.push(bm);
+    const copy = new obj.constructor(obj.geometry, bm);
+    copy.renderOrder = 3;
+    group.add(copy);
+  };
   // the solids
   if (m && m.vertices && m.vertices.length) {
     let nSolids = 0;
@@ -2171,7 +2347,7 @@ function createSketchUnderlay(model, frame, upto) {
     for (let si = 0; si < nSolids; si++) {
       const mat = new THREE.MeshStandardMaterial({ color: bodyColor("solid:" + si, COL.solid), metalness: 0.15, roughness: 0.6, side: THREE.DoubleSide });
       mats.push(mat);
-      group.add(new THREE.Mesh(facesGeometry(m, solidFaces[si]), mat));
+      add(new THREE.Mesh(facesGeometry(m, solidFaces[si]), mat), mat);
     }
   }
   // the surface and curve bodies
@@ -2189,7 +2365,7 @@ function createSketchUnderlay(model, frame, upto) {
       mats.push(mat);
       const mesh = new THREE.Mesh(g, mat);
       mesh.renderOrder = 2;
-      group.add(mesh);
+      add(mesh, mat);
     } else if (sm.edges && sm.edges.length) {
       const pos = [];
       for (const pl of sm.edges) for (let k = 0; k + 1 < pl.length; k++) pos.push(...pl[k], ...pl[k + 1]);
@@ -2198,12 +2374,23 @@ function createSketchUnderlay(model, frame, upto) {
         eg.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
         const mat = new THREE.LineBasicMaterial({ color: COL.curve });
         mats.push(mat);
-        group.add(new THREE.LineSegments(eg, mat));
+        add(new THREE.LineSegments(eg, mat), mat);
       }
     }
   }
   const render = () => { if (visible && W && H) renderer.render(scene, camera); };
-  const applyClip = () => { for (const mat of mats) mat.clippingPlanes = cut ? [clip] : []; };
+  const bb = new THREE.Box3();
+  group.traverse(ob => { if (ob.geometry) { ob.geometry.computeBoundingBox(); bb.union(ob.geometry.boundingBox); } });
+  const tolZ = 1e-3 * (bb.isEmpty() ? 100 : bb.getSize(new THREE.Vector3()).length() || 100);
+  const keepFront = new THREE.Plane(z.clone(), -z.dot(o) + tolZ), keepBack = new THREE.Plane(z.clone().negate(), z.dot(o) - tolZ);
+  const slabTop = new THREE.Plane(z.clone().negate(), z.dot(o) + tolZ);
+  const applyClip = () => {
+    const c = cut ? [clip] : [];
+    const front = isolate ? [...c, keepFront, slabTop] : behind === "show" ? c : [...c, keepFront];
+    for (const mat of mats) { mat.clippingPlanes = front; mat.needsUpdate = true; }
+    for (const bm of backMats) { bm.clippingPlanes = [...c, keepBack]; bm.visible = !isolate && behind === "dim"; bm.needsUpdate = true; }
+  };
+  applyClip();
   async function refreshCap() {
     if (capObj) { scene.remove(capObj); capObj = null; }
     if (!cut || !m || !m.vertices || !m.vertices.length) { render(); return; }
@@ -2245,11 +2432,17 @@ function createSketchUnderlay(model, frame, upto) {
       refreshCap();
     },
     setVisible(on) { visible = !!on; el.hidden = !visible; if (visible) render(); },
+    /** The model behind the sketch plane: "dim" (10 % opacity), "hide" or "show". */
+    setBehind(mode) { behind = ["dim", "hide", "show"].includes(mode) ? mode : "dim"; applyClip(); render(); },
+    /** Isolate: only the model within the sketch plane (+-0.1 % of the model size). */
+    setIsolate(on) { isolate = !!on; applyClip(); render(); },
+    /** State for the tests. */
+    state() { return { behind, isolate, cut, backVisible: backMats.some(b => b.visible), front: mats.map(x => (x.clippingPlanes || []).length) }; },
     dispose() {
       ++capSeq;
       if (el.parentNode) el.parentNode.removeChild(el);
       group.traverse(ob => { if (ob.geometry) ob.geometry.dispose(); });
-      for (const mat of mats) mat.dispose();
+      for (const mat of mats.concat(backMats)) mat.dispose();
       renderer.dispose();
     },
   };
@@ -3223,13 +3416,18 @@ const COMMANDS = {
         done: f => !!(f.ends || [])[i],
         summary: f => { const e = (f.ends || [])[i]; return e ? (e.kind === "point" ? itemName(e.point) : (e.kind === "curve" ? itemName(e.body) : "edge") + ", " + (e.cont || "tangent")) : "none"; } }))
       .concat([{ key: "opts", label: "Result", html: f => `<p class="hint">A curve body: a cubic (tangent) or quintic (curvature) Bezier curve between the two ends. Fill surface, Loft surface, Bridge surface, Extend surface (up to) and Sweep surface take it.</p>` + resultLine(f), summary: f => "" }]) },
-  curve_points: { title: "Curve through points", needsSolid: false, defaults: () => ({ points: [], method: "polyline", closed: false }),
+  curve_points: { title: "Curve through points", needsSolid: false, defaults: init => Object.assign({ points: [], method: "polyline", closed: false }, init && init.space ? { space: true, grid: { axis: "z" } } : {}),
     steps: f => [{ key: "points", label: "Points", kinds: ["point"], multi: true, before: false,
-        hint: "Click vertices of the solid, of surface and curve bodies, or point features, in order. Click again to remove a point.",
-        accept(f, h) { f.points = f.points || []; const ref = refOf(h); const k = f.points.findIndex(x => sameRef(x, ref)); if (k >= 0) f.points.splice(k, 1); else f.points.push(ref); PT.dirty = true; },
+        hint: f.space ? "Click points in space: vertices, edge midpoints, centres of circular edges, centre lines, points on edges, else the 3D snap grid (a plane through the last point; X, Y, Z: its normal). Shift: along the grid normal through the last point. Backspace: removes the last point."
+          : "Click vertices of the solid, of surface and curve bodies, or point features, in order. Click again to remove a point.",
+        accept(f, h) {
+          f.points = f.points || []; const ref = refOf(h);
+          if (f.space) { const last = f.points[f.points.length - 1]; if (!(last && sameRef(last, ref))) f.points.push(ref); PT.dirty = true; return; }
+          const k = f.points.findIndex(x => sameRef(x, ref)); if (k >= 0) f.points.splice(k, 1); else f.points.push(ref); PT.dirty = true; },
         // the chips (hover and click highlight the point, x removes it, Clear) are bound by bindChips
-        html: f => ((f.points || []).length ? `<div class="cw-chips" data-prop="points">` + (f.points || []).map((p, k) => `<span class="cw-chip" data-i="${k}" title="${pesc(itemName(p))}. Click: keep highlighted">${k + 1} · ${pesc(isVertexRef(p) ? "(" + p.map(v => pfmt(v, 2)).join(", ") + ")" : itemName(p))}<button type="button" data-cwdel="${k}" title="Remove">×</button></span>`).join("") + `</div>` +
+        html: f => (f.space ? spaceHtml(f) : "") + ((f.points || []).length ? `<div class="cw-chips" data-prop="points">` + (f.points || []).map((p, k) => `<span class="cw-chip" data-i="${k}" title="${pesc(itemName(p))}. Click: keep highlighted">${k + 1} · ${pesc(isVertexRef(p) ? "(" + p.map(v => pfmt(v, 2)).join(", ") + ")" : itemName(p))}<button type="button" data-cwdel="${k}" title="Remove">×</button></span>`).join("") + `</div>` +
           `<div class="buttons"><button type="button" data-cwclear="points">Clear</button></div>` : `<p class="hint">No point yet.</p>`),
+        bind: (f, box) => { if (f.space) bindSpace(f, box); },
         done: f => (f.points || []).length >= 2, summary: f => (f.points || []).length + " point(s)" },
       { key: "opts", label: "Curve", html: f => select("pf-cpm", "Curve", [["polyline", "Polyline (straight segments)"], ["spline", "Smooth spline through the points"], ["line", "Best-fit straight line"], ["arc", "Circular arc through three points"]], f.method || "polyline") +
           (f.method === "polyline" || f.method === "spline" || !f.method ? check("pf-cpclosed", "Closed", !!f.closed) : "") + resultLine(f),
@@ -3407,6 +3605,7 @@ function startCommand(type, init, existingId) {
     const last = (PT.last || {})[type];
     if (last && STICKY[type]) for (const k of STICKY[type]) if (last[k] !== undefined && !(init && k in init)) f[k] = JSON.parse(JSON.stringify(last[k]));
     if (type === "surf_sketch" && f.kind === "revolve") f.name = "Revolved surface " + (PT.part.features.filter(x => x.type === "surf_sketch" && x.kind === "revolve").length + 1);
+    if (type === "curve_points" && f.space) f.name = "3D sketch " + (PT.part.features.filter(x => x.type === "curve_points" && x.space).length + 1);
     if (type === "sketch" && !init) { const s = PT.sel && (BASE_PLANES[PT.sel] ? PT.sel : feat(PT.sel) && feat(PT.sel).type === "plane" ? PT.sel : null); if (s) { if (BASE_PLANES[s]) f.plane = s; else { f.plane = "datum"; f.plane_ref = s; } } }
     if (SKETCH_TYPES.has(type) || type === "surf_sketch") { const s = PT.sel && feat(PT.sel); if (s && s.type === "sketch") f.sketch_ref = s.id; }
     if (init && init.insertAt !== undefined) PT.part.features.splice(init.insertAt, 0, f); else PT.part.features.push(f);
@@ -3460,7 +3659,8 @@ function finishCommand(silent) {
   const resume = c.resume, isNew = c.isNew;
   if (isNew) for (const sid of consumedSources(f)) PT.hidden[sid] = true;
   rememberLast(f);
-  PT.cmd = null; PT.chipPin = null; PT.chipHover = null;
+  PT.cmd = null; PT.chipPin = null; PT.chipHover = null; PT.spaceHover = null;
+  drawSpace(null);
   PT.sel = f.id;
   if (def.finish) { def.finish(f, isNew, resume); return; }
   changedPart();
@@ -3475,7 +3675,8 @@ function cancelCommand() {
     else Object.assign(f, JSON.parse(c.snapshot));
   }
   const resume = c.resume;
-  PT.cmd = null; PT.chipPin = null; PT.chipHover = null;
+  PT.cmd = null; PT.chipPin = null; PT.chipHover = null; PT.spaceHover = null;
+  drawSpace(null);
   changedPart();
   if (resume) resumeCommand(resume);
 }
@@ -3545,6 +3746,8 @@ async function loadRegions(f) {
  *  user is typing) is deferred to the blur of that field; a nested render during the DOM replacement is skipped. */
 function renderCommand(force) {
   if (PT.quiet) return;
+  if (PT.three && PT.three.space && PT.three.space.children.length && !spaceFeat()) drawSpace(null);
+  else if (spaceFeat()) drawSpace(spaceFeat(), PT.spaceHover);
   const box = $("#pt-cmdbody");
   const c = PT.cmd;
   if (!c) { $("#pt-cmdwin").hidden = true; renderProps(); return; }
@@ -3812,7 +4015,14 @@ const LEGACY_PANELS = {
     bindAll(box, { "#pf-path": el => { f.path = el.value.trim(); if (/\.stl$/i.test(f.path) && !f.stl) f.stl = { fit: true }; }, "#pf-partidx": el => { const v = el.value.trim(); f.part = v === "" ? null : v; },
                    "#pf-crebuild": el => setClean("rebuild", el.checked), "#pf-cfix": el => setClean("fix", el.checked), "#pf-cunify": el => setClean("unify", el.checked), "#pf-cana": el => setClean("analytic", el.checked), "#pf-canatol": el => setClean("analytic_tol", Math.max(1e-6, numv(el.value) || 0.001)),
                    "#pf-cminvol": el => setClean("min_volume", Math.max(0, numv(el.value) || 0)) });
-    box.querySelector("#pf-browse").onclick = async () => { try { const p = await window.browse("open", "model", "", "STEP or STL file to import"); if (p) { f.path = p; if (/\.stl$/i.test(p) && !f.stl) f.stl = { fit: true }; changedPart(); } } catch (e) { showErr(e); } };
+    box.querySelector("#pf-browse").onclick = async () => { try { const p = await window.browse("open", "model", "", "STEP or STL file to import"); if (p) { f.path = p; if (/\.stl$/i.test(p) && !f.stl) f.stl = { fit: true }; if (!(await importSurfaceStep(f))) changedPart(); } } catch (e) { showErr(e); } };
+    const pin = box.querySelector("#pf-path"), pch = pin.onchange;
+    pin.onchange = async ev => { if (pch) pch.call(pin, ev); try { await importSurfaceStep(f); } catch (e) { showErr(e); } };
+    const err = (PT.status[f.id] || {}).error || "";
+    if (/only surfaces/.test(err)) {
+      box.insertAdjacentHTML("beforeend", `<button type="button" id="pf-assurf" title="Replace this feature with one Import surface feature per component of the file">Import as surfaces</button>`);
+      box.querySelector("#pf-assurf").onclick = () => importSurfaceStep(f).catch(showErr);
+    }
   },
   unify(f, box) {
     box.innerHTML = check("pf-uf", "Merge coplanar and co-cylindrical faces", f.faces !== false) + check("pf-ue", "Merge collinear and co-circular edges", f.edges !== false) +
@@ -3958,10 +4168,11 @@ const LEGACY_PANELS = {
   },
   surf_import(f, box) {
     box.innerHTML = `<label>STEP file path on this PC<span class="row"><input type="text" id="pf-spath" value="${pesc(f.path || "")}" placeholder="C:\\...\\deck.step"><button type="button" id="pf-sbrowse" class="browse" title="Choose the file">…</button></span></label>` +
-      `<label>Component<input type="text" id="pf-slabel" value="${pesc(f.label || "")}" placeholder="empty: all faces of the file"></label>` + resultText(PT.status[f.id] || {}) +
+      `<label>Component<input type="text" id="pf-slabel" list="pf-slabels" value="${pesc(f.label || "")}" placeholder="empty: all faces of the file"></label><datalist id="pf-slabels"></datalist>` + resultText(PT.status[f.id] || {}) +
       `<p class="hint">The faces of the component (STEP label) become one surface body.</p>`;
     bindAll(box, { "#pf-spath": el => { f.path = el.value.trim(); }, "#pf-slabel": el => { f.label = el.value.trim(); } });
     box.querySelector("#pf-sbrowse").onclick = async () => { try { const p = await window.browse("open", "step", "", "STEP file to import"); if (p) { f.path = p; changedPart(); } } catch (e) { showErr(e); } };
+    if (f.path) stepInfo(f.path).then(j => { const dl = box.querySelector("#pf-slabels"); if (dl && j) dl.innerHTML = (j.surfaces || []).map(n => `<option value="${pesc(n)}">`).join(""); }).catch(() => {});
   },
   surf_cut(f, box) {
     const i = featIndex(f.id);
@@ -3973,6 +4184,27 @@ const LEGACY_PANELS = {
     bindAll(box, { "#pf-src": el => { if (el.value.startsWith("plane:")) { f.with = "plane"; f.plane = el.value.slice(6); f.source = null; } else { f.with = "surface"; f.source = el.value || null; } }, "#pf-keep": el => { f.keep = el.value; } });
   },
 };
+
+/** Components of a STEP file: {"solids", "surfaces": [names]} (server: model.step_solids, step_surfaces). */
+async function stepInfo(path) {
+  return await (await postJSON("/api/part/step_info", { path })).json();
+}
+/** Import geometry of a STEP file without solids: the feature is replaced by one Import surface feature per
+ * component with faces (one surface body each, named by the component). Returns true when replaced. */
+async function importSurfaceStep(f) {
+  if (!f.path || /\.stl$/i.test(f.path)) return false;
+  const j = await stepInfo(f.path);
+  if (!j || j.solids !== 0 || !(j.surfaces || []).length || !feat(f.id)) return false;
+  const names = [...new Set(j.surfaces)];
+  const one = names.length === 1 || names.some(n => !n);
+  const items = (one ? [""] : names).map(n => ({ id: newId(), name: n || nextName("surf_import"), type: "surf_import", suppressed: false, path: f.path, label: n }));
+  PT.part.features.splice(featIndex(f.id), 1, ...items);
+  PT.cmd = null; PT.chipPin = null; PT.chipHover = null;
+  PT.sel = items[0].id;
+  changedPart();
+  msgPart(`${f.path.split(/[\\/]/).pop()} has no solids: ${items.length} Import surface feature(s), one surface body per component`);
+  return true;
+}
 
 // ------------------------------------------------------------------ sketch editing
 
@@ -4240,6 +4472,7 @@ window.__partNewFromStep = function (name, path, index) {
   p.features.push({ id: "f" + (p.next++), name: "Import geometry 1", type: "import", suppressed: false, path, part: index === undefined ? null : index, clean: { rebuild: true, fix: true, unify: false, min_volume: 0 } });
   loadPart(p);
   if (FM) FM.markUnsaved();
+  importSurfaceStep(p.features[p.features.length - 1]).catch(() => {});          // a STEP file without solids
 };
 window.__partCurrent = () => (PT.part ? { name: PT.part.name, dirty: !!PT.dirty } : null);
 
@@ -4298,13 +4531,16 @@ window.partShown = function () {
       if (ni >= 0 && PT.part) { const items = nextCommands(); const it = items[ni]; if (it) { e.preventDefault(); runNext(it); } }
       return;
     }
+    const sf = spaceFeat();
+    if (sf && ["x", "y", "z"].includes(e.key.toLowerCase())) { e.preventDefault(); sf.grid = Object.assign({}, sf.grid, { axis: e.key.toLowerCase() }); renderCommand(); drawSpace(sf, null); return; }
+    if (sf && e.key === "Backspace") { e.preventDefault(); if ((sf.points || []).length) { sf.points.pop(); PT.dirty = true; changedPart(); renderCommand(); } return; }
     if (e.key === "Escape") cancelCommand();
     if (e.key === "Enter") finishCommand();
   });
   window.addEventListener("beforeunload", e => { if (PT.dirty) { e.preventDefault(); e.returnValue = ""; } });
 })();
 // exposed for tests
-window.__part = { PT, feat, feedCommand, showOnlyBody, showAllBodies, showBodies, toggleBodyGroup, bodyGroupIds, surfOpacity, setSurfOpacity, cancelBuild, boxHits, selectShown, addHits, activePick, THREE, loadPart, setMesh, viewXdir, setMeasure, measureClick, startCommand, finishCommand, cancelCommand, gotoStep, nextStep, selectItem, pickAt, commandSteps, changedPart, viewDir, hoverText };
+window.__part = { PT, feat, snap3d, spaceGrid, feedCommand, showOnlyBody, showAllBodies, showBodies, toggleBodyGroup, bodyGroupIds, surfOpacity, setSurfOpacity, cancelBuild, boxHits, selectShown, addHits, activePick, THREE, loadPart, setMesh, viewXdir, setMeasure, measureClick, startCommand, finishCommand, cancelCommand, gotoStep, nextStep, selectItem, pickAt, commandSteps, changedPart, viewDir, hoverText };
 
 // ------------------------------------------------------------------ mesh preview
 

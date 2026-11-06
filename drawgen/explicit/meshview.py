@@ -87,8 +87,9 @@ def boundary(cells):
     return faces, lines
 
 
-def payload(xyz, cells):
-    """View data (see the module text)."""
+def payload(xyz, cells, node_ids=None, cell_ids=None):
+    """View data (see the module text). node_ids: the mesh node id of each point; cell_ids: the element ids of the
+    cells, one array per cell group (then "node_ids" and "cell_ids" in the view data, for the mesh selection)."""
     xyz = np.asarray(xyz, float).reshape(-1, 3)
     faces, lines = boundary(cells)
     tri, tcell, tkind = [], [], []
@@ -114,7 +115,10 @@ def payload(xyz, cells):
     pid = np.concatenate(parts) if parts else np.zeros(0, np.int64)
     return {"count": int(len(xyz)), "pos": _b64(xyz, np.float32), "tri": _b64(T, np.uint32), "tri_cell": _b64(C, np.uint32),
             "tri_kind": _b64(K, np.uint8), "lines": _b64(L, np.uint32), "ncell": int(ncell), "ntri": int(len(T)),
-            "part": _b64(pid, np.int32), "bbox": [float(v) for v in list(lo) + list(hi)]}
+            "part": _b64(pid, np.int32), "bbox": [float(v) for v in list(lo) + list(hi)],
+            **({"node_ids": _b64(np.asarray(node_ids, np.int64), np.uint32)} if node_ids is not None else {}),
+            **({"cell_ids": _b64(np.concatenate([np.asarray(c, np.int64) for c in cell_ids]) if len(cell_ids) else np.zeros(0, np.int64), np.uint32)}
+               if cell_ids is not None else {})}
 
 
 # --------------------------------------------------------------------------- legacy VTK
@@ -405,6 +409,32 @@ def read_inp(path):
     thick = [shell_sec.get(str(e).upper()) if inp_kind(t) in SHELL_KINDS else None for e, t in parts]
     return {"xyz": xyz, "cells": cells, "node_ids": nid, "elem_ids": elem_ids, "parts": parts,
             "part_thick": [x if x and x[0] and x[0] > 0 else None for x in thick]}
+
+
+def read_rad(path):
+    """Nodes and elements of a Radioss starter deck (radmodel.read) in the form of read_inp."""
+    from .. import radmodel
+    r = radmodel.read(path)
+    ids = sorted(r["nodes"])
+    nid = np.asarray(ids, np.int64)
+    xyz = np.asarray([r["nodes"][n] for n in ids], float).reshape(-1, 3)
+    lookup = {n: i for i, n in enumerate(ids)}
+    thick = {s["elset"]: s.get("t") for s in r["sections"]}
+    cells, elem_ids, parts, pth = [], [], [], []
+    for elset, eids in r["elsets"].items():
+        by = {}
+        for e in eids:
+            by.setdefault(r["elements"][e][0], []).append(e)
+        for et, es in sorted(by.items()):
+            kind = inp_kind(et)
+            nc = NCORNER[kind]
+            ok = [e for e in es if all(n in lookup for n in r["elements"][e][1][:nc])]
+            conn = np.array([[lookup[n] for n in r["elements"][e][1][:nc]] for e in ok], np.int64).reshape(-1, nc)
+            cells.append((kind, conn, np.full(len(ok), len(parts), np.int64)))
+            elem_ids.append(np.asarray(ok, np.int64))
+            parts.append((elset, et))
+            pth.append([thick[elset], 0.0] if kind in SHELL_KINDS and thick.get(elset) else None)
+    return {"xyz": xyz, "cells": cells, "node_ids": nid, "elem_ids": elem_ids, "parts": parts, "part_thick": pth}
 
 
 def eps1(T9):

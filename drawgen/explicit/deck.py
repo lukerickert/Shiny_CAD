@@ -329,7 +329,7 @@ def build(doc, inp_path, title="", progress=None, timeout=1800):
         raise ModelError("deck meshing failed: %s" % res.get("error"))
     say("view", "Reading the mesh")
     mm = meshview.read_inp(inp_path)
-    pl = meshview.payload(mm["xyz"], mm["cells"])
+    pl = meshview.payload(mm["xyz"], mm["cells"], node_ids=mm["node_ids"], cell_ids=mm["elem_ids"])
     pl["part_names"] = ["%s (%s)" % p for p in mm["parts"]]
     pl["part_thick"] = mm["part_thick"]
     warnings = list(c["warnings"])

@@ -260,7 +260,7 @@ def print_tensor(I, indent="  "):
 
 
 def emit_rbody(M, cg, I, node_id=None, rbody_id=None, tilt=None):
-    """Emit the mass + inertia data for an OpenRadioss /RBODY master node.
+    """Emit the mass + inertia data for an OpenCourant /RBODY master node.
 
     Returns a dict of the six inertia components (global frame, about CG)
     plus mass and CG, and a formatted /RBODY block as text. If tilt is
@@ -443,7 +443,7 @@ def main():
                     help="tilt the assembly about its CG, e.g. --tilt Y 10 "
                          "(overrides any 'tilt' in the JSON)")
     ap.add_argument("--rad", action="store_true",
-                    help="also emit an OpenRadioss /RBODY inertia block")
+                    help="also emit an OpenCourant /RBODY inertia block")
     ap.add_argument("--node", default=None,
                     help="master node id for the --rad block")
     ap.add_argument("--rbody", default=None,

@@ -850,8 +850,10 @@ def _surf_dev(g, pts):
     from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
     from OCP.gp import gp_Pnt
     d = 0.0
+    pr = GeomAPI_ProjectPointOnSurf()
+    pr.Init(g, *g.Bounds(), 1e-7)
     for p in pts:
-        pr = GeomAPI_ProjectPointOnSurf(gp_Pnt(*[float(x) for x in p]), g)
+        pr.Perform(gp_Pnt(*[float(x) for x in p]))
         if not pr.NbPoints():
             return 1e30
         d = max(d, pr.LowerDistance())
@@ -952,8 +954,10 @@ def _curve_on_surface(g, pts, v0, v1):
     except ImportError:
         from OCP.collections import HArray1_gp_Pnt as HArr
     q = []
+    pr = GeomAPI_ProjectPointOnSurf()
+    pr.Init(g, *g.Bounds(), 1e-7)
     for p in pts:
-        pr = GeomAPI_ProjectPointOnSurf(gp_Pnt(*[float(x) for x in p]), g)
+        pr.Perform(gp_Pnt(*[float(x) for x in p]))
         if not pr.NbPoints():
             return None
         q.append(pr.NearestPoint())

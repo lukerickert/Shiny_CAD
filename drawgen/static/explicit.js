@@ -1,4 +1,4 @@
-// Explicit tab: explicit analysis with OpenCourant (ORC**3 core, drawgen/explicit). Model from the ShinyCAD geometry
+// Explicit tab: explicit analysis with OpenCourant. Model from the ShinyCAD geometry
 // (bodies, materials, supports, mesh, .inp) or an external .inp; run folders; deck build; local and remote solve; job
 // status board and console; results: animation frames on the 3D view, KE/IE curves, post-processing commands.
 import * as THREE from "three";
@@ -13,6 +13,12 @@ import { drawBcLoads } from "/static/bcglyphs.js";
 import * as PN from "/static/panels.js";
 import * as MS from "/static/matsel.js";
 import * as VS from "/static/viewsel.js";
+import * as TP from "/static/paneltree.js";
+import * as TH from "/static/thplot.js";
+import * as HR from "/static/histreq.js";
+import * as IF from "/static/inpinfo.js";
+import * as HO from "/static/handoff.js";
+import * as CV from "/static/curves.js";
 
 const XP = { doc: null, dirty: false, meta: null, env: null, envInfo: null, three: null, geo: null, asm: null,
              bbox: null, size: 100, pick: null, sel: null,
@@ -47,7 +53,81 @@ function blankDoc(name) {
            default_material: "S355", mesh: { size: 0, strategy: "tet", tet_type: "C3D4", hex_type: "C3D8R" }, bonded: true,
            bodies: {}, supports: [], settings: {}, next: 1 };
 }
-function changed() { XP.dirty = true; if (FM) FM.render(); renderStatusBar(); }
+/** Held components of a support (analysis.support_dofs): from its type (supports of the CalculiX branch), else dofs. */
+function supDofs(s) {
+  const T = { fixed: [1, 1, 1, 1, 1, 1], pinned: [1, 1, 1, 0, 0, 0], xsymm: [1, 0, 0, 0, 1, 1], ysymm: [0, 1, 0, 1, 0, 1], zsymm: [0, 0, 1, 1, 1, 0] };
+  return T[s.type] ? T[s.type].slice() : (s.dofs || [1, 1, 1]).concat([0, 0, 0, 0, 0, 0]).slice(0, 6);
+}
+function changed() { XP.dirty = true; if (XP.shared && window.__feaDirty) window.__feaDirty(); if (FM) FM.render(); renderStatusBar(); }
+
+// ------------------------------------------------------------------ one document with the Analysis tab
+// Solver OpenCourant of the Analysis tab: this pane edits the analysis document itself (XP.shared). Its model
+// (geometry, materials, bodies, sections, surfaces, node sets, reference points, constraints, supports) is the one of
+// the Analysis tab; "mesh" of this pane is kept as "xp_mesh" of the document (explicit element types).
+const SHARED_KEYS = { mesh: "xp_mesh" };
+function sharedProxy(t) {
+  const key = k => SHARED_KEYS[k] || k;
+  return new Proxy(t, {
+    get: (o, k) => o[key(k)],
+    set: (o, k, v) => { o[key(k)] = v; return true; },
+    has: (o, k) => key(k) in o,
+    deleteProperty: (o, k) => { delete o[key(k)]; return true; },
+    ownKeys: o => { const ks = Reflect.ownKeys(o).filter(k => k !== "mesh"); if ("xp_mesh" in o && !ks.includes("mesh")) ks.push("mesh"); return ks; },
+    getOwnPropertyDescriptor: (o, k) => {
+      const kk = key(k);
+      if (!(kk in o)) return undefined;
+      return { value: o[kk], writable: true, enumerable: k !== "xp_mesh", configurable: true };
+    },
+  });
+}
+/** A document of this pane in the form of the Analysis tab (solver OpenCourant): "mesh" as "xp_mesh", supports with
+ *  their dofs as type dofs. */
+function toShared(d) {
+  const out = JSON.parse(JSON.stringify(d));
+  out.xp_mesh = out.mesh;
+  delete out.mesh;
+  for (const s of out.supports || []) if (!s.type) s.type = "dofs";
+  out.solver = "explicit";
+  return out;
+}
+/** File menu of the pane: the analysis documents while attached. */
+const XFO = {};
+function setFileMenu(shared) {
+  Object.assign(XFO, shared ? {
+    type: "analysis", label: "analysis", listUrl: "/api/analysis/list",
+    cur: () => (XP.doc ? { name: XP.doc.name, dirty: !!(XP.dirty || (window.__feaIsDirty && window.__feaIsDirty())) } : null),
+    load: async name => { await window.__feaLoadNamed(name); },
+    save: async name => { await window.__feaSaveDoc(name); XP.dirty = false; refreshRuns(); },
+    blank: async () => { await window.__feaNewDoc("explicit"); },
+    setName: name => { XP.doc.name = name; refreshRuns(); },
+  } : {
+    type: "explicit", label: "explicit analysis", listUrl: "/api/explicit/list",
+    cur: () => (XP.doc ? { name: XP.doc.name, dirty: !!XP.dirty } : null),
+    load: async name => loadDoc(await (await api("/api/explicit/file/" + encodeURIComponent(name))).json()),
+    save: saveDoc, blank: () => loadDoc(blankDoc("explicit")), setName: name => { XP.doc.name = name; refreshRuns(); },
+  });
+}
+/** Attaches the analysis document (solver OpenCourant) to this pane. */
+window.__xpAttach = async function (doc, saved) {
+  XP.shared = doc;
+  setFileMenu(true);
+  if (!XP.meta) { try { XP.meta = await (await api("/api/explicit/meta")).json(); } catch (e) { showErr(e); return; } }
+  XP.attaching = true;
+  try { await loadDoc(sharedProxy(doc)); } finally { XP.attaching = false; }
+  XP.dirty = false;
+  if (FM) { if (saved) FM.markSaved(doc.name); else FM.markUnsaved(); FM.refresh(); }
+  $("#xp-solver").value = "explicit";
+};
+/** Solver of the pane: CalculiX shows the document in the Analysis pane (an explicit document of the former kind is
+ *  converted to an analysis document first). */
+async function setSolver(v) {
+  if (v === "explicit") return;
+  const doc = XP.shared || toShared(XP.doc);
+  doc.solver = "calculix";
+  if (window.__feaAdopt) await window.__feaAdopt(doc, !!XP.shared && FM && FM.isSaved());
+  showTab("fea");
+  HO.handover(window.__xpPane, window.__feaPane);            // the view of this pane in the CalculiX pane
+}
 /** Host of the sections and node sets panels (shellmodel.js). */
 const SH = {
   doc: () => XP.doc,
@@ -58,6 +138,7 @@ const SH = {
   changed: () => changed(), draw: () => draw(), render: () => renderModel(),
   status: (t, e) => status(t, e), postJSON: (u, b) => postJSON(u, b), fmt: v => fmt(v, 6), esc: v => esc(v),
   setTypes: types => VS.setTypes(SH, types),
+  collect: opts => VS.collect(SH, opts),
   suppressCfg: (kind, id) => {
     const d = XP.doc;
     if (kind === "section") { const s = (d.sections || []).find(x => x.id === id); return s ? [s, "mode", "shell"] : null; }
@@ -72,10 +153,18 @@ const SH = {
     comps: () => ((XP.geo && XP.geo.components) || []).filter(c => c.mesh).map(c => ({ id: c.id, mesh: c.mesh, matrix: matOf(c), surfaces: c.surfaces || [] })),
     points: () => (XP.doc.points || []).filter(p => p.xyz),
     faceAt: e => faceUnder(e), edgeAt: e => edgeUnder(e),
+    meshShown: () => $("#xp-show").value === "mesh",
+    showMesh: () => { if (XP.mesh) { $("#xp-show").value = "mesh"; draw(); } else status("Mesh first: the mesh nodes and elements are selected on Show Mesh", true); },
+    mesh: () => XP.meshSel || null,
+    meshHit: e => {
+      if (!XP.meshSel || !XP.three) return null;
+      const h = rayAt(e).intersectObjects(XP.three.group.children.filter(o => o.userData && o.userData.kind === "mesh" && o.userData.triIdx), false)[0];
+      return h && h.faceIndex !== undefined ? { tri: h.object.userData.triIdx[h.faceIndex], point: h.point.toArray() } : null;
+    },
   },
   onNsetSupport: ns => {
     const id = "s" + (XP.doc.next++);
-    XP.doc.supports.push({ id, name: "Support " + (XP.doc.supports.length + 1), target: { nset: ns.id }, dofs: [1, 1, 1, 0, 0, 0] });
+    XP.doc.supports.push({ id, name: "Support " + (XP.doc.supports.length + 1), type: "dofs", target: { nset: ns.id }, dofs: [1, 1, 1, 0, 0, 0] });
     XP.sel = { sup: id }; changed(); renderModel(); draw();
   },
 };
@@ -126,11 +215,12 @@ function snapAt(e) {
       ctx.face = { xyz: h.point.toArray(), normal: h.face.normal.clone().transformDirection(h.object.matrixWorld).toArray(), ref: null };
     }
   }
+  if (XP.pick && XP.pick.raw) return ctx.face ? { xyz: ctx.face.xyz, normal: ctx.face.normal, face: ctx.face.ref, kind: "face" } : null;     // the point on the surface
   const sp = RP.snapPoint(ctx);
   if (sp) sp.xyz = sp.xyz.map(v => Math.round(v * 1e6) / 1e6);
   return sp;
 }
-/** Document setting (the ORC**3 defaults when not set). */
+/** Document setting (the defaults when not set). */
 function S(k) { const v = (XP.doc.settings || {})[k]; return v === undefined ? (XP.meta.defaults[k]) : v; }
 function setS(k, v) { XP.doc.settings = XP.doc.settings || {}; XP.doc.settings[k] = v; changed(); }
 function E(k) { return XP.env ? XP.env[k] : ""; }
@@ -311,12 +401,16 @@ function hoverView(e) {
   render3();
 }
 function clickView(e) {
+  if (XP.probeMode && $("#xp-show").value === "results" && XP.res.frame) { xpProbeClick(e); return; }
   if (!XP.pick && VS.click(SH, e)) return;                    // selection (viewsel.js): faces, edges, bodies, points
   if (!XP.pick) {
     const h = hitAt(e), ud = (h && h.object.userData) || {};
     const prev = JSON.stringify([XP.sel, XP.csel]);
     if (CON_KINDS[ud.kind]) { XP.csel = { kind: ud.kind, id: ud.id }; XP.sel = null; }
-    else { XP.sel = ud.comp !== undefined && $("#xp-show").value === "model" ? { comp: ud.comp } : null; XP.csel = null; }
+    else {
+      XP.sel = ud.comp !== undefined && $("#xp-show").value === "model" ? { comp: ud.comp } : null; XP.csel = null;
+      if (VS.quickFace(SH, e)) return;                         // a plain click selects or deselects the face
+    }
     if (JSON.stringify([XP.sel, XP.csel]) !== prev) { renderModel(); draw(); }
     return;
   }
@@ -325,7 +419,7 @@ function clickView(e) {
     if (!sp) return;
     const cb = XP.pick.cb;
     XP.pick = null;
-    cb({ xyz: sp.xyz, normal: sp.normal || null, face: sp.face || null, kind: sp.kind });
+    cb({ xyz: sp.xyz, normal: sp.normal || null, face: sp.face || null, kind: sp.kind, shift: e.shiftKey });
     changed(); renderModel(); draw();
     return;
   }
@@ -368,7 +462,7 @@ function startPick(text, cb, opts) {
   status(text + " (Esc cancels)");
   renderModel();
 }
-function endPick() { XP.pick = null; renderModel(); draw(); }
+function endPick() { const p = XP.pick; XP.pick = null; if (p && p.onCancel) p.onCancel(); renderModel(); draw(); }
 /** The face of a component under the cursor: {comp, face}, or null. */
 function faceUnder(e) {
   if (!XP.three) return null;
@@ -410,6 +504,8 @@ function faceRef(ref) {
 }
 function faceText(ref) {
   if (!ref) return "(none)";
+  const st = SM.surfaceText(SH, ref);
+  if (st) return st;
   const mt = VS.multiText(ref);
   if (mt) return mt;
   const comp = ((XP.asm && XP.asm.components) || []).find(x => x.id === ref.comp);
@@ -421,14 +517,14 @@ function faceText(ref) {
 }
 async function sourceAsm() {
   const s = XP.doc.source || {};
-  if (s.kind === "inp" || !s.name) return { components: [] };
+  if (s.kind === "inp" || s.type === "inp" || !s.name) return { components: [] };
   if (s.type === "part") return { components: [{ id: "1", name: s.name, source: { type: "part", name: s.name }, pos: [0, 0, 0], rot: [0, 0, 0] }] };
   return await (await api("/api/assembly/file/" + encodeURIComponent(s.name))).json();
 }
 /** State key of the assembly or part of the geometry (server: sha1 of the assembly file and of its sources). */
 async function geometryKey(src) {
   if (!src || !src.name) return "";
-  try { return (await (await postJSON("/api/geometry/state", { source: { type: src.type, name: src.name } })).json()).key || ""; } catch (e) { return null; }
+  try { return (await (await postJSON("/api/geometry/state", { source: { type: src.type, name: src.name, path: src.path } })).json()).key || ""; } catch (e) { return null; }
 }
 /** A changed assembly or part marks Update (the update itself is manual). */
 async function checkGeometry() {
@@ -440,7 +536,7 @@ async function checkGeometry() {
     XP.geoStale = stale;
     $("#xp-update").classList.toggle("cm-stale", stale);
     $("#xp-update").title = stale ? "The assembly or one of its parts has changed: Update loads the geometry again" : "Load the geometry again (after a change of the assembly or its parts)";
-    if (stale) status((XP.doc.source.type === "part" ? "The part " : "The assembly ") + XP.doc.source.name + " has changed: Update loads the geometry again");
+    if (stale) status(({ part: "The part ", inp: "The .inp file " }[XP.doc.source.type] || "The assembly ") + XP.doc.source.name + " has changed: Update loads the geometry again");
   }
 }
 /** Update: the geometry loaded again; the mesh of the old geometry is cleared (Mesh writes the model .inp again). */
@@ -457,10 +553,16 @@ async function loadGeometry() {
   XP.geo = { components: [] };
   XP.asm = { components: [] };
   if (isDeck()) { draw(); renderModel(); deckRefresh(); return; }
-  if (!isShiny()) { draw(); renderModel(); return; }
+  if (!isShiny()) {
+    draw(); renderModel();
+    const src = XP.doc.source || {};
+    if (src.kind === "inp" && src.inp && !XP.mesh) showInpMesh();          // the mesh of the external file
+    return;
+  }
   info("Loading the geometry...");
   try {
     const key = await geometryKey(XP.doc.source);
+    if (XP.doc.source.type === "inp") { await loadInp(seq, key); return; }
     const asm = await sourceAsm();
     if (seq !== XP.seq) return;
     XP.asm = asm;
@@ -471,6 +573,7 @@ async function loadGeometry() {
     for (const c of j.components) if (c.mkey && c.mesh) MESHES.set(c.mkey, { mesh: c.mesh, refs: c.refs || [], erefs: c.erefs || [], surfaces: c.surfaces || [] });
     for (const c of j.components) if (c.mkey && MESHES.has(c.mkey)) { const e = MESHES.get(c.mkey); c.mesh = e.mesh; c.refs = e.refs; c.erefs = e.erefs; c.surfaces = e.surfaces; }
     XP.geo = j;
+    if (isShiny() && SM.ensureSections(SH)) changed();      // every surface body face in a section
     XP.geoKey = key === null ? undefined : key;
     XP.geoStale = false;
     $("#xp-update").classList.remove("cm-stale");
@@ -479,6 +582,50 @@ async function loadGeometry() {
     if (XP.three) XP.three.zoomed = false;
     draw(); renderModel();
   } catch (e) { if (seq === XP.seq) { info(""); showErr(e); } }
+}
+/** Geometry of a CalculiX .inp source (server: inpmodel.view): one component per body of the file. */
+async function loadInp(seq, key) {
+  const src = XP.doc.source;
+  const j = await (await postJSON("/api/analysis/inp_geometry", { path: src.path })).json();
+  if (seq !== XP.seq) return;
+  for (const c of j.components) {
+    if (!MESHES.has(c.mkey)) MESHES.set(c.mkey, { mesh: c.mesh, refs: c.refs || [], erefs: c.erefs || [], surfaces: c.surfaces || [] });
+    const e = MESHES.get(c.mkey); c.mesh = e.mesh; c.refs = e.refs; c.erefs = e.erefs; c.surfaces = e.surfaces;
+  }
+  XP.asm = { components: j.components.map(c => ({ id: c.id, name: c.name })) };
+  XP.geo = { components: j.components };
+  if (src.imported !== src.path) { importInp(j); src.imported = src.path; changed(); }
+  if (SM.ensureSections(SH)) changed();
+  XP.geoKey = key === null ? undefined : key;
+  XP.geoStale = false;
+  $("#xp-update").classList.remove("cm-stale");
+  info(`${src.name}: ${j.nodes} nodes, ${j.elements} elements, ${j.components.length} bod${j.components.length === 1 ? "y" : "ies"}` +
+    (j.warnings.length ? "; " + j.warnings.join("; ") : ""));
+  if (XP.three) XP.three.zoomed = false;
+  draw(); renderModel();
+}
+/** Inputs of an .inp file into the document (once per file): materials, body materials, shell sections, node sets. */
+function importInp(j) {
+  const d = XP.doc;
+  d.materials = d.materials || {};
+  for (const [n, m] of Object.entries(j.materials || {})) if (!d.materials[n]) d.materials[n] = { library: "", E: m.E, nu: m.nu, rho: m.rho };
+  if (!d.default_material || !d.materials[d.default_material]) d.default_material = Object.keys(j.materials || {})[0] || d.default_material;
+  d.bodies = d.bodies || {};
+  for (const [id, b] of Object.entries(j.bodies || {})) d.bodies[id] = Object.assign({ role: "deformable" }, b, d.bodies[id] || {});
+  d.shells = d.shells || {};
+  for (const [id, s] of Object.entries(j.shells || {})) d.shells[id] = Object.assign({}, s, d.shells[id] || {});
+  d.nsets = d.nsets || [];
+  for (const n of j.nsets || []) if (!d.nsets.some(x => x.kind === "inp" && x.set === n)) d.nsets.push({ id: SH.nid("ns"), name: n, kind: "inp", set: n });
+}
+/** Import CalculiX .inp: a file dialog, then the .inp as the geometry source (an editable model). */
+async function chooseInp() {
+  let p = "";
+  try { p = await window.browse("open", "mesh", (XP.doc.source || {}).path || ""); } catch (e) { showErr(e); }
+  if (!p) { refreshSources(); return; }
+  XP.doc.source = Object.assign({}, XP.doc.source, { kind: "shinycad", type: "inp", path: p, name: p.split(/[\\/]/).pop() });
+  XP.mesh = null; XP.meshSummary = null;
+  $("#xp-show").value = "model";
+  changed(); await refreshSources(); loadGeometry();
 }
 function meshGeo(mkey) {
   const e = MESHES.get(mkey);
@@ -494,6 +641,11 @@ function meshGeo(mkey) {
     for (const pl of m.edges) for (let k = 0; k + 1 < pl.length; k++) pos.push(...pl[k], ...pl[k + 1]);
     e.edgeGeo = new THREE.BufferGeometry();
     e.edgeGeo.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+    if (m.wire && m.wire.length) {                 // mesh file geometry: the element edges of the file
+      e.wireGeo = new THREE.BufferGeometry();
+      e.wireGeo.setAttribute("position", new THREE.Float32BufferAttribute(m.vertices.flat(), 3));
+      e.wireGeo.setIndex(m.wire);
+    }
     e.groups = addBodyGroups(e.geo, m);
   }
   return e;
@@ -513,7 +665,7 @@ function draw() {
   const box = new THREE.Box3();
   if (show === "results" && XP.res.geo && XP.res.frame) drawResults(box);
   else if (show === "mesh" && XP.mesh) {
-    drawPayload(box, decoded(XP.mesh), null);
+    drawPayload(box, decoded(XP.mesh), { meshSel: true });
     drawCons(box);
     if ($("#xp-bcs").checked && (XP.mesh.bcs || []).length && !box.isEmpty()) {     // supports at the mesh nodes
       const sz = box.getSize(new THREE.Vector3());
@@ -522,6 +674,7 @@ function draw() {
   }
   else if (isDeck()) drawDeck(box);
   else drawModel(box);
+  if (XP.queryMarks) t.group.add(IF.marksGroup(XP.queryMarks, track));     // search results of the Input file page
   t.group.updateMatrixWorld(true);
   const bb = box.isEmpty() ? null : [box.min.x, box.min.y, box.min.z, box.max.x, box.max.y, box.max.z];
   if (bb) { XP.bbox = bb; XP.size = Math.max(bb[3] - bb[0], bb[4] - bb[1], bb[5] - bb[2], 1); }
@@ -551,9 +704,12 @@ function drawModel(box) {
       mesh.userData = { comp: c.id };
       inner.add(mesh);
       t.pickables.push(mesh);
+      if ($("#xp-edges").checked && e.wireGeo) inner.add(new THREE.LineSegments(e.wireGeo, new THREE.LineBasicMaterial({ color: 0x1d2125 })));
       if ($("#xp-edges").checked) inner.add(new THREE.LineSegments(e.edgeGeo, new THREE.LineBasicMaterial({ color: 0x1d2125 })));
       box.union(e.geo.boundingBox.clone().applyMatrix4(inner.matrix));
     }
+    const vsel = VS.selectedVertices(SH, c.id);              // selected vertices
+    if (vsel.length) { const o = VS.pointsObject(vsel, 0xe03131); track(o.geometry); inner.add(o); }
     for (const o of SM.overlays(SH, c.id)) {                // sections (colour), selected faces and edges
       const g = track(new THREE.BufferGeometry());
       if (o.edge !== undefined) {
@@ -590,8 +746,8 @@ function drawModel(box) {
                                                                polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 })));
     }
     for (const mm of XP.doc.masses || []) {                // distributed masses on faces: purple
-      if (mm.kind !== "distributed" || !(mm.target && mm.target.faces)) continue;
-      for (const fr of mm.target.faces) {
+      if (mm.kind !== "distributed" || !(mm.target && (mm.target.faces || mm.target.surface !== undefined))) continue;
+      for (const fr of VS.targetRefs(SH, mm.target).faces) {
         if (fr.comp !== c.id) continue;
         const pos = faceTris(c, fr.face);
         if (!pos.length) continue;
@@ -651,7 +807,8 @@ function b64(s, T) {
 function decoded(p) {
   if (!p._d) p._d = { pos: b64(p.pos, Float32Array), tri: b64(p.tri, Uint32Array), cell: b64(p.tri_cell, Uint32Array),
                       kind: p.tri_kind ? b64(p.tri_kind, Uint8Array) : null, part: p.part ? b64(p.part, Int32Array) : null,
-                      lines: p.lines ? b64(p.lines, Uint32Array) : null, n: p.count, thick: p.part_thick || null };
+                      lines: p.lines ? b64(p.lines, Uint32Array) : null, n: p.count, thick: p.part_thick || null,
+                      ids: p.node_ids ? b64(p.node_ids, Uint32Array) : null, cellIds: p.cell_ids ? b64(p.cell_ids, Uint32Array) : null };
   return p._d;
 }
 /** Rainbow colour scale in 12 bands (blue low, red high). */
@@ -686,7 +843,7 @@ function drawPayload(box, d, opt) {
     }
   }
   const ntri = tri.length / 3;
-  const P = [], Col = [], L = [];
+  const P = [], Col = [], L = [], TI = [];
   const span = (opt.hi - opt.lo) || 1;
   const partCol = PART_COLORS.map(c => new THREE.Color(c));
   const hp = opt.hideParts && d.part ? opt.hideParts : null;
@@ -696,6 +853,7 @@ function drawPayload(box, d, opt) {
     if (hp && hp.has(d.part[c])) continue;
     const a = tri[3 * k], b = tri[3 * k + 1], cc = tri[3 * k + 2];
     for (const v of [a, b, cc]) P.push(pos[3 * v], pos[3 * v + 1], pos[3 * v + 2]);
+    TI.push(k);
     let ca, cb, ccol;
     if (opt.values && opt.loc === "cell") { ca = cb = ccol = bandColor((opt.values[c] - opt.lo) / span); }
     else if (opt.values) { ca = bandColor((opt.values[a] - opt.lo) / span); cb = bandColor((opt.values[b] - opt.lo) / span); ccol = bandColor((opt.values[cc] - opt.lo) / span); }
@@ -715,8 +873,17 @@ function drawPayload(box, d, opt) {
   const mat = opt.values ? new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 })
     : new THREE.MeshStandardMaterial({ vertexColors: true, metalness: 0.1, roughness: 0.75, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });
   const m = new THREE.Mesh(g, mat);
-  m.userData = { kind: "mesh" };
+  m.userData = { kind: "mesh", src: { triIdx: TI, tri, cell, pos } };
   t.group.add(m);
+  // mesh selection (viewsel.js: nodes, elements) on the mesh view without shell thickness
+  if (opt.meshSel) {
+    XP.meshSel = null;
+    if (!Lthick && d.ids && d.cellIds) {
+      m.userData.triIdx = TI;
+      XP.meshSel = { pos, ids: d.ids, tri, triElem: Uint32Array.from(cell, c => d.cellIds[c]) };
+      for (const o of VS.meshOverlays(SH)) { track(o.geometry); t.group.add(o); }
+    }
+  }
   if ($("#xp-edges").checked && L.length < 6000000) {
     const eg = track(new THREE.BufferGeometry());
     eg.setAttribute("position", new THREE.BufferAttribute(pos instanceof Float32Array ? pos : new Float32Array(pos), 3));
@@ -902,7 +1069,7 @@ function hidden(sec) {
   return spec.includes(sec);
 }
 
-// ------------------------------------------------------------------ "?" pop-ups (ORC**3 *_DOC texts)
+// ------------------------------------------------------------------ "?" pop-ups
 // doc: text, or {mode: text} (one section per mode; the current mode first). Markup: "## " sub-heading, "* " bullet,
 // 4-space indent code line, other lines paragraphs.
 const HELP = new Map();
@@ -1055,15 +1222,22 @@ function renderModel() {
   if (!box || !XP.doc) return;
   renderStatusBar();
   const src = XP.doc.source || {};
-  let h = `<div class="row"><label class="inline">Source<select id="xp-kind">${optList([["shinycad", "ShinyCAD geometry (assembly or part)"], ["deck", "Deck generator (stiffened panel, shells)"], ["inp", "External .inp (PrePoMax)"]], src.kind || "shinycad")}</select></label></div>`;
+  let h = `<div class="row"><label class="inline">Source<select id="xp-kind">${optList([["shinycad", "ShinyCAD geometry (assembly or part)"], ["deck", "Deck generator (stiffened panel, shells)"], ["inp", "External .inp (PrePoMax) or Radioss .rad"]], src.kind || "shinycad")}</select></label></div>`;
   if (src.kind === "inp") {
-    h += `<div class="row"><label class="inline" style="flex:1">.inp<input type="text" id="xp-inp" value="${esc(src.inp || "")}" style="flex:1;width:auto" placeholder="path of the meshed .inp"></label>` +
+    h += `<div class="row"><label class="inline" style="flex:1">.inp<input type="text" id="xp-inp" value="${esc(src.inp || "")}" style="flex:1;width:auto" placeholder="path of the meshed .inp or of the starter deck ..._0000.rad"></label>` +
       `<button type="button" id="xp-inp-b" class="small" title="Choose the .inp">…</button><button type="button" id="xp-inp-show" title="Show the mesh of the .inp">Show mesh</button></div>`;
-    h += XP.meshSummary ? summaryHtml(XP.meshSummary) : `<p class="hint">Show mesh reads the nodes and elements of the .inp.</p>`;
+    h += XP.meshSummary ? summaryHtml(XP.meshSummary) : `<p class="hint">The mesh of the file is shown when the path is set (Show mesh reads it again). A .rad starter deck is the Target .rad of Solve (no build).</p>`;
+    h += `<div data-page="inpfile"><h3 class="xp-h">Input file</h3><div id="xp-inpfile"></div></div>`;
     box.innerHTML = h;
+    if (src.inp) IF.render($("#xp-inpfile"), src.inp, inpHost());
     $("#xp-kind").onchange = setKind;
-    $("#xp-inp").onchange = () => { XP.doc.source.inp = $("#xp-inp").value.trim().replace(/^"|"$/g, ""); XP.mesh = null; XP.meshSummary = null; changed(); renderAllPanels(); };
-    $("#xp-inp-b").onclick = async () => { try { const p = await window.browse("open", "inp", src.inp || ""); if (p) { $("#xp-inp").value = p; $("#xp-inp").onchange(); } } catch (e) { showErr(e); } };
+    $("#xp-inp").onchange = () => {
+      XP.doc.source.inp = $("#xp-inp").value.trim().replace(/^"|"$/g, ""); XP.mesh = null; XP.meshSummary = null;
+      if (/\.rad$/i.test(XP.doc.source.inp)) setS("rad_target", XP.doc.source.inp.replace(/\\/g, "/"));      // a starter deck: solved as it is
+      changed(); renderAllPanels();
+      if (XP.doc.source.inp) showInpMesh();
+    };
+    $("#xp-inp-b").onclick = async () => { try { const p = await window.browse("open", "mesh", src.inp || ""); if (p) { $("#xp-inp").value = p; $("#xp-inp").onchange(); } } catch (e) { showErr(e); } };
     $("#xp-inp-show").onclick = showInpMesh;
     return;
   }
@@ -1076,17 +1250,20 @@ function renderModel() {
   }
   const mats = XP.doc.materials || {};
   h += `<div id="xp-panels"></div>`;
-  h += materialsHtml();
+  const pg = (k, html) => html ? `<div data-page="${k}">${html}</div>` : "";       // a page of the model tree
+  if (src.type === "inp" && src.path) h += pg("inpfile", `<h3 class="xp-h">Input file</h3><div id="xp-inpfile"></div>`);
+  h += pg("mats", materialsHtml());
   const comps = (XP.asm && XP.asm.components) || [];
-  h += `<h3 class="xp-h">Bodies</h3>` + bodiesHtml();
-  h += `<h3 class="xp-h">Mesh</h3>` + meshHtml();
-  const opt = (k, title, div) => PN.isHidden(XP.doc, k) ? "" : `<h3 class="xp-h" id="xp-h-${k}">${title}</h3>` + div;
+  h += pg("bodies", `<h3 class="xp-h">Bodies</h3>` + bodiesHtml());
+  h += pg("mesh", `<h3 class="xp-h">Mesh</h3>` + meshHtml());
+  const opt = (k, title, div) => PN.isHidden(XP.doc, k) ? "" : pg(k, `<h3 class="xp-h" id="xp-h-${k}">${title}</h3>` + div);
   if (comps.some(c => ((compOf(c.id) || {}).surfaces || []).length)) h += opt("sections", "Sections", `<div id="xp-sections"></div>`);
-  h += opt("nsets", "Node sets", `<div id="xp-nsets"></div>`) + opt("rps", "Reference points", `<div id="xp-rps"></div>`) +
+  h += opt("surfaces", "Surfaces", `<div id="xp-surfaces"></div>`) + opt("nsets", "Node sets", `<div id="xp-nsets"></div>`) + opt("rps", "Reference points", `<div id="xp-rps"></div>`) +
     opt("springs", "Springs", `<div id="xp-springs"></div>`) + opt("joints", "Joints", `<div id="xp-joints"></div>`) + opt("eqs", "Equations", `<div id="xp-eqs"></div>`);
-  h += `<h3 class="xp-h">Supports</h3>` + supportsHtml();
+  h += pg("sups", `<h3 class="xp-h">Supports</h3>` + supportsHtml());
+  h += pg("amps", `<h3 class="xp-h">Amplitudes</h3><div id="xp-amps"></div>`);
   h += opt("vels", "Velocities", `<div id="xp-vels"></div>`) + opt("masses", "Masses", `<div id="xp-masses"></div>`) +
-    opt("init", "Initial state (static)", `<div id="xp-init"></div>`);
+    opt("init", "Initial state (static)", `<div id="xp-init"></div>`) + opt("hist", "History output", `<div id="xp-hist"></div>`);
   if (XP.pick) h += `<p class="fa-pick">${esc(XP.pick.text)}</p>`;
   h += XP.meshSummary ? summaryHtml(XP.meshSummary) : `<p class="hint">Mesh (toolbar) meshes the bodies and shells, writes the model .inp and shows the mesh.</p>`;
   box.innerHTML = h;
@@ -1097,20 +1274,32 @@ function renderModel() {
   bindSupports(box);
   if ($("#xp-sections")) SM.renderSections(SH, $("#xp-sections"));
   if ($("#xp-nsets")) SM.renderNsets(SH, $("#xp-nsets"));
+  if ($("#xp-surfaces")) SM.renderSurfaces(SH, $("#xp-surfaces"));
   renderVelocities($("#xp-vels"));
+  CV.renderAmplitudes($("#xp-amps"), XP.doc, { changed, rerender: () => renderModel(), status, nid: p => p + (XP.doc.next++), xlabel: "time (s)",
+    hint: "Tabular amplitudes: time (s, from the start of the run), factor; linear between the points, constant after the last point. An imposed velocity with an amplitude is its value times the factor (*AMPLITUDE, /FUNCT)." });
   renderMasses($("#xp-masses"));
   renderInit($("#xp-init"));
+  if ($("#xp-inpfile") && src.path) IF.render($("#xp-inpfile"), src.path, inpHost());
+  HR.render({ doc: () => XP.doc, solver: "explicit", sel: SH, nid: p => p + (XP.doc.next++), num: fnum, changed, rerender: () => { renderModel(); draw(); }, targetText: faceText }, $("#xp-hist"));
   if ($("#xp-rps")) RP.renderPoints(RH, $("#xp-rps"));
   if ($("#xp-springs")) RP.renderSprings(RH, $("#xp-springs"));
   if ($("#xp-joints")) RP.renderJoints(RH, $("#xp-joints"));
   if ($("#xp-eqs")) RP.renderEquations(RH, $("#xp-eqs"));
   const d0 = XP.doc;
-  PN.renderToggles($("#xp-panels"), d0, [["sections", "Sections", (d0.sections || []).length], ["nsets", "Node sets", (d0.nsets || []).length],
+  PN.renderToggles($("#xp-panels"), d0, [["sections", "Sections", (d0.sections || []).length], ["surfaces", "Surfaces", (d0.surfaces || []).length], ["nsets", "Node sets", (d0.nsets || []).length],
     ["rps", "Reference points", (d0.points || []).length], ["springs", "Springs", (d0.springs || []).length], ["joints", "Joints", (d0.joints || []).length],
     ["eqs", "Equations", (d0.equations || []).length], ["vels", "Velocities", (d0.velocities || []).length], ["masses", "Masses", (d0.masses || []).length],
-    ["init", "Initial state", (d0.initial_state || {}).analysis ? 1 : 0]]
+    ["init", "Initial state", (d0.initial_state || {}).analysis ? 1 : 0], ["hist", "History output", (d0.history || []).length]]
     .map(([key, label, count]) => ({ key, label, count })), () => { changed(); renderModel(); });
   if (XP.popup) renderPopup();
+}
+/** Host of the Input file page (inpinfo.js): search results drawn in the view, a point picked in the view. */
+function inpHost() {
+  return { mark: m => { XP.queryMarks = m; draw(); },
+           pick: cb => startPick("Click a point of the model", hit => { if (hit && hit.xyz) cb(hit.xyz); }, { snap: true }),
+           pickAt: (cb, cancel) => startPick("Click a node or element of the model", hit => { if (hit && hit.xyz) cb(hit); }, { snap: true, raw: true, onCancel: cancel }),
+           endPick: () => { if (XP.pick && XP.pick.raw) { XP.pick.onCancel = null; endPick(); } } };
 }
 /** Bodies and shells tables. */
 function bodiesHtml() {
@@ -1131,16 +1320,7 @@ function bodiesHtml() {
         `<td><input type="text" data-bk="size" value="${esc(b.size || "")}" style="width:46px" placeholder="auto"></td>` +
         `<td><select data-bk="strategy"><option value="">(default)</option>${optList(MESH_STRATEGIES, b.strategy || "")}</select></td></tr>`;
     }).join("") + `</table><p class="hint">Rigid: *RIGID BODY over the nodes of the body, REF NODE at its centre of mass with the masses on it (the /RBODY main node driven by the Build loading or the Velocities). A reference point coupled to a rigid body is a node of it. Rigid bodies are meshed apart from the deformable bodies.</p>`;
-  if (shells.length) h += `<table class="fa-tbl xp-shells"><tr><th>Shell</th><th>Role</th><th>t (mm)</th><th>Position</th><th>Material</th><th>Size (mm)</th></tr>` +
-    shells.map(([c, sf]) => {
-      const key = c.id + ":" + sf.id, b = (XP.doc.shells || {})[key] || {};
-      return `<tr data-shell="${esc(key)}"><td title="${esc(c.name)} / ${esc(sf.name)}">${esc(c.name)} / ${esc(sf.name)}</td>` +
-        `<td><select data-hk="mode">${optList([["shell", "deformable"], ["rigid", "rigid (impactor)"], ["off", "off"]], b.mode || "shell")}</select></td>` +
-        `<td><input type="text" data-hk="t" value="${esc(b.t || "")}" style="width:46px" placeholder="10"></td>` +
-        `<td><select data-hk="offset">${optList([["mid", "mid"], ["positive", "positive (SPOS)"], ["negative", "negative (SNEG)"]], b.offset || "mid")}</select></td>` +
-        `<td><select data-hk="material" class="xp-matsel">${matOpts(b.material)}</select></td>` +
-        `<td><input type="text" data-hk="size" value="${esc(b.size || "")}" style="width:46px" placeholder="auto"></td></tr>`;
-    }).join("") + `</table><p class="hint">Shells: the surface bodies of the parts, meshed with shell elements (Shell elements in Mesh) of thickness t (empty: 10 mm), *SHELL SECTION per shell. Position: OFFSET=SPOS / SNEG (inp2rad does not read the offset). Touching shells share their nodes (Bonded).</p>`;
+  if (shells.length) h += `<p class="hint">Shells: ${shells.length} surface body(ies), meshed with shell elements (Shell elements in Mesh). Role, thickness, position, material and element size are set in Sections; touching shells share their nodes (Bonded).</p>`;
   return h;
 }
 function bindBodies(box) {
@@ -1155,18 +1335,6 @@ function bindBodies(box) {
       changed(); renderModel(); draw();
     });
     tr.onclick = e => { if (e.target.closest("select, input")) return; XP.sel = { comp: cid }; renderModel(); draw(); };
-  });
-  box.querySelectorAll("tr[data-shell]").forEach(tr => {
-    const key = tr.dataset.shell;
-    tr.querySelectorAll("[data-hk]").forEach(el => el.onchange = () => {
-      XP.doc.shells = XP.doc.shells || {};
-      const b = XP.doc.shells[key] = XP.doc.shells[key] || {};
-      const k = el.dataset.hk, v = el.value;
-      if (k === "t" || k === "size") { const x = fnum(v); if (isFinite(x) && x > 0) b[k] = x; else delete b[k]; }
-      else if (v && !(k === "mode" && v === "shell") && !(k === "offset" && v === "mid")) b[k] = v; else delete b[k];
-      if (!Object.keys(b).length) delete XP.doc.shells[key];
-      changed(); renderModel(); draw();
-    });
   });
 }
 /** Mesh settings. */
@@ -1186,10 +1354,13 @@ function meshHtml() {
     `<label class="inline xp-f" title="Lowest number of elements between two break coordinates of the structured mesh">Min divisions per interval<input type="text" data-mesh="shell_min_div" value="${esc(m.shell_min_div || "")}" placeholder="1" style="width:36px"></label>` +
     `<label class="inline xp-f">Section sizes<select data-mesh="shell_size_mode">${optList([["local", "local, free transition"], ["grid", "along the grid, all structured"]], m.shell_size_mode || "local")}</select></label>` +
     `<label class="inline xp-f" title="Tolerance of the general fuse of the shells (mm). 0: exact">Fuzzy (mm)<input type="text" data-mesh="fuzzy" value="${esc(m.fuzzy || "")}" placeholder="0" style="width:46px"></label>` +
-    `<label class="check inline"><input type="checkbox" data-xpm="bonded"${XP.doc.bonded !== false ? " checked" : ""}> Bonded: touching deformable bodies share nodes</label></div>`;
+    `<label class="check inline"><input type="checkbox" data-xpm="bonded"${XP.doc.bonded !== false ? " checked" : ""}> Bonded: touching deformable bodies share nodes</label></div>` +
+    (isShiny() ? `<div class="xp-refine"></div>` : "");
   return h;
 }
 function bindMesh(box) {
+  const rb = box.querySelector(".xp-refine");
+  if (rb) SM.renderRefine(SH, rb);
   box.querySelectorAll("[data-mesh]").forEach(el => el.onchange = () => {
     const k = el.dataset.mesh, v = el.value.trim();
     XP.doc.mesh = XP.doc.mesh || {};
@@ -1205,11 +1376,11 @@ function bindMesh(box) {
 function supportsHtml() {
   let h = "";
   h += ((XP.doc.supports || []).length ? `<table class="fa-tbl xp-sups"><tr><th>Name</th><th>Face or edge</th><th>Preset</th>${DOF6.map(n => `<th>${n}</th>`).join("")}<th></th></tr>` +
-    XP.doc.supports.map(s => { const dofs = (s.dofs || [1, 1, 1]).concat([0, 0, 0]).slice(0, 6); const pre = (SUP_PRESETS.find(([v]) => v && PRESET_DOFS[v].every((x, i) => x === dofs[i])) || [""])[0];
+    XP.doc.supports.map(s => { const dofs = supDofs(s); const pre = (SUP_PRESETS.find(([v]) => v && PRESET_DOFS[v].every((x, i) => x === dofs[i])) || [""])[0];
       return `<tr data-sup="${esc(s.id)}"${XP.sel && XP.sel.sup === s.id ? ' class="sel"' : ""}><td><input type="text" data-sk="name" value="${esc(s.name)}" style="width:80px"></td><td class="xp-face">${esc(faceText(s.target))}</td>` +
       `<td><select data-spre>${optList(SUP_PRESETS, pre)}</select></td>` +
       DOF6.map((n, i) => `<td><input type="checkbox" data-sd="${i}"${dofs[i] ? " checked" : ""}></td>`).join("") +
-      `<td><button type="button" class="small" data-spick="${esc(s.id)}" title="Replace the target with the selection (or select, then Done)">Pick</button><button type="button" class="small" data-sshow="${esc(s.id)}" title="Select the target in the view">Show</button><button type="button" class="small" data-sdel="${esc(s.id)}" title="Delete">×</button></td></tr>`; }).join("") + `</table>` +
+      `<td><button type="button" class="small" data-spick="${esc(s.id)}" title="Replace the target with the selection (or select, then Done)">Pick</button><button type="button" class="small" data-sshow="${esc(s.id)}" title="Select the target in the view">Show</button>${(XP.doc.surfaces || []).length ? `<select data-ssurf="${esc(s.id)}" title="A surface as the target"><option value="">surface…</option>${SM.surfaceOptions(SH, s.target && s.target.surface)}</select>` : ""}<button type="button" class="small" data-sdel="${esc(s.id)}" title="Delete">×</button></td></tr>`; }).join("") + `</table>` +
       `<p class="hint">The checked components of the nodes of the face or edge are held (*BOUNDARY); rx, ry, rz act on the shell nodes only.</p>`
     : `<p class="hint">Support in the toolbar: the selected faces, edges, bodies or reference point, or select them and press Done. The checked components of their nodes are held (*BOUNDARY).</p>`);
   return h;
@@ -1218,15 +1389,19 @@ function bindSupports(box) {
   box.querySelectorAll("tr[data-sup]").forEach(tr => {
     const s = XP.doc.supports.find(x => x.id === tr.dataset.sup);
     tr.querySelector("[data-sk=name]").onchange = e => { s.name = e.target.value; changed(); };
-    tr.querySelectorAll("[data-sd]").forEach(el => el.onchange = () => { s.dofs = (s.dofs || [1, 1, 1]).concat([0, 0, 0]).slice(0, 6); s.dofs[+el.dataset.sd] = el.checked ? 1 : 0; changed(); renderModel(); });
-    tr.querySelector("[data-spre]").onchange = e => { if (e.target.value) { s.dofs = PRESET_DOFS[e.target.value].slice(); changed(); renderModel(); } };
+    tr.querySelectorAll("[data-sd]").forEach(el => el.onchange = () => { s.dofs = supDofs(s); s.type = "dofs"; s.dofs[+el.dataset.sd] = el.checked ? 1 : 0; changed(); renderModel(); });
+    tr.querySelector("[data-spre]").onchange = e => { if (e.target.value) { s.dofs = PRESET_DOFS[e.target.value].slice(); s.type = "dofs"; changed(); renderModel(); } };
     tr.onclick = e => { if (e.target.closest("input, button")) return; XP.sel = { sup: s.id }; renderModel(); draw(); };
   });
   box.querySelectorAll("[data-sdel]").forEach(b => b.onclick = () => { XP.doc.supports = XP.doc.supports.filter(x => x.id !== b.dataset.sdel); changed(); renderModel(); draw(); });
+  box.querySelectorAll("[data-ssurf]").forEach(el => el.onchange = () => {
+    const s = XP.doc.supports.find(x => x.id === el.dataset.ssurf);
+    if (el.value) { s.target = { surface: el.value.slice(5) }; changed(); renderModel(); draw(); }
+  });
   box.querySelectorAll("[data-sshow]").forEach(b => b.onclick = () => VS.show(SH, (XP.doc.supports.find(x => x.id === b.dataset.sshow) || {}).target));
   box.querySelectorAll("[data-spick]").forEach(b => b.onclick = () => {
     const s = XP.doc.supports.find(x => x.id === b.dataset.spick);
-    VS.collect(SH, { text: "Support " + s.name + ": faces, edges, bodies or a reference point", types: ["faces", "edges", "bodies", "points"],
+    VS.collect(SH, { text: "Support " + s.name + ": faces, edges, vertices, bodies, mesh nodes or elements, or a reference point", types: ["faces", "edges", "vertices", "bodies", "points", "nodes", "elements"],
                      cb: it => { const r = VS.targetOf(it); if (r.error) return r.error; s.target = r.target; XP.sel = { sup: s.id }; changed(); } });
   });
 }
@@ -1235,7 +1410,11 @@ function bindSupports(box) {
  *  inp2rad /IMPVEL) on the main node of a rigid body or rigidly coupled reference point, else on all nodes. */
 function isRigidBody(id) {
   if (id.startsWith("sec:")) return ((XP.doc.sections || []).find(x => "sec:" + x.id === id) || {}).mode === "rigid";
-  if (id.includes(":")) return ((XP.doc.shells || {})[id] || {}).mode === "rigid";
+  if (id.includes(":")) {                                     // a surface body: rigid when its faces are in rigid sections
+    const fk = new Set(VS.facesOfBody(SH, id).map(r => r.comp + ":" + r.face));
+    const secs = (XP.doc.sections || []).filter(x => (x.faces || []).some(r => fk.has(r.comp + ":" + r.face)));
+    return secs.length ? secs.every(x => x.mode === "rigid") : ((XP.doc.shells || {})[id] || {}).mode === "rigid";
+  }
   return ((XP.doc.bodies || {})[id] || {}).role === "rigid";
 }
 function velTargets() {
@@ -1259,7 +1438,9 @@ function renderVelocities(box) {
       `<div class="rp-slot">Target <select data-vk="target"><option value="">(choose)</option>${optList(tg, velKey(v.target))}</select></div>` +
       `<div class="rp-slot">vx vy vz ${v3("v", v.v, "mm/s")}</div>` +
       (imp ? `<div class="rp-slot">wx wy wz ${v3("w", v.w, "rad/s")}</div><div class="rp-slot">Components ${DOF6.map((n, i) => `<label class="check inline"><input type="checkbox" data-vf="${i}"${f[i] ? " checked" : ""}> ${n}</label>`).join("")}</div>` +
-        `<div class="rp-slot"><label class="inline">Ramp (s)<input type="text" class="numf" data-vk="ramp" value="${esc(v.ramp || 0)}" style="width:64px"></label> 0 to the value in the ramp time, then constant; a component at 0 is held</div>` : "") + `</div>`;
+        `<div class="rp-slot"><label class="inline">Amplitude<select data-vk="amplitude"><option value="">(ramp)</option>${optList((d.amplitudes || []).map(a => [String(a.id), a.name]), v.amplitude || "")}</select></label>` +
+        (v.amplitude ? ` the value times the factor of the amplitude; a component at 0 is held</div>` :
+          `<label class="inline">Ramp (s)<input type="text" class="numf" data-vk="ramp" value="${esc(v.ramp || 0)}" style="width:64px"></label> 0 to the value in the ramp time, then constant; a component at 0 is held</div>`) : "") + `</div>`;
   }).join("");
   if (!d.velocities.length) h += `<p class="hint">Initial velocity of all nodes of a body, reference point or node set (a rigid body: its nodes and its reference node); imposed velocity of the main node of a rigid body or rigidly coupled reference point, else of all nodes. Not together with a Build loading that drives the same rigid body.</p>`;
   box.innerHTML = h;
@@ -1279,6 +1460,7 @@ function renderVelocities(box) {
       else if (k === "kind") { v.kind = val; if (val === "imposed") { v.w = v.w || [0, 0, 0]; v.dofs = v.dofs || [1, 1, 1, 0, 0, 0]; v.ramp = v.ramp || 0; } }
       else if (k === "target") v.target = !val ? null : val[0] === "b" ? { body: val.slice(2) } : val[0] === "p" ? { point: val.slice(2) } : { nset: val.slice(2) };
       else if (k === "ramp") { const x = fnum(val); v.ramp = isFinite(x) && x > 0 ? x : 0; }
+      else if (k === "amplitude") { if (val) v.amplitude = val; else delete v.amplitude; }
       changed(); renderModel(); draw();
     });
     el.querySelectorAll("[data-vv]").forEach(inp => inp.onchange = () => {
@@ -1316,8 +1498,8 @@ function statusItems() {
       const g = compOf(c.id), role = ((d.bodies || {})[c.id] || {}).role || "deformable";
       const solid = !(g && g.mesh) || g.mesh.triangles.length > 0 && (!g.mesh.face_body || g.mesh.face_body.some(v => v === null || v === undefined));
       if (solid) { if (role === "deformable") def++; else if (role === "rigid") rig++; }
-      for (const sf of (g && g.surfaces) || []) { const md = ((d.shells || {})[c.id + ":" + sf.id] || {}).mode || "shell"; if (md === "shell") def++; else if (md === "rigid") rig++; }
     }
+    for (const x of d.sections || []) { const md = x.mode || "shell"; if (!(x.faces || []).length) continue; if (md === "shell") def++; else if (md === "rigid") rig++; }
     add("bodies", "Bodies", def ? "ok" : "bad", `${def} deformable, ${rig} rigid`);
     if (n(d.sections)) add("sections", "Sections", "ok", n(d.sections) + "");
     const ms = XP.meshSummary, stale = meshStale();
@@ -1497,12 +1679,12 @@ function renderMasses(box) {
   d.masses = d.masses || [];
   const pts = (d.points || []).map(p => [p.id, p.name]);
   const dt = [["f:", "faces (picked)"]].concat(SM.bodyList(SH).map(([id, t]) => ["b:" + id, t + (isRigidBody(id) ? " (rigid)" : "")]))
-    .concat((d.nsets || []).map(n => ["n:" + n.id, "node set " + n.name]));
-  const tkey = t => !t ? "" : t.faces ? "f:" : t.body !== undefined ? "b:" + t.body : t.nset !== undefined ? "n:" + t.nset : "";
+    .concat((d.nsets || []).map(n => ["n:" + n.id, "node set " + n.name])).concat((d.surfaces || []).map(f => ["s:" + f.id, "surface " + f.name]));
+  const tkey = t => !t ? "" : t.faces ? "f:" : t.surface !== undefined ? "s:" + t.surface : t.body !== undefined ? "b:" + t.body : t.nset !== undefined ? "n:" + t.nset : "";
   let h = `<div class="buttons sm-tools"><button type="button" class="small" data-ma="point">Add point mass</button><button type="button" class="small" data-ma="distributed">Add distributed mass</button></div>`;
   h += d.masses.map(m => {
-    const pt = m.kind === "point", faces = !pt && m.target && m.target.faces;
-    const area = faces && m.mode === "area";
+    const pt = m.kind === "point", faces = !pt && m.target && m.target.faces, surf = !pt && m.target && m.target.surface !== undefined;
+    const area = (faces || surf) && m.mode === "area";
     return `<div class="fa-props rp-props xp-mass" data-mass="${esc(m.id)}"><div class="rp-slot"><input type="text" data-mk2="name" value="${esc(m.name)}" style="width:110px">` +
       `<select data-mk2="kind">${optList([["point", "point mass"], ["distributed", "distributed mass"]], m.kind || "point")}</select>` +
       `<button type="button" class="small" data-mdel2="${esc(m.id)}" title="Delete">&#10005;</button></div>` +
@@ -1510,7 +1692,8 @@ function renderMasses(box) {
         : `<div class="rp-slot">Target <select data-mk2="target"><option value="">(choose)</option>${optList(dt, tkey(m.target))}</select></div>` +
           (faces ? `<div class="rp-slot"><span class="hint">${m.target.faces.length ? m.target.faces.map(faceText).map(esc).join("; ") : "no faces"}</span> ` +
             `<button type="button" class="small" data-mface="${esc(m.id)}" title="Add the selected faces (or select, then Done)">Add faces</button><button type="button" class="small" data-mclear="${esc(m.id)}">Clear</button></div>` +
-            `<div class="rp-slot"><select data-mk2="mode">${optList([["total", "total mass"], ["area", "mass per area"]], m.mode || "total")}</select></div>` : "")) +
+            `<div class="rp-slot"><select data-mk2="mode">${optList([["total", "total mass"], ["area", "mass per area"]], m.mode || "total")}</select></div>` :
+           surf ? `<div class="rp-slot"><span class="hint">${esc(faceText(m.target))}</span> <select data-mk2="mode">${optList([["total", "total mass"], ["area", "mass per area"]], m.mode || "total")}</select></div>` : "")) +
       `<div class="rp-slot"><label class="inline">${area ? "Mass per area" : "Mass"}<input type="text" class="numf" data-mk2="m" value="${esc(m.m === undefined ? "" : m.m)}" style="width:70px"></label> ${area ? "kg/m^2" : "kg"}</div></div>`;
   }).join("");
   if (!d.masses.length) h += `<p class="hint">Point mass: on the node of a reference point (a point coupled to a rigid body adds to the rigid body). Distributed mass: on the nodes of faces (area weights), of a body (element volume or area) or of a node set (equal shares). /ADMAS cards; mass only, no rotational inertia.</p>`;
@@ -1538,7 +1721,7 @@ function renderMasses(box) {
       if (k === "name") m.name = val.trim() || m.name;
       else if (k === "kind") { m.kind = val; m.target = val === "point" ? (pts[0] ? { point: pts[0][0] } : null) : { faces: [] }; }
       else if (k === "point") m.target = val ? { point: val } : null;
-      else if (k === "target") { m.target = !val ? null : val === "f:" ? { faces: [] } : val[0] === "b" ? { body: val.slice(2) } : { nset: val.slice(2) }; if (!m.target || !m.target.faces) m.mode = "total"; }
+      else if (k === "target") { m.target = !val ? null : val === "f:" ? { faces: [] } : val[0] === "b" ? { body: val.slice(2) } : val[0] === "s" ? { surface: val.slice(2) } : { nset: val.slice(2) }; if (!m.target || !(m.target.faces || m.target.surface !== undefined)) m.mode = "total"; }
       else if (k === "mode") m.mode = val;
       else if (k === "m") { const x = fnum(val); if (isFinite(x) && x > 0) m.m = x; else { inp.value = m.m; return; } }
       changed(); renderModel(); draw();
@@ -1572,9 +1755,20 @@ function materialsHtml() {
     }).join("") + `</table><div class="row"><button type="button" data-xpmat="add" class="small">Add material</button>` +
     `<label class="inline">Default<select data-xpmat="def" class="xp-matsel">${MS.matOptions(XP.doc, XP.doc.default_material, libraryNames(), false)}</select></label></div>` +
     `<p class="hint">A material with a library entry is written to the .inp with the E, nu and density of the entry and replaced in the deck by the library card (Build, Library materials). Other materials: *ELASTIC and *DENSITY.</p>`;
+  h += `<h3 class="xp-h">Curve</h3><div id="xp-matcurve"></div>`;
   return h;
 }
+/** Hardening curves of the materials with a library entry (as the deck writes them). */
+function renderMatCurves() {
+  const lib = (XP.meta && XP.meta.library) || {};
+  XP.matPlot = XP.matPlot || {};
+  CV.renderMaterials($("#xp-matcurve"), Object.entries(XP.doc.materials || {}).map(([n, m]) => {
+    const L = m.library && lib[m.library];
+    return { name: n + (L ? " (" + m.library + ")" : ""), E: L ? +L.E : +m.E, curves: L ? L.curves || [] : [] };
+  }), XP.matPlot, { empty: "No material with a hardening curve (materials without a library entry or with an elastic entry are elastic)." });
+}
 function bindMaterials(box) {
+  renderMatCurves();
   box.querySelectorAll("tr[data-m]").forEach(tr => {
     const n = tr.dataset.m;
     tr.querySelectorAll("[data-mk]").forEach(el => el.onchange = () => {
@@ -1646,7 +1840,7 @@ async function pollJob(jid, label) {
 /** Inputs of the model .inp (ShinyCAD geometry): a change after Mesh makes the .inp out of date. */
 function modelKey() {
   const d = XP.doc;
-  return JSON.stringify([d.source, d.materials, d.default_material, d.mesh, d.bonded, d.bodies, d.shells, d.sections, d.nsets, d.supports,
+  return JSON.stringify([d.source, d.materials, d.default_material, d.mesh, d.bonded, d.bodies, d.shells, d.sections, d.refine || [], d.nsets, d.supports,
                          d.points, d.springs, d.joints, d.equations, d.velocities, d.masses, XP.geoKey === undefined ? null : XP.geoKey]);
 }
 function meshStale() { return isShiny() && !!XP.doc.mesh_key && XP.doc.mesh_key !== modelKey(); }
@@ -1684,11 +1878,11 @@ async function showInpMesh() {
 }
 function addSupport() {
   if (!isShiny()) { status(isDeck() ? "Deck generator: Edge supports in Model" : "Supports are defined for the ShinyCAD geometry; an external .inp carries its own *BOUNDARY", true); return; }
-  VS.collect(SH, { text: "New support: faces, edges, bodies or a reference point", types: ["faces", "edges", "bodies", "points"], cb: it => {
+  VS.collect(SH, { text: "New support: faces, edges, vertices, bodies, mesh nodes or elements, or a reference point", types: ["faces", "edges", "vertices", "bodies", "points", "nodes", "elements"], cb: it => {
     const r = VS.targetOf(it);
     if (r.error) return r.error;
     const id = "s" + (XP.doc.next++);
-    XP.doc.supports.push({ id, name: "Support " + (XP.doc.supports.length + 1), target: r.target, dofs: [1, 1, 1] });
+    XP.doc.supports.push({ id, name: "Support " + (XP.doc.supports.length + 1), type: "dofs", target: r.target, dofs: [1, 1, 1] });
     XP.sel = { sup: id };
     changed();
   } });
@@ -2163,7 +2357,7 @@ function renderBuild() {
   const mode = S("analysis_mode");
   const spec = M.mode_spec[mode] || {};
   const rbvs = spec.rbv_values || M.rbv_modes;
-  let h = `<div class="row">${selS("analysis_mode", "Analysis", M.analysis_modes)}<button type="button" class="small" id="xp-orc3set" title="Build settings of the ORC**3 configuration (%APPDATA%\\ORC3\\workspace_config.json); paths unchanged">Import ORC**3 settings</button></div><p class="hint">${esc(M.mode_help[mode] || "")}</p>`;
+  let h = `<div class="row">${selS("analysis_mode", "Analysis", M.analysis_modes)}</div><p class="hint">${esc(M.mode_help[mode] || "")}</p>`;
   const inp = isModel() ? "(model .inp of the document: Mesh)" : ((XP.doc.source || {}).inp || "(choose the .inp in Model)");
   h += `<p class="hint">Source .inp: ${esc(inp)}</p><div class="row">${chkS("downgrade_quad", "Downgrade 2nd-order → linear", "Quadratic elements of the source .inp to linear elements before inp2rad (inp_to_linear.py; nodes kept)")}</div>`;
   h += `<div class="row">${inSB("out_dir", "Output Dir", 240, "folder", "", "Folder of the build (a run folder of Runs, or any folder; empty: next to the .inp)")}</div>`;
@@ -2200,7 +2394,7 @@ function renderBuild() {
   }
   if (!hidden("rigidify")) h += `<div class="row">${inS("rigid_part", "Rigid parts", 160, "PID or part name substring; comma between several (blank = off)")}<button type="button" class="small" data-listparts="1" title="Lists PID: name of the /PART cards of the Target .rad (or the newest deck in Output Dir) in the console">List Parts</button></div>`;
   h += `<p class="hint">${esc(M.rbv_hint[rv] || "")}</p>`;
-  // concentrated mass (ORC**3 Inertia tab)
+  // concentrated mass
   if (!hidden("point_mass")) {
     h += `<h3 class="xp-h">Concentrated mass (unmeshed rigid body)</h3><div class="row">${inSB("point_mass_json", "Inertia payload (JSON)", 200, "open", "json", "inertia_builder / inertia_calc payload or primitives file (blank = off)")}</div>` +
       `<div class="row wrap"><button type="button" class="small" id="xp-in-verify">Reload / verify</button><button type="button" class="small" id="xp-in-builder" title="inertia_builder.py (Tools)">Open inertia builder</button>` +
@@ -2239,7 +2433,6 @@ function renderBuild() {
   $("#xp-slot-add").onclick = () => { const sl = (S("mat_slots") || XP.meta.slots_default).map(x => x.slice()); sl.push([XP.meta.library_none, ""]); setS("mat_slots", sl); renderBuild(); };
   $("#xp-build2").onclick = build;
   $("#xp-mindt").onclick = suggestMinDt;
-  $("#xp-orc3set").onclick = () => restoreSettings({ orc3: true }, "the ORC**3 configuration");
   box.querySelectorAll("[data-listparts]").forEach(b => b.onclick = () => postJSON("/api/explicit/list_parts", req()).then(() => { poll(); openSection("xp-sec-console"); }).catch(showErr));
   if ($("#xp-in-verify")) {
     $("#xp-in-verify").onclick = inertiaRefresh;
@@ -2248,7 +2441,7 @@ function renderBuild() {
     inertiaRefresh();
   }
 }
-/** Travel table of the Explicit driver (ORC**3 _update_travel_table): time for TRAVEL_MM at |V|, against Tstop. */
+/** Travel table of the Explicit driver: time for TRAVEL_MM at |V|, against Tstop. */
 function travelHtml() {
   const M = XP.meta;
   const raw = String(S("rigid_vel") || "").trim();
@@ -2281,7 +2474,7 @@ async function inertiaRefresh() {
     el.className = "xp-log xp-inertia xp-in-" + j.state;
   } catch (e) { el.textContent = String(e.message || e); }
 }
-/** Settings of the last build of a run ({path}) or of the ORC**3 configuration ({orc3: true}); paths unchanged. */
+/** Settings of the last build of a run ({path}); paths unchanged. */
 async function restoreSettings(body, what) {
   try {
     const j = await (await postJSON("/api/explicit/run/settings", body)).json();
@@ -2298,7 +2491,7 @@ function libSlotsOfModel() {
   for (const [n, m] of Object.entries(XP.doc.materials || {})) if (m.library && XP.meta.library[m.library]) out.push([m.library, n.replace(/[^A-Za-z0-9_]+/g, "_").toUpperCase()]);
   return out;
 }
-/** Hidden fields of the analysis type that still act at build time (ORC**3 MK2 rule). */
+/** Hidden fields of the analysis type that still act at build time. */
 function hiddenActive() {
   const out = [];
   if (hidden("floor") && S("test_mode").includes("Rigid Floor")) out.push("rigid floor");
@@ -2316,6 +2509,8 @@ function hiddenActive() {
 }
 async function build() {
   try {
+    const src = XP.doc.source || {};
+    if (src.kind === "inp" && /\.rad$/i.test(src.inp || "")) { setS("rad_target", src.inp.replace(/\\/g, "/")); renderSolve(); status("External .rad: no build; Run solves it as it is (Target .rad)"); return; }
     if (isShiny() && (!XP.doc.mesh_key || meshStale())) {
       status(XP.doc.mesh_key ? "The model changed since the last Mesh: writing the model .inp first" : "Writing the model .inp first");
       if (!(await writeInp())) return;
@@ -2360,8 +2555,7 @@ function renderExecInfo() {
   if (!el || !XP.envInfo) return;
   const ex = E("run_target") === XP.meta.remote ? {} : (XP.envInfo.executables || {});
   el.innerHTML = Object.entries(ex).map(([k, v]) => `${esc(k)}: ${v.found ? esc(v.found) : `<span class="xp-bad">${esc(v.exe)} not found</span>`}`).join("<br>") +
-    (Object.keys(ex).length ? "<br>" : "") + `pvbatch: ${XP.envInfo.pvbatch ? esc(XP.envInfo.pvbatch) : "not found"}; paraview: ${XP.envInfo.paraview ? esc(XP.envInfo.paraview) : "not found"}` +
-    (XP.envInfo.from_orc3 ? `<br>Machine settings read from ${esc(XP.envInfo.from_orc3)}` : "");
+    (Object.keys(ex).length ? "<br>" : "") + `pvbatch: ${XP.envInfo.pvbatch ? esc(XP.envInfo.pvbatch) : "not found"}; paraview: ${XP.envInfo.paraview ? esc(XP.envInfo.paraview) : "not found"}`;
 }
 function renderSolve() {
   const box = section("xp-solvep");
@@ -2384,7 +2578,7 @@ function renderSolve() {
     `<button type="button" id="xp-kill2" class="xp-kill">Kill</button>${remote ? `<button type="button" id="xp-shutdown">Shutdown Server</button>` : ""}</div>`;
   h += `<div class="row wrap">Queue: <button type="button" class="small" data-q="add">Add Current</button><button type="button" class="small" data-q="remove">Remove Selected</button><button type="button" class="small" data-q="clear">Clear List</button>` +
     (remote ? ` | Server: <button type="button" class="small" data-srv="show">Show Queue</button><button type="button" class="small" data-srv="clear">Kill+Flush Server</button>` : "") + `</div>`;
-  h += `<div id="xp-board"></div>`;
+  h += `<div id="xp-board"></div><div id="xp-monitor"></div>`;
   h += `<details class="xp-hist"${XP.histOpen ? " open" : ""}><summary class="sk-h">Run history</summary><div class="row wrap"><button type="button" class="small" data-hop="load" title="Target .rad and Output Dir of the selected entry">Load Selected</button>` +
     `<button type="button" class="small" data-hop="open">Open folder</button><button type="button" class="small" data-hop="remove">Remove</button><button type="button" class="small" data-hop="clear">Clear</button></div><div id="xp-history"></div></details>`;
   box.innerHTML = h;
@@ -2420,7 +2614,7 @@ async function solve(mode) {
   } catch (e) { showErr(e); }
 }
 function kill() { postJSON("/api/explicit/kill", { env: E("run_target") }).then(poll).catch(showErr); }
-/** Env changed: Target .rad and Output Dir remembered per Env (ORC**3 env_dirs). */
+/** Env changed: Target .rad and Output Dir remembered per Env. */
 async function envSwitch() {
   const nw = E("run_target"), old = XP.lastEnv;
   XP.lastEnv = nw;
@@ -2469,6 +2663,7 @@ function renderBoard() {
     const r = rows.find(x => x.id === XP.boardSel);
     if (r && r.id.startsWith("s::") && r.folder) selectResult(r.folder, r.job);
     renderBoard();
+    monitor(true);
   });
   const hb = $("#xp-history");
   if (hb && st) hb.innerHTML = st.history.length ? `<table class="fa-tbl"><tr><th>Job</th><th>Date</th><th>Status</th><th>Env</th><th>ERR</th><th>DM/M</th><th>Wall</th></tr>` +
@@ -2478,6 +2673,34 @@ function renderBoard() {
     XP.histSel = +tr.dataset.hi;
     hb.querySelectorAll("tr[data-hi]").forEach(x => x.classList.toggle("sel", x === tr));
     selectResult(tr.dataset.hf.replace(/\\/g, "/"), tr.dataset.hj);
+  });
+}
+
+/** Run monitor (Solve): time step, energy error and added mass of the cycle lines of the engine output against T,
+ *  of the job selected on the board or the running job; read every 1.5 s while the job runs. */
+const MON_Q = [["dt", "time step DT", "s"], ["err", "energy error ERR", "%"], ["dmm", "added mass DM/M", "-"]];
+async function monitor(force) {
+  const box = $("#xp-monitor");
+  if (!box || !XP.status) return;
+  const rows = XP.status.rows.filter(r => r.id.startsWith("s::"));
+  let sel = rows.find(r => r.id === XP.boardSel) || rows.find(r => r.tag === "running" || r.tag === "warn" || r.tag === "bad");
+  if (!sel && force && XP.mon && XP.mon.job) sel = { job: XP.mon.job, status: XP.mon.st, tag: "done" };      // a curve choice of the job shown
+  if (!sel) { if (!XP.mon) box.innerHTML = ""; return; }
+  const run = !["done", "failed", "queued"].includes(sel.tag);
+  const M = XP.mon;
+  if (!force && M && M.job === sel.job && M.st === sel.status && (!run || Date.now() - M.at < 1500)) return;
+  XP.mon = Object.assign(M && M.job === sel.job ? M : { on: (M && M.on) || ["err"] }, { job: sel.job, st: sel.status, at: Date.now() });
+  let d;
+  try { d = await (await api("/api/explicit/monitor?job=" + encodeURIComponent(sel.job))).json(); } catch (e) { return; }
+  if (!d.t || !d.t.length) { box.innerHTML = ""; return; }
+  XP.mon.data = d;
+  const on = XP.mon.on;
+  box.innerHTML = `<h3 class="xp-h">Run monitor: ${esc(d.job)} (${esc(d.status || "")}, ${d.t.length} cycle lines)</h3><div class="row wrap">` +
+    MON_Q.map(([k, t]) => `<label class="check inline"><input type="checkbox" data-mon="${k}"${on.includes(k) ? " checked" : ""}> ${t}</label>`).join("") + `</div><div id="xp-monplot"></div>`;
+  TH.plot($("#xp-monplot"), MON_Q.filter(([k]) => on.includes(k)).map(([k, t, u]) => ({ name: t, unit: u, t: d.t, v: d[k].map(v => (v === null ? NaN : v)) })), { xlabel: "T (s)" });
+  box.querySelectorAll("[data-mon]").forEach(c => c.onchange = () => {
+    XP.mon.on = [...box.querySelectorAll("[data-mon]:checked")].map(x => x.dataset.mon);
+    monitor(true);
   });
 }
 
@@ -2518,6 +2741,15 @@ function renderResults() {
     `<label class="check inline"><input type="checkbox" data-pv="tot"${pv.tot ? " checked" : ""}> KE+IE</label><label class="check inline" title="All loaded curves"><input type="checkbox" data-pv="overlay"${pv.overlay ? " checked" : ""}> Overlay all</label>` +
     (Object.keys(XP.curves).length ? `<label class="inline">Curve<select id="xp-curvesel">${optList(Object.keys(XP.curves).sort(), XP.curveSel)}</select></label>` : "") + `</div>`;
   h += `<div id="xp-plot" class="xp-plot"></div><div id="xp-parts"></div>`;
+  h += xpProbeHtml();
+  if (d && (d.time_history || []).length) {
+    const q = d.time_history.find(x => x.id === XP.thReq) || d.time_history[0];
+    const on = (XP.thOn || {})[q.id] || q.series.slice(0, 1).map(x => x.name);
+    h += `<h3 class="xp-h">Time history</h3><div class="row wrap"><label class="inline">Request<select id="xp-threq">${d.time_history.map(x => `<option value="${esc(x.id)}"${x === q ? " selected" : ""}>${esc(x.name)}</option>`).join("")}</select></label>` +
+      `<button type="button" class="small" id="xp-thcsv" title="The curves of the request as CSV">CSV</button></div>` +
+      `<div class="row wrap">${q.series.map(x => `<label class="check inline"><input type="checkbox" data-ths="${esc(x.name)}"${on.includes(x.name) ? " checked" : ""}> ${esc(x.name)}</label>`).join("") || '<span class="hint">no values (results CSV)</span>'}</div><div id="xp-thplot"></div>` +
+      (d.th_note ? `<p class="hint">${esc(d.th_note)}</p>` : "");
+  }
   if (d && d.energy && d.energy.note) h += `<p class="hint">${esc(d.energy.note)}</p>`;
   if (d) {
     if (!d.energy) h += `<p class="hint">No results CSV of ${esc(d.job)} (Plot KE rebuilds it from the T-file).</p>`;
@@ -2526,6 +2758,8 @@ function renderResults() {
     if (d.strains && d.strains.length > 1) h += `<div class="fa-wide"><table class="fa-tbl"><tr>${d.strains[0].map(c => `<th>${esc(c)}</th>`).join("")}</tr>` + d.strains.slice(1).map(r => `<tr>${r.map(c => `<td>${esc(c)}</td>`).join("")}</tr>`).join("") + `</table></div>`;
   } else h += `<p class="hint">Choose a job of the run, or click a row of the status board.</p>`;
   box.innerHTML = h;
+  if ($("#xp-thplot")) bindTimeHistory(d);
+  xpBindProbe();
   renderResultsJobs();
   $("#xp-resjob").onchange = () => { const v = $("#xp-resjob").value; if (v) { const i = v.lastIndexOf("|"); selectResult(v.slice(0, i), v.slice(i + 1)); } };
   $("#xp-resload").onclick = () => { if (XP.res.job) selectResult(XP.res.folder, XP.res.job, true); };
@@ -2555,6 +2789,138 @@ function renderResults() {
   box.querySelectorAll("[data-folder]").forEach(a => a.onclick = e => { e.preventDefault(); postJSON("/api/explicit/open_folder", { path: XP.res.folder }).catch(showErr); });
   plotEnergy();
 }
+// ------------------------------------------------------------------ probe and path (Results)
+
+/** A click on the result (Probe or Path): the point of the hit triangle nearest the hit, and the cell of the triangle. */
+function xpProbeClick(e) {
+  const h = rayAt(e).intersectObjects(XP.three.group.children.filter(o => o.userData && o.userData.kind === "mesh"), false)[0];
+  if (!h || h.faceIndex === undefined || !h.object.userData.src) { status("Probe: click a face of the result", true); return; }
+  const S = h.object.userData.src, k = S.triIdx[h.faceIndex], pos = S.pos;
+  let best = -1, bd = Infinity;
+  for (const v of [S.tri[3 * k], S.tri[3 * k + 1], S.tri[3 * k + 2]]) {
+    const dd = Math.hypot(pos[3 * v] - h.point.x, pos[3 * v + 1] - h.point.y, pos[3 * v + 2] - h.point.z);
+    if (dd < bd) { bd = dd; best = v; }
+  }
+  const ids = decoded(XP.res.geo.payload).ids;
+  const q = { point: best, cell: S.cell[k], label: ids ? "node " + ids[best] : "point " + (best + 1) };
+  if (XP.probeMode === "probe") {
+    XP.probes = (XP.probes || []).filter(x => x.point !== q.point).concat([q]).slice(-8);
+    XP.probeData = null;
+  } else {
+    XP.path = XP.path && XP.path.length === 1 ? [XP.path[0], q] : [q];
+    if (XP.path.length === 2) XP.probeMode = null;
+  }
+  status(XP.probeMode === "path" ? "Path: click the end of the path" : "Probe: " + q.label);
+  renderResults(); draw();
+}
+/** The field over the frames at the probes (server: every frame read). */
+async function xpProbeData() {
+  const field = $("#xp-field").value;
+  const key = XP.res.folder + "|" + XP.res.job + "|" + field + "|" + (XP.probes || []).map(q => q.point + ":" + q.cell).join(",");
+  if (XP.probeData && XP.probeData.key === key) return XP.probeData;
+  const j = await (await postJSON("/api/explicit/probe", { folder: XP.res.folder, job: XP.res.job, field, probes: (XP.probes || []).map(q => ({ point: q.point, cell: q.cell })) })).json();
+  XP.probeData = Object.assign(j, { key });
+  return XP.probeData;
+}
+/** Path: the field of the frame shown along the straight line between the path ends (60 samples) on the undeformed
+ *  surface (nearest point of the surface triangles; point fields linear on the triangle, cell fields of the cell). */
+function xpPathSeries() {
+  const f = XP.res.frame, g = XP.res.geo;
+  if (!XP.path || XP.path.length < 2 || !f || !f._d || !f._d.values) return [];
+  const d = decoded(g.payload), P = d.pos, T = d.tri, vals = f._d.values, cellLoc = f.loc === "cell";
+  const A = new THREE.Vector3().fromArray(P, 3 * XP.path[0].point), B = new THREE.Vector3().fromArray(P, 3 * XP.path[1].point);
+  const L = A.distanceTo(B), N = 60;
+  const tri = new THREE.Triangle(), q = new THREE.Vector3(), c = new THREE.Vector3(), bary = new THREE.Vector3();
+  const va = new THREE.Vector3(), vb = new THREE.Vector3(), vc = new THREE.Vector3();
+  const xs = [], vs = [];
+  for (let k = 0; k <= N; k++) {
+    const x = new THREE.Vector3().lerpVectors(A, B, k / N);
+    let bd = Infinity, bt = -1;
+    for (let j = 0; j < T.length; j += 3) {
+      va.fromArray(P, 3 * T[j]); vb.fromArray(P, 3 * T[j + 1]); vc.fromArray(P, 3 * T[j + 2]);
+      tri.set(va, vb, vc); tri.closestPointToPoint(x, q);
+      const dd = q.distanceToSquared(x);
+      if (dd < bd) { bd = dd; bt = j; c.copy(q); }
+    }
+    if (bt < 0) continue;
+    let v;
+    if (cellLoc) v = vals[d.cell[bt / 3]];
+    else {
+      va.fromArray(P, 3 * T[bt]); vb.fromArray(P, 3 * T[bt + 1]); vc.fromArray(P, 3 * T[bt + 2]);
+      THREE.Triangle.getBarycoord(c, va, vb, vc, bary);
+      v = bary.x * vals[T[bt]] + bary.y * vals[T[bt + 1]] + bary.z * vals[T[bt + 2]];
+    }
+    xs.push(L * k / N); vs.push(v);
+  }
+  const fl = (g.fields || []).find(x => x.key === $("#xp-field").value);
+  return [{ name: `${fl ? fl.label : "field"} ${XP.path[0].label} to ${XP.path[1].label}`, unit: "", t: xs, v: vs }];
+}
+function xpProbeHtml() {
+  if (!XP.res.geo) return "";
+  const mode = XP.probeMode;
+  const fl = (XP.res.geo.fields || []).find(x => x.key === $("#xp-field").value);
+  let h = `<h3 class="xp-h">Probe and path</h3><div class="row wrap">` +
+    `<button type="button" class="small${mode === "probe" ? " primary" : ""}" id="xp-probe" title="Click points of the result: the Field at the point (point fields) or element (element fields) over the frames">Probe</button>` +
+    `<button type="button" class="small${mode === "path" ? " primary" : ""}" id="xp-path" title="Click the two ends of a path on the result: the Field of the frame shown along the straight line on the surface">Path</button>` +
+    `<button type="button" class="small" id="xp-pclear">Clear</button><button type="button" class="small" id="xp-pcsv" title="The probe and path curves as CSV">CSV</button>` +
+    (mode ? `<span class="hint">${mode === "probe" ? "click points of the result (Probe again: end)" : "click the two ends of the path"}</span>` : "") + `</div>`;
+  if ((XP.probes || []).length) h += `<p class="hint">Probe: ${esc(fl ? fl.label : "")} at ${XP.probes.map(q => esc(q.label)).join(", ")} against the time (s)</p><div id="xp-probeplot"></div>`;
+  if (XP.path && XP.path.length === 2) h += `<p class="hint">Path: ${esc(fl ? fl.label : "")} of frame ${XP.res.k + 1} against the distance from ${esc(XP.path[0].label)} (mm)</p><div id="xp-pathplot"></div>`;
+  return h;
+}
+async function xpBindProbe() {
+  if (!$("#xp-probe")) return;
+  const toggle = m => { XP.probeMode = XP.probeMode === m ? null : m; if (m === "path" && XP.probeMode) XP.path = []; if (XP.probeMode && XP.res.frame) { $("#xp-show").value = "results"; draw(); } renderResults(); };
+  $("#xp-probe").onclick = () => toggle("probe");
+  $("#xp-path").onclick = () => toggle("path");
+  $("#xp-pclear").onclick = () => { XP.probes = []; XP.path = null; XP.probeMode = null; XP.probeData = null; renderResults(); draw(); };
+  const probeSeries = () => {
+    const pd = XP.probeData;
+    if (!pd || !(XP.probes || []).length) return [];
+    const fl = (XP.res.geo.fields || []).find(x => x.key === $("#xp-field").value);
+    return XP.probes.map((q, i) => ({ name: `${q.label} ${fl ? fl.label : ""}`, unit: "", t: pd.time, v: (pd.values[i] || []).map(v => (v === null ? NaN : v)) }));
+  };
+  $("#xp-pcsv").onclick = () => {
+    const S = probeSeries().concat(xpPathSeries());
+    if (!S.length) { status("Probe: no curves", true); return; }
+    TH.download(`${XP.res.job}_probe.csv`.replace(/[^A-Za-z0-9_.\-]+/g, "_"), TH.csv(S));
+  };
+  if ($("#xp-pathplot")) TH.plot($("#xp-pathplot"), xpPathSeries(), { xlabel: "distance (mm)" });
+  if ($("#xp-probeplot")) {
+    try { await xpProbeData(); } catch (e) { showErr(e); return; }
+    const fr = (XP.res.data && XP.res.data.frames) || [];
+    TH.plot($("#xp-probeplot"), probeSeries(), { mark: XP.res.frame ? XP.res.frame.time : null, onPick: async t => {
+      if (!fr.length || !XP.res.geo) return;
+      let best = 0;
+      fr.forEach((f, i) => { if (Math.abs((f.time || 0) - t) < Math.abs((fr[best].time || 0) - t)) best = i; });
+      try { await loadFrame(best); draw(); renderResults(); } catch (e) { showErr(e); }
+    } });
+  }
+}
+
+/** Time history of the job (history requests): the chosen request, its curves; a click shows the nearest frame. */
+function bindTimeHistory(d) {
+  const q = d.time_history.find(x => x.id === XP.thReq) || d.time_history[0];
+  XP.thOn = XP.thOn || {};
+  const on = () => XP.thOn[q.id] || q.series.slice(0, 1).map(x => x.name);
+  const draw1 = () => TH.plot($("#xp-thplot"), q.series.filter(x => on().includes(x.name)), {
+    mark: XP.res.frame ? XP.res.frame.time : null,
+    onPick: async t => {
+      const fr = (XP.res.data && XP.res.data.frames) || [];
+      if (!fr.length || !XP.res.geo) return;
+      let best = 0;
+      fr.forEach((f, i) => { if (Math.abs((f.time || 0) - t) < Math.abs((fr[best].time || 0) - t)) best = i; });
+      try { await loadFrame(best); draw(); } catch (e) { showErr(e); }
+    } });
+  XP.thDraw = draw1;
+  draw1();
+  $("#xp-threq").onchange = () => { XP.thReq = $("#xp-threq").value; renderResults(); };
+  document.querySelectorAll("#xp-results [data-ths]").forEach(el => el.onchange = () => {
+    XP.thOn[q.id] = [...document.querySelectorAll("#xp-results [data-ths]:checked")].map(x => x.dataset.ths);
+    draw1();
+  });
+  $("#xp-thcsv").onclick = () => TH.download(`${d.job}_${q.name}.csv`.replace(/[^A-Za-z0-9_.\-]+/g, "_"), TH.csv(q.series.filter(x => on().includes(x.name))));
+}
 async function postOp(op) {
   const needJob = !["macro", "extract"].includes(op) && !(op === "plot_ke" && S("out_dir"));
   if (needJob && !XP.res.job) { status("Choose a job in Results", true); return; }
@@ -2578,6 +2944,7 @@ async function selectResult(folder, job, reload) {
   if (!reload && XP.res.folder === folder && XP.res.job === job && XP.res.data) return;
   XP.res = { folder, job, data: null, geo: null, frame: null, k: 0, playing: false };
   XP.partHide = new Set();
+  XP.probes = []; XP.path = null; XP.probeMode = null; XP.probeData = null;
   try {
     XP.res.data = await (await postJSON("/api/explicit/results", { folder, job })).json();
     if (XP.res.data.energy) { XP.curveSel = job; delete XP.zoom.energy; }
@@ -2599,6 +2966,7 @@ async function selectResult(folder, job, reload) {
       await loadFrame(+sl.value);
       $("#xp-show").value = "results";
       draw();
+      renderResults();                          // Probe and path (the frames are loaded)
     } catch (e) { showErr(e); }
   } else if ($("#xp-show").value === "results") { $("#xp-show").value = XP.mesh ? "mesh" : "model"; draw(); }
 }
@@ -2610,6 +2978,8 @@ async function loadFrame(k) {
   $("#xp-ftime").textContent = `${f.index + 1}/${XP.res.geo.frames.length}` + (f.time !== null && f.time !== undefined ? ` t=${fmt(f.time, 4)} s` : "");
   if (fr) $("#xp-frame").value = f.index;
   renderParts();
+  if (XP.thDraw && $("#xp-thplot")) XP.thDraw();
+  if ($("#xp-probeplot") || $("#xp-pathplot")) xpBindProbe();
 }
 async function play() {
   if (XP.res.playing) { XP.res.playing = false; $("#xp-play").textContent = "▶"; return; }
@@ -2625,7 +2995,7 @@ async function play() {
   XP.res.playing = false; $("#xp-play").textContent = "▶";
 }
 
-/** KE / IE / KE+IE curves (ORC**3 Results tab): the selected curve, or all loaded curves (Overlay all). */
+/** KE / IE / KE+IE curves: the selected curve, or all loaded curves (Overlay all). */
 function plotEnergy() {
   const box = $("#xp-plot");
   if (!box) return;
@@ -2651,7 +3021,7 @@ function plotEnergy() {
     empty: "No curves loaded. Run a job (Plot KE ticked), or Load CSV…", marker: !pv.overlay && f && XP.curveSel === XP.res.job ? f.time : null, legend: series.length > 1 });
 }
 
-// ------------------------------------------------------------------ Rivet panel (ORC**3 Rivet tab)
+// ------------------------------------------------------------------ Rivet panel
 
 function renderRivet() {
   const sec = $("#xp-sec-rivet"), box = section("xp-rivet");
@@ -2717,7 +3087,7 @@ function plotRivet() {
     title: names.length === 1 ? names[0] : "", empty: "No curve yet. Build the gauge rings, run the job, then Extract F-d." });
 }
 
-// ------------------------------------------------------------------ Tools panel (ORC**3 Tools tab)
+// ------------------------------------------------------------------ Tools panel
 
 async function loadTools() {
   try { XP.tools = await (await api("/api/explicit/tools")).json(); } catch (e) { XP.tools = null; showErr(e); }
@@ -2840,6 +3210,7 @@ async function poll() {
     const prev = XP.status;
     XP.status = st;
     renderBoard();
+    monitor();
     $("#xp-busy").textContent = (st.building ? "building " : "") + st.busy.map(b => b + " run").join(", ") + (st.tasks.length ? " " + st.tasks.join(", ") : "");
     // a finished build: the new deck is the Target .rad
     if (st.last_build && (!XP.lastBuild || XP.lastBuild.time !== st.last_build.time) && XP.doc) {
@@ -2874,7 +3245,49 @@ function startPolling() {
     if (!$("#tab-xp").hidden || active) poll();
   }, 1000);
 }
-function openSection(id) { const d = $("#" + id); if (d) d.open = true; }
+function openSection(id) { const d = $("#" + id); if (d) d.open = true; if (XP.tree) XP.tree.reveal(id.replace(/^xp-sec-/, "")); }
+
+/** Leaves of the model tree: the items of a list of the document [{id, label}]. */
+function treeItems(field) { return ((XP.doc || {})[field] || []).map(x => ({ id: String(x.id), label: x.name || String(x.id) })); }
+/** A body, the faces of a section or surface, or a reference point picked from the tree: selected in the view. */
+function treePickView(field, id) {
+  const d = XP.doc || {};
+  if (field === "bodies") VS.show(SH, { bodies: [id] });
+  else if (field === "points") VS.show(SH, { point: id });
+  else { const x = (d[field] || []).find(q => String(q.id) === id); if (x) VS.show(SH, { faces: x.faces || [] }); }
+  draw();
+}
+/** Model tree of the panel (paneltree.js): the sections and the parts of Model as pages. */
+function installTree() {
+  if (XP.tree) return;
+  const sec = k => () => [$("#xp-sec-" + k)];
+  const page = k => () => [...document.querySelectorAll(`#xp-model > [data-page="${k}"]`)];
+  const shiny = () => !!XP.doc && isShiny();
+  const n = (k, label, field) => ({ id: k, label, els: page(k), count: field ? () => (shiny() ? (XP.doc[field] || []).length : null) : null,
+                                     off: () => !!XP.doc && PN.isHidden(XP.doc, k), items: () => (shiny() ? treeItems(field) : []),
+                                     pick: ["sections", "surfaces", "points"].includes(field) ? id => treePickView(field, id) : null });
+  const bodies = () => (shiny() && XP.geo ? SM.bodyList(SH).filter(([v]) => !v.startsWith("sec:")).map(([v, t]) => ({ id: v, label: t })) : []);
+  XP.tree = TP.install({ key: "xp", panel: $("#xp-panel"), body: $("#xp-panel").parentElement, title: "Model tree",
+    root: { id: "all", label: () => (XP.shared ? "Analysis (OpenCourant)" : "Explicit"), children: [
+      { id: "model", label: "Model", els: () => [$("#xp-sec-model"), ...[...($("#xp-model") || { children: [] }).children].filter(c => !c.dataset.page)], children: [
+        { id: "inpfile", label: "Input file", els: page("inpfile") },
+        { id: "mats", label: "Materials", els: page("mats"), count: () => (shiny() ? Object.keys(XP.doc.materials || {}).length : null),
+          items: () => (shiny() ? Object.keys(XP.doc.materials || {}).map(m => ({ id: m, label: m })) : []) },
+        { id: "bodies", label: "Bodies", els: page("bodies"), count: () => (shiny() ? bodies().length : null), items: bodies, pick: id => treePickView("bodies", id) },
+        { id: "mesh", label: "Mesh", els: page("mesh") },
+        n("sections", "Sections", "sections"), n("surfaces", "Surfaces", "surfaces"), n("nsets", "Node sets", "nsets"), n("rps", "Reference points", "points"),
+        { id: "constraints", label: "Constraints", children: [n("springs", "Springs", "springs"), n("joints", "Joints", "joints"), n("eqs", "Equations", "equations")] },
+        { id: "sups", label: "Supports", els: page("sups"), count: () => (shiny() ? (XP.doc.supports || []).length : null), items: () => (shiny() ? treeItems("supports") : []) },
+        { id: "loading", label: "Loading", children: [{ id: "amps", label: "Amplitudes", els: page("amps"), count: () => (shiny() ? (XP.doc.amplitudes || []).length : null), items: () => (shiny() ? treeItems("amplitudes") : []) },
+          n("vels", "Velocities", "velocities"), n("masses", "Masses", "masses"), { id: "init", label: "Initial state (static)", els: page("init"), off: () => !!XP.doc && PN.isHidden(XP.doc, "init") }] },
+        n("hist", "History output", "history")] },
+      { id: "runs", label: "Runs", els: sec("runs") },
+      { id: "build", label: "Build", els: sec("build"), children: [{ id: "rivet", label: "Rivet", els: sec("rivet") }] },
+      { id: "solve", label: "Solve", els: sec("solve") },
+      { id: "results", label: "Results", els: sec("results") },
+      { id: "tools", label: "Tools", els: sec("tools") },
+      { id: "console", label: "Console", els: sec("console") }] } });
+}
 
 // ------------------------------------------------------------------ documents
 
@@ -2895,16 +3308,20 @@ async function refreshSources() {
   try { asms = await (await api("/api/assembly/list")).json(); } catch (e) { /* none */ }
   try { parts = await (await api("/api/part/list")).json(); } catch (e) { /* none */ }
   const s = XP.doc ? XP.doc.source || {} : {};
-  const cur = (s.kind || "shinycad") === "shinycad" && s.name ? s.type + ":" + s.name : "";
+  const shiny = (s.kind || "shinycad") === "shinycad";
+  const cur = shiny && s.type === "inp" ? "inp:" + (s.path || "") : shiny && s.name ? s.type + ":" + s.name : "";
   const sel = $("#xp-source");
   sel.innerHTML = `<option value="">(geometry)</option>` +
     (asms.length ? `<optgroup label="Assemblies">${asms.map(n => `<option value="assembly:${esc(n)}">${esc(n)}</option>`).join("")}</optgroup>` : "") +
-    (parts.length ? `<optgroup label="Parts">${parts.map(n => `<option value="part:${esc(n)}">${esc(n)}</option>`).join("")}</optgroup>` : "");
+    (parts.length ? `<optgroup label="Parts">${parts.map(n => `<option value="part:${esc(n)}">${esc(n)}</option>`).join("")}</optgroup>` : "") +
+    `<optgroup label="Mesh file">${shiny && s.type === "inp" ? `<option value="${esc(cur)}" title="${esc(s.path || "")}">${esc(s.name || s.path)}</option>` : ""}` +
+    `<option value="inp:">Import CalculiX .inp or Radioss .rad…</option></optgroup>`;
   if (cur && ![...sel.options].some(o => o.value === cur)) sel.insertAdjacentHTML("beforeend", `<option value="${esc(cur)}">${esc(s.name)} (missing)</option>`);
   sel.value = cur;
   sel.disabled = (s.kind || "shinycad") !== "shinycad";
 }
 async function loadDoc(d) {
+  if (XP.shared && !XP.attaching) { XP.shared = null; setFileMenu(false); if (FM) FM.refresh(); $("#xp-solver").value = "explicit"; }   // a document of the former kind: detached
   const b = blankDoc(d.name);
   for (const k of Object.keys(b)) if (d[k] === undefined) d[k] = b[k];
   XP.doc = d;
@@ -2958,8 +3375,10 @@ window.xpShown = async function () {
   });
   $("#xp-source").onchange = () => {
     const v = $("#xp-source").value;
+    if (v === "inp:") { chooseInp(); return; }
+    if (v.startsWith("inp:")) return;
     const i = v.indexOf(":");
-    XP.doc.source = Object.assign({}, XP.doc.source, v ? { kind: "shinycad", type: v.slice(0, i), name: v.slice(i + 1) } : { kind: "shinycad", type: "assembly", name: "" });
+    XP.doc.source = Object.assign({}, XP.doc.source, v ? { kind: "shinycad", type: v.slice(0, i), name: v.slice(i + 1), path: undefined, imported: undefined } : { kind: "shinycad", type: "assembly", name: "" });
     XP.mesh = null; XP.meshSummary = null;
     $("#xp-show").value = "model";
     changed(); loadGeometry();
@@ -2981,39 +3400,32 @@ window.xpShown = async function () {
     draw();
   };
   for (const id of ["#xp-edges", "#xp-thick", "#xp-bcs", "#xp-axes", "#xp-scale", "#xp-undef", "#xp-eroded", "#xp-min", "#xp-max"]) $(id).onchange = draw;
-  $("#xp-field").onchange = async () => { try { await loadFrame(XP.res.k); draw(); } catch (e) { showErr(e); } };
+  $("#xp-field").onchange = async () => {
+    try { await loadFrame(XP.res.k); draw(); } catch (e) { showErr(e); }
+    if ((XP.probes || []).length || (XP.path || []).length === 2) renderResults();       // probe and path curves of the field
+  };
   $("#xp-frame").oninput = () => { $("#xp-ftime").textContent = `${+$("#xp-frame").value + 1}/${XP.res.geo ? XP.res.geo.frames.length : 0}`; };
   $("#xp-frame").onchange = async () => { try { await loadFrame(+$("#xp-frame").value); draw(); plotEnergy(); } catch (e) { showErr(e); } };
   $("#xp-play").onclick = () => play().then(plotEnergy);
-  FM = docFileMenu({ pre: "xp", type: "explicit", label: "explicit analysis", pane: "#tab-xp", listUrl: "/api/explicit/list",
-    cur: () => (XP.doc ? { name: XP.doc.name, dirty: !!XP.dirty } : null),
-    load: async name => loadDoc(await (await api("/api/explicit/file/" + encodeURIComponent(name))).json()),
-    save: saveDoc, blank: () => loadDoc(blankDoc("explicit")), setName: name => { XP.doc.name = name; refreshRuns(); } });
+  setFileMenu(false);
+  FM = docFileMenu(Object.assign(XFO, { pre: "xp", pane: "#tab-xp" }));
+  $("#xp-solver").onchange = () => setSolver($("#xp-solver").value).catch(showErr);
   $("#xp-openrun").onclick = () => { if (XP.runsDir) postJSON("/api/explicit/open_folder", { path: XP.runsDir }).catch(showErr); };
   window.addEventListener("beforeunload", e => { if (XP.dirty) { e.preventDefault(); e.returnValue = ""; } });
   bindSplit();
+  installTree();
 })();
 function bindSplit() {
-  const bar = $("#xp-split"), panel = $("#xp-panel");
-  if (!bar || bar.dataset.bound) return;
-  bar.dataset.bound = "1";
-  try { const w = +localStorage.getItem("xp_panel_w"); if (w >= 300) panel.style.width = w + "px"; } catch (e) { /* no storage */ }
-  bar.onmousedown = e => {
-    e.preventDefault();
-    const w0 = panel.getBoundingClientRect().width, x0 = e.clientX;
-    bar.classList.add("drag");
-    const move = ev => { panel.style.width = Math.max(300, Math.min(window.innerWidth * 0.75, w0 + x0 - ev.clientX)) + "px"; };
-    const up = () => {
-      bar.classList.remove("drag");
-      window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up);
-      try { localStorage.setItem("xp_panel_w", parseInt(panel.style.width)); } catch (err) { /* no storage */ }
-      resize3();
-    };
-    window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
-  };
+  TP.bindSplit($("#xp-split"), $("#xp-panel"), $("#xp-panel").parentElement, "xp_panel_w", resize3);
 }
 
-window.__xp = { XP, SH, renderModel, draw };
+/** View handover between the OpenCourant and the CalculiX pane (handoff.js). */
+window.__xpPane = {
+  ready: () => !!(XP.three && XP.geo && !XP.attaching && !$("#tab-xp").hidden),
+  state: () => HO.state(XP.three, SM.selState(SH), XP.tree, $("#xp-panel")),
+  apply: st => HO.apply(st, XP.three, SM.selState(SH), XP.tree, $("#xp-panel"), () => { resize3(); VS.renderBar(SH); draw(); }),
+};
+window.__xp = { XP, SH, renderModel, renderResults, monitor, draw, openSection };
 window.__xpLoadNamed = async function (name) { await loadDoc(await (await api("/api/explicit/file/" + encodeURIComponent(name))).json()); if (FM) FM.markSaved(name); };
 window.__xpSetName = name => { if (XP.doc) { XP.doc.name = name; if (FM) FM.markSaved(name); } };
 window.__xpRefresh = () => { if (XP.doc) refreshList(); };

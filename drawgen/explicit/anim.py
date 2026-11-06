@@ -1,6 +1,6 @@
-"""OpenRadioss animation files (<job>A001, <job>A002, ...) read directly, without the anim_to_vtk conversion.
+"""OpenCourant animation files (<job>A001, <job>A002, ...) read directly, without the anim_to_vtk conversion.
 
-Format FASTMAGI10 (big-endian), as read by anim_to_vtk (OpenRadioss/Tools, output_converters/anim_to_vtk, MIT):
+Format FASTMAGI10 (big-endian), as read by anim_to_vtk (OpenCourant tools, output_converters/anim_to_vtk, MIT):
 header (magic, time, 3 x 81 character texts, 10 flags), 2D block (nodes, 4-node elements, parts, nodal normals,
 nodal and element scalars, nodal vectors, element tensors xx yy xy, masses, numbering, hierarchy), 3D block (flag 2:
 8-node elements, scalars, tensors xx yy zz xy xz yz), 1D block (flag 3: 2-node elements, scalars, 9-component
@@ -117,7 +117,7 @@ def read_anim(path):
     b = _Buf(data)
     magic = b.i4()
     if magic != MAGIC:
-        raise AnimError("%s: not an OpenRadioss animation file (magic 0x%x)" % (path, magic & 0xffffffff))
+        raise AnimError("%s: not an OpenCourant animation file (magic 0x%x)" % (path, magic & 0xffffffff))
     t = _f7(b.arr(">f4", 1)[0])
     b.text(TEXT); b.text(TEXT); b.text(TEXT)
     flag = [int(x) for x in b.arr(">i4", 10)]

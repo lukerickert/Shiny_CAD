@@ -12,7 +12,7 @@ integration points and the plastic strain, per shell element the stress at 5 poi
 through the two integration point layers of the expanded element) and the plastic strain. The build (apply) moves the
 /NODE coordinates by the displacements and writes /INIBRI/STRS_FGLO (solids, 1 integration point: 8-node bricks
 Isolid 1, 4-node tetrahedra Isolid 0) and /INISHE/STRS_F/GLOB, /INISH3/STRS_F/GLOB (shells: 5 points through the
-thickness at T = -1, -0.5, 0, 0.5, 1, 1 surface point) into the starter deck (formats of the OpenRadioss hm_cfg_files
+thickness at T = -1, -0.5, 0, 0.5, 1, 1 surface point) into the starter deck (formats of the OpenCourant hm_cfg_files
 radioss2021 TABLE inibri_strs_fglo_sub.cfg and inishe_strs_f_glob_sub.cfg). Units: mm, t, s (stress MPa, density
 t/mm^3, energy mJ).
 """

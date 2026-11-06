@@ -1,8 +1,8 @@
-"""Headless ORC**3 workspace: the build, run manager, solve and post-processing mixins on settings objects instead of
+"""Headless explicit workspace: the build, run manager, solve and post-processing mixins on settings objects instead of
 Tk variables.
 
-Settings: every ORC**3 setting is an attribute holding a Var (get(), set()). apply(dict) sets them, snapshot() returns
-them (the keys of the ORC**3 settings snapshot written to run.json). The library material slots are a list
+Settings: every setting is an attribute holding a Var (get(), set()). apply(dict) sets them, snapshot() returns
+them (the keys of the settings snapshot written to run.json). The library material slots are a list
 (mat_slots: [[library entry, name in model], ...]) instead of the three slots MAT1 to MAT3.
 
 Machine settings (ENV_KEYS) are kept in config.json > "explicit" by the web module; the others in the explicit
@@ -28,13 +28,13 @@ from .runs import RunMixin
 from .solve import SolveMixin
 from .post import PostMixin
 
-LOCAL = "Local (Windows)"          # run_target values (ORC**3 labels)
+LOCAL = "Local (Windows)"          # run_target values
 REMOTE = "Remote (Linux)"
 HISTORY_MAX = 200
 # solver packages unpacked next to the program: <program>/solvers/<package>/exec
 SOLVERS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "solvers")
 
-# ORC**3 defaults (workspace.py with an empty configuration), except the server fields
+# defaults (an empty configuration), except the server fields
 DEFAULTS = {
     "analysis_mode": MODE_ALL,
     "project_dir": "", "run_desc": "", "run_notes": "",
@@ -68,10 +68,10 @@ _OLD_MATERIALS = {"Aluminium 6061-T6 (Johnson-Cook, Lesuer)": "Aluminium 6061-T6
 
 
 def migrate(settings, legacy=False):
-    """Settings of an older ORC**3 configuration or run.json snapshot in the current keys (ORC**3 workspace.py and
+    """Settings of an older configuration or run.json snapshot in the current keys (workspace.py and
     cmd_load_run_settings): auto_tie / tie_pairs / tie_dist -> tie_mode; self_contact -> contact_mode; rigid_vel without
     a valid rigid_vel_mode -> rigid_vel_mode; renamed library materials; an unknown analysis_mode -> Advanced.
-    legacy: an ORC**3 file (missing keys are migrated); else only legacy keys and unknown values are.
+    legacy: an older file (missing keys are migrated); else only legacy keys and unknown values are.
     Returns (settings, notes)."""
     s = dict(settings or {})
     notes = []
@@ -168,7 +168,7 @@ class Workspace(BuildMixin, MaterialsMixin, RunMixin, SolveMixin, PostMixin):
                 getattr(self, k).set(_coerce(k, v))
         if "mat_slots" in (settings or {}):
             self.mat_slots = [[str(a or ""), str(b or "")] for a, b in (settings.get("mat_slots") or [])]
-        elif any(k in (settings or {}) for k in ("mat1", "mat1_name")):      # ORC**3 snapshot
+        elif any(k in (settings or {}) for k in ("mat1", "mat1_name")):      # older snapshot
             self.mat_slots = [[settings.get("mat%d" % i, DEFAULT_SLOTS[i - 1][0]),
                                settings.get("mat%d_name" % i, DEFAULT_SLOTS[i - 1][1])] for i in (1, 2, 3)]
         self._tie_text = self.tie_pairs.get().strip()
@@ -177,7 +177,7 @@ class Workspace(BuildMixin, MaterialsMixin, RunMixin, SolveMixin, PostMixin):
         return [(Var(a), Var(b)) for a, b in self.mat_slots]
 
     def _settings_snapshot(self):
-        """All settings as a dict (the ORC**3 snapshot keys; mat1..mat3 for the first three library slots)."""
+        """All settings as a dict (the snapshot keys; mat1..mat3 for the first three library slots)."""
         out = {k: getattr(self, k).get() for k in DEFAULTS}
         out["mat_slots"] = [list(s) for s in self.mat_slots]
         for i, (a, b) in enumerate(self.mat_slots[:3], start=1):
@@ -197,7 +197,7 @@ class Workspace(BuildMixin, MaterialsMixin, RunMixin, SolveMixin, PostMixin):
 
     # ------------------------------------------------------------------ log
     def log_msg(self, message):
-        """Console line; also appended to <run folder>/console.log when Output Dir is a run folder (ORC**3)."""
+        """Console line; also appended to <run folder>/console.log when Output Dir is a run folder."""
         text = str(message)
         with self._log_lock:
             for ln in text.split("\n"):
@@ -256,7 +256,7 @@ class Workspace(BuildMixin, MaterialsMixin, RunMixin, SolveMixin, PostMixin):
         self.last_build = {"rad": final_rad_file.replace("\\", "/"), "dir": deck_dir.replace("\\", "/"),
                            "job": model_name, "time": datetime.now().isoformat(timespec="seconds")}
 
-    # ------------------------------------------------------------------ run history (ORC**3 Solve tab)
+    # ------------------------------------------------------------------ run history
     def _history_load(self):
         self.run_history = []
         p = self.history_path
@@ -308,7 +308,7 @@ class Workspace(BuildMixin, MaterialsMixin, RunMixin, SolveMixin, PostMixin):
 
     def _or_exe(self, name):
         """starter, engine, anim_to_vtk, th_to_csv: <name>_win64 (Windows) or <name>_linux64_gf, in the exec folder
-        (_or_dir) when there is one, else found on PATH (ORC**3)."""
+        (_or_dir) when there is one, else found on PATH."""
         exe = name + ("_win64" if os.name == "nt" else "_linux64_gf")
         d = self._or_dir()
         if not d:
@@ -348,7 +348,7 @@ class Workspace(BuildMixin, MaterialsMixin, RunMixin, SolveMixin, PostMixin):
         env.setdefault("OMP_STACKSIZE", "400m")
         return env
 
-    # ------------------------------------------------------------------ Plot KE (ORC**3 _plot_ke_manual)
+    # ------------------------------------------------------------------ Plot KE
     def _plot_ke_manual(self, folder, job=""):
         """KE plot of a results folder: the results CSV of the job (else the newest *_Results.csv of the folder);
         without a CSV the CSV is rebuilt from the T-file with th_to_csv first."""
@@ -388,7 +388,7 @@ class Workspace(BuildMixin, MaterialsMixin, RunMixin, SolveMixin, PostMixin):
 
     # ------------------------------------------------------------------ commands
     def execute_build(self):
-        """Build in a thread (ORC**3 execute_build). Returns False when a build is running."""
+        """Build in a thread. Returns False when a build is running."""
         if self.building:
             self.log_msg("Build: a build is already running.")
             return False
@@ -424,7 +424,7 @@ class Workspace(BuildMixin, MaterialsMixin, RunMixin, SolveMixin, PostMixin):
         return True
 
     def status(self):
-        """Job status board (ORC**3 _refresh_status_tree): rows of the current batches, then the queued decks."""
+        """Job status board: rows of the current batches, then the queued decks."""
         rows = []
         for jn in list(self.job_order):
             rec = self.job_status.get(jn) or {}

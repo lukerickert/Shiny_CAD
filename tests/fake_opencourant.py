@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """Stand-in for the OpenCourant executables in the tests (starter, engine, anim_to_vtk, th_to_csv).
 
-python fake_openradioss.py <tool> <arguments of the tool>; install(folder) writes launchers named like the
+python fake_opencourant.py <tool> <arguments of the tool>; install(folder) writes launchers named like the
 OpenCourant executables (<tool>_win64.cmd on Windows, <tool>_linux64_gf elsewhere) into folder.
 The engine writes 5 animation files (FASTMAGI10, anim_writer.py) and a T01 file of a 4 x 4 x 1 hexahedron grid
 (10 mm cells) with Displacement, erosion, von Mises and a strain tensor that grow with the frame number; anim_to_vtk
 writes the same frame as legacy ASCII VTK;
-th_to_csv prints the energies. FAKE_OR_FAIL=engine makes the engine stop with a RUN KILLED message."""
+th_to_csv prints the energies and the /TH/NODE and /TH/PART columns of the starter deck. FAKE_OR_FAIL=engine makes the engine stop with a RUN KILLED message."""
 import os
 import re
 import struct
@@ -42,7 +42,7 @@ def _arg(name):
 def starter():
     deck = _arg("-i")
     job = deck.replace("_0000.rad", "")
-    print(" ** OpenRadioss STARTER (fake) **")
+    print(" ** OpenCourant STARTER (fake) **")
     print(" READING INPUT %s" % deck)
     with open(job + "_0000.out", "w") as f:
         f.write(" NODAL TIME STEP DISTRIBUTION\n")
@@ -157,13 +157,64 @@ def anim_to_vtk():
     sys.stdout.write("\n".join(out) + "\n")
 
 
+GLOBAL = ["INTERNAL ENERGY", "KINETIC ENERGY", "X-MOMENTUM", "Y-MOMENTUM", "Z-MOMENTUM", "MASS", "TIME STEP",
+          "ROTATION ENERGY", "EXTERNAL WORK", "SPRING ENERGY", "CONTACT ENERGY", "HOURGLASS ENERGY",
+          "ELASTIC CONTACT ENERGY", "FRICTIONAL CONTACT ENERGY", "DAMPING CONTACT ENERGY ", "PLASTIC WORK", "ADDED MASS",
+          "PERCENTAGE ADDED MASS", "INLET MASS", "OUTLET MASS", "INLET ENERGY", "OUTLET ENERGY", "NO NAME"]
+
+
+def _th_groups(rad):
+    """(type, vars, [(object id, name)]) of the /TH/NODE and /TH/PART groups of a starter deck."""
+    out = []
+    if not os.path.isfile(rad):
+        return out
+    L = open(rad, errors="replace").read().splitlines()
+    i = 0
+    while i < len(L):
+        m = re.match(r"/TH/(NODE|PART|INTER|SECTIO)/\d+", L[i])
+        if not m:
+            i += 1
+            continue
+        typ, vs, objs = m.group(1), [], []
+        j = i + 2
+        while j < len(L) and not L[j].startswith("/"):
+            ln = L[j]
+            j += 1
+            if ln.startswith("#") or not ln.strip():
+                continue
+            f = ln.split()
+            if not f[0].isdigit():
+                vs += f
+            elif typ == "NODE":
+                objs.append((int(ln[:10]), ln[20:].strip()))
+            else:
+                objs += [(int(x), "") for x in f]
+        out.append((typ, vs, objs))
+        i = j
+    return out
+
+
 def th_to_csv():
+    """The 23 global variables (internal energy 10 k, kinetic energy 100 - 10 k at row k) and the /TH groups of the
+    deck: columns "<var> <id> <name>" (nodes: DZ -k, VZ -1000, REACZ 10 k, other 0; parts: IE 5 k, KE 100 - 5 k;
+    interfaces and sections: FNZ 7 k, FTX 2 k, MY 3 k, other 0)."""
     tf = sys.argv[2]
     with open(tf) as f:
         ts = [float(x) for x in f.read().split()]
-    print('"time","INTERNAL ENERGY","KINETIC ENERGY"')
+    gs = _th_groups(tf[:-3] + "_0000.rad")
+    head = ['"time"'] + ['"%s"' % g for g in GLOBAL]
+    cols = []
+    for typ, vs, objs in gs:
+        for o, name in objs:
+            for v in vs:
+                head.append('"%s %d %s"' % (v, o, name))
+                cols.append(v)
+    print(",".join(head) + ",")
+    val = {"DZ": lambda k: -1.0 * k, "VZ": lambda k: -1000.0, "REACZ": lambda k: 10.0 * k, "IE": lambda k: 5.0 * k,
+           "KE": lambda k: 100.0 - 5.0 * k, "FNZ": lambda k: 7.0 * k, "FTX": lambda k: 2.0 * k, "MY": lambda k: 3.0 * k}
     for k, t in enumerate(ts):
-        print("%g,%g,%g" % (t, 10.0 * k, 100.0 - 10.0 * k))
+        row = [t, 10.0 * k, 100.0 - 10.0 * k] + [0.0] * (len(GLOBAL) - 2) + [val.get(v, lambda k: 0.0)(k) for v in cols]
+        print(",".join("%g" % x for x in row))
 
 
 if __name__ == "__main__":

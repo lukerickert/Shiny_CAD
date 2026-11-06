@@ -1,6 +1,6 @@
-"""Constants of the explicit analysis (ORC**3 core): the material library, the tie, contact, impactor
+"""Constants of the explicit analysis: the material library, the tie, contact, impactor
 velocity and failure modes with their help texts, and the engine output parsing.
-Taken from ORC**3 workspace_constants.py; the GUI theme, the config file and the Tools list are not used here.
+The GUI theme, the config file and the Tools list are not used here.
 """
 
 import os
@@ -147,21 +147,7 @@ MATERIAL_LIBRARY = {
 # ==============================================================================
 # CONFIGURATION PERSISTENCE
 # ==============================================================================
-# ------------------------------------------------------------------ identity
-# One definition of what this program is called. The window title, the console
-# banner, the per-build settings report and the docs all read these; before
-# v21.8 each carried its own literal and the version had drifted five releases
-# out of date (report said v20.67, title said v21.7 MK2).
-#
-# ORC**3 is written the Fortran way - "ORC cubed" - for the three C's:
-# CalculiX, Converter, Control. Pure ASCII, so it types on any keyboard and
-# survives any encoding.
-#
-# WORKSPACE_NAME_FILE is not a nicety: an asterisk is illegal in a Windows
-# path, so anything that becomes a filename or an identifier must use it.
-WORKSPACE_NAME       = "ORC**3"
-WORKSPACE_NAME_FILE  = "ORC3"
-WORKSPACE_TAGLINE    = "OpenRadioss CalculiX Converter and Control"
+# ------------------------------------------------------------------ version (settings report)
 WORKSPACE_VERSION    = "v1.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))   # inp2rad.py, inp_to_linear.py, inertia_calc.py
@@ -199,7 +185,7 @@ TIE_HELP = {
 # interface formulation, same philosophy as Tie/Velocity modes. All modes use
 # the universal groups the build always writes (GRNOD 9999998 = all nodes,
 # SURF 9999999 = external surface of all parts). Card layouts verified against
-# the OpenRadioss hm_cfg_files starter readers (radioss2021/2023 formats).
+# the OpenCourant hm_cfg_files starter readers (radioss2021/2023 formats).
 CONTACT_T7   = "TYPE7 (node-to-surface)"
 CONTACT_T19  = "TYPE19 (TYPE7 + edge-to-edge)"
 CONTACT_T24  = "TYPE24 (constant stiffness)"
@@ -544,7 +530,7 @@ INERTIA_DOC = (
 # Engine stdout parsing for the Job Status board. Matches the cycle lines
 #   NC= 70200 T= 1.0609E-01 DT= 1.5145E-06 ERR= -0.2% DM/M= 0.0000E+00
 #   ELAPSED TIME= 1067.70 s  REMAINING TIME= 139.96 s
-# exactly as OpenRadioss prints them (case/spacing tolerant).
+# exactly as OpenCourant prints them (case/spacing tolerant).
 # ==============================================================================
 _NC_RE = re.compile(
     r"NC\s*=\s*(\d+)\s+T\s*=\s*([0-9.Ee+-]+)\s+DT\s*=\s*([0-9.Ee+-]+)"

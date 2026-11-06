@@ -12,6 +12,12 @@ import { thicken } from "/static/shellthick.js";
 import * as PN from "/static/panels.js";
 import * as MS from "/static/matsel.js";
 import * as VS from "/static/viewsel.js";
+import * as TP from "/static/paneltree.js";
+import * as TH from "/static/thplot.js";
+import * as HR from "/static/histreq.js";
+import * as HO from "/static/handoff.js";
+import * as IF from "/static/inpinfo.js";
+import * as CV from "/static/curves.js";
 
 const FA = { doc: null, dirty: false, three: null, geo: null, bbox: null, size: 100,
              sel: null,        // {kind: "member" | "fastener" | "support" | "load" | "rp", id}
@@ -54,9 +60,10 @@ const SH = {
   compName: id => (((FA.asm && FA.asm.components) || []).find(x => x.id === id) || {}).name || id,
   matOptions: cur => matOptions(cur), modes: [["shell", "shell"], ["off", "off"]], nid: p => nid(p),
   layers: () => ({ enabled: s8r(), title: LAYERS_TIP }),
-  changed: () => changed(), draw: () => draw(), render: () => { renderSections(); renderNsets(); renderContacts(); renderSups(); },
+  changed: () => changed(), draw: () => draw(), render: () => { renderSections(); renderNsets(); renderContacts(); renderSups(); if ($("#fs-refine")) SM.renderRefine(SH, $("#fs-refine")); },
   status: (t, e) => status(t, e), postJSON: (u, b) => postJSON(u, b), fmt: v => ffmt(v, 6), esc: s => fesc(s),
   setTypes: types => VS.setTypes(SH, types),
+  collect: opts => VS.collect(SH, opts),
   suppressCfg: (kind, id) => {
     const d = FA.doc;
     if (kind === "section") { const s = (d.sections || []).find(x => x.id === id); return s ? [s, "mode", "shell"] : null; }
@@ -71,6 +78,14 @@ const SH = {
     comps: () => ((FA.geo && FA.geo.components) || []).filter(c => c.mesh && !c.plate).map(c => ({ id: c.id, mesh: c.mesh, matrix: matOf(c), surfaces: c.surfaces || [] })),
     points: () => (FA.doc.points || []).filter(p => p.xyz),
     faceAt: e => faceUnder(e), edgeAt: e => edgeUnder(e),
+    meshShown: () => $("#fa-show").value === "mesh",
+    showMesh: () => { if (FA.mesh) { $("#fa-show").value = "mesh"; draw(); } else status("Mesh first: the mesh nodes and elements are selected on Show Mesh", true); },
+    mesh: () => FA.meshSel || null,
+    meshHit: e => {
+      if (!FA.meshSel || !FA.three) return null;
+      const h = rayAt(e).intersectObjects(FA.three.group.children.filter(o => o.userData && o.userData.kind === "mesh"), false)[0];
+      return h && h.faceIndex !== undefined && h.faceIndex < FA.meshSel.triElem.length ? { tri: h.faceIndex, point: h.point.toArray() } : null;
+    },
   },
   onNsetSupport: ns => {
     const s = { id: nid("s"), name: "Support " + (FA.doc.supports.length + 1), type: "fixed", target: { nset: ns.id } };
@@ -109,7 +124,7 @@ function renderCons() {
   if ($("#fa-eqs")) RP.renderEquations(RH, $("#fa-eqs"));
 }
 function renderSections() { if ($("#fa-sections")) SM.renderSections(SH, $("#fa-sections")); }
-function renderNsets() { if ($("#fa-nsets")) SM.renderNsets(SH, $("#fa-nsets")); }
+function renderNsets() { if ($("#fa-nsets")) SM.renderNsets(SH, $("#fa-nsets")); if ($("#fa-surfaces")) SM.renderSurfaces(SH, $("#fa-surfaces")); }
 function changed() { FA.dirty = true; if (FM) FM.render(); }
 function findItem(kind, id) { return (FA.doc[{ member: "members", fastener: "fasteners", support: "supports", load: "loads", plate: "plates", rp: "points", contact: "contacts" }[kind]] || []).find(x => x.id === id); }
 
@@ -301,6 +316,7 @@ function snapAt(e) {
       ctx.face = { xyz: h.point.toArray(), normal: h.face.normal.clone().transformDirection(h.object.matrixWorld).toArray(), ref: null };
     }
   }
+  if (FA.pick && FA.pick.raw) return ctx.face ? { xyz: ctx.face.xyz, normal: ctx.face.normal, face: ctx.face.ref, kind: "face" } : null;     // the point on the surface
   const sp = RP.snapPoint(ctx);
   if (sp) sp.xyz = sp.xyz.map(v => Math.round(v * 1e6) / 1e6);
   return sp;
@@ -414,14 +430,14 @@ function faceText(ref) {
 
 async function sourceAsm() {
   const s = FA.doc.source || {};
-  if (!s.name) return { components: [] };
+  if (s.type === "inp" || !s.name) return { components: [] };
   if (s.type === "part") return { components: [{ id: "1", name: s.name, source: { type: "part", name: s.name }, pos: [0, 0, 0], rot: [0, 0, 0] }] };
   return await (await api("/api/assembly/file/" + encodeURIComponent(s.name))).json();
 }
 
 /** State key of the assembly or part of the geometry (server: sha1 of the assembly file and of its sources). */
 async function geometryKey(src) {
-  if (!src || !src.name) return "";
+  if (!src || !(src.name || src.path)) return "";
   try { return (await (await postJSON("/api/geometry/state", { source: src })).json()).key || ""; } catch (e) { return null; }
 }
 /** A changed assembly or part marks Update (the update itself is manual). */
@@ -434,7 +450,7 @@ async function checkGeometry() {
     FA.geoStale = stale;
     $("#fa-update").classList.toggle("cm-stale", stale);
     $("#fa-update").title = stale ? "The assembly or one of its parts has changed: Update loads the geometry again" : "Load the geometry again (after a change of the assembly or its parts)";
-    if (stale) status((FA.doc.source.type === "part" ? "The part " : "The assembly ") + FA.doc.source.name + " has changed: Update loads the geometry again");
+    if (stale) status(({ part: "The part ", inp: "The .inp file " }[FA.doc.source.type] || "The assembly ") + FA.doc.source.name + " has changed: Update loads the geometry again");
   }
 }
 /** Update: the geometry loaded again; the mesh and results of the old geometry are cleared. */
@@ -450,6 +466,7 @@ async function loadGeometry() {
   $("#fa-info").textContent = "Loading the geometry...";
   try {
     const key = await geometryKey(FA.doc.source);
+    if ((FA.doc.source || {}).type === "inp") { await loadInp(seq, key); return; }
     const asm = await sourceAsm();
     if (seq !== FA.seq) return;
     FA.asm = asm;
@@ -463,6 +480,7 @@ async function loadGeometry() {
     for (const c of j.components) if (c.mkey && c.mesh) MESHES.set(c.mkey, { mesh: c.mesh, refs: c.refs || [], erefs: c.erefs || [], surfaces: c.surfaces || [] });
     for (const c of j.components) if (c.mkey && MESHES.has(c.mkey)) { const e = MESHES.get(c.mkey); c.mesh = e.mesh; c.refs = e.refs; c.erefs = e.erefs; c.surfaces = e.surfaces; }
     FA.geo = j;
+    if (SM.ensureSections(SH)) changed();                    // every surface body face in a section
     FA.geoKey = key === null ? undefined : key;
     FA.geoStale = false;
     $("#fa-update").classList.remove("cm-stale");
@@ -472,6 +490,54 @@ async function loadGeometry() {
     if (FA.three) FA.three.zoomed = false;
     draw(); renderAll();
   } catch (e) { if (seq === FA.seq) { $("#fa-info").textContent = ""; showErr(e); } }
+}
+
+/** Geometry of a CalculiX .inp or Radioss .rad source (server: inpmodel.view): one component per body of the file. */
+async function loadInp(seq, key) {
+  const src = FA.doc.source;
+  const j = await (await postJSON("/api/analysis/inp_geometry", { path: src.path })).json();
+  if (seq !== FA.seq) return;
+  for (const c of j.components) {
+    if (!MESHES.has(c.mkey)) MESHES.set(c.mkey, { mesh: c.mesh, refs: c.refs || [], erefs: c.erefs || [], surfaces: c.surfaces || [] });
+    const e = MESHES.get(c.mkey); c.mesh = e.mesh; c.refs = e.refs; c.erefs = e.erefs; c.surfaces = e.surfaces;
+  }
+  FA.asm = { components: j.components.map(c => ({ id: c.id, name: c.name })) };
+  FA.sketches = [];
+  FA.geo = { components: j.components };
+  FA.inp = j;
+  if (src.imported !== src.path) { importInp(j); src.imported = src.path; changed(); }
+  if (SM.ensureSections(SH)) changed();
+  FA.geoKey = key === null ? undefined : key;
+  FA.geoStale = false;
+  $("#fa-update").classList.remove("cm-stale");
+  FA.inpInfo = `${src.name}: ${j.nodes} nodes, ${j.elements} elements, ${j.components.length} bod${j.components.length === 1 ? "y" : "ies"}` +
+    (j.warnings.length ? "; " + j.warnings.join("; ") : "");
+  $("#fa-info").textContent = FA.inpInfo;
+  if (FA.three) FA.three.zoomed = false;
+  draw(); renderAll();
+}
+/** Inputs of an .inp file into the document (once per file): materials, body materials, shell sections, node sets. */
+function importInp(j) {
+  const d = FA.doc;
+  d.materials = d.materials || {};
+  for (const [n, m] of Object.entries(j.materials || {})) if (!d.materials[n]) d.materials[n] = m;
+  if (!d.default_material || !d.materials[d.default_material]) d.default_material = Object.keys(j.materials || {})[0] || d.default_material;
+  d.bodies = d.bodies || {};
+  for (const [id, b] of Object.entries(j.bodies || {})) d.bodies[id] = Object.assign({}, b, d.bodies[id] || {});
+  d.shells = d.shells || {};
+  for (const [id, s] of Object.entries(j.shells || {})) d.shells[id] = Object.assign({}, s, d.shells[id] || {});
+  d.nsets = d.nsets || [];
+  for (const n of j.nsets || []) if (!d.nsets.some(x => x.kind === "inp" && x.set === n)) d.nsets.push({ id: SH.nid("ns"), name: n, kind: "inp", set: n });
+}
+/** Import CalculiX .inp or Radioss .rad: a file dialog, then the file as the geometry source. */
+async function chooseInp() {
+  let p = "";
+  try { p = await window.browse("open", "mesh", (FA.doc.source || {}).path || ""); } catch (e) { showErr(e); }
+  if (!p) { refreshSources(); return; }
+  FA.doc.source = { type: "inp", path: p, name: p.split(/[\\/]/).pop() };
+  FA.mesh = null; FA.res = null; setStates();
+  $("#fa-show").value = "model";
+  changed(); await refreshSources(); loadGeometry();
 }
 
 /** View data of the plate items (server: plate_views), kept in FA.geo.components as "plate_<id>". */
@@ -510,6 +576,11 @@ function meshGeo(mkey) {
     for (const pl of m.edges) for (let k = 0; k + 1 < pl.length; k++) pos.push(...pl[k], ...pl[k + 1]);
     e.edgeGeo = new THREE.BufferGeometry();
     e.edgeGeo.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+    if (m.wire && m.wire.length) {                 // mesh file geometry: the element edges of the file
+      e.wireGeo = new THREE.BufferGeometry();
+      e.wireGeo.setAttribute("position", new THREE.Float32BufferAttribute(m.vertices.flat(), 3));
+      e.wireGeo.setIndex(m.wire);
+    }
     e.groups = addBodyGroups(e.geo, m);
   }
   return e;
@@ -543,9 +614,10 @@ function draw() {
   $("#fa-legend").hidden = true;
   const box = new THREE.Box3();
   const nsk = (FA.sketches || []).reduce((n, e) => n + e.sketches.length, 0);
-  if (show !== "results" && !FA.job) $("#fa-info").textContent = FA.geo ? `${FA.geo.components.length} component(s)` + (nsk ? `, ${nsk} sketch(es)` : "") : "";
+  if (show !== "results" && !FA.job) $("#fa-info").textContent = (FA.doc.source || {}).type === "inp" && FA.inpInfo ? FA.inpInfo : FA.geo ? `${FA.geo.components.length} component(s)` + (nsk ? `, ${nsk} sketch(es)` : "") : "";
   if (show === "model" || !FA.mesh) drawModel(box);
   else drawMesh(box, show === "results" && FA.res ? $("#fa-state").value : null);
+  if (FA.queryMarks) t.group.add(IF.marksGroup(FA.queryMarks, track));     // search results of the Input file page
   t.group.updateMatrixWorld(true);
   const bb = box.isEmpty() ? null : [box.min.x, box.min.y, box.min.z, box.max.x, box.max.y, box.max.z];
   FA.bbox = bb;
@@ -565,8 +637,8 @@ function highlights() {
   for (const p of d.points || []) for (const r of p.faces || []) out.push([r, 0x7048e8, sel.kind === "rp" && sel.id === p.id]);
   for (const c of d.contacts || []) {
     const on = sel.kind === "contact" && sel.id === c.id;
-    for (const r of c.master || []) out.push([r, COLORS.master, on]);
-    for (const r of c.slave || []) out.push([r, COLORS.slave, on]);
+    for (const r of contactFaces(c, "master")) out.push([r, COLORS.master, on]);
+    for (const r of contactFaces(c, "slave")) out.push([r, COLORS.slave, on]);
   }
   return out;
 }
@@ -594,9 +666,12 @@ function drawModel(box) {
       mesh.userData = c.plate ? { comp: c.id, kind: "plate", id: c.id.slice(6) } : { comp: c.id };
       inner.add(mesh);
       t.pickables.push(mesh);
+      if ($("#fa-edges").checked && e.wireGeo) inner.add(new THREE.LineSegments(e.wireGeo, new THREE.LineBasicMaterial({ color: 0x1d2125 })));
       if ($("#fa-edges").checked) inner.add(new THREE.LineSegments(e.edgeGeo, new THREE.LineBasicMaterial({ color: 0x1d2125 })));
       box.union(e.geo.boundingBox.clone().applyMatrix4(inner.matrix));
     }
+    const vsel = VS.selectedVertices(SH, c.id);              // selected vertices
+    if (vsel.length) { const o = VS.pointsObject(vsel, 0xe03131); track(o.geometry); inner.add(o); }
     for (const o of SM.overlays(SH, c.id)) {                // sections (colour), selected faces and edges
       const pos = [];
       if (o.edge !== undefined) {
@@ -815,7 +890,7 @@ function drawLoad(l, size, strong) {
   };
   const v = Array.isArray(l.value) ? l.value.map(Number) : null;
   if (l.type === "gravity") return;
-  if (VS.multiText(l.target)) {                                         // several faces or edges: each drawn
+  if (VS.multiText(l.target) || (l.target && l.target.surface !== undefined)) {   // several faces or edges, a surface: each drawn
     const R = VS.targetRefs(SH, l.target);
     for (const r of [...R.faces, ...R.edges]) drawLoad(Object.assign({}, l, { target: r }), size, strong);
     return;
@@ -889,7 +964,8 @@ function b64(s, T) {
 }
 function decoded(p) {
   if (!p._d) {
-    p._d = { pos: b64(p.pos, Float32Array), tri: b64(p.tri, Uint32Array), edges: p.edges ? b64(p.edges, Uint32Array) : null, states: {} };
+    p._d = { pos: b64(p.pos, Float32Array), tri: b64(p.tri, Uint32Array), edges: p.edges ? b64(p.edges, Uint32Array) : null, states: {},
+             ids: p.node_ids ? b64(p.node_ids, Uint32Array) : null, triElem: p.tri_elem ? b64(p.tri_elem, Uint32Array) : null };
   }
   return p._d;
 }
@@ -961,12 +1037,12 @@ function drawMesh(box, st) {
       : `${stateName(st)}: max |u| ${ffmt(p.states[st].umax)} mm, max von Mises ${ffmt(p.states[st].vmmax)} MPa, scale ${ffmt(scale, 3)}`;
   }
   // Shell thickness: shell bodies and sections as slabs of their thickness and offset
-  let gpos = pos, gtri = d.tri, gvals = vals, gedges = null;
+  let gpos = pos, gtri = d.tri, gvals = vals, gedges = null, vsrc = null;
   const shells = bodies.filter(b => b.t > 0 && b.count > 0);
   if ($("#fa-thick").checked && shells.length) {
     const groups = shells.map(b => ({ tris: Array.from({ length: b.count }, (_, i) => b.start + i), t: b.t, off: b.offset }));
     const th = thicken(pos, d.tri, groups, elemEdges(d));
-    gpos = th.pos; gtri = th.tri; gedges = th.edges;
+    gpos = th.pos; gtri = th.tri; gedges = th.edges; vsrc = th.vsrc;
     if (vals) gvals = Float32Array.from(th.vsrc, v => vals[v]);
   }
   const g = track(new THREE.BufferGeometry());
@@ -985,8 +1061,17 @@ function drawMesh(box, st) {
     mat = new THREE.MeshStandardMaterial({ color: 0xb8c2cc, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });
   }
   const mesh = new THREE.Mesh(g, mat);
-  mesh.userData = { kind: "mesh" };
+  mesh.userData = { kind: "mesh", vsrc };
   t.group.add(mesh);
+  if (st) drawProbes(t, pos);
+  // mesh selection (viewsel.js: nodes, elements) on the undeformed mesh without shell thickness
+  FA.meshSel = null;
+  if (!st && gtri === d.tri && d0.ids && d0.triElem) {
+    let te = d0.triElem;
+    if (hide) { te = new Uint32Array(d.tri.length / 3); let o = 0; for (const b of p.bodies || []) if (!hide.has(b.id)) { te.set(d0.triElem.subarray(b.start, b.start + b.count), o); o += b.count; } }
+    FA.meshSel = { pos: d.pos, ids: d0.ids, tri: d.tri, triElem: te };
+    for (const o of VS.meshOverlays(SH)) { track(o.geometry); t.group.add(o); }
+  }
   if ($("#fa-edges").checked && (!vals || d.tri.length < 600000)) {
     const eg = track(new THREE.BufferGeometry());
     const idx = gedges || elemEdges(d);
@@ -1089,11 +1174,15 @@ function memberTubes(lp, cols, r) {
 const STATE_NAME = { total: "Total", preload: "Step 1 preload", loads: "Step 2 loads" };
 /** Name of a result state: static states, or "Mode k: f Hz" / "Mode k: factor" of a modal or buckling result. */
 function stateName(st) {
-  if (STATE_NAME[st]) return FA.res && FA.res.increments && st === "total" ? "End of the step" : STATE_NAME[st];
+  const steps = (FA.res && FA.res.summary && FA.res.summary.steps) || [];
+  if (STATE_NAME[st]) return st === "total" && steps.length > 1 ? "End of the last step" : FA.res && FA.res.increments && st === "total" ? "End of the step" : STATE_NAME[st];
+  const sk = /^s(\d+)$/.exec(st || "");
+  if (sk) return `End of step ${sk[1]}: ${(steps[+sk[1] - 1] || {}).name || ""}`;
   const ii = /^i(\d+)$/.exec(st || "");
   if (ii && FA.res && FA.res.increments) {
     const inc = FA.res.increments.find(x => x.state === st);
-    if (inc) return `Increment ${ii[1]}: ${inc.preload ? "preload step, " : ""}time ${ffmt(inc.time, 4)}`;
+    const sn = inc && inc.user_step && steps.length > 1 ? (steps[inc.user_step - 1] || {}).name + ", " : "";
+    if (inc) return `Increment ${ii[1]}: ${inc.preload ? "preload step, " : ""}${sn}time ${ffmt(inc.time, 4)}`;
   }
   const m = /^m(\d+)$/.exec(st || "");
   const md = m && FA.res && FA.res.modes ? FA.res.modes[+m[1] - 1] : null;
@@ -1126,11 +1215,12 @@ function endPick() { const p = FA.pick; FA.pick = null; if (p && p.onCancel) p.o
 
 function clickView(e) {
   const t = FA.three;
+  if (FA.probeMode && $("#fa-show").value === "results" && FA.res) { probeClick(e); return; }
   const hits = rayAt(e).intersectObjects(t.pickables, false);
   if (!FA.pick && VS.click(SH, e)) return;                  // selection (viewsel.js): faces, edges, bodies, points
   if (FA.pick) {
     const done = hit => { const cb = FA.pick.cb; FA.pick = null; cb(hit); changed(); renderAll(); draw(); schedulePlates(); };
-    if (FA.pick.snap) { const sp = snapAt(e); if (sp) done({ xyz: sp.xyz, normal: sp.normal || null, face: sp.face || null, kind: sp.kind }); return; }
+    if (FA.pick.snap) { const sp = snapAt(e); if (sp) done({ xyz: sp.xyz, normal: sp.normal || null, face: sp.face || null, kind: sp.kind, shift: e.shiftKey }); return; }
     // supports and loads: a member end within 10 px, or a member
     if (FA.pick.end) {
       for (const rp of FA.doc.points || []) if (rp.xyz) { const s = toScreen(rp.xyz); if (Math.hypot(s[0] - e.clientX, s[1] - e.clientY) < 10) return done({ point: rp.id, xyz: rp.xyz.slice() }); }
@@ -1174,6 +1264,7 @@ function clickView(e) {
   const end = $("#fa-show").value === "model" ? endAt(e) : null;
   const h = hits[0], ud = (h && h.object.userData) || {};
   const prev = JSON.stringify(FA.sel || null);
+  if (!end && !(ud.kind && ud.id) && VS.quickFace(SH, e)) { FA.sel = null; return; }   // a plain click selects or deselects the face
   FA.sel = end ? { kind: "member", id: end.member, end: end.end } : ud.kind && ud.id ? { kind: ud.kind, id: ud.id } : null;
   if (JSON.stringify(FA.sel) === prev) return;
   if (FA.sel && FA.sel.end) status(targetText({ member: FA.sel.id, end: FA.sel.end }) + " selected: Support or Load applies to it");
@@ -1183,7 +1274,7 @@ function clickView(e) {
 // ------------------------------------------------------------------ panels
 
 /** Optional cards (Panels row): shown or hidden per analysis (doc.panels_hidden). */
-const OPT_CARDS = [["sections", "Sections", "sections"], ["nsets", "Node sets", "nsets"], ["members", "Members", "members"],
+const OPT_CARDS = [["sections", "Sections", "sections"], ["surfaces", "Surfaces", "surfaces"], ["nsets", "Node sets", "nsets"], ["members", "Members", "members"],
                    ["plates", "Plates", "plates"], ["fasts", "Fasteners", "fasteners"], ["rps", "Reference points", "points"],
                    ["springs", "Springs", "springs"], ["joints", "Joints", "joints"], ["eqs", "Equations", "equations"],
                    ["contacts", "Contact", "contacts"]];
@@ -1194,8 +1285,58 @@ function renderPanels() {
 }
 function renderAll() {
   if (!FA.doc) return;
+  installTree();
   renderPanels();
-  renderSettings(); renderMats(); renderBodies(); renderSections(); renderNsets(); renderMembers(); renderPlates(); renderFasts(); renderRps(); renderCons(); renderContacts(); renderSups(); renderLoads(); renderResults();
+  renderInpFile(); renderSettings(); renderMats(); renderBodies(); renderSections(); renderNsets(); renderMembers(); renderPlates(); renderFasts(); renderRps(); renderCons(); renderContacts(); renderSteps(); renderSups(); renderLoads(); renderAmps(); renderIvel(); renderHist(); renderResults();
+  // an item selected in the view or a list: its page in the property pane
+  const sk = FA.sel ? FA.sel.kind + ":" + FA.sel.id : "";
+  if (sk && sk !== FA.treeSel && FA.tree) FA.tree.reveal({ member: "members", plate: "plates", fastener: "fasts", support: "sups", load: "loads", contact: "contacts" }[FA.sel.kind]);
+  FA.treeSel = sk;
+  if (FA.tree) FA.tree.render();
+}
+
+/** Leaves of the model tree: the items of a list of the document [{id, label}]. */
+function treeItems(field) { return ((FA.doc || {})[field] || []).map(x => ({ id: String(x.id), label: x.name || String(x.id) })); }
+/** A body, the faces of a section or surface, or a reference point picked from the tree: selected in the view. */
+function treePickView(field, id) {
+  const d = FA.doc || {};
+  if (field === "bodies") VS.show(SH, { bodies: [id] });
+  else if (field === "points") VS.show(SH, { point: id });
+  else { const x = (d[field] || []).find(q => String(q.id) === id); if (x) VS.show(SH, { faces: x.faces || [] }); }
+  draw();
+}
+/** Bodies of the geometry as tree leaves: solids and surface bodies (shellmodel bodyList without the sections). */
+function treeBodies() { return FA.geo ? SM.bodyList(SH).filter(([v]) => !v.startsWith("sec:")).map(([v, t]) => ({ id: v, label: t })) : []; }
+/** Model tree of the panel (paneltree.js): the cards as pages. */
+function installTree() {
+  if (FA.tree) return;
+  const card = k => () => [$("#fa-" + k + "-card")];
+  const KIND = { members: "member", plates: "plate", fasteners: "fastener", supports: "support", loads: "load", contacts: "contact" };
+  const pickOf = field => KIND[field] ? id => { FA.sel = { kind: KIND[field], id: FA.doc[field].find(x => String(x.id) === id).id }; renderAll(); draw(); }
+    : ["sections", "surfaces", "points"].includes(field) ? id => treePickView(field, id) : null;
+  const n = (k, label, field) => ({ id: k, label, els: card(k), count: field ? () => (FA.doc ? (FA.doc[field] || []).length : 0) : null,
+                                     off: () => !!FA.doc && PN.isHidden(FA.doc, k), items: field ? () => treeItems(field) : null, pick: field ? pickOf(field) : null });
+  const ATYPE = { static: "static", modal: "modal", buckling: "buckling" };
+  FA.tree = TP.install({ key: "fa", panel: $("#fa-panel"), body: $("#fa-panel").parentElement, title: "Model tree",
+    root: { id: "all", label: "Analysis (CalculiX)", els: () => [$("#fa-panels")], children: [
+      { id: "settings", label: "Settings", els: card("settings") },
+      { id: "model", label: "Model", children: [
+        { id: "inpfile", label: "Input file", els: card("inpfile") },
+        { id: "mats", label: "Materials", els: card("mats"), count: () => Object.keys((FA.doc || {}).materials || {}).length,
+          items: () => Object.keys((FA.doc || {}).materials || {}).map(m => ({ id: m, label: m })) },
+        { id: "bodies", label: "Bodies", els: card("bodies"), count: () => treeBodies().length, items: treeBodies, pick: id => treePickView("bodies", id) },
+        n("sections", "Sections", "sections"), n("surfaces", "Surfaces", "surfaces"), n("nsets", "Node sets", "nsets"),
+        n("rps", "Reference points", "points"),
+        { id: "structure", label: "Members and plates", children: [n("members", "Members", "members"), n("plates", "Plates", "plates"), n("fasts", "Fasteners", "fasteners")] },
+        { id: "constraints", label: "Constraints", children: [n("springs", "Springs", "springs"), n("joints", "Joints", "joints"), n("eqs", "Equations", "equations")] },
+        n("contacts", "Contact", "contacts")] },
+      { id: "step", label: () => (FA.doc || {}).analysis_type && FA.doc.analysis_type !== "static" ? "Step (" + ATYPE[FA.doc.analysis_type] + ")" : "Steps", children: [
+        { id: "steps", label: "Step list", els: card("steps"), count: () => (((FA.doc || {}).steps || []).length || 1), items: () => stepList().map(st => ({ id: st.id, label: st.name + " (" + st.kind + ")" })) },
+        n("sups", "Supports", "supports"), n("loads", "Loads", "loads"),
+        { id: "amps", label: "Amplitudes", els: card("amps"), count: () => ((FA.doc || {}).amplitudes || []).length, items: () => treeItems("amplitudes") },
+        { id: "ivel", label: "Initial velocities", els: card("ivel"), count: () => ((FA.doc || {}).initial_velocities || []).length, items: () => treeItems("initial_velocities") },
+        { id: "hist", label: "History output", els: card("hist"), count: () => ((FA.doc || {}).history || []).length, items: () => treeItems("history") }] },
+      { id: "results", label: "Results", els: card("results") }] } });
 }
 
 /** Material drop-downs: model materials with their library entry or law and values, library entries (choosing one
@@ -1247,7 +1388,7 @@ function meshSettingsHtml(m) {
     `<label title="Tolerance of the general fuse of the shells (mm): faces and edges closer than this are joined. 0: exact">Fuzzy (mm)<input type="text" class="numf" id="fs-fuzzy" value="${m.fuzzy || ""}" placeholder="0"></label>` +
     `<div class="grid2"><label title="Element type of the shells (surface bodies). S4: CalculiX expands it to C3D8I elements. Triangles left by the quadrangle mesh are S3 (S6 with S8R)">Shell elements<select id="fs-shtype">${optList(SHELL_TYPES, m.shell_type || "S4")}</select></label>` +
     `<label title="gmsh surface algorithm of the shells">Shell mesh<select id="fs-shalgo">${optList(SHELL_ALGOS, m.shell_algorithm || "quasi")}</select></label></div>` +
-    `<p class="hint">Structured hexahedra need bodies whose cells are blocks (6 faces with 4 edges each) or prisms (Part tab, Partition). Bodies of different strategies, and plates, are tied where they touch.</p>`;
+    `<p class="hint">Structured hexahedra need bodies whose cells are blocks (6 faces with 4 edges each) or prisms (Part tab, Partition). Bodies of different strategies, and plates, are tied where they touch.</p>` + `<div id="fs-refine"></div>`;
 }
 function bindMeshSettings(d) {
   const m = () => (d.mesh = d.mesh || {});
@@ -1264,26 +1405,12 @@ function bindMeshSettings(d) {
   if ($("#fs-shsizemode")) $("#fs-shsizemode").onchange = () => { m().shell_size_mode = $("#fs-shsizemode").value; changed(); };
   if ($("#fs-shmindiv")) $("#fs-shmindiv").onchange = () => { const v = Math.round(fnum($("#fs-shmindiv").value)); if (v >= 1) m().shell_min_div = v; else delete m().shell_min_div; changed(); };
   if ($("#fs-fuzzy")) $("#fs-fuzzy").onchange = () => { const v = fnum($("#fs-fuzzy").value); if (v > 0) m().fuzzy = v; else delete m().fuzzy; changed(); };
+  if ($("#fs-refine")) SM.renderRefine(SH, $("#fs-refine"));
 }
 
-/** Width of the analysis panel: drag of the bar at its left edge, kept in the browser (localStorage). */
+/** Width of the analysis panel: drag of the bar between the view and the panel, kept in the browser (localStorage). */
 function bindPanelSplit() {
-  const bar = $("#fa-split"), panel = $("#fa-panel");
-  if (!bar || bar.dataset.bound) return;
-  bar.dataset.bound = "1";
-  try { const w = +localStorage.getItem("fa_panel_w"); if (w >= 300) panel.style.width = w + "px"; } catch (e) { /* no storage */ }
-  bar.onmousedown = e => {
-    e.preventDefault();
-    const w0 = panel.getBoundingClientRect().width, x0 = e.clientX;
-    bar.classList.add("drag");
-    const move = ev => { panel.style.width = Math.max(300, Math.min(window.innerWidth * 0.75, w0 + x0 - ev.clientX)) + "px"; };
-    const up = () => {
-      bar.classList.remove("drag");
-      window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up);
-      try { localStorage.setItem("fa_panel_w", parseInt(panel.style.width)); } catch (err) { /* no storage */ }
-    };
-    window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
-  };
+  TP.bindSplit($("#fa-split"), $("#fa-panel"), $("#fa-panel").parentElement, "fa_panel_w");
 }
 
 function renderSettings() {
@@ -1316,7 +1443,7 @@ const LAWS = [["elastic", "linear elastic"], ["plastic:isotropic", "plastic, iso
               ["hyper:neohooke", "hyperelastic Neo-Hooke"], ["hyper:mooney", "hyperelastic Mooney-Rivlin"]];
 const lawOf = m => (m.law || "elastic") === "plastic" ? "plastic:" + (m.hardening || "isotropic") : (m.law || "elastic") === "hyper" ? "hyper:" + (m.hyper || "neohooke") : "elastic";
 /** Materials: name, E, nu, rho, law (elastic, plastic with isotropic or kinematic hardening, hyperelastic), the
- *  ORC**3 library material; per plastic material the hardening table, per hyperelastic material its constants. */
+ *  library material; per plastic material the hardening table, per hyperelastic material its constants. */
 /** Nonlinear step settings (doc.nonlinear): large deformation, increments, output frequency. */
 function nlActive(d) {
   const nl = d.nonlinear || {};
@@ -1354,7 +1481,7 @@ function renderMats() {
       `<td><input type="text" class="numf" data-k="E" value="${m.E}"${lib ? " disabled" : ""}></td><td><input type="text" class="numf" data-k="nu" value="${m.nu}"${lib ? " disabled" : ""}></td>` +
       `<td><input type="text" class="numf" data-k="rho" value="${m.rho || ""}"${lib ? " disabled" : ""}></td>` +
       `<td><select data-k="law">${optList(LAWS, lawOf(m))}</select></td>` +
-      `<td><select data-k="library" title="ORC**3 material library: E, nu, rho and the hardening curve">${libOpts(m.library || "")}</select></td>` +
+      `<td><select data-k="library" title="Material library: E, nu, rho and the hardening curve">${libOpts(m.library || "")}</select></td>` +
       `<td><button type="button" class="small" data-k="del" title="Delete">&#10005;</button></td></tr>`;
   }).join("");
   let h = `<div class="fa-wide"><table class="pc-table"><tr><th>Name</th><th>E (MPa)</th><th>nu</th><th>rho (kg/m^3)</th><th>Law</th><th>Library</th><th></th></tr>${rows}</table></div>` +
@@ -1373,7 +1500,11 @@ function renderMats() {
         `<label title="Compressibility: bulk modulus K = 2 / D1">D1 (1/MPa)<input type="text" class="numf" data-mk="D1" value="${m.D1 ?? ""}"></label></div></div>`;
     }
   }
+  h += `<h3 class="xp-h">Curve</h3><div id="fa-matcurve"></div>`;
   $("#fa-mats").innerHTML = h;
+  FA.matPlot = FA.matPlot || {};
+  CV.renderMaterials($("#fa-matcurve"), Object.entries(d.materials).map(([n, m]) => CV.materialEntry(n, m, m.library)), FA.matPlot,
+    { empty: "No plastic or hyperelastic material (Law)." });
   $("#fa-mats").querySelectorAll("tr[data-n]").forEach(tr => {
     const n = tr.dataset.n;
     tr.querySelectorAll("input").forEach(inp => inp.onchange = () => {
@@ -1427,7 +1558,7 @@ function renderMats() {
         if (rows[0][1] !== 0) { status("Hardening table: the first row is at plastic strain 0 (the yield stress)", true); return; }
         m.plastic = rows.map(r => [r[0], r[1]]);
       } else { const v = fnum(el.value); if (isFinite(v)) m[k] = v; else delete m[k]; }
-      changed(); status("Material " + div.dataset.mn + " changed");
+      changed(); status("Material " + div.dataset.mn + " changed"); renderMats();
     });
   });
   $("#fm-add").onclick = () => { let k = 1; while (d.materials["Material " + k]) k++; d.materials["Material " + k] = { E: 210000, nu: 0.3, rho: 7850 }; changed(); renderAll(); };
@@ -1454,26 +1585,7 @@ function renderBodies() {
     return `<tr data-id="${fesc(c.id)}"><td>${fesc(c.name)}</td><td><select data-k="mode">${["solid", "plate", "off"].map(m => `<option${(b.mode || "solid") === m ? " selected" : ""}>${m}</option>`).join("")}</select></td>` +
       `<td>${strat}</td><td><select data-k="material">${matOptions(b.material)}</select></td><td><input type="text" class="numf" data-k="size" value="${b.size || ""}" placeholder="auto"></td></tr>`;
   }).join("") + `</table><p class="hint">solid: meshed with the strategy in Mesh (tet: tetrahedra; hex: structured hexahedra; hex sub: hexahedra by subdivision; in brackets: the default of Settings); plate: prismatic part meshed through the thickness (C3D8I); off: left out.</p>` : "") +
-    (shells.length ? `<table class="pc-table"><tr><th>Shell</th><th>Model</th><th>t (mm)</th><th>Position</th><th>Material</th><th>Size (mm)</th><th title="${LAYERS_TIP}">Layers</th></tr>` + shells.map(([c, sf]) => {
-      const key = c.id + ":" + sf.id, b = (d.shells || {})[key] || {};
-      return `<tr data-shell="${fesc(key)}"><td>${fesc(c.name)} / ${fesc(sf.name)}</td><td><select data-k="mode">${["shell", "off"].map(m => `<option${(b.mode || "shell") === m ? " selected" : ""}>${m}</option>`).join("")}</select></td>` +
-        `<td><input type="text" class="numf" data-k="t" value="${b.t || ""}" placeholder="${d.shell_t || 10}"></td><td><select data-k="offset">${optList(SHELL_POS, b.offset || "mid")}</select></td>` +
-        `<td><select data-k="material">${matOptions(b.material)}</select></td><td><input type="text" class="numf" data-k="size" value="${b.size || ""}" placeholder="auto"></td>` +
-        `<td><input type="text" class="numf" data-k="layers" value="${b.layers || ""}" placeholder="1" title="${LAYERS_TIP}"${s8r() ? "" : " disabled"}></td></tr>`;
-    }).join("") + `</table><p class="hint">Shells: the surface bodies of the parts, meshed with shell elements (Shell elements in Settings) of thickness t (empty: ${d.shell_t || 10} mm). Position: the surface is the mid-surface, or the shell lies on the positive or negative side of the surface (the element normal). Touching shells share their nodes (bonded); shells on solid faces are tied to them.</p>` : "");
-  $("#fa-bodies").querySelectorAll("tr[data-shell]").forEach(tr => {
-    const key = tr.dataset.shell;
-    tr.querySelectorAll("[data-k]").forEach(el => el.onchange = () => {
-      d.shells = d.shells || {};
-      const b = d.shells[key] = d.shells[key] || {};
-      const k = el.dataset.k;
-      if (k === "t" || k === "size") { const v = fnum(el.value); if (v > 0) b[k] = v; else delete b[k]; }
-      else if (k === "layers") { const v = Math.round(fnum(el.value)); if (v > 1 && v <= 20) b.layers = v; else { delete b.layers; el.value = ""; } }
-      else if (el.value && !(k === "mode" && el.value === "shell") && !(k === "offset" && el.value === "mid")) b[k] = el.value; else delete b[k];
-      if (!Object.keys(b).length) delete d.shells[key];
-      changed(); draw();
-    });
-  });
+    (shells.length ? `<p class="hint">Shells: ${shells.length} surface body(ies), meshed with shell elements (Shell elements in Settings). Model, thickness, position, material, element size and layers are set in Sections; touching shells share their nodes (bonded), shells on solid faces are tied to them.</p>` : "");
   $("#fa-bodies").querySelectorAll("tr[data-id]").forEach(tr => {
     const id = tr.dataset.id;
     tr.querySelectorAll("[data-k]").forEach(el => el.onchange = () => {
@@ -2132,6 +2244,8 @@ function addFastener() {
 
 function targetText(tg) {
   if (!tg) return "(none)";
+  const st = SM.surfaceText(SH, tg);
+  if (st) return st;
   const mt = VS.multiText(tg);
   if (mt) return mt + ((tg.faces || []).some(shellFace) ? " (shell)" : "");
   if (tg.point !== undefined) { const p = (FA.doc.points || []).find(x => x.id === tg.point); return "reference point " + (p ? p.name : tg.point); }
@@ -2158,10 +2272,11 @@ function renderSups() {
   const d = FA.doc, box = $("#fa-sups");
   let h = d.supports.map(s => itemRow("support", s, `${s.name}: ${s.type}`, targetText(s.target))).join("") || '<p class="hint">Supports on faces and edges of the bodies and shells, node sets, member ends and reference points.</p>';
   const s = FA.sel && FA.sel.kind === "support" && findItem("support", FA.sel.id);
+  for (const x of d.supports) if (!x.type) x.type = x.dofs ? "dofs" : "fixed";     // supports made in the explicit pane
   if (s) {
     const onMember = s.target && (s.target.member !== undefined || s.target.point !== undefined);
     const onPoint = s.target && s.target.point !== undefined;
-    const onEdge = s.target && (s.target.edge !== undefined || s.target.nset !== undefined || !!VS.multiText(s.target));
+    const onEdge = s.target && (s.target.edge !== undefined || s.target.nset !== undefined || s.target.surface !== undefined || !!VS.multiText(s.target));
     const onShell = onEdge || shellFace(s.target);
     const types = onMember ? [["fixed", "fixed (all 6)"], ["pinned", "pinned (ux uy uz)"], ["dofs", "chosen components"], ["displacement", "prescribed displacement"]]
                 : onShell ? [["fixed", "fixed (all 6)"], ["pinned", "pinned (ux uy uz)"], ...SYMM_TYPES, ...(onEdge ? [] : [["normal", "normal to the face (planar)"]]),
@@ -2177,14 +2292,16 @@ function renderSups() {
       (s.type === "dofs" ? `<div class="fa-dofs">${DOF_NAMES.slice(0, ndof).map((n, i) => `<label><input type="checkbox" data-dof="${i}"${dofs[i] ? " checked" : ""}>${n}</label>`).join("")}</div>` : "") +
       (!onMember && !onShell && (s.type === "dofs" || s.type === "displacement") ? `<p class="hint">rx, ry, rz on a face: the face is rigidly coupled (kinematic coupling) to a node at its centre, which carries the support.</p>` : "") +
       (onShell ? `<p class="hint">Edges and shell faces: the translations of all their nodes are held; the rotations act on the shell nodes only (nodes of solid elements have no rotations).</p>` : "") +
+      ((d.surfaces || []).length ? `<label>or surface<select id="fsp-surf"><option value="">(choose)</option>${SM.surfaceOptions(SH, s.target && s.target.surface)}</select></label>` : "") +
       ((d.nsets || []).length ? `<label>or node set<select id="fsp-ns"><option value="">(choose)</option>${d.nsets.map(n => `<option value="${fesc(n.id)}"${s.target && s.target.nset === n.id ? " selected" : ""}>${fesc(n.name)}</option>`).join("")}</select></label>` : "") +
       ((d.points || []).length ? `<label>or reference point<select id="fsp-rp"><option value="">(choose)</option>${d.points.map(p => `<option value="${fesc(p.id)}"${onPoint && s.target.point === p.id ? " selected" : ""}>${fesc(p.name)}</option>`).join("")}</select></label>` : "") +
       (s.type === "displacement" ? `<p class="hint">Checked components are prescribed (mm; rotations in rad); unchecked components are free.</p><table class="pc-table fa-disp">` +
         DOF_NAMES.slice(0, ndof).map((n, i) => `<tr><td><label><input type="checkbox" data-dof="${i}"${dofs[i] ? " checked" : ""}>${n}</label></td><td><input type="text" class="numf" data-dval="${i}" value="${val[i] || 0}"${dofs[i] ? "" : " disabled"}></td></tr>`).join("") + `</table>` : "") +
       (s.type === "normal" ? `<label title="Displacement along the outward normal of the face (mm); 0: held">Normal displacement (mm, along the outward normal)<input type="text" class="numf" id="fsp-nval" value="${typeof s.value === "number" ? s.value : 0}"></label>` : "") +
-      pickHint() + `</div>`;
+      stepFactorsHtml(s, "support") + pickHint() + `</div>`;
   }
   box.innerHTML = h;
+  if (s) bindStepFactors(box, s, renderSups);
   bindRows(box, "support", "supports");
   if (!s) return;
   $("#fsp-name").onchange = () => { s.name = $("#fsp-name").value.trim() || s.name; changed(); renderSups(); };
@@ -2196,6 +2313,7 @@ function renderSups() {
     changed(); renderSups(); draw(); };
   $("#fsp-pick").onclick = () => pickSupport(s);
   $("#fsp-show").onclick = () => VS.show(SH, s.target);
+  if ($("#fsp-surf")) $("#fsp-surf").onchange = () => { const v = $("#fsp-surf").value; if (v) { s.target = { surface: v.slice(5) }; if (s.type === "normal") s.type = "fixed"; } changed(); renderSups(); draw(); };
   if ($("#fsp-ns")) $("#fsp-ns").onchange = () => { if ($("#fsp-ns").value) { s.target = { nset: $("#fsp-ns").value }; if (s.type === "normal") s.type = "fixed"; } changed(); renderSups(); draw(); };
   if ($("#fsp-rp")) $("#fsp-rp").onchange = () => { if ($("#fsp-rp").value) { s.target = { point: $("#fsp-rp").value }; if (s.type === "normal") s.type = "fixed"; } changed(); renderSups(); draw(); };
   if ($("#fsp-mem")) $("#fsp-mem").onchange = () => { const [mid, end] = $("#fsp-mem").value.split(":"); if (mid) { s.target = { member: mid, end }; if (s.type === "normal") s.type = "fixed"; } changed(); renderSups(); draw(); };
@@ -2207,8 +2325,19 @@ function renderSups() {
  *  type, friction, penalty stiffness, adjust, tied tolerance; a node set as the slave of node-to-surface and tied pairs. */
 const CONTACT_TYPES = [["surface", "surface-to-surface (penalty)"], ["node", "node-to-surface (penalty)"], ["tied", "tied (bonded)"]];
 const fkeyOf = r => r.comp + ":" + r.face;
+/** Faces of a contact side: of its surface (master_surface / slave_surface), else the picked faces. */
+function contactFaces(c, side) {
+  const sid = c[side + "_surface"];
+  if (sid) { const f = (FA.doc.surfaces || []).find(x => x.id === sid); return f ? f.faces || [] : []; }
+  return c[side] || [];
+}
+function sideText(c, side) {
+  const sid = c[side + "_surface"];
+  if (sid) { const f = (FA.doc.surfaces || []).find(x => x.id === sid); return f ? `surface ${f.name} (${(f.faces || []).length} face(s))` : "surface (deleted)"; }
+  return (c[side] || []).length + " face(s)";
+}
 function contactSub(c) {
-  return `master ${(c.master || []).length} face(s), slave ${c.slave_nset ? "node set " + ((FA.doc.nsets || []).find(n => n.id === c.slave_nset) || {}).name : (c.slave || []).length + " face(s)"}`;
+  return `master ${sideText(c, "master")}, slave ${c.slave_nset ? "node set " + ((FA.doc.nsets || []).find(n => n.id === c.slave_nset) || {}).name : sideText(c, "slave")}`;
 }
 function renderContacts() {
   const d = FA.doc, box = $("#fa-contacts");
@@ -2227,8 +2356,8 @@ function renderContacts() {
     const typ = c.type || "surface";
     h += `<div class="fa-props"><div class="grid2"><label>Name<input type="text" id="fc-name" value="${fesc(c.name)}"></label>` +
       `<label>Type<select id="fc-type">${optList(CONTACT_TYPES, typ)}</select></label></div>` +
-      `<p class="hint"><span style="color:#0c8599">Master</span>: ${(c.master || []).length} face(s) <button type="button" class="small" data-fcs="master">Set from selection</button><button type="button" class="small" data-fcx="master">Clear</button></p>` +
-      `<p class="hint"><span style="color:#d6336c">Slave</span>: ${(c.slave || []).length} face(s) <button type="button" class="small" data-fcs="slave">Set from selection</button><button type="button" class="small" data-fcx="slave">Clear</button>` +
+      `<p class="hint"><span style="color:#0c8599">Master</span>: ${fesc(sideText(c, "master"))} <button type="button" class="small" data-fcs="master">Set from selection</button><button type="button" class="small" data-fcx="master">Clear</button>${(d.surfaces || []).length ? `<select data-fcsurf="master" title="A surface as the master side"><option value="">or surface…</option>${SM.surfaceOptions(SH, c.master_surface)}</select>` : ""}</p>` +
+      `<p class="hint"><span style="color:#d6336c">Slave</span>: ${fesc(sideText(c, "slave"))} <button type="button" class="small" data-fcs="slave">Set from selection</button><button type="button" class="small" data-fcx="slave">Clear</button>${(d.surfaces || []).length ? `<select data-fcsurf="slave" title="A surface as the slave side"><option value="">or surface…</option>${SM.surfaceOptions(SH, c.slave_surface)}</select>` : ""}` +
       `<button type="button" class="small" id="fc-swap" title="Swap master and slave">Swap</button><button type="button" class="small" id="fc-show" title="Select the faces of the pair">Select</button></p>` +
       (typ !== "surface" && (d.nsets || []).length ? `<label title="Slave nodes: a node set in place of the slave faces">Slave node set<select id="fc-ns"><option value="">(slave faces)</option>${d.nsets.map(n => `<option value="${fesc(n.id)}"${c.slave_nset === n.id ? " selected" : ""}>${fesc(n.name)}</option>`).join("")}</select></label>` : "") +
       (typ !== "tied" ? `<div class="grid2"><label title="Coulomb friction coefficient (0: frictionless)">Friction<input type="text" class="numf" id="fc-mu" value="${c.friction ?? ""}" placeholder="0"></label>` +
@@ -2242,6 +2371,16 @@ function renderContacts() {
   $("#fc-sel").onclick = () => { const t = new Set(S.types); if (t.has("faces")) t.delete("faces"); else t.add("faces"); VS.setTypes(SH, [...t]); };
   const selRefs = () => VS.items(SH, ["faces", "bodies"], true).faces;
   $("#fc-add").onclick = () => {
+    if (!selRefs().length) {                                   // nothing selected: select, then Done
+      VS.collect(SH, { text: "New contact pair: faces (first component: master)", types: ["faces", "bodies"], expand: true, cb: it => {
+        if (!it.faces.length) return "select faces";
+        const first = it.faces[0].comp;
+        const x = { id: nid("ct"), name: "Contact " + (d.contacts.length + 1), type: "surface", master: it.faces.filter(r => r.comp === first), slave: it.faces.filter(r => r.comp !== first), friction: 0 };
+        d.contacts.push(x); FA.sel = { kind: "contact", id: x.id };
+        changed(); renderAll(); draw();
+      } });
+      return;
+    }
     const refs = selRefs();
     const first = refs.length ? refs[0].comp : null;
     const x = { id: nid("ct"), name: "Contact " + (d.contacts.length + 1), type: "surface", master: refs.filter(r => r.comp === first), slave: refs.filter(r => r.comp !== first), friction: 0 };
@@ -2270,10 +2409,28 @@ function renderContacts() {
   const num = (id, k) => { $(id).onchange = () => { const raw = $(id).value.trim(), v = fnum(raw); if (raw === "") delete c[k]; else if (v >= 0) c[k] = v; else { status("Not a number", true); return; } changed(); renderContacts(); }; };
   $("#fc-name").onchange = () => { c.name = $("#fc-name").value.trim() || c.name; changed(); renderContacts(); };
   $("#fc-type").onchange = () => { c.type = $("#fc-type").value; if (c.type === "surface") delete c.slave_nset; changed(); renderAll(); };
-  box.querySelectorAll("[data-fcs]").forEach(b => b.onclick = () => { const refs = selRefs(); if (!refs.length) { status("Select faces first (Select faces)", true); return; } c[b.dataset.fcs] = refs; if (b.dataset.fcs === "slave") delete c.slave_nset; changed(); renderAll(); draw(); });
-  box.querySelectorAll("[data-fcx]").forEach(b => b.onclick = () => { c[b.dataset.fcx] = []; changed(); renderAll(); draw(); });
-  $("#fc-swap").onclick = () => { [c.master, c.slave] = [c.slave || [], c.master || []]; changed(); renderAll(); draw(); };
-  $("#fc-show").onclick = () => { S.faces = new Set([...(c.master || []), ...(c.slave || [])].map(fkeyOf)); renderAll(); draw(); };
+  box.querySelectorAll("[data-fcs]").forEach(b => b.onclick = () => {
+    const side = b.dataset.fcs;
+    const take = refs => { c[side] = refs; delete c[side + "_surface"]; if (side === "slave") delete c.slave_nset; changed(); renderAll(); draw(); };
+    const refs = selRefs();
+    if (refs.length) { take(refs); return; }
+    VS.collect(SH, { text: `${c.name}: ${side} faces`, types: ["faces", "bodies"], expand: true, cb: it => { if (!it.faces.length) return "select faces"; take(it.faces); } });
+  });
+  box.querySelectorAll("[data-fcsurf]").forEach(sel => sel.onchange = () => {
+    const side = sel.dataset.fcsurf, v = sel.value;
+    if (v) { c[side + "_surface"] = v.slice(5); c[side] = []; if (side === "slave") delete c.slave_nset; } else delete c[side + "_surface"];
+    changed(); renderAll(); draw();
+  });
+  box.querySelectorAll("[data-fcx]").forEach(b => b.onclick = () => { c[b.dataset.fcx] = []; delete c[b.dataset.fcx + "_surface"]; changed(); renderAll(); draw(); });
+  $("#fc-swap").onclick = () => {
+    [c.master, c.slave] = [c.slave || [], c.master || []];
+    const ms = c.master_surface, ss = c.slave_surface;
+    delete c.master_surface; delete c.slave_surface;
+    if (ss) c.master_surface = ss;
+    if (ms) c.slave_surface = ms;
+    changed(); renderAll(); draw();
+  };
+  $("#fc-show").onclick = () => { S.faces = new Set([...contactFaces(c, "master"), ...contactFaces(c, "slave")].map(fkeyOf)); renderAll(); draw(); };
   if ($("#fc-ns")) $("#fc-ns").onchange = () => { if ($("#fc-ns").value) c.slave_nset = $("#fc-ns").value; else delete c.slave_nset; changed(); renderAll(); };
   if ($("#fc-mu")) num("#fc-mu", "friction");
   if ($("#fc-k")) num("#fc-k", "stiffness");
@@ -2283,7 +2440,7 @@ function renderContacts() {
 const SYMM_TYPES = [["xsymm", "symmetry X (ux, ry, rz held)"], ["ysymm", "symmetry Y (uy, rx, rz held)"], ["zsymm", "symmetry Z (uz, rx, ry held)"]];
 /** Target of a support from the selection (viewsel.js) or a member end clicked during it. */
 function pickSupport(s) {
-  VS.collect(SH, { text: s.name + ": faces, edges, bodies, a reference point or a member end", types: ["faces", "edges", "bodies", "points"],
+  VS.collect(SH, { text: s.name + ": faces, edges, vertices, bodies, mesh nodes or elements, a reference point or a member end", types: ["faces", "edges", "vertices", "bodies", "points", "nodes", "elements"],
     cb: it => {
       const r = VS.targetOf(it);
       if (r.error) return r.error;
@@ -2299,7 +2456,7 @@ function pickSupport(s) {
 /** Target of a load from the selection (viewsel.js) or a member end or member clicked during it. */
 function pickLoad(l) {
   const ut = uiType(l);
-  const types = ut === "pressure" ? ["faces", "bodies"] : ut === "eline" ? ["edges"] : ["faces", "edges", "bodies", "points"];
+  const types = ut === "pressure" ? ["faces", "bodies"] : ut === "eline" ? ["edges"] : ["faces", "edges", "vertices", "bodies", "points", "nodes", "elements"];
   VS.collect(SH, { text: l.name + ": " + (ut === "pressure" ? "faces or bodies" : ut === "eline" ? "edges" : "faces, edges (line load), a reference point, a member end or a member"),
     types, expand: true,
     cb: it => {
@@ -2310,6 +2467,8 @@ function pickLoad(l) {
       else if (t.face !== undefined) loadHit(l, { face: t });
       else if (t.edge !== undefined) loadHit(l, { edge: t });
       else if (t.faces && t.edges) return "a load takes faces or edges";
+      else if ((t.vertices || t.nodes || t.elements) && (t.faces || t.edges || t.bodies)) return "vertices, mesh nodes and elements take a load of their own (not with faces, edges or bodies)";
+      else if (t.vertices || t.nodes || t.elements) { if (!Array.isArray(l.value)) l.value = [0, 0, -1000]; l.type = "force"; l._ui = "force"; l.target = t; }
       else if (t.edges) { if (l.type !== "line") l.value = [0, 0, -1]; l.target = t; l.type = "line"; l._ui = "eline"; }
       else {
         if (l.type === "line" || (l.type !== "pressure" && !Array.isArray(l.value))) { l.type = "force"; l.value = [0, 0, -1000]; }
@@ -2372,11 +2531,16 @@ function renderLoads() {
       (ut !== "gravity" ? `<p class="hint">Target: ${fesc(targetText(l.target))} <button type="button" class="small" id="fld-pick" title="${ut === "pressure" ? "Click a face" : ut === "eline" ? "Click an edge" : "Click a face, an edge (line load), a member end or a member (line load)"} in the view">Pick</button><button type="button" class="small" id="fld-show" title="Select the target in the view">Show</button></p>` : "") +
       (["mforce", "mmoment"].includes(ut) ? `<label>Member end${memberEndSelect("fld-mem", l.target, false)}</label>` +
         ((d.points || []).length ? `<label>or reference point<select id="fld-rp"><option value="">(choose)</option>${d.points.map(p => `<option value="${fesc(p.id)}"${l.target && l.target.point === p.id ? " selected" : ""}>${fesc(p.name)}</option>`).join("")}</select></label>` : "") : "") +
-      (ut === "line" ? `<label>Member${memberEndSelect("fld-mem", l.target, true)}</label>` : "") + pickHint() + `</div>`;
+      (ut === "line" ? `<label>Member${memberEndSelect("fld-mem", l.target, true)}</label>` : "") +
+      (["force", "pressure", "moment"].includes(ut) && (d.surfaces || []).length ? `<label>or surface<select id="fld-surf"><option value="">(choose)</option>${SM.surfaceOptions(SH, l.target && l.target.surface)}</select></label>` : "") +
+      ((d.amplitudes || []).length ? `<label>Amplitude<select id="fld-amp"><option value="">(none: ramp in static steps, at once in dynamic steps)</option>${d.amplitudes.map(a => `<option value="${fesc(a.id)}"${l.amplitude === a.id ? " selected" : ""}>${fesc(a.name)}</option>`).join("")}</select></label>` : "") +
+      stepFactorsHtml(l, "load") + pickHint() + `</div>`;
   }
   box.innerHTML = h;
   bindRows(box, "load", "loads");
   if (!l) return;
+  bindStepFactors(box, l, renderLoads);
+  if ($("#fld-amp")) $("#fld-amp").onchange = () => { if ($("#fld-amp").value) l.amplitude = $("#fld-amp").value; else delete l.amplitude; changed(); renderLoads(); };
   const upd = () => { changed(); renderLoads(); draw(); };
   $("#fld-name").onchange = () => { l.name = $("#fld-name").value.trim() || l.name; upd(); };
   $("#fld-type").onchange = () => {
@@ -2394,9 +2558,116 @@ function renderLoads() {
   if ($("#fld-v0")) [0, 1, 2].forEach(i => $("#fld-v" + i).onchange = () => { l.value = read3("fld-v"); upd(); });
   if ($("#fld-pick")) $("#fld-pick").onclick = () => pickLoad(l);
   if ($("#fld-show")) $("#fld-show").onclick = () => VS.show(SH, l.target);
+  if ($("#fld-surf")) $("#fld-surf").onchange = () => { const v = $("#fld-surf").value; if (v) l.target = { surface: v.slice(5) }; upd(); };
   if ($("#fld-rp")) $("#fld-rp").onchange = () => { if ($("#fld-rp").value) l.target = { point: $("#fld-rp").value }; upd(); };
   if ($("#fld-mem")) $("#fld-mem").onchange = () => { const [mid, end] = $("#fld-mem").value.split(":"); l.target = mid ? (end ? { member: mid, end } : { member: mid }) : null; upd(); };
 }
+// ------------------------------------------------------------------ steps, amplitudes, initial velocities
+
+const STEP_KINDS = [["static", "static"], ["dynamic", "dynamic (implicit)"], ["explicit", "dynamic (explicit)"]];
+/** Steps of the document, or the one default static step. */
+function stepList() {
+  const d = FA.doc || {};
+  return (d.steps || []).length ? d.steps : [{ id: "1", name: "Step 1", kind: "static", _default: true }];
+}
+function renderSteps() {
+  const d = FA.doc, box = $("#fa-steps");
+  if (!box) return;
+  $("#fa-steps-card").hidden = !!(d.analysis_type && d.analysis_type !== "static");
+  const steps = stepList(), def = !(d.steps || []).length;
+  const num = (st, k, ph) => `<input type="text" class="numf" data-stk="${k}" value="${st[k] === undefined ? "" : fesc(st[k])}" placeholder="${ph}" style="width:52px">`;
+  let h = `<table class="fa-tbl fa-steps"><tr><th>Step</th><th>Kind</th><th title="Step time (s)">Time (s)</th><th title="First increment, fraction of the step time">1st inc.</th><th title="Largest increment, fraction of the step time">Max inc.</th><th title="Largest number of increments">Incs</th><th title="Results every n increments">Every</th><th></th></tr>` +
+    steps.map((st, i) => `<tr data-st="${fesc(st.id)}"><td><input type="text" data-stk="name" value="${fesc(st.name)}" style="width:80px"${def ? " disabled" : ""}></td>` +
+      `<td><select data-stk="kind"${def ? " disabled" : ""}>${STEP_KINDS.map(([v, t]) => `<option value="${v}"${(st.kind || "static") === v ? " selected" : ""}>${t}</option>`).join("")}</select></td>` +
+      (def ? `<td colspan="5" class="hint">increments: Settings, Nonlinear step</td><td></td>` :
+        `<td>${num(st, "time", st.kind === "static" ? "1" : "0.01")}</td><td>${num(st, "inc0", st.kind === "static" ? "0.1" : "0.01")}</td><td>${num(st, "incmax", st.kind === "static" ? "0.25" : "0.05")}</td>` +
+        `<td>${num(st, "maxinc", st.kind === "static" ? "100" : "10000")}</td><td>${num(st, "every", "1")}</td>` +
+        `<td><button type="button" class="small" data-sta="up" title="Move up"${i ? "" : " disabled"}>▲</button><button type="button" class="small" data-sta="del" title="Delete the step">×</button></td>`) + `</tr>`).join("") + `</table>` +
+    `<div class="row"><button type="button" class="small" id="fst-add">Add step</button></div>` +
+    `<p class="hint">Steps run in sequence. Static: the loads ramp from the values of the step before. Dynamic (implicit, *DYNAMIC) and explicit (*DYNAMIC, EXPLICIT): the loads act at once, densities needed; Initial velocities apply at the start. Each support and load has a factor per step (Supports, Loads: Steps).</p>`;
+  box.innerHTML = h;
+  $("#fst-add").onclick = () => {
+    if (!(d.steps || []).length) d.steps = [{ id: "1", name: "Step 1", kind: "static" }];
+    let k = d.steps.length + 1;
+    while (d.steps.some(x => x.id === String(k))) k++;
+    d.steps.push({ id: String(k), name: "Step " + k, kind: "static" });
+    changed(); renderAll();
+  };
+  box.querySelectorAll("tr[data-st]").forEach(tr => {
+    const st = (d.steps || []).find(x => x.id === tr.dataset.st);
+    if (!st) return;
+    tr.querySelectorAll("[data-stk]").forEach(el => el.onchange = () => {
+      const k = el.dataset.stk;
+      if (k === "name") st.name = el.value.trim() || st.name;
+      else if (k === "kind") st.kind = el.value;
+      else { const v = fnum(el.value); if (el.value.trim() === "") delete st[k]; else if (v > 0) st[k] = k === "maxinc" || k === "every" ? Math.round(v) : v; else el.value = st[k] === undefined ? "" : st[k]; }
+      changed(); renderAll();
+    });
+    tr.querySelectorAll("[data-sta]").forEach(b => b.onclick = () => {
+      const i = d.steps.indexOf(st);
+      if (b.dataset.sta === "up" && i > 0) { d.steps.splice(i, 1); d.steps.splice(i - 1, 0, st); }
+      if (b.dataset.sta === "del") {
+        d.steps.splice(i, 1);
+        for (const x of [...(d.supports || []), ...(d.loads || [])]) if (x.steps) delete x.steps[st.id];
+        if (d.steps.length === 1 && !d.steps[0].time && d.steps[0].kind === "static") d.steps = [];
+      }
+      changed(); renderAll();
+    });
+  });
+}
+/** Factors of a support or load per step (empty: 1 in every step until one is set). */
+function stepFactorsHtml(x, what) {
+  const steps = stepList();
+  if (steps.length < 2 && !x.steps) return "";
+  return `<p class="hint" style="margin:6px 0 2px">Steps: factor of the ${what} (0: ${what === "support" ? "released" : "removed"})</p><div class="row wrap fa-stepf">` +
+    steps.map(st => `<label class="inline">${fesc(st.name)}<input type="text" class="numf" data-stf="${fesc(st.id)}" value="${x.steps ? (x.steps[st.id] === undefined ? 0 : x.steps[st.id]) : 1}" style="width:44px"></label>`).join("") + `</div>`;
+}
+function bindStepFactors(box, x, rerender) {
+  box.querySelectorAll("[data-stf]").forEach(el => el.onchange = () => {
+    const v = fnum(el.value);
+    if (!isFinite(v)) { el.value = x.steps ? (x.steps[el.dataset.stf] || 0) : 1; return; }
+    if (!x.steps) { x.steps = {}; for (const st of stepList()) x.steps[st.id] = 1; }
+    x.steps[el.dataset.stf] = v;
+    if (stepList().every(st => x.steps[st.id] === 1)) delete x.steps;
+    changed(); rerender();
+  });
+}
+function renderAmps() {
+  const d = FA.doc, box = $("#fa-amps");
+  if (!box) return;
+  CV.renderAmplitudes(box, d, { changed, rerender: renderAll, status, nid, xlabel: "step time (s)", addId: "famp-add",
+    hint: "Tabular amplitudes: time (s, from the start of the step), factor; linear between the points, constant outside. A load with an amplitude is its value times the factor." });
+}
+function renderIvel() {
+  const d = FA.doc, box = $("#fa-ivel");
+  if (!box) return;
+  d.initial_velocities = d.initial_velocities || [];
+  box.innerHTML = d.initial_velocities.map(v => `<div class="fa-ivel" data-iv="${fesc(v.id)}"><div class="row"><input type="text" data-ivk="name" value="${fesc(v.name)}" style="width:110px">` +
+      `<span class="hint">${fesc(v.target ? (v.target.nset ? "node set " + ((d.nsets || []).find(n => n.id === v.target.nset) || {}).name : VS.multiText(v.target) || "(none)") : "(no target)")}</span>` +
+      `<button type="button" class="small" data-ivk="pick" title="The selection (bodies, faces, edges, vertices, mesh nodes, elements) or select, then Done">Pick</button>` +
+      `<button type="button" class="small" data-ivk="del" title="Delete">×</button></div>${v3("fiv-" + v.id, v.v || [0, 0, 0])}</div>`).join("") +
+    `<div class="row"><button type="button" class="small" id="fiv-add">Add initial velocity</button></div>` +
+    `<p class="hint">Velocity (mm/s, global x y z) of the nodes of the target at the start (*INITIAL CONDITIONS, TYPE=VELOCITY); used by dynamic steps.</p>`;
+  const pick = v => VS.collect(SH, { text: v.name + ": bodies, faces, edges, vertices, mesh nodes or elements", types: ["bodies", "faces", "edges", "vertices", "nodes", "elements"], cb: it => {
+    const r = VS.targetOf(it);
+    if (r.error) return r.error;
+    const t = r.target;
+    v.target = t.face !== undefined ? { faces: [t] } : t.edge !== undefined ? { edges: [t] } : t;
+    changed(); renderAll(); draw();
+  } });
+  $("#fiv-add").onclick = () => { const v = { id: nid("iv"), name: "Velocity " + (d.initial_velocities.length + 1), v: [0, 0, -1000], target: null }; d.initial_velocities.push(v); changed(); renderAll(); pick(v); };
+  box.querySelectorAll("[data-iv]").forEach(div => {
+    const v = d.initial_velocities.find(x => x.id === div.dataset.iv);
+    div.querySelectorAll("[data-ivk]").forEach(el => {
+      const k = el.dataset.ivk;
+      if (k === "del") el.onclick = () => { d.initial_velocities = d.initial_velocities.filter(x => x !== v); changed(); renderAll(); };
+      else if (k === "pick") el.onclick = () => pick(v);
+      else el.onchange = () => { v.name = el.value.trim() || v.name; changed(); renderAll(); };
+    });
+    [0, 1, 2].forEach(i => { const el = $("#fiv-" + v.id + i); if (el) el.onchange = () => { v.v = read3("fiv-" + v.id); changed(); }; });
+  });
+}
+
 function uiType(l) {
   if (l._ui) return l._ui;
   if (l.target && l.target.edge !== undefined) return "eline";
@@ -2456,6 +2727,7 @@ function renderResults() {
   const r = FA.res;
   if (!r || !r.tables) {
     const s = FA.mesh && FA.mesh._summary;
+    if (FA.live && (FA.job || FA.liveFailed)) { renderLive(box, FA.liveFailed); return; }
     box.innerHTML = s ? `<p class="hint">Mesh: ${s.nodes} nodes, ${s.elements} elements${s.ties ? ", " + s.ties + " tie(s)" : ""}. ${s.bodies.map(b => fesc(b.name) + " " + b.elements + " " + b.types.join("+")).join(", ")}</p>` + shellReport(s.shell) +
       ((s.warnings || []).length ? `<p class="hint">${s.warnings.map(fesc).join("<br>")}</p>` : "") : '<p class="hint">Solve to see the results.</p>';
     return;
@@ -2504,8 +2776,24 @@ function renderResults() {
   if (r.history && r.history.rows.length) h += `<p class="hint" style="margin:8px 0 2px">Load history (one point per output increment; a click shows the increment)</p>` +
     `<div class="row wrap"><label class="inline">x<select id="fr-hx">${optList(historySeries(r.history).map(q => [q.key, q.name]), FA.histX || "time")}</select></label>` +
     `<label class="inline">y<select id="fr-hy">${optList(historySeries(r.history).map(q => [q.key, q.name]), FA.histY || historySeries(r.history)[1].key)}</select></label></div><div id="fr-hplot"></div>`;
+  if ((r.time_history || []).length) {
+    const q = r.time_history.find(x => x.id === FA.thReq) || r.time_history[0];
+    const on = FA.thOn && FA.thOn[q.id] ? FA.thOn[q.id] : q.series.slice(0, 1).map(x => x.name);
+    h += `<h3 class="xp-h">Time history</h3><div class="row wrap"><label class="inline">Request<select id="fr-threq">${r.time_history.map(x => `<option value="${fesc(x.id)}"${x === q ? " selected" : ""}>${fesc(x.name)}</option>`).join("")}</select></label>` +
+      `<button type="button" class="small" id="fr-thcsv" title="The curves of the request as CSV">CSV</button></div>` +
+      `<div class="row wrap fa-thser">${q.series.map(x => `<label class="check inline"><input type="checkbox" data-ths="${fesc(x.name)}"${on.includes(x.name) ? " checked" : ""}> ${fesc(x.name)}</label>`).join("") || '<span class="hint">no values (see the solver log)</span>'}</div><div id="fr-thplot"></div>`;
+  }
+  if (r.run) {
+    const R = r.run;
+    h += `<h3 class="xp-h">Run</h3><p class="hint">${fesc(liveProcText(R, true))}${R.n ? `; ${R.n} increment(s)` : ""}${R.cvg ? `, ${R.cvg.series[0].t.length} iteration(s)` : ""}. ${fesc(liveStagesText(R))}</p>` +
+      `<div id="fr-runcvg"></div><details class="fr-rundet"><summary class="hint">Solver output</summary><div id="fr-runlog"></div></details>`;
+  }
+  h += probeHtml(r);
   h += `<div class="row" style="margin-top:8px"><button type="button" id="fr-report">Report</button><button type="button" id="fr-download">Download report</button><button type="button" id="fr-folder">Open run folder</button></div>`;
   box.innerHTML = h;
+  if ($("#fr-thplot")) bindTimeHistory(r);
+  if (r.run) { renderCvg($("#fr-runcvg"), r.run.cvg); renderLog($("#fr-runlog"), r.run.log, r.name); }
+  bindProbe(r);
   box.querySelectorAll("[data-bshow]").forEach(cb => cb.onchange = () => {
     FA.bodyHide = FA.bodyHide || new Set();
     if (cb.checked) FA.bodyHide.delete(cb.dataset.bshow); else FA.bodyHide.add(cb.dataset.bshow);
@@ -2527,6 +2815,286 @@ function renderResults() {
   $("#fr-report").onclick = () => window.open("/api/analysis/report/" + name, "_blank");
   $("#fr-download").onclick = () => { const a = document.createElement("a"); a.href = "/api/analysis/report/" + name + "?download=1"; document.body.appendChild(a); a.click(); a.remove(); };
   $("#fr-folder").onclick = () => postJSON("/api/analysis/open_folder", { name: r.name }).catch(showErr);
+}
+
+// ------------------------------------------------------------------ probe and path (Results)
+
+const FIELD_UNIT = { vm: ["von Mises", "MPa"], u: ["|u|", "mm"], ux: ["ux", "mm"], uy: ["uy", "mm"], uz: ["uz", "mm"], peeq: ["PEEQ", "-"] };
+/** Value of a field at view node i of a state. */
+function fieldAt(st, field, i) {
+  const p = FA.res.payload;
+  if (!p.states[st]) return NaN;
+  const s = stateData(p, st);
+  const ux = s.U[3 * i], uy = s.U[3 * i + 1], uz = s.U[3 * i + 2];
+  return field === "vm" ? s.vm[i] : field === "peeq" ? (s.pe ? s.pe[i] : NaN) : field === "u" ? Math.hypot(ux, uy, uz) : field === "ux" ? ux : field === "uy" ? uy : uz;
+}
+/** States of the probe curves in time order: the increments, else the steps (time: step number), else the state. */
+function probeStates() {
+  const r = FA.res;
+  if ((r.increments || []).length) return r.increments.map(x => ({ st: x.state, t: x.time }));
+  const ss = (r.states || []).filter(s => /^s\d+$/.test(s));
+  if (ss.length) return ss.map(s => ({ st: s, t: +s.slice(1) }));
+  return [{ st: $("#fa-state").value, t: 0 }];
+}
+/** A click on the result: the view node nearest the hit (probe: added to the probes; path: an end of the path). */
+function probeClick(e) {
+  const h = rayAt(e).intersectObjects(FA.three.group.children.filter(o => o.userData && o.userData.kind === "mesh"), false)[0];
+  if (!h || !h.face) { status("Probe: click a face of the result", true); return; }
+  const P = h.object.geometry.attributes.position.array;
+  let best = null, bd = Infinity;
+  for (const v of [h.face.a, h.face.b, h.face.c]) {
+    const dd = Math.hypot(P[3 * v] - h.point.x, P[3 * v + 1] - h.point.y, P[3 * v + 2] - h.point.z);
+    if (dd < bd) { bd = dd; best = v; }
+  }
+  const vs = h.object.userData.vsrc, i = vs ? vs[best] : best;
+  const ids = decoded(FA.res.payload).ids;
+  const node = { i, id: ids ? ids[i] : i };
+  if (FA.probeMode === "probe") {
+    FA.probes = (FA.probes || []).filter(x => x.i !== i).concat([node]).slice(-8);
+    status(`Probe: node ${node.id}`);
+  } else {
+    FA.path = (FA.path && FA.path.length === 1) ? [FA.path[0], node] : [node];
+    status(FA.path.length === 1 ? `Path: node ${node.id}; click the end of the path` : `Path: node ${FA.path[0].id} to node ${node.id}`);
+    if (FA.path.length === 2) FA.probeMode = null;
+  }
+  renderResults(); draw();
+}
+/** Markers of the probes and the path on the result (deformed positions pos). */
+function drawProbes(t, pos) {
+  const r = (FA.size || 100) / 300;
+  const at = i => new THREE.Vector3(pos[3 * i], pos[3 * i + 1], pos[3 * i + 2]);
+  (FA.probes || []).forEach((q, k) => {
+    const b = new THREE.Mesh(track(new THREE.SphereGeometry(r * 2.4, 12, 8)), new THREE.MeshBasicMaterial({ color: TH.COLORS[k % TH.COLORS.length], depthTest: false }));
+    b.position.copy(at(q.i)); b.renderOrder = 12; b.userData = { kind: "probe" };
+    t.group.add(b);
+  });
+  if (FA.path && FA.path.length) {
+    const g = track(new THREE.BufferGeometry().setFromPoints(FA.path.map(q => at(q.i))));
+    const ln = new THREE.Line(g, new THREE.LineBasicMaterial({ color: 0x111111, depthTest: false }));
+    ln.renderOrder = 12; ln.userData = { kind: "probe" };
+    t.group.add(ln);
+    for (const q of FA.path) {
+      const b = new THREE.Mesh(track(new THREE.SphereGeometry(r * 2, 12, 8)), new THREE.MeshBasicMaterial({ color: 0x111111, depthTest: false }));
+      b.position.copy(at(q.i)); b.renderOrder = 12; b.userData = { kind: "probe" };
+      t.group.add(b);
+    }
+  }
+}
+/** Probe curves: the field at each probed node over the states. */
+function probeSeries(field) {
+  const sts = probeStates();
+  const [fn, unit] = FIELD_UNIT[field] || [field, ""];
+  return (FA.probes || []).map(q => ({ name: `node ${q.id} ${fn}`, unit, t: sts.map(x => x.t), v: sts.map(x => fieldAt(x.st, field, q.i)) }));
+}
+/** Path curve: the field along the straight line between the path ends (60 samples), on the surface of the bodies
+ *  (nearest point of the undeformed surface triangles, linear on the triangle). */
+function pathSeries(field, st) {
+  if (!FA.path || FA.path.length < 2) return [];
+  const d = decoded(FA.res.payload), P = d.pos, T = d.tri;
+  const A = new THREE.Vector3().fromArray(P, 3 * FA.path[0].i), B = new THREE.Vector3().fromArray(P, 3 * FA.path[1].i);
+  const L = A.distanceTo(B), N = 60;
+  const tri = new THREE.Triangle(), q = new THREE.Vector3(), c = new THREE.Vector3(), bary = new THREE.Vector3();
+  const va = new THREE.Vector3(), vb = new THREE.Vector3(), vc = new THREE.Vector3();
+  const xs = [], vs = [];
+  for (let k = 0; k <= N; k++) {
+    const x = new THREE.Vector3().lerpVectors(A, B, k / N);
+    let bd = Infinity, bt = -1;
+    for (let j = 0; j < T.length; j += 3) {
+      va.fromArray(P, 3 * T[j]); vb.fromArray(P, 3 * T[j + 1]); vc.fromArray(P, 3 * T[j + 2]);
+      tri.set(va, vb, vc); tri.closestPointToPoint(x, q);
+      const dd = q.distanceToSquared(x);
+      if (dd < bd) { bd = dd; bt = j; c.copy(q); }
+    }
+    if (bt < 0) continue;
+    va.fromArray(P, 3 * T[bt]); vb.fromArray(P, 3 * T[bt + 1]); vc.fromArray(P, 3 * T[bt + 2]);
+    THREE.Triangle.getBarycoord(c, va, vb, vc, bary);
+    xs.push(L * k / N);
+    vs.push(bary.x * fieldAt(st, field, T[bt]) + bary.y * fieldAt(st, field, T[bt + 1]) + bary.z * fieldAt(st, field, T[bt + 2]));
+  }
+  const [fn, unit] = FIELD_UNIT[field] || [field, ""];
+  return [{ name: `${fn} node ${FA.path[0].id} to ${FA.path[1].id}`, unit, t: xs, v: vs }];
+}
+function probeHtml(r) {
+  if (r.atype !== "static") return "";
+  const mode = FA.probeMode;
+  const fname = (FIELD_UNIT[$("#fa-field").value] || [""])[0];
+  let h = `<h3 class="xp-h">Probe and path</h3><div class="row wrap">` +
+    `<button type="button" class="small${mode === "probe" ? " primary" : ""}" id="fr-probe" title="Click points of the result: the Result field at the nearest node over the increments (or steps)">Probe</button>` +
+    `<button type="button" class="small${mode === "path" ? " primary" : ""}" id="fr-path" title="Click the two ends of a path on the result: the Result field along the straight line on the surface">Path</button>` +
+    `<button type="button" class="small" id="fr-pclear">Clear</button><button type="button" class="small" id="fr-pcsv" title="The probe and path curves as CSV">CSV</button>` +
+    (mode ? `<span class="hint">${mode === "probe" ? "click points of the result (Probe again: end)" : "click the two ends of the path"}</span>` : "") + `</div>`;
+  if ((FA.probes || []).length) h += `<p class="hint">Probe: ${fname} at ${FA.probes.map(q => "node " + q.id).join(", ")} against ${(r.increments || []).length ? "the total time (s)" : "the step"}</p><div id="fr-probeplot"></div>`;
+  if (FA.path && FA.path.length === 2) h += `<p class="hint">Path: ${fname} of ${fesc(stateName($("#fa-state").value))} against the distance from node ${FA.path[0].id} (mm)</p><div id="fr-pathplot"></div>`;
+  return h;
+}
+function bindProbe(r) {
+  if (!$("#fr-probe")) return;
+  const field = $("#fa-field").value;
+  const sts = probeStates();
+  if ($("#fr-probeplot")) TH.plot($("#fr-probeplot"), probeSeries(field), { xlabel: (r.increments || []).length ? "time (s)" : "step",
+    mark: (sts.find(x => x.st === $("#fa-state").value) || {}).t,
+    onPick: t => { let b = sts[0]; for (const x of sts) if (Math.abs(x.t - t) < Math.abs(b.t - t)) b = x; $("#fa-state").value = b.st; draw(); renderResults(); } });
+  if ($("#fr-pathplot")) TH.plot($("#fr-pathplot"), pathSeries(field, $("#fa-state").value), { xlabel: "distance (mm)" });
+  const toggle = m => { FA.probeMode = FA.probeMode === m ? null : m; if (m === "path" && FA.probeMode) FA.path = []; if (FA.probeMode) { $("#fa-show").value = "results"; draw(); } renderResults(); };
+  $("#fr-probe").onclick = () => toggle("probe");
+  $("#fr-path").onclick = () => toggle("path");
+  $("#fr-pclear").onclick = () => { FA.probes = []; FA.path = null; FA.probeMode = null; renderResults(); draw(); };
+  $("#fr-pcsv").onclick = () => {
+    const S = probeSeries(field).concat(pathSeries(field, $("#fa-state").value));
+    if (!S.length) { status("Probe: no curves", true); return; }
+    TH.download(`${r.name}_probe.csv`.replace(/[^A-Za-z0-9_.\-]+/g, "_"), TH.csv(S));
+  };
+}
+
+/** Input file page (inpinfo.js): the contents of the .inp or .rad file of a mesh file geometry. */
+function renderInpFile() {
+  const s = (FA.doc && FA.doc.source) || {}, card = $("#fa-inpfile-card"), box = $("#fa-inpfile");
+  if (!card) return;
+  const path = s.type === "inp" ? s.path || "" : "";
+  card.hidden = !path;
+  if (!path) { FA.inpFileShown = null; return; }
+  if (FA.inpFileShown === path && box.innerHTML) return;
+  FA.inpFileShown = path;
+  IF.render(box, path, { mark: m => { FA.queryMarks = m; draw(); },
+    pick: cb => startPick("Click a point of the model", { snap: true }, hit => { if (hit && hit.xyz) cb(hit.xyz); }),
+    pickAt: (cb, cancel) => startPick("Click a node or element of the model", { snap: true, raw: true, onCancel: cancel }, hit => { if (hit && hit.xyz) cb(hit); }),
+    endPick: () => { if (FA.pick && FA.pick.raw) { FA.pick.onCancel = null; endPick(); } } });
+}
+
+/** Text of the solver state of a run monitor record: the iteration of a step with increments and the stage of the
+ *  solver. */
+function liveStageText(L) {
+  const a = L.sta;
+  let h = L.increment ? `${L.increment[0].toUpperCase()}${L.increment.slice(1)}: ${L.stage.toLowerCase()}` : L.stage;
+  if (a) h += `. Last increment: step ${a.step}, increment ${a.inc}${a.att > 1 ? ", attempt " + a.att : ""}${a.cut ? " (cutback)" : ""}, ${a.itrs} iterations, step time ${ffmt(a.time, 4)} s, total time ${ffmt(a.tot, 4)} s, increment ${ffmt(a.dt, 3)} s (${L.n} increments)`;
+  return h;
+}
+
+/** Text of the process of a run monitor record: elapsed time, CPU use, memory and the estimate of the remaining
+ *  time. */
+function liveProcText(L, done) {
+  const parts = [`${done ? "solver" : "elapsed"} ${ffmt(L.elapsed, 4)} s`];
+  if (L.threads) parts.push(`${L.threads} thread(s)`);
+  if (!done && L.cpu_pct !== null && L.cpu_pct !== undefined) parts.push(`CPU ${L.cpu_pct} %`);
+  if (!done && L.mem_mb !== null && L.mem_mb !== undefined) parts.push(`memory ${L.mem_mb} MB`);
+  const e = L.estimate;
+  if (!done && e) parts.push(`${Math.round(100 * e.done)} % of the analysis time of ${ffmt(e.total, 4)} s, about ${e.remaining} s remaining`);
+  return parts.join(", ");
+}
+
+/** Text of the stages of a run: name and duration (the stages before the increments, Increments, Finished). */
+function liveStagesText(L) {
+  const st = L.stages || [];
+  if (!st.length) return "";
+  const end = ["Finished", "Stopped"];
+  return "Stages: " + st.map((x, i) => end.includes(x.name) ? x.name : `${x.name} ${ffmt((i + 1 < st.length ? st[i + 1].t0 : L.elapsed) - x.t0, 3)} s`).join(", ");
+}
+
+/** Convergence plot of a run (the iterations of job.cvg) into box (built once; the curves chosen are kept in
+ *  FA.cvgOn). */
+function renderCvg(box, cvg) {
+  if (!box) return;
+  if (!cvg) { box.innerHTML = ""; return; }
+  const on = FA.cvgOn || cvg.series.slice(0, 2).map(x => x.name);
+  if (!box.querySelector(".fr-cvgplot")) {
+    box.innerHTML = `<h3 class="xp-h">Convergence</h3><div class="row wrap">${cvg.series.map(x => `<label class="check inline"><input type="checkbox" data-cvs="${fesc(x.name)}"${on.includes(x.name) ? " checked" : ""}> ${fesc(x.name)}</label>`).join("")}` +
+      `<span class="hint fr-cvgn"></span></div><div class="fr-cvgplot"></div>`;
+    box.querySelectorAll("[data-cvs]").forEach(el => el.onchange = () => {
+      FA.cvgOn = [...box.querySelectorAll("[data-cvs]:checked")].map(x => x.dataset.cvs);
+      renderCvg(box, box._cvg);
+    });
+  }
+  box._cvg = cvg;
+  const n = cvg.series[0].t.length;
+  box.querySelector(".fr-cvgn").textContent = `${n} iteration(s), ${cvg.incs.length} increment attempt(s); residual force and displacement correction in % of the convergence limit, dashed lines at the start of each attempt`;
+  TH.plot(box.querySelector(".fr-cvgplot"), cvg.series.filter(x => on.includes(x.name)),
+    { xlabel: "iteration", xname: "iteration", ylog: true, xint: true, marks: cvg.incs.map(m => ({ t: m[0], title: `step ${m[1]}, increment ${m[2]}, attempt ${m[3]}` })) });
+}
+
+/** Solver output into box (built once): the text of solver.log with Follow (scrolled to the end at each update)
+ *  and the link to the whole file. */
+function renderLog(box, text, name, title) {
+  if (!box) return;
+  if (!box.querySelector(".fr-log")) {
+    box.innerHTML = (title ? `<h3 class="xp-h">Solver output</h3>` : "") + `<div class="row wrap"><label class="check inline"><input type="checkbox" class="fr-logfollow" checked> Follow</label>` +
+      `<button type="button" class="small fr-logopen" title="The whole solver.log in a new tab">Open solver.log</button><span class="hint fr-lognote"></span></div><pre class="xp-log fr-log"></pre>`;
+    box.querySelector(".fr-logopen").onclick = () => window.open("/api/analysis/log/" + encodeURIComponent(name), "_blank");
+  }
+  const pre = box.querySelector(".fr-log");
+  if (pre.textContent !== text) {
+    pre.textContent = text || "";
+    if (box.querySelector(".fr-logfollow").checked) pre.scrollTop = pre.scrollHeight;
+  }
+  box.querySelector(".fr-lognote").textContent = text && text.length >= 24000 ? "last 24 kB; the messages of the input reading are written when the solver exits" : "the messages of the input reading are written when the solver exits";
+}
+
+/** Run monitor of a running solve (FA.live, read every 1.5 s on the server): the stage of the solver and the last
+ *  increment of job.sta; elapsed time, CPU use, memory and the estimate of the remaining time; the stages of the run;
+ *  the convergence of the iterations (job.cvg); the curves of the history requests and of the increments; the solver
+ *  output. The box is built once and updated at each poll; failed: the solver stopped with an error. */
+function renderLive(box, failed) {
+  const L = FA.live;
+  if (!box || !L) return;
+  if (!box.querySelector("#fr-live")) {
+    box.innerHTML = `<div id="fr-live"><h3 class="xp-h" id="fr-lvhead">Run monitor</h3><p class="hint" id="fr-lvstage"></p><p class="hint" id="fr-lvproc"></p>` +
+      `<p class="hint" id="fr-lvstages"></p><div id="fr-lvcvg"></div><div id="fr-lvth"></div><div id="fr-lvlog"></div></div>`;
+  }
+  $("#fr-lvhead").textContent = failed ? "Run monitor: the solver stopped with an error" : L.final ? "Run monitor: finished" : "Run monitor";
+  $("#fr-lvstage").textContent = liveStageText(L);
+  $("#fr-lvproc").textContent = liveProcText(L, !!L.final);
+  $("#fr-lvstages").textContent = liveStagesText(L);
+  renderCvg($("#fr-lvcvg"), L.cvg);
+  const th = L.time_history || [];
+  const tb = $("#fr-lvth");
+  if (th.length) {
+    const q = th.find(x => x.id === FA.thReq) || th[0];
+    const on = (FA.thOn || {})[q.id] || q.series.slice(0, 1).map(x => x.name);
+    const key = th.map(x => x.id).join("|") + "|" + q.id + "|" + q.series.map(x => x.name).join("|");
+    if (tb._key !== key) {
+      tb._key = key;
+      tb.innerHTML = `<h3 class="xp-h">Time history</h3><div class="row wrap"><label class="inline">Request<select id="fr-lvreq">${th.map(x => `<option value="${fesc(x.id)}"${x === q ? " selected" : ""}>${fesc(x.name)}</option>`).join("")}</select></label></div>` +
+        `<div class="row wrap">${q.series.map(x => `<label class="check inline"><input type="checkbox" data-lvs="${fesc(x.name)}"${on.includes(x.name) ? " checked" : ""}> ${fesc(x.name)}</label>`).join("")}</div><div id="fr-lvplot"></div>`;
+      $("#fr-lvreq").onchange = () => { FA.thReq = $("#fr-lvreq").value; tb._key = null; renderLive(box, failed); };
+      tb.querySelectorAll("[data-lvs]").forEach(el => el.onchange = () => {
+        FA.thOn = FA.thOn || {};
+        FA.thOn[q.id] = [...tb.querySelectorAll("[data-lvs]:checked")].map(x => x.dataset.lvs);
+        renderLive(box, failed);
+      });
+    }
+    TH.plot($("#fr-lvplot"), q.series.filter(x => on.includes(x.name)));
+  } else tb.innerHTML = "";
+  renderLog($("#fr-lvlog"), L.log, FA.jobName || "", true);
+}
+
+/** Time history of the result (history requests): the chosen request, its curves, a click picks the nearest
+ *  increment state. */
+function bindTimeHistory(r) {
+  const q = r.time_history.find(x => x.id === FA.thReq) || r.time_history[0];
+  FA.thOn = FA.thOn || {};
+  const on = () => FA.thOn[q.id] || q.series.slice(0, 1).map(x => x.name);
+  const incs = r.increments || [];
+  const cur = incs.find(x => x.state === $("#fa-state").value);
+  const draw1 = () => TH.plot($("#fr-thplot"), q.series.filter(x => on().includes(x.name)), {
+    mark: cur ? cur.time : null,
+    onPick: t => {
+      if (!incs.length) return;
+      let best = incs[0];
+      for (const x of incs) if (Math.abs(x.time - t) < Math.abs(best.time - t)) best = x;
+      $("#fa-state").value = best.state; draw(); renderResults();
+    } });
+  draw1();
+  $("#fr-threq").onchange = () => { FA.thReq = $("#fr-threq").value; renderResults(); };
+  document.querySelectorAll("#fa-results [data-ths]").forEach(el => el.onchange = () => {
+    FA.thOn[q.id] = [...document.querySelectorAll("#fa-results [data-ths]:checked")].map(x => x.dataset.ths);
+    draw1();
+  });
+  $("#fr-thcsv").onclick = () => TH.download(`${r.name}_${q.name}.csv`.replace(/[^A-Za-z0-9_.\-]+/g, "_"), TH.csv(q.series.filter(x => on().includes(x.name))));
+}
+
+// ------------------------------------------------------------------ history requests
+
+function renderHist() {
+  HR.render({ doc: () => FA.doc, solver: "calculix", sel: SH, nid, num: fnum, changed, rerender: () => { renderAll(); draw(); }, targetText }, $("#fa-hist"));
 }
 
 /** Series of the load history: [{key, name, v: [value per increment]}]. */
@@ -2570,7 +3138,7 @@ function plotHistory() {
 function setStates() {
   const sel = $("#fa-state");
   const sts = !FA.res || !FA.res.states ? [] : modeResult() ? FA.res.states : ["total", "preload", "loads"].filter(s => FA.res.states.includes(s))
-    .concat((FA.res.increments || []).map(x => x.state));
+    .concat(FA.res.states.filter(s => /^s\d+$/.test(s))).concat((FA.res.increments || []).map(x => x.state));
   sel.innerHTML = sts.map(s => `<option value="${s}">${fesc(stateName(s))}</option>`).join("");
   sel.disabled = sts.length < 2;
 }
@@ -2591,6 +3159,8 @@ async function runJob(meshOnly) {
   try {
     const j = await (await postJSON("/api/analysis/run", { name, analysis: FA.doc, mesh_only: !!meshOnly })).json();
     FA.job = j.job;
+    FA.jobName = name;
+    FA.live = null; FA.liveFailed = false;
   } catch (e) { showErr(e); return; }
   $("#fa-cancel").disabled = false;
   $("#fa-solve").disabled = $("#fa-mesh").disabled = true;
@@ -2604,13 +3174,20 @@ async function runJob(meshOnly) {
     if (s.mesh) { FA.meshKeys = keys; showMesh(s.mesh); }
     if (s.state === "running") {
       $("#fa-info").textContent = `${s.message || s.stage} … ${Math.round((Date.now() - t0) / 1000)} s`;
+      if (s.live) { FA.live = s.live; renderLive($("#fa-results")); }
       setTimeout(poll, 700);
       return;
     }
     FA.job = null;
     $("#fa-cancel").disabled = true;
     $("#fa-solve").disabled = $("#fa-mesh").disabled = false;
-    if (s.state === "error") { $("#fa-info").textContent = ""; status(s.error, true); return; }
+    if (s.state === "error") {
+      $("#fa-info").textContent = "";
+      status(s.error, true);
+      if (s.live) { FA.live = s.live; FA.liveFailed = true; renderLive($("#fa-results"), true); } else FA.live = null;
+      return;
+    }
+    FA.live = null;
     const r = s.result;
     FA.res = null;
     FA.meshKeys = keys;
@@ -2622,6 +3199,7 @@ async function runJob(meshOnly) {
       status(`Mesh: ${r.summary.nodes} nodes, ${r.summary.elements} elements (${r.summary.bodies.map(b => b.types.join(" + ")).filter(Boolean).join(", ") || "members"}); input file ${r.files.inp}`);
     } else {
       FA.res = r;
+      FA.probes = []; FA.path = null; FA.probeMode = null;
       setStates();
       $("#fa-show").value = "results";
       status(`Solved in ${ffmt((Date.now() - t0) / 1000, 3)} s`);
@@ -2641,19 +3219,29 @@ async function refreshSources() {
   try { asms = await (await api("/api/assembly/list")).json(); } catch (e) { /* none */ }
   try { parts = await (await api("/api/part/list")).json(); } catch (e) { /* none */ }
   const s = FA.doc ? FA.doc.source || {} : {};
-  const cur = s.name ? s.type + ":" + s.name : "";
+  const cur = s.type === "inp" ? "inp:" + (s.path || "") : s.name ? s.type + ":" + s.name : "";
   $("#fa-source").innerHTML = `<option value="">(none: members and plates)</option>` +
     (asms.length ? `<optgroup label="Assemblies">${asms.map(n => `<option value="assembly:${fesc(n)}">${fesc(n)}</option>`).join("")}</optgroup>` : "") +
-    (parts.length ? `<optgroup label="Parts">${parts.map(n => `<option value="part:${fesc(n)}">${fesc(n)}</option>`).join("")}</optgroup>` : "");
+    (parts.length ? `<optgroup label="Parts">${parts.map(n => `<option value="part:${fesc(n)}">${fesc(n)}</option>`).join("")}</optgroup>` : "") +
+    `<optgroup label="Mesh file">${s.type === "inp" ? `<option value="${fesc(cur)}" title="${fesc(s.path || "")}">${fesc(s.name || s.path)}</option>` : ""}` +
+    `<option value="inp:">Import CalculiX .inp or Radioss .rad…</option></optgroup>`;
   if (cur && ![...$("#fa-source").options].some(o => o.value === cur)) $("#fa-source").insertAdjacentHTML("beforeend", `<option value="${fesc(cur)}">${fesc(s.name)} (missing)</option>`);
   $("#fa-source").value = cur;
 }
 
-async function loadDoc(d) {
+async function loadDoc(d, saved) {
   const b = blankDoc(d.name);
   for (const k of Object.keys(b)) if (d[k] === undefined) d[k] = b[k];
   FA.doc = d;
-  FA.sel = null; FA.pick = null; FA.mesh = null; FA.res = null; FA.bodyHide = new Set(); VS.clear(SH); SM.selState(SH).collect = null; VS.renderBar(SH);
+  if ($("#fa-solver")) $("#fa-solver").value = d.solver === "explicit" ? "explicit" : "calculix";
+  if (d.solver === "explicit" && window.__xpAttach) {
+    // solver OpenCourant: the document in the explicit pane of the tab
+    FA.dirty = false;
+    await window.__xpAttach(d, saved);
+    if (!$("#tab-fea").hidden) showTab("xp");
+    return;
+  }
+  FA.sel = null; FA.pick = null; FA.mesh = null; FA.res = null; FA.probes = []; FA.path = null; FA.probeMode = null; FA.bodyHide = new Set(); VS.clear(SH); SM.selState(SH).collect = null; VS.renderBar(SH);
   FA.dirty = false;
   if (FA.three) FA.three.zoomed = false;
   setStates();
@@ -2679,6 +3267,7 @@ async function saveDoc(name, asNew) {
 }
 
 window.feaShown = async function () {
+  if (FA.doc && FA.doc.solver === "explicit" && window.__xpAttach) { showTab("xp"); return; }   // solver OpenCourant: the explicit pane
   if (!FA.three) initThree();
   MS.installLibraryPick($("#tab-fea"), addLibraryMaterial);
   if (!FA.solver) { try { FA.solver = await (await api("/api/analysis/solver")).json(); } catch (e) { FA.solver = {}; } }
@@ -2697,6 +3286,8 @@ window.feaShown = async function () {
   });
   $("#fa-source").onchange = () => {
     const v = $("#fa-source").value;
+    if (v === "inp:") { chooseInp(); return; }
+    if (v.startsWith("inp:")) return;
     const i = v.indexOf(":");
     FA.doc.source = v ? { type: v.slice(0, i), name: v.slice(i + 1) } : { type: "assembly", name: "" };
     FA.mesh = null; FA.res = null; setStates();
@@ -2704,6 +3295,16 @@ window.feaShown = async function () {
     changed(); loadGeometry();
   };
   $("#fa-update").onclick = updateGeometry;
+  $("#fa-solver").onchange = async () => {
+    if ($("#fa-solver").value !== "explicit") return;
+    FA.doc.solver = "explicit";
+    changed();
+    const saved = FM && FM.isSaved();
+    await window.__xpAttach(FA.doc, saved);
+    if (saved) window.__feaDirty();
+    showTab("xp");
+    HO.handover(window.__feaPane, window.__xpPane);          // the view of this pane in the explicit pane
+  };
   window.addEventListener("focus", checkGeometry);
   setInterval(checkGeometry, 4000);
   $("#fa-mesh").onclick = () => runJob(true);
@@ -2727,6 +3328,7 @@ window.feaShown = async function () {
     if ($("#fa-show").value !== "model" && !FA.mesh) { $("#fa-show").value = "model"; status("Mesh or solve first", true); }
     if ($("#fa-show").value === "results" && !FA.res) { $("#fa-show").value = FA.mesh ? "mesh" : "model"; status("Solve first", true); }
     draw();
+    if (id === "#fa-field" && FA.res && ((FA.probes || []).length || (FA.path || []).length === 2)) renderResults();      // probe and path curves of the field
   };
   $("#fa-state").onchange = () => { draw(); renderResults(); };
   FM = docFileMenu({ pre: "fa", type: "analysis", label: "analysis", pane: "#tab-fea", listUrl: "/api/analysis/list",
@@ -2736,8 +3338,25 @@ window.feaShown = async function () {
   window.addEventListener("beforeunload", e => { if (FA.dirty) { e.preventDefault(); e.returnValue = ""; } });
 })();
 
-window.__fea = { FA, SH };
-window.__feaLoadNamed = async function (name) { await loadDoc(await (await api("/api/analysis/file/" + encodeURIComponent(name))).json()); if (FM) FM.markSaved(name); };
+window.__fea = { FA, SH, renderResults, select: (k, id) => { FA.sel = k ? { kind: k, id } : null; renderAll(); draw(); } };
+window.__feaLoadNamed = async function (name) {
+  const d = await (await api("/api/analysis/file/" + encodeURIComponent(name))).json();
+  if (FM) FM.markSaved(name);
+  await loadDoc(d, true);
+};
+// one document with the explicit pane (solver OpenCourant, explicit.js)
+window.__feaDirty = () => { FA.dirty = true; if (FM) FM.render(); };
+window.__feaIsDirty = () => !!FA.dirty;
+window.__feaSaveDoc = async name => { await saveDoc(name); if (FM) FM.markSaved(name); };
+window.__feaNewDoc = async solver => { const d = blankDoc("analysis"); if (solver) d.solver = solver; if (FM) FM.markUnsaved(); await loadDoc(d); };
+/** A document from the explicit pane (solver CalculiX): shown in this pane. */
+/** View handover between the CalculiX and the OpenCourant pane (handoff.js). */
+window.__feaPane = {
+  ready: () => !!(FA.three && FA.geo && !$("#tab-fea").hidden),
+  state: () => HO.state(FA.three, SM.selState(SH), FA.tree, $("#fa-panel")),
+  apply: st => HO.apply(st, FA.three, SM.selState(SH), FA.tree, $("#fa-panel"), () => { resize3(); VS.renderBar(SH); draw(); }),
+};
+window.__feaAdopt = async (d, saved) => { if (FM) { if (saved) FM.markSaved(d.name); else FM.markUnsaved(); } await loadDoc(d, saved); if (!saved) FA.dirty = true; if (FM) FM.render(); };
 window.__feaSetName = name => { if (FA.doc) { FA.doc.name = name; if (FM) FM.markSaved(name); } };
 window.__feaRefresh = refreshList;
 window.__feaCurrent = () => (FA.doc ? { name: FA.doc.name, dirty: !!FA.dirty } : null);

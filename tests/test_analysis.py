@@ -323,6 +323,13 @@ def test_api_save_run_results_report(client, web):
     assert saved["tables"]["total"]["fasteners"][0]["name"] == "M10"
     rep = client.get("/api/analysis/report/fea_api")
     assert rep.status_code == 200 and b"ANALYSIS REPORT" in rep.data and b"Fasteners" in rep.data
+    # the run monitor data of the solve: the stages of the run end with Finished, the log ends with Job finished
+    run = r["run"]
+    assert run["stages"][-1]["name"] == "Finished" and run["elapsed"] > 0 and run["threads"] >= 1 and "Job finished" in run["log"]
+    assert saved["run"]["stages"] == run["stages"]
+    log = client.get("/api/analysis/log/fea_api")
+    assert log.status_code == 200 and b"Job finished" in log.data
+    assert client.get("/api/analysis/log/no_such_analysis").status_code == 404
     docs = ok(client.get("/api/project/docs"))["docs"]
     d = next(x for x in docs if x["type"] == "analysis" and x["name"] == "fea_api")
     assert d["links"] == [{"type": "assembly", "name": "fea_asm"}]
@@ -823,6 +830,72 @@ def test_mesh_without_supports(client, web, tmp_path):
     assert s["state"] == "done" and s["result"]["mesh_only"], s
 
 
+def test_auto_size_three_elements_across(tmp_path):
+    """Automatic element size (no size given): at least 3 elements across every face. A block 100 x 20 x 10 mm
+    (h = diagonal / 20 = 5.1 mm) gets 3 elements across the 10 mm faces; a strip 1000 x 30 mm (shell, h = 50 mm)
+    3 elements across its width, but not smaller than its thickness; with a size given, the size is kept."""
+    from build123d import Box, Pos, Face
+    from build123d import export_brep
+    from drawgen import femesh
+    p = str(tmp_path / "b.brep")
+    export_brep(Pos(50, 10, 5) * Box(100, 20, 10), p)
+
+    def edge_nodes(path, mode, size, sel):
+        m = femesh.run({"size": size, "bonded": True, "bodies": [{"id": "b", "brep": path, "mode": mode, "t": 2}],
+                        "mesh": {"tet_type": "C3D4", "shell_type": "S4"}})
+        X = np.asarray(m["nodes"]["xyz"], float).reshape(-1, 3)
+        return int(sel(X).sum())
+    on_edge = lambda X: (np.abs(X[:, 0] - 100) < 1e-6) & (np.abs(X[:, 1]) < 1e-6)       # edge along z, 10 mm
+    assert edge_nodes(p, "solid", 0, on_edge) >= 4
+    assert edge_nodes(p, "solid", 5.0, on_edge) == 3
+    q = str(tmp_path / "s.brep")
+    export_brep(Pos(500, 15, 0) * Face.make_rect(1000, 30), q)
+    short = lambda X: np.abs(X[:, 0]) < 1e-6                                            # edge x = 0, 30 mm
+    assert edge_nodes(q, "shell", 0, short) >= 4
+    assert edge_nodes(q, "shell", 50.0, short) == 2
+    # shells: not smaller than the thickness (t 15 mm: 2 elements across the 30 mm strip)
+    m = femesh.run({"size": 0, "bonded": True, "bodies": [{"id": "b", "brep": q, "mode": "shell", "t": 15}],
+                    "mesh": {"shell_type": "S4"}})
+    X = np.asarray(m["nodes"]["xyz"], float).reshape(-1, 3)
+    assert int(short(X).sum()) == 3
+
+
+def test_mesh_refinement_regions(client, web, tmp_path):
+    """Mesh refinement on picked faces (doc["refine"]): a box per face; the tetrahedra of a block are finer at the
+    refined end face; the structured shell faces of the second of two decks take the region size."""
+    from build123d import Box, Pos
+    from drawgen import femesh
+    blk = Pos(50, 10, 5) * Box(100, 20, 10)
+    B = bodies_of({"b": blk})
+    tip = face_index(B[0], lambda r: r["kind"] == "plane" and abs(r["c"][0] - 100) < 1e-6)
+    doc = {"refine": [{"id": "r1", "name": "TIP", "faces": [{"comp": "b", "face": tip}], "size": 1.0}]}
+    for b in B:
+        b["comp"] = b["id"]
+    boxes = analysis.refine_boxes(doc, B)
+    assert len(boxes) == 1 and boxes[0]["size"] == 1.0 and np.allclose(boxes[0]["box"], [100, 0, 0, 100, 20, 10], atol=1e-6)
+    from build123d import export_brep
+    p = str(tmp_path / "b.brep")
+    export_brep(blk, p)
+
+    def tip_nodes(refine):
+        m = femesh.run({"size": 5.0, "bonded": True, "bodies": [{"id": "b", "brep": p, "mode": "solid"}],
+                        "mesh": {"tet_type": "C3D4"}, "refine": refine})
+        X = np.asarray(m["nodes"]["xyz"], float).reshape(-1, 3)
+        return int((np.abs(X[:, 0] - 100) < 1e-6).sum()), int((np.abs(X[:, 0]) < 1e-6).sum())
+    n0, r0 = tip_nodes([])
+    n1, r1 = tip_nodes(boxes)
+    assert n1 > 5 * n0 and r1 < 2 * r0, (n0, n1, r0, r1)
+    # shells: two decks of the girder, the faces of deck2 refined (structured: the region size)
+    asm = _girder(client, "gd_rf")
+    c3 = next(c for c in ok(client.post("/api/assembly/build", json={"assembly": asm}))["components"] if c["id"] == "3")
+    faces = [{"comp": "3", "face": i} for i, fb in enumerate(c3["mesh"]["face_body"]) if fb is not None]
+    sd = _shell_doc("gd_rf", {}, [], [], mesh={"size": 20}, refine=[{"id": "r1", "name": "D2", "faces": faces, "size": 5.0}])
+    r = analysis.run(sd, asm, web._asm_sources(), str(tmp_path / "s"), None, mesh_only=True, meta={"name": "gd_rf"})
+    el = {b["name"]: b["elements"] for b in r["summary"]["bodies"]}
+    d1, d2 = next(v for k, v in el.items() if k.startswith("deck /")), next(v for k, v in el.items() if k.startswith("deck2 /"))
+    assert d2 >= (200 // 5) * (100 // 5) and d1 < d2 / 4, el     # deck 1: 20 mm, with a transition at the shared edge
+
+
 # --------------------------------------------------------------------------- sections, node sets, structured mesh
 
 def _girder(client, name="gd", web_z=0.0):
@@ -1089,6 +1162,13 @@ def test_multi_item_supports_and_loads(tmp_path):
     root, bot, tip, top = fi(0, 0), fi(2, 0), fi(0, 100), fi(2, 10)
     F = lambda i: {"comp": "b", "face": i}
     assert analysis.single_target({"faces": [F(root)]}) == F(root) and analysis.is_multi({"edges": []})
+    # surfaces: targets and contact sides resolved to the faces of the surface
+    rs = analysis.resolve_surfaces({"surfaces": [{"id": "sf", "name": "S", "faces": [F(root), F(bot)]}],
+                                    "supports": [{"id": "a", "target": {"surface": "sf"}}],
+                                    "contacts": [{"id": "c", "master_surface": "sf", "master": [], "slave": [F(tip)]}]})
+    assert rs["supports"][0]["target"] == {"faces": [F(root), F(bot)]} and rs["contacts"][0]["master"] == [F(root), F(bot)]
+    with pytest.raises(analysis.AnalysisError, match="surface zz not found"):
+        analysis.resolve_surfaces({"supports": [{"id": "a", "name": "A", "target": {"surface": "zz"}}]})
     doc = {"materials": STEEL, "default_material": "Steel", "mesh": {"size": 5.0},
            "supports": [{"id": "s1", "name": "root", "target": {"faces": [F(root), F(bot)]}, "type": "fixed"}],
            "loads": [{"id": "l1", "name": "tipz", "type": "force", "target": {"faces": [F(tip), F(top)]}, "value": [0, 0, -100]},
@@ -1152,9 +1232,33 @@ def test_contact_plastic_nonlinear(client, web, tmp_path):
            "contacts": [{"id": "c1", "name": "seat", "type": "surface", "master": [F["lo_top"]], "slave": [F["hi_bot"]], "friction": 0.2}],
            "nonlinear": {"inc0": 0.25, "incmax": 0.25}}
     src = web._asm_sources()
-    r = analysis.run(doc, asm, src, str(tmp_path / "a"), CCX, meta={"name": "ct"})
+
+    class Prog(object):                 # the progress of the server job with the run monitor
+        def __init__(self):
+            self.snaps, self.proc = [], None
+
+        def __call__(self, stage, message=""):
+            pass
+
+        def live(self, data):
+            self.snaps.append(data)
+    prog = Prog()
+    r = analysis.run(doc, asm, src, str(tmp_path / "a"), CCX, meta={"name": "ct"}, progress=prog)
     inp = open(r["files"]["inp"]).read()
     assert "*CONTACT PAIR, INTERACTION=C1I, TYPE=SURFACE TO SURFACE" in inp and "*FRICTION" in inp
+    # run monitor: the snapshots of the run and the final one; the convergence request of job.cvg with one entry
+    # per increment attempt; the final snapshot is the run data of the result
+    fin = prog.snaps[-1]
+    assert fin["final"] and fin["stage"] == "Finished" and [x["name"] for x in fin["stages"]][-2:] == ["Increments", "Finished"] and fin["threads"] >= 1
+    assert fin["sta"]["inc"] == fin["n"] == 4 and fin["increment"].startswith("step 1, increment 4, attempt 1, iteration")
+    cvg = fin["cvg"]
+    assert [x["name"] for x in cvg["series"]] == ["residual force", "displacement correction", "contact elements", "attempt"]
+    assert [m[2] for m in cvg["incs"]] == [1, 2, 3, 4] and cvg["incs"][0][0] == 1 and len(cvg["series"][0]["t"]) == sum(x["itrs"] for x in analysis.read_sta(str(tmp_path / "a" / "job.sta")))
+    assert cvg["series"][0]["v"][0] > cvg["series"][0]["v"][cvg["incs"][1][0] - 2]        # the residual falls within the increment
+    assert "Job finished" in fin["log"] and any(x["id"] == "_sta" for x in fin["time_history"])
+    assert r["run"]["cvg"] == cvg and r["run"]["stages"] == fin["stages"]
+    if len(prog.snaps) > 1:
+        assert all(not x["final"] for x in prog.snaps[:-1]) and prog.snaps[-2]["elapsed"] <= fin["elapsed"]
     assert "*PLASTIC, HARDENING=ISOTROPIC" in inp and "*STEP, INC=100" in inp and "S, PEEQ" in inp
     assert "*TIE" not in inp
     assert r["summary"]["nonlinear"] and r["summary"]["contacts"][0]["name"] == "seat"
@@ -1169,8 +1273,40 @@ def test_contact_plastic_nonlinear(client, web, tmp_path):
     assert "pe" in r["payload"]["states"]["total"] and "pe" in r["payload"]["states"]["i1"]
 
 
+@pytest.mark.skipif(not CCX, reason="CalculiX not installed")
+def test_contact_and_section_history(client, web, tmp_path):
+    """History output of contact and section forces: a block pressed onto a block (surface-to-surface contact);
+    a contact request on the pair (*CONTACT PRINT, SLAVE, MASTER, CF) and a section request on the bottom face of the
+    lower block (*SURFACE of its element faces, *SECTION PRINT SOF, SOM): the contact force in z equal to the reaction
+    of the pressed face within 1 %, the section force in z on the supported face equal to the base reaction within
+    15 % (stresses integrated over the element faces), the area 40 x 20 mm^2; a tied contact is
+    refused."""
+    asm, F = _stack(client, web, "cs")
+    doc = {"name": "cs", "materials": {"Steel": {"E": 210000.0, "nu": 0.3, "rho": 7850.0}}, "default_material": "Steel",
+           "mesh": {"size": 4}, "bonded": True, "bodies": {}, "members": [], "plates": [], "fasteners": [], "loads": [],
+           "supports": [{"id": "s1", "name": "base", "target": F["lo_bot"], "type": "fixed"},
+                        {"id": "s2", "name": "press", "target": F["hi_top"], "type": "displacement", "dofs": [1, 1, 1, 0, 0, 0], "value": [0, 0, -0.01, 0, 0, 0]}],
+           "contacts": [{"id": "c1", "name": "seat", "type": "surface", "master": [F["lo_top"]], "slave": [F["hi_bot"]]}],
+           "nonlinear": {"inc0": 0.5, "incmax": 0.5},
+           "history": [{"id": "h1", "name": "seat", "kind": "contact", "target": {"contact": "c1"}, "quantities": ["CF"]},
+                       {"id": "h2", "name": "base", "kind": "section", "target": {"faces": [F["lo_bot"]]}, "quantities": ["SOF"]}]}
+    src = web._asm_sources()
+    r = analysis.run(doc, asm, src, str(tmp_path / "a"), CCX, meta={"name": "cs"})
+    inp = open(r["files"]["inp"]).read()
+    assert "*CONTACT PRINT, SLAVE=C1S, MASTER=C1M" in inp and "*SECTION PRINT, SURFACE=HS2, NAME=SP2" in inp and "*SURFACE, NAME=HS2, TYPE=ELEMENT" in inp
+    th = {q["id"]: {x["name"]: x for x in q["series"]} for q in r["time_history"]}
+    Fb, Fp = (np.asarray(x["F"]) for x in r["tables"]["total"]["reactions"])
+    assert len(th["h1"]["Fz total"]["v"]) == 2 and abs(th["h1"]["Fz total"]["v"][-1]) == pytest.approx(abs(Fp[2]), rel=0.01)
+    assert abs(th["h2"]["Fz total"]["v"][-1]) == pytest.approx(abs(Fb[2]), rel=0.15)
+    assert th["h2"]["area"]["v"][-1] == pytest.approx(800, rel=1e-3) and "bending moment" in th["h2"]
+    bad = dict(doc, contacts=[dict(doc["contacts"][0], type="tied")])
+    with pytest.raises(analysis.AnalysisError, match="tied"):
+        analysis.run(bad, asm, src, str(tmp_path / "b"), CCX, meta={"name": "cs"})
+
+
 def test_nonlinear_refuses_beams_and_fasteners(tmp_path):
-    """A nonlinear solve (here: contact) with a fastener: refused (U1 elements are linear only); mesh only: a warning."""
+    """A nonlinear solve (here: contact) with a fastener: refused (fasteners are U1 elements with preload, linear
+    only); mesh only: a warning."""
     from build123d import Box, Cylinder, Pos
     a = Pos(0, 0, 5) * Box(50, 50, 10) - Pos(0, 0, 5) * Cylinder(5, 10)
     b = Pos(0, 0, 15) * Box(50, 50, 10) - Pos(0, 0, 15) * Cylinder(5, 10)
@@ -1193,7 +1329,7 @@ def test_nonlinear_refuses_beams_and_fasteners(tmp_path):
         export_brep(x["shape"], p)
         job["bodies"].append({"id": x["id"], "brep": p, "mode": "solid", "size": None, "layers": 1})
     mesh = femesh.run(job)
-    with pytest.raises(analysis.AnalysisError, match="U1 elements, linear only"):
+    with pytest.raises(analysis.AnalysisError, match="U1 elements with preload, linear only"):
         analysis.Model(doc, B, mesh).build()
     M = analysis.Model(doc, B, mesh)
     M.build(mesh_only=True)
@@ -1299,3 +1435,581 @@ def test_shell_layers_s8r_composite(client, web, tmp_path):
     bad = dict(doc, shells={"1:s1": {"t": 2, "layers": 0}})
     with pytest.raises(analysis.AnalysisError, match="layers must be 1 to 20"):
         analysis.run(bad, asm, web._asm_sources(), str(tmp_path / "c"), CCX, meta={"name": "sh_lay"})
+
+
+# --------------------------------------------------------------------------- CalculiX .inp as the geometry
+
+def write_test_inp(path):
+    """Solid bar 100 x 10 x 10 mm (10 x 2 x 2 C3D8, ELSET BEAM, *SOLID SECTION) and a shell strip 100 x 10 mm at
+    z = 20 mm (10 x 2 S4, ELSET PLATE, *SHELL SECTION t 2 mm); *NSET FIX (x = 0 of the bar) and PFIX (x = 0 of the
+    strip); material STEEL (density in t/mm^3); a step with a boundary condition (not read)."""
+    L, W, H, nx, ny, nz = 100.0, 10.0, 10.0, 10, 2, 2
+    nid = lambda i, j, k: 1 + i + (nx + 1) * (j + (ny + 1) * k)
+    sid = lambda i, j: 1001 + i + (nx + 1) * j
+    out = ["*HEADING", "test", "*NODE"]
+    for k in range(nz + 1):
+        for j in range(ny + 1):
+            for i in range(nx + 1):
+                out.append("%d, %g, %g, %g" % (nid(i, j, k), L * i / nx, W * j / ny, H * k / nz))
+    for j in range(ny + 1):
+        for i in range(nx + 1):
+            out.append("%d, %g, %g, %g" % (sid(i, j), L * i / nx, W * j / ny, 20.0))
+    out.append("*ELEMENT, TYPE=C3D8, ELSET=BEAM")
+    e = 1
+    for k in range(nz):
+        for j in range(ny):
+            for i in range(nx):
+                n = [nid(i, j, k), nid(i + 1, j, k), nid(i + 1, j + 1, k), nid(i, j + 1, k),
+                     nid(i, j, k + 1), nid(i + 1, j, k + 1), nid(i + 1, j + 1, k + 1), nid(i, j + 1, k + 1)]
+                out.append("%d, %s" % (e, ", ".join(map(str, n))))
+                e += 1
+    out.append("*ELEMENT, TYPE=S4, ELSET=PLATE")
+    for j in range(ny):
+        for i in range(nx):
+            out.append("%d, %d, %d, %d, %d" % (e, sid(i, j), sid(i + 1, j), sid(i + 1, j + 1), sid(i, j + 1)))
+            e += 1
+    out += ["*NSET, NSET=FIX", ", ".join(str(nid(0, j, k)) for k in range(nz + 1) for j in range(ny + 1)),
+            "*NSET, NSET=PFIX", ", ".join(str(sid(0, j)) for j in range(ny + 1)),
+            "*MATERIAL, NAME=STEEL", "*ELASTIC", "210000, 0.3", "*DENSITY", "7.85e-09",
+            "*SOLID SECTION, ELSET=BEAM, MATERIAL=STEEL", "",
+            "*SHELL SECTION, ELSET=PLATE, MATERIAL=STEEL", "2.0",
+            "*STEP", "*STATIC", "*BOUNDARY", "FIX, 1, 3", "*END STEP"]
+    with open(path, "w") as f:
+        f.write("\n".join(out) + "\n")
+    return path
+
+
+def test_inp_view(tmp_path):
+    """inpmodel.view: one component per element set with a section; the bar has 6 planar faces and 12 edges, the
+    strip 1 face and 4 edges (the free boundary split at the corners); materials (density in kg/m^3), body
+    materials, shell sections and node sets of the file."""
+    from drawgen import inpmodel
+    v = inpmodel.view(write_test_inp(str(tmp_path / "t.inp")))
+    c = {x["id"]: x for x in v["components"]}
+    assert set(c) == {"BEAM", "PLATE"}
+    assert len(c["BEAM"]["refs"]) == 6 and all(r["kind"] == "plane" for r in c["BEAM"]["refs"]) and len(c["BEAM"]["erefs"]) == 12
+    assert len(c["PLATE"]["refs"]) == 1 and len(c["PLATE"]["erefs"]) == 4 and c["PLATE"]["surfaces"][0]["id"] == "shell"
+    assert c["BEAM"]["mesh"]["face_body"] == [None] * 6 and c["PLATE"]["mesh"]["face_body"] == [0]
+    assert len(c["BEAM"]["mesh"]["wire"]) == 2 * 176 and len(c["PLATE"]["mesh"]["wire"]) == 2 * 52      # element edges
+    assert v["materials"]["STEEL"] == {"E": 210000.0, "nu": 0.3, "rho": 7850.0}
+    assert v["bodies"] == {"BEAM": {"material": "STEEL"}} and v["shells"] == {"PLATE:shell": {"t": 2.0, "material": "STEEL"}}
+    assert v["nsets"] == ["FIX", "PFIX"] and v["nodes"] == 99 + 33 and v["elements"] == 60
+    with pytest.raises(inpmodel.InpError):
+        inpmodel.view(str(tmp_path / "missing.inp"))
+
+
+@needs_ccx
+def test_inp_source_solve(client, tmp_path):
+    """Analysis of an .inp source: supports on the *NSET node sets of the file, a force on the end face of the bar,
+    a line load on the free edge of the strip (section of the tab, t 2 mm). The elements of the file are solved as
+    they are: reactions equal to the loads; strip tip deflection within 10 % of F L^3 / (3 E I) (1 - nu^2); the
+    report gives the bar volume 10000 mm^3; the API returns the view data and the geometry state key."""
+    from drawgen import inpmodel
+    p = write_test_inp(str(tmp_path / "t.inp"))
+    v = inpmodel.view(p)
+    beam = v["components"][0]
+    end = next(i for i, r in enumerate(beam["refs"]) if abs(r["c"][0] - 100) < 1e-6)
+    tip = next(i for i, r in enumerate(v["components"][1]["erefs"]) if abs(r["c"][0] - 100) < 1e-6)
+    doc = {"source": {"type": "inp", "path": p, "name": "t.inp"}, "materials": v["materials"], "default_material": "STEEL",
+           "bodies": v["bodies"], "shells": v["shells"],
+           "sections": [{"id": "s1", "name": "PLATE", "faces": [{"comp": "PLATE", "face": 0}], "t": 2.0, "material": "STEEL"}],
+           "nsets": [{"id": "n1", "name": "FIX", "kind": "inp", "set": "FIX"}, {"id": "n2", "name": "PFIX", "kind": "inp", "set": "PFIX"}],
+           "supports": [{"id": "s1", "name": "fix", "target": {"nset": "n1"}, "type": "fixed"},
+                        {"id": "s2", "name": "pfix", "target": {"nset": "n2"}, "type": "fixed"}],
+           "loads": [{"id": "l1", "name": "tip", "type": "force", "target": {"comp": "BEAM", "face": end}, "value": [0, 0, -100]},
+                     {"id": "l2", "name": "ptip", "type": "line", "target": {"comp": "PLATE", "edge": tip}, "value": [0, 0, -0.1]}],
+           "members": [], "fasteners": [], "contacts": []}
+    r = analysis.run(doc, {"components": []}, None, str(tmp_path / "wd"), CCX, meta={"name": "inp_src"})
+    t = r["tables"]["total"]
+    reac = {x["name"]: x["F"] for x in t["reactions"]}
+    assert np.allclose(reac["fix"], [0, 0, 100], atol=1e-3) and np.allclose(reac["pfix"], [0, 0, 1.0], atol=1e-3)
+    strip = next(b for b in t["bodies"] if b["id"] == "sec:s1")
+    assert strip["umax"] == pytest.approx(1.0 * 100 ** 3 / (3 * 210000.0 * 10 * 2 ** 3 / 12) * (1 - 0.3 ** 2), rel=0.1)
+    rows = [ln for ln in open(r["files"]["report"]).read().splitlines() if ln.strip().startswith("BEAM")]
+    assert rows and "10000" in rows[0]
+    j = ok(client.post("/api/analysis/inp_geometry", json={"path": p}))
+    assert [c["id"] for c in j["components"]] == ["BEAM", "PLATE"]
+    k = ok(client.post("/api/geometry/state", json={"source": doc["source"]}))["key"]
+    assert k and k == ok(client.post("/api/geometry/state", json={"source": doc["source"]}))["key"]
+    assert client.post("/api/analysis/inp_geometry", json={"path": str(tmp_path / "x.inp")}).status_code != 200
+    doc["nsets"][0]["set"] = "NOPE"
+    with pytest.raises(analysis.AnalysisError, match="NOPE is not in the mesh file"):
+        analysis.run(doc, {"components": []}, None, str(tmp_path / "wd2"), CCX, meta={"name": "inp_src2"})
+
+
+def write_test_rad(path, strip_only=False):
+    """Radioss starter deck (block format, Mg mm s): shell strip 100 x 10 mm (10 x 2 /SHELL, part STRIP, /PROP/SHELL
+    t 2 mm, /MAT/LAW2 STEEL density 7.85e-9 t/mm^3), /GRNOD/NODE ROOT (x = 0 of the strip); the nodes in an #include
+    file. Unless strip_only: two /SH3N (part TRI), two /BRICK (part BAR), a degenerate /BRICK (part TET, C3D4) and a
+    /SPRING (left out)."""
+    nx, ny = 10, 2
+    sid = lambda i, j: 1 + i + (nx + 1) * j
+    nodes = [(sid(i, j), 10.0 * i, 5.0 * j, 0.0) for j in range(ny + 1) for i in range(nx + 1)]
+    extra = {}
+    if not strip_only:
+        for k, p in enumerate([(0, 0, 50), (10, 0, 50), (10, 10, 50), (0, 10, 50)]):          # TRI
+            extra[101 + k] = p
+        for k in range(3):                                                                    # BAR 20 x 10 x 10
+            for j, (y, z) in enumerate([(0, 0), (10, 0), (10, 10), (0, 10)]):
+                extra[201 + 4 * k + j] = (10.0 * k, 100.0 + y, z)
+        for k, p in enumerate([(0, 0, 200), (10, 0, 200), (0, 10, 200), (0, 0, 210)]):        # TET
+            extra[301 + k] = p
+    nodes += [(n, *p) for n, p in sorted(extra.items())]
+    inc = os.path.splitext(path)[0] + "_nodes.inc"
+    with open(inc, "w") as f:
+        f.write("/NODE\n#  node_ID                  Xc                  Yc                  Zc\n")
+        f.write("".join("%10d%20.6f%20.6f%20.6f\n" % n for n in nodes))
+    L = ["#RADIOSS STARTER", "/BEGIN", "test", "      2025         0",
+         "                  Mg                  mm                   s", "                  Mg                  mm                   s",
+         "#include %s" % os.path.basename(inc),
+         "/MAT/LAW2/1", "STEEL", "#              RHO_I", "            7.85e-09", "#                  E                  nu",
+         "              210000                 0.3", "               355.0               500.0                 0.3",
+         "/PART/1", "STRIP", "         1         1         0",
+         "/PROP/SHELL/1", "STRIP", "        24        -1         1         0", "                   0                   0",
+         "         5                   2               0.833         1         1",
+         "/SHELL/1"]
+    e = 1
+    for j in range(ny):
+        for i in range(nx):
+            L.append("%10d%10d%10d%10d%10d" % (e, sid(i, j), sid(i + 1, j), sid(i + 1, j + 1), sid(i, j + 1)))
+            e += 1
+    if not strip_only:
+        L += ["/PART/2", "TRI", "         1         1         0", "/SH3N/2", "%10d%10d%10d%10d" % (101, 101, 102, 103), "%10d%10d%10d%10d" % (102, 101, 103, 104),
+              "/PART/3", "BAR", "         2         1         0", "/PROP/SOLID/2", "BAR", "        24", "/BRICK/3"]
+        for k in range(2):
+            a, b = [201 + 4 * k + j for j in range(4)], [205 + 4 * k + j for j in range(4)]
+            L.append("%10d" * 9 % (201 + k, a[0], b[0], b[1], a[1], a[3], b[3], b[2], a[2]))
+        L += ["/PART/4", "", "         2         1         0", "/BRICK/4", "%10d" * 9 % (301, 301, 302, 303, 303, 304, 304, 304, 304),
+              "/SPRING/5", "%10d%10d%10d" % (401, 1, 2)]
+    L += ["/GRNOD/NODE/1", "ROOT", "".join("%10d" % sid(0, j) for j in range(ny + 1)), "/END"]
+    with open(path, "w") as f:
+        f.write("\n".join(L) + "\n")
+    return path
+
+
+def test_rad_read(tmp_path):
+    """radmodel.read through inpmodel: the parts as element sets (S4, S3, C3D8, a degenerate brick as C3D4; a part
+    without title PART_<id>), the shell thickness of /PROP/SHELL, the material of /MAT/LAW2 (density in kg/m^3), the
+    /GRNOD node set, the nodes of the #include file; /SPRING left out with a warning. The view has a component per
+    part."""
+    from drawgen import inpmodel
+    p = write_test_rad(str(tmp_path / "t_0000.rad"))
+    m = inpmodel.read(p)
+    assert {k: len(v) for k, v in m["elsets"].items()} == {"STRIP": 20, "TRI": 2, "BAR": 2, "PART_4": 1}
+    assert sorted(set(m["elements"][e][0] for e in m["elsets"]["STRIP"])) == ["S4"]
+    assert m["elements"][101][0] == "S3" and m["elements"][201][0] == "C3D8" and m["elements"][301] == ("C3D4", [301, 302, 303, 304])
+    sec = {s["elset"]: s for s in m["sections"]}
+    assert sec["STRIP"]["kind"] == "shell" and sec["STRIP"]["t"] == 2.0 and sec["BAR"]["kind"] == "solid" and sec["STRIP"]["material"] == "STEEL"
+    assert m["materials"]["STEEL"]["E"] == 210000.0 and m["materials"]["STEEL"]["rho"] == pytest.approx(7850.0)
+    assert m["nsets"] == {"ROOT": [1, 12, 23]} and len(m["nodes"]) == 33 + 4 + 12 + 4
+    assert any("SPRING" in w for w in m["warnings"])
+    v = inpmodel.view(p)
+    assert [c["id"] for c in v["components"]] == ["STRIP", "TRI", "BAR", "PART_4"]
+    assert v["shells"]["STRIP:shell"] == {"t": 2.0, "material": "STEEL"}
+    from drawgen.explicit import meshview
+    r = meshview.read_rad(p)
+    assert [x[0] for x in r["parts"]] == ["STRIP", "TRI", "BAR", "PART_4"] and r["part_thick"][0] == [2.0, 0.0]
+
+
+@needs_ccx
+def test_rad_source_solve(tmp_path):
+    """Analysis of a .rad source: the strip clamped on its /GRNOD node set, a line load on the free edge (total 1 N):
+    tip deflection within 10 % of F L^3 / (3 E I) (1 - nu^2), reaction equal to the load."""
+    from drawgen import inpmodel
+    p = write_test_rad(str(tmp_path / "s_0000.rad"), strip_only=True)
+    v = inpmodel.view(p)
+    tip = next(i for i, r in enumerate(v["components"][0]["erefs"]) if abs(r["c"][0] - 100) < 1e-6)
+    doc = {"source": {"type": "inp", "path": p, "name": "s_0000.rad"}, "materials": v["materials"], "default_material": "STEEL",
+           "bodies": {}, "shells": v["shells"],
+           "sections": [{"id": "s1", "name": "STRIP", "faces": [{"comp": "STRIP", "face": 0}], "t": 2.0, "material": "STEEL"}],
+           "nsets": [{"id": "n1", "name": "ROOT", "kind": "inp", "set": "ROOT"}],
+           "supports": [{"id": "s1", "name": "root", "target": {"nset": "n1"}, "type": "fixed"}],
+           "loads": [{"id": "l1", "name": "tip", "type": "line", "target": {"comp": "STRIP", "edge": tip}, "value": [0, 0, -0.1]}],
+           "members": [], "fasteners": [], "contacts": []}
+    r = analysis.run(doc, {"components": []}, None, str(tmp_path / "wd"), CCX, meta={"name": "rad_src"})
+    t = r["tables"]["total"]
+    assert np.allclose(t["reactions"][0]["F"], [0, 0, 1.0], atol=1e-3)
+    assert t["bodies"][0]["umax"] == pytest.approx(1.0 * 100 ** 3 / (3 * 210000.0 * 10 * 2 ** 3 / 12) * (1 - 0.3 ** 2), rel=0.1)
+
+
+@needs_ccx
+def test_vertex_node_element_targets(tmp_path):
+    """Targets of mesh nodes, elements and geometry vertices (.inp source): the bar clamped on its x = 0 nodes given
+    as mesh nodes, a force of 100 N on the end elements of the bar (shared by their nodes), the strip clamped on its
+    x = 0 elements and loaded by 1 N at a vertex of its free end; reactions equal to the loads; a node set of a
+    selection with vertices, nodes and elements; a node not in the mesh refused."""
+    from drawgen import inpmodel
+    p = write_test_inp(str(tmp_path / "t.inp"))
+    m = inpmodel.read(p)
+    fix = sorted(m["nsets"]["FIX"])
+    end_el = [e for e in m["elsets"]["BEAM"] if max(m["nodes"][n][0] for n in m["elements"][e][1]) == 100.0]
+    root_el = [e for e in m["elsets"]["PLATE"] if min(m["nodes"][n][0] for n in m["elements"][e][1]) == 0.0]
+    v = inpmodel.view(p)
+    doc = {"source": {"type": "inp", "path": p, "name": "t.inp"}, "materials": v["materials"], "default_material": "STEEL",
+           "bodies": v["bodies"], "shells": v["shells"],
+           "sections": [{"id": "s1", "name": "PLATE", "faces": [{"comp": "PLATE", "face": 0}], "t": 2.0, "material": "STEEL"}],
+           "nsets": [{"id": "n1", "name": "MIX", "kind": "selection", "vertices": [{"comp": "PLATE", "vertex": 0, "xyz": [100, 10, 20]}],
+                      "nodes": [1], "elements": [end_el[0]]}],
+           "supports": [{"id": "s1", "name": "bar", "target": {"nodes": fix}, "type": "fixed"},
+                        {"id": "s2", "name": "strip", "target": {"elements": root_el}, "type": "fixed"}],
+           "loads": [{"id": "l1", "name": "end", "type": "force", "target": {"elements": end_el}, "value": [0, 0, -100]},
+                     {"id": "l2", "name": "tip", "type": "force", "target": {"vertices": [{"comp": "PLATE", "vertex": 3, "xyz": [100, 0, 20]}]}, "value": [0, 0, -1]}],
+           "members": [], "fasteners": [], "contacts": []}
+    r = analysis.run(doc, {"components": []}, None, str(tmp_path / "wd"), CCX, meta={"name": "vne"}, keep=True)
+    reac = {x["name"]: x["F"] for x in r["tables"]["total"]["reactions"]}
+    assert np.allclose(reac["bar"], [0, 0, 100], atol=1e-3) and np.allclose(reac["strip"], [0, 0, 1], atol=1e-3)
+    M = r["model"]
+    ids = M.node_set(doc["nsets"][0])
+    assert 1 in ids and len(ids) == 1 + 1 + 8          # the vertex node, node 1, the 8 nodes of the end element
+    assert any(np.allclose(M.X[n], [100, 10, 20]) for n in ids)
+    doc["supports"][0]["target"] = {"nodes": fix + [99999]}
+    with pytest.raises(analysis.AnalysisError, match="not in the mesh"):
+        analysis.run(doc, {"components": []}, None, str(tmp_path / "wd2"), CCX, meta={"name": "vne2"})
+
+
+def _inp_steps_doc(p):
+    from drawgen import inpmodel
+    v = inpmodel.view(p)
+    end = next(i for i, r in enumerate(v["components"][0]["refs"]) if abs(r["c"][0] - 100) < 1e-6)
+    top = next(i for i, r in enumerate(v["components"][0]["refs"]) if abs(r["c"][2] - 10) < 1e-6)
+    return {"source": {"type": "inp", "path": p, "name": "t.inp"}, "materials": v["materials"], "default_material": "STEEL",
+            "bodies": v["bodies"], "shells": {"PLATE:shell": {"mode": "off"}}, "sections": [],
+            "nsets": [{"id": "n1", "name": "FIX", "kind": "inp", "set": "FIX"}],
+            "supports": [{"id": "s1", "name": "root", "target": {"nset": "n1"}, "type": "fixed"},
+                         {"id": "s2", "name": "end", "target": {"comp": "BEAM", "face": end}, "type": "pinned", "steps": {"a": 1}}],
+            "loads": [{"id": "l1", "name": "top", "type": "force", "target": {"comp": "BEAM", "face": top}, "value": [0, 0, -100],
+                       "steps": {"a": 1, "b": 0.5, "c": 1}}],
+            "members": [], "fasteners": [], "contacts": []}, v
+
+
+@needs_ccx
+def test_steps_load_history_release_and_dynamics(tmp_path):
+    """Three steps: static (both supports, load 100 N), static (end support released, load factor 0.5), implicit
+    dynamic (load 100 N, a 50 N pulse in y with a triangular amplitude, initial velocity of the bar): reactions per step equal to the
+    loads, the released support without reaction, the dynamic applied load following the amplitude; the input file
+    with *AMPLITUDE, *INITIAL CONDITIONS, *DYNAMIC and *BOUNDARY, OP=NEW only where a support is released; the
+    report lists the steps. A step of kind explicit (*DYNAMIC, EXPLICIT) runs."""
+    from test_analysis import write_test_inp as w
+    p = w(str(tmp_path / "t.inp"))
+    doc, v = _inp_steps_doc(p)
+    doc["steps"] = [{"id": "a", "name": "Both", "kind": "static"}, {"id": "b", "name": "Released", "kind": "static"},
+                    {"id": "c", "name": "Hit", "kind": "dynamic", "time": 0.002}]
+    doc["loads"][0]["amplitude"] = None
+    doc["amplitudes"] = [{"id": "am", "name": "pulse", "points": [[0, 0], [0.001, 1], [0.002, 0]]}]
+    endf = doc["supports"][1]["target"]
+    doc["loads"].append({"id": "l2", "name": "pulse", "type": "force", "target": dict(endf), "value": [0, -50, 0],
+                         "amplitude": "am", "steps": {"c": 1}})
+    doc["initial_velocities"] = [{"id": "v1", "name": "v", "target": {"bodies": ["BEAM"]}, "v": [0, 100, 0]}]
+    r = analysis.run(doc, {"components": []}, None, str(tmp_path / "wd"), CCX, meta={"name": "steps"})
+    T = r["tables"]
+    reac = lambda st: {x["name"]: np.asarray(x["F"]) for x in T[st]["reactions"]}
+    assert np.allclose(reac("s1")["root"] + reac("s1")["end"], [0, 0, 100], atol=1e-2) and abs(reac("s1")["end"][2]) > 1
+    assert np.allclose(reac("s2")["end"], 0, atol=1e-6) and np.allclose(reac("s2")["root"], [0, 0, 50], atol=1e-2)
+    assert np.allclose(T["s3"]["applied"], [0, 0, -100], atol=1e-6) and T["total"] == T["s3"]      # the pulse back at 0
+    inc = [x for x in r["increments"] if x["user_step"] == 3]
+    peak = min(inc, key=lambda x: abs(x["tau"] - 0.5))
+    assert abs(T[peak["state"]]["applied"][1] - (-50 * (1 - abs(peak["tau"] * 0.002 - 0.001) / 0.001))) < 1e-6
+    text = open(r["files"]["inp"]).read()
+    assert "*AMPLITUDE, NAME=AMP_am" in text and "*INITIAL CONDITIONS, TYPE=VELOCITY" in text and "*DYNAMIC, ALPHA=-0.05" in text
+    assert text.count("*BOUNDARY, OP=NEW") == 2 and "S, ENER" in text
+    assert [s["name"] for s in r["summary"]["steps"]] == ["Both", "Released", "Hit"]
+    rep = open(r["files"]["report"]).read()
+    assert "Supports released in a step: end." in rep and "Hit" in rep
+    doc2, _v = _inp_steps_doc(p)
+    doc2["steps"] = [{"id": "a", "name": "Explicit", "kind": "explicit", "time": 0.0005, "inc0": 0.002}]
+    r2 = analysis.run(doc2, {"components": []}, None, str(tmp_path / "wd2"), CCX, meta={"name": "expl"})
+    assert "*DYNAMIC, EXPLICIT" in open(r2["files"]["inp"]).read() and r2["increments"]
+
+
+@needs_ccx
+def test_b31_beams_in_nonlinear_step(tmp_path, web):
+    """A cantilever beam (RECT 20 x 40 mm, 1000 mm) in a step with large deformation: written as B31 with *BEAM
+    SECTION, SECTION=RECT; tip deflection within 1 % of P L^3 / (3 E I), reaction equal to the load; an I section is
+    refused in a nonlinear step."""
+    doc = {"materials": STEEL, "default_material": "Steel", "source": {"type": "assembly", "name": ""},
+           "members": [{"id": "m1", "name": "B", "kind": "beam", "a": {"xyz": [0, 0, 0]}, "b": {"xyz": [1000, 0, 0]},
+                        "section": {"shape": "RECT", "b": 20, "h": 40}, "up": [0, 0, 1], "elements": 20}],
+           "supports": [{"id": "s1", "name": "root", "target": {"member": "m1", "end": "a"}, "type": "fixed"}],
+           "loads": [{"id": "l1", "name": "tip", "type": "force", "target": {"member": "m1", "end": "b"}, "value": [0, 0, -100]}],
+           "nonlinear": {"nlgeom": True}, "fasteners": [], "plates": []}
+    r = analysis.run(doc, {"components": []}, web._asm_sources(), str(tmp_path), CCX, meta={"name": "b31"})
+    text = open(r["files"]["inp"]).read()
+    assert "TYPE=B31" in text and "SECTION=RECT" in text and "TYPE=U1" not in text
+    assert np.allclose(r["tables"]["total"]["reactions"][0]["F"], [0, 0, 100], atol=1e-3)
+    I = 20 * 40 ** 3 / 12
+    uz = max(abs(u[2]) for u in analysis.read_dat(r["files"]["dat"])[1][("displacements", "NMEMB")].values())
+    assert uz == pytest.approx(100 * 1000 ** 3 / (3 * 210000 * I), rel=0.01)
+    doc["members"][0]["section"] = {"shape": "I", "b": 50, "h": 100, "tf": 8, "tw": 5}
+    with pytest.raises(analysis.AnalysisError, match="RECT, ROUND, PIPE or BOX"):
+        analysis.run(doc, {"components": []}, web._asm_sources(), str(tmp_path / "b"), CCX, meta={"name": "b31i"})
+
+
+@needs_ccx
+def test_time_history_requests(tmp_path, monkeypatch):
+    """History output: a node request on the clamped nodes (displacement, velocity, total reaction force) and an
+    element request on the bar (stress, strain, internal and kinetic energy) over a static step (4 increments) and an
+    implicit dynamic step: *NODE PRINT and *EL PRINT with TOTALS=ONLY, velocities and kinetic energy only in the
+    dynamic step; the total reaction in z at the end of the static step equal to the load less its share on the clamped
+    nodes (the solver reaction RF); the internal energy at the
+    end of the static step equal to the work of the load (half the force times the mean deflection of the loaded top
+    face, 0.4 x the tip deflection for a uniform load on a cantilever) within 5 %."""
+    from test_analysis import write_test_inp as w
+    p = w(str(tmp_path / "t.inp"))
+    doc, v = _inp_steps_doc(p)
+    doc["supports"][1].pop("steps")
+    doc["loads"][0].pop("steps")
+    doc["supports"].pop(1)
+    doc["steps"] = [{"id": "a", "name": "Load", "kind": "static", "inc0": 0.25, "incmax": 0.25}, {"id": "b", "name": "Dyn", "kind": "dynamic", "time": 0.001}]
+    doc["nonlinear"] = {"nlgeom": True}
+    doc["history"] = [{"id": "h1", "name": "root", "kind": "node", "target": {"nset": "n1"}, "quantities": ["U", "RF", "V"]},
+                      {"id": "h2", "name": "bar", "kind": "element", "target": {"bodies": ["BEAM"]}, "quantities": ["S", "E", "ENER", "EKIN"]}]
+    class Prog(object):                     # run monitor: live_state while ccx runs
+        calls = []
+
+        def __call__(self, *a):
+            pass
+
+        def live(self, d):
+            self.calls.append(d)
+    monkeypatch.setattr(analysis, "LIVE_EVERY", 0.0)
+    prog = Prog()
+    r = analysis.run(doc, {"components": []}, None, str(tmp_path / "wd"), CCX, progress=prog, meta={"name": "th"})
+    assert prog.calls and all({"sta", "n", "time_history", "cvg", "log", "stage", "stages", "elapsed", "estimate"} <= set(c) for c in prog.calls)
+    last = prog.calls[-1]
+    if last["n"]:
+        assert last["sta"]["step"] >= 1 and last["time_history"][-1]["id"] in ("_sta", "h2")
+    sta = next(q for q in r["time_history"] if q["id"] == "_sta")
+    s_ = {x["name"]: x for x in sta["series"]}
+    assert s_["step"]["v"][:4] == [1, 1, 1, 1] and s_["increment size"]["v"][0] == pytest.approx(0.25) and s_["step"]["v"][-1] == 2
+    rows = analysis.read_sta(r["files"]["dat"][:-4] + ".sta")
+    assert len(rows) == len(sta["series"][0]["t"])
+    p2 = tmp_path / "cut.sta"
+    p2.write_text("SUMMARY OF JOB INFORMATION\n  STEP      INC     ATT  ITRS     TOT TIME     STEP TIME      INC TIME\n"
+                  "     1          1     1     2  0.250000E+00  0.250000E+00  0.250000E+00\n"
+                  "     1          2     2U    9  0.375000E+00  0.375000E+00  0.125000E+00\n")
+    assert [(x["att"], x["cut"], x["itrs"]) for x in analysis.read_sta(str(p2))] == [(1, False, 2), (2, True, 9)]
+    text = open(r["files"]["inp"]).read()
+    assert "*NODE PRINT, NSET=H1, TOTALS=ONLY" in text and "*EL PRINT, ELSET=HE2, TOTALS=ONLY" in text
+    st1 = text.split("*END STEP")[0]
+    assert "U, V" not in st1 and "ELKE" not in st1 and "ELSE, ELKE" in text.split("*END STEP")[1]
+    th = {q["id"]: {s["name"]: s for s in q["series"]} for q in r["time_history"]}
+    rf = th["h1"]["RFz total"]
+    k = max(i for i, t in enumerate(rf["t"]) if t <= 1.0 + 1e-9)
+    # the solver reaction (RF) leaves out the load share on the clamped nodes: 100 N less 0.5 / 10 of it
+    assert rf["v"][k] == pytest.approx(95, rel=1e-3) and sum(1 for t in rf["t"] if t <= 1.0 + 1e-9) == 4
+    assert "vx mean" in th["h1"] and "kinetic energy" in th["h2"] and th["h2"]["von Mises max"]["v"][k] > 0
+    ener = th["h2"]["internal energy"]["v"][k]
+    uz = r["tables"]["s1"]["bodies"][0]["umax"]
+    assert ener == pytest.approx(0.5 * 100 * 0.4 * uz, rel=0.05)        # uniform load: mean deflection 0.4 x the tip
+
+
+def test_inp_info_contents_and_report(tmp_path):
+    """Input file contents (inpinfo.inspect, report): the test file with an include file, a second step with a
+    concentrated load on node set FIX, *TIE, *AMPLITUDE, *SURFACE, a B31 element (not used as geometry) and an
+    inverted C3D8: nodes (count, extent 100 x 10 x 20 mm), element types (family, order, integration, numbers), the
+    quality of the C3D8 (edges 5 to 10 mm, volume 250 mm^3, one inverted element), element sets with volume and mass
+    (bar 7.85e-2 kg, strip 1.57e-2 kg), sections, the material, the constraints, both steps with the total load
+    (9 nodes x -10 N), output requests, the keyword list and the checks; the report in 96 columns; a Radioss deck."""
+    from drawgen import inpinfo
+    p = write_test_inp(str(tmp_path / "info.inp"))
+    text = open(p).read()
+    extra = ["*NODE", "5001, 0, 0, 50", "5002, 10, 0, 50", "*ELEMENT, TYPE=B31, ELSET=BAR", "9001, 5001, 5002",
+             "*ELEMENT, TYPE=C3D8, ELSET=BAD", "9002, 1, 12, 13, 2, 34, 45, 46, 35",
+             "*SURFACE, NAME=STOP, TYPE=ELEMENT", "1, S1", "2, S1", "*TIE, NAME=T1", "STOP, STOP",
+             "*AMPLITUDE, NAME=RAMP", "0, 0, 1, 1"]
+    open(str(tmp_path / "extra.inc"), "w").write("\n".join(extra) + "\n")
+    text = text.replace("*MATERIAL", "*INCLUDE, INPUT=extra.inc\n*MATERIAL", 1)
+    text += "*STEP, NLGEOM\n*STATIC\n0.1, 1\n*CLOAD, AMPLITUDE=RAMP\nFIX, 3, -10\n*NODE PRINT, NSET=FIX\nRF\n*END STEP\n"
+    open(p, "w").write(text)
+    i = inpinfo.inspect(p)
+    assert i["file"]["includes"] == [{"file": "extra.inc", "found": True, "lines": len(extra)}]
+    assert i["nodes"]["count"] == 132 + 2 and i["nodes"]["bbox"]["size"] == pytest.approx([100, 10, 50])
+    T = {t["type"]: t for t in i["element_types"]}
+    assert T["C3D8"]["count"] == 41 and T["C3D8"]["family"] == "solid" and T["C3D8"]["order"] == "linear" and T["C3D8"]["read"]
+    assert T["B31"]["family"] == "beam" and not T["B31"]["read"] and T["S4"]["family"] == "shell"
+    q = T["C3D8"]["quality"]
+    assert q["inverted"] == 1 and q["edge"]["min"] == pytest.approx(5) and q["volume"]["max"] == pytest.approx(250)
+    assert T["S4"]["quality"]["area_total"] == pytest.approx(1000) and T["S4"]["quality"]["angle_min"]["min"] == pytest.approx(90)
+    E = {e["name"]: e for e in i["elsets"]}
+    assert E["BEAM"]["mass_kg"] == pytest.approx(0.0785) and E["PLATE"]["mass_kg"] == pytest.approx(0.0157) and E["PLATE"]["volume"] == pytest.approx(2000)
+    assert i["mass"]["kg"] == pytest.approx(0.0942) and {s["kind"] for s in i["sections"]} == {"solid", "shell"}
+    m = i["materials"][0]
+    assert m["name"] == "STEEL" and m["E"] == 210000 and m["rho"] == pytest.approx(7850) and m["used"]
+    kinds = [c[0] for c in i["constraints"]]
+    assert "*TIE" in kinds and "*AMPLITUDE" in kinds and i["surfaces"][0]["name"] == "STOP"
+    s2 = i["steps"][1]
+    assert s2["params"] == {"NLGEOM": ""} and s2["procedure"] == "STATIC" and s2["cload_total"][2] == pytest.approx(-90)
+    assert s2["amplitudes"] == ["RAMP"] and s2["outputs"][0]["vars"] == ["RF"]
+    assert {"*TIE": False, "*NODE": True}.items() <= {k["keyword"]: k["read"] for k in i["keywords"]}.items()
+    chk = " | ".join(i["checks"])
+    assert "C3D8: 1 inverted element" in chk and "B31: 1 element(s) not used as geometry" in chk and "in no section" in chk
+    r = inpinfo.report(i)
+    assert "ELEMENT TYPES (62 elements)" in r and "linear beam" in r and "*TIE" in r and "2. Step 2: STATIC" in r
+    rad = inpinfo.inspect(write_test_rad(str(tmp_path / "r_0000.rad")))
+    assert rad["file"]["kind"] == "rad" and any(t["type"] == "S4" for t in rad["element_types"]) and any(k["keyword"] == "/PART" for k in rad["keywords"])
+    assert "INPUT FILE: r_0000.rad" in inpinfo.report(rad)
+
+
+def test_inp_query_nodes_and_elements(tmp_path):
+    """Search of a .inp (inpquery.query) on the test file with a duplicated node and an inverted element: nodes by
+    number (coordinates, sets, elements), the nearest node of a point, nodes in a box, nodes of an element, nodes of a
+    set and of a type, coincident nodes; elements by number (type, nodes, set, section, material, volume, edges),
+    centroid in a box and near a point, of a set, of a type, on a node, inverted elements, aspect ratio above a value
+    (largest first); the marks of the view; numbers not in the file; an unknown set refused."""
+    from drawgen import inpquery
+    p = write_test_inp(str(tmp_path / "q.inp"))
+    text = open(p).read().replace("*MATERIAL", "*NODE\n7001, 100, 10, 10\n*ELEMENT, TYPE=C3D8, ELSET=BAD\n9002, 1, 12, 13, 2, 34, 45, 46, 35\n*MATERIAL", 1)
+    open(p, "w").write(text)
+    Q = lambda **q: inpquery.query(p, q)
+    r = Q(what="nodes", by="number", numbers="1-3, 88888")
+    assert [x["id"] for x in r["rows"]] == [1, 2, 3] and r["rows"][1]["xyz"] == [10, 0, 0] and "88888" in r["note"]
+    assert "FIX" in r["rows"][0]["sets"] and r["rows"][0]["elements"] == 2 and r["marks"]["points"][0] == [0, 0, 0]
+    r = Q(what="nodes", by="near", point=[100.1, 10, 10], nearest=1)
+    assert r["rows"][0]["id"] in (99, 7001) and r["rows"][0]["dist"] == pytest.approx(0.1)
+    assert Q(what="nodes", by="box", box=[95, None, None, None, None, None])["count"] == 9 + 3 + 1
+    assert Q(what="nodes", by="attached", numbers="1")["count"] == 8
+    assert Q(what="nodes", by="set", set="pfix")["count"] == 3 and Q(what="nodes", by="type", type="S4")["count"] == 33
+    r = Q(what="nodes", by="quality", criterion="coincident")
+    assert sorted(x["id"] for x in r["rows"]) == [99, 7001]
+    r = Q(what="elements", by="number", numbers="1")
+    e = r["rows"][0]
+    assert e["type"] == "C3D8" and e["nodes"] == [1, 2, 13, 12, 34, 35, 46, 45] and e["sets"] == ["BEAM"] and e["section"] == "solid"
+    assert e["material"] == "STEEL" and e["measure"] == pytest.approx(250) and e["edge_min"] == pytest.approx(5) and e["aspect"] == pytest.approx(2)
+    assert len(r["marks"]["lines"]) == 12 and e["edges"] == 12
+    assert Q(what="elements", by="box", box=[None, None, None, 10, None, None])["count"] == 4 + 2 + 1
+    r = Q(what="elements", by="near", point=[95, 7.5, 21], nearest=1)
+    assert r["rows"][0]["type"] == "S4" and r["rows"][0]["dist"] == pytest.approx(1.0)
+    assert Q(what="elements", by="set", set="PLATE")["count"] == 20 and Q(what="elements", by="type", type="S4")["count"] == 20
+    assert sorted(x["id"] for x in Q(what="elements", by="attached", numbers="1")["rows"]) == [1, 9002]
+    r = Q(what="elements", by="quality", criterion="inverted")
+    assert [x["id"] for x in r["rows"]] == [9002] and r["rows"][0]["inverted"]
+    r = Q(what="elements", by="quality", criterion="aspect", value=1.5, limit=3)
+    assert r["count"] == 41 + 20 and len(r["rows"]) == 3 and r["truncated"]
+    with pytest.raises(inpquery.QueryError, match="node set NOPE not found"):
+        Q(what="nodes", by="set", set="nope")
+
+
+def test_inp_query_at_a_point(tmp_path):
+    """Search at a point picked in the view (inpquery by "at"): the nearest node; the element at a point on the top of
+    the bar (the hexahedron, not the strip), on the strip (the shell), inside the bar; a point off the elements: the
+    nearest centroid; restricted to a node set and to an element type; the faces of the element as triangles."""
+    from drawgen import inpquery
+    p = write_test_inp(str(tmp_path / "at.inp"))
+    Q = lambda **q: inpquery.query(p, q)["rows"]
+    assert [x["id"] for x in Q(what="nodes", by="at", point=[99.9, 10, 10])] == [99]
+    assert Q(what="nodes", by="at", point=[0, 0, 19], within={"set": "PFIX"})[0]["id"] == 1001
+    assert Q(what="nodes", by="at", point=[0, 0, 11], within={"type": "S4"})[0]["id"] == 1001
+    e = Q(what="elements", by="at", point=[55, 3, 10])[0]
+    assert e["type"] == "C3D8" and e["centroid"] == pytest.approx([55, 2.5, 7.5]) and len(e["tris"]) == 12 * 9
+    e = Q(what="elements", by="at", point=[55, 3, 20])[0]
+    assert e["type"] == "S4" and e["centroid"] == pytest.approx([55, 2.5, 20]) and len(e["tris"]) == 2 * 9
+    assert Q(what="elements", by="at", point=[51, 9, 4])[0]["centroid"] == pytest.approx([55, 7.5, 2.5])
+    assert Q(what="elements", by="at", point=[55, 3, 20.5], within={"type": "C3D8"})[0]["centroid"] == pytest.approx([55, 2.5, 7.5])
+    assert Q(what="elements", by="at", point=[55, 3, 10], within={"set": "PLATE"})[0]["type"] == "S4"
+    with pytest.raises(inpquery.QueryError, match="element set NOPE not found"):
+        Q(what="elements", by="at", point=[0, 0, 0], within={"set": "nope"})
+
+
+def test_inp_text_lines_and_find(tmp_path):
+    """File text of the Input file page (inptext): lines by number with the total, the last block short; find of a
+    text forward and backward, of the data line of a node and of an element (not a *NSET line with the number), not
+    found; a .rad node line."""
+    from drawgen import inptext
+    p = write_test_inp(str(tmp_path / "t.inp"))
+    L = open(p).read().splitlines()
+    r = inptext.lines(p, 1, 3)
+    assert r["lines"] == L[:3] and r["total"] == len(L) and r["start"] == 1
+    r = inptext.lines(p, len(L) - 1, 200)
+    assert r["lines"] == L[-2:]
+    F = lambda **q: inptext.find(p, q)["line"]
+    k = F(text="*element")
+    assert L[k - 1].startswith("*ELEMENT, TYPE=C3D8") and L[F(text="*element", **{"from": k}) - 1].startswith("*ELEMENT, TYPE=S4")
+    assert F(text="*element", back=True, **{"from": len(L)}) == F(text="*element", **{"from": k})
+    assert L[F(text="12", kind="node") - 1].startswith("12, ") and L[F(text="41", kind="element") - 1].startswith("41, 1001,")
+    assert F(text="nope") is None and F(text="99999", kind="node") is None
+    rad = tmp_path / "d_0000.rad"
+    rad.write_text("#RADIOSS STARTER\n/NODE\n#  id x y z\n       5 0 0 0\n/SHELL/1\n       5 1 2 3 4\n/END\n")
+    assert inptext.find(str(rad), {"text": "5", "kind": "node"})["line"] == 4 and inptext.find(str(rad), {"text": "5", "kind": "element"})["line"] == 6
+
+
+def test_material_and_amplitude_curves(tmp_path):
+    """Curves of the plots: the library entries (the static curve; Cowper-Symonds rate curves; Johnson-Cook a + b ep^n
+    at eps0 and at 10, 100, 1000 1/s; an elastic entry none); the *PLASTIC table (one curve per temperature) and the
+    *AMPLITUDE points of an .inp (Input file page); /MAT/PLAS_TAB with its /FUNCT, /MAT/PLAS_JOHNS and the /FUNCT
+    curves of a .rad."""
+    from drawgen import matcurve, inpinfo
+    from drawgen.analysis import library_list
+    c = matcurve.library("Steel S355 (DNVGL 19-pt + Cowper-Symonds rate)")
+    assert [x["name"] for x in c] == ["static", "1 1/s", "10 1/s", "100 1/s", "1000 1/s"] and len(c[0]["ep"]) == 19
+    assert c[0]["s"][0] == 355 and c[3]["s"][0] == pytest.approx(355 * (1 + (100 / 5000) ** (1 / 2.5)))
+    j = matcurve.library("Steel S355 (Johnson-Cook fit of DNVGL curve)")
+    assert [x["name"] for x in j] == ["1 1/s", "10 1/s", "100 1/s", "1000 1/s"]
+    k = j[0]["ep"].index(0.1)
+    assert j[0]["s"][k] == pytest.approx(355 + 523.2 * 0.1 ** 0.617) and j[3]["s"][0] == pytest.approx(355 * (1 + 0.01 * math.log(1000)))
+    assert matcurve.library("Elastic Tool Steel (LAW1, no yield)") == [] and matcurve.library("nope") == []
+    assert next(x for x in library_list() if x["name"].startswith("Steel S355 (DNVGL 19-Point"))["curves"][0]["s"][-1] == pytest.approx(853.86)
+    p = write_test_inp(str(tmp_path / "c.inp"))
+    text = open(p).read().replace("*DENSITY", "*PLASTIC\n250, 0, 20\n300, 0.1, 20\n200, 0, 300\n240, 0.1, 300\n*DENSITY", 1)
+    text = text.replace("*STEP", "*AMPLITUDE, NAME=A1\n0, 0, 0.5, 1, 1, 1\n2, 0\n*STEP", 1)
+    open(p, "w").write(text)
+    cv = inpinfo.inspect(p)["curves"]
+    assert [x["name"] for x in cv["materials"]["STEEL"]] == ["T 20", "T 300"] and cv["materials"]["STEEL"][1]["s"] == [200, 240]
+    assert cv["amplitudes"] == [{"name": "A1", "time": "STEP TIME", "t": [0, 0.5, 1, 2], "v": [0, 1, 1, 0]}]
+    rad = ["/MAT/PLAS_TAB/1", "S355", "#  rho", "7.85e-9 0", "# E nu", "210000 0.3 0 0 0", "# N", "2 1 0 1e4 0 0", "# fct", "0 0 0 0 0",
+           "# ids", "10 11", "# fscale", "0 2", "# rate", "0 100", "/MAT/PLAS_JOHNS/2", "JC", "7.85e-9", "210000 0.3 0", "300 400 0.5 0 0",
+           "/FUNCT/10", "CURVE10", "#  X  Y", "0 355", "0.5 700", "/FUNCT/11", "CURVE11", "0 355", "0.5 700", "/END"]
+    r = matcurve.rad(rad)
+    assert [x["name"] for x in r["materials"]["S355"]] == ["static", "100 1/s"] and r["materials"]["S355"][1]["s"] == [710, 1400]
+    assert r["materials"]["JC"][0]["s"][r["materials"]["JC"][0]["ep"].index(0.1)] == pytest.approx(300 + 400 * 0.1 ** 0.5)
+    assert [(f["id"], f["name"], f["y"]) for f in r["functions"]] == [(10, "CURVE10", [355, 700]), (11, "CURVE11", [355, 700])]
+
+
+def test_run_monitor_readers(tmp_path):
+    """The readers of the run monitor: job.cvg rows and the convergence request (iteration count, increment attempts,
+    a cutback attempt), the solver stage from the log text, the log tail from a line start, the estimate of the
+    remaining time from the increments."""
+    from drawgen.analysis import read_cvg, cvg_series, log_stage, log_tail, RunMonitor
+    cvg = tmp_path / "job.cvg"
+    cvg.write_text("SUMMARY OF C0NVERGENCE INFORMATION\n  STEP   INC  ATT   ITER     CONT.   RESID.        CORR.      RESID.      CORR.\n"
+                   "                              EL.    FORCE         DISP       FLUX        TEMP.\n                              (#)     (%)           (%)        (%)         (%)\n"
+                   "     1     1     1     1    13377  0.5671E+04  0.1000E+03  0.0000E+00  0.0000E+00\n"
+                   "     1     1     1     2    13360  0.6342E+02  0.1805E+01  0.0000E+00  0.0000E+00\n"
+                   "     1     2     1     1    13805  0.1708E+05  0.3739E+02  0.0000E+00  0.0000E+00\n"
+                   "     1     2     2     1    13700  0.1700E+03  0.3000E+01  0.0000E+00  0.0000E+00\n"
+                   "     1     2     2     2    13700  0.0000E+00  0.4348E-03  0.0000E+00  0.0000E+00\n")
+    rows = read_cvg(str(cvg))
+    assert len(rows) == 5 and rows[0] == {"step": 1, "inc": 1, "att": 1, "iter": 1, "cont": 13377, "force": 5671.0, "disp": 100.0}
+    q = cvg_series(rows)
+    assert q["ylog"] and q["x"] == "iteration" and q["incs"] == [[1, 1, 1, 1], [3, 1, 2, 1], [4, 1, 2, 2]]
+    assert q["series"][0]["t"] == [1, 2, 3, 4, 5] and q["series"][3]["v"] == [1, 1, 1, 2, 2] and q["series"][1]["v"][-1] == 0.0004348
+    assert cvg_series([]) is None and read_cvg(str(tmp_path / "none.cvg")) == []
+    lin = (" Decascading the MPC's\n\n Determining the structure of the matrix:\n number of equations\n 12\n\n"
+           " Using up to 1 cpu(s) for the stress calculation.\n\n Using up to 1 cpu(s) for the symmetric stiffness/mass contributions.\n\n"
+           " Factoring the system of equations using the symmetric spooles solver\n Using up to 2 cpu(s) for spooles.\n\n"
+           " Using up to 1 cpu(s) for the stress calculation.\n\n STEP            1\n\n Job finished\n")
+    assert log_stage("") == ("Reading the input file", None)
+    assert log_stage(lin[:lin.index("number of equations")]) == ("Setting up the matrix structure", None)
+    assert log_stage(lin[:lin.index("symmetric stiffness")]) == ("Assembling the stiffness matrix", None)
+    assert log_stage(lin[:lin.index("for spooles")]) == ("Factorising the system of equations", None)
+    assert log_stage(lin[:lin.index(" STEP")]) == ("Computing the stresses and writing the results", None)
+    assert log_stage(lin) == ("Finished", None)
+    nl = " increment 2 attempt 1 \n increment size= 2.5e-01\n\n iteration 3\n\n Factoring the system of equations using the unsymmetric spooles solver\n"
+    assert log_stage(nl) == ("Factorising the system of equations", "increment 2 attempt 1, iteration 3")
+    log = tmp_path / "solver.log"
+    log.write_text("".join("line %03d\n" % i for i in range(200)))
+    t = log_tail(str(log), 100)
+    assert t.startswith("line ") and len(t) < 100 and t.endswith("line 199\n") and log_tail(str(log), 10 ** 6) == log.read_text()
+    assert log_tail(str(tmp_path / "none.log")) == ""
+
+    class M(object):
+        atype, hist = "static", None
+
+        def step_periods(self):
+            return [1.0, 2.0]
+    mon = RunMonitor(M(), str(tmp_path))
+    mon.samples = [(10.0, 0.5), (20.0, 1.0), (30.0, 1.5)]            # 0.05 s of analysis time per s
+    assert mon.estimate(1.5) == {"total": 3.0, "done": 0.5, "remaining": 30}
+    assert mon.estimate(None) is None and RunMonitor(M(), str(tmp_path)).estimate(1.0) is None
+    snap = mon.snapshot()
+    assert snap["cvg"]["incs"] == q["incs"] and snap["stage"] == "Reading the input file" and snap["increment"] == "step 1, increment 2, attempt 2, iteration 2"
+    assert snap["stages"] == [{"name": "Increments", "t0": snap["elapsed"]}] and snap["estimate"] is None and snap["sta"] is None

@@ -1,4 +1,4 @@
-"""Run manager of the explicit analysis (ORC**3 workspace_runmanager.py): numbered run folders, run.json,
+"""Run manager of the explicit analysis: numbered run folders, run.json,
 the settings report, purge and clean.
 
 RunMixin of the headless workspace (host.Workspace)."""
@@ -10,7 +10,7 @@ import glob
 import re
 from datetime import datetime, date
 
-from .constants import (CONTACT_HELP, CONTACT_T7, FAIL_HELP, FAIL_JC, FAIL_TENS, MATERIAL_LIBRARY, RBV_EXPL, RBV_HELP, RBV_PROFILE, RBV_PROFILE_F, TIE_HELP, TIE_SCOPED, WORKSPACE_NAME, WORKSPACE_TAGLINE, WORKSPACE_VERSION)
+from .constants import (CONTACT_HELP, CONTACT_T7, FAIL_HELP, FAIL_JC, FAIL_TENS, MATERIAL_LIBRARY, RBV_EXPL, RBV_HELP, RBV_PROFILE, RBV_PROFILE_F, TIE_HELP, TIE_SCOPED, WORKSPACE_VERSION)
 
 
 class RunMixin:
@@ -28,7 +28,7 @@ class RunMixin:
             return True
         if name == "_extract_principal_strain.py":
             return True
-        # OpenRadioss A-files (<job>A0001) and T-files (<job>T01) have no extension.
+        # OpenCourant A-files (<job>A0001) and T-files (<job>T01) have no extension.
         return "." not in name and re.search(r"[AT]\d{2,}$", name) is not None
 
     def _runs_root(self):
@@ -206,7 +206,7 @@ class RunMixin:
         L.append(f"BUILD SETTINGS REPORT - {model_name}")
         L.append("=" * W)
         L.append(f"Generated : {datetime.now().isoformat(timespec='seconds')}")
-        L.append(f"Script    : SHINYCAD Explicit tab, {WORKSPACE_NAME} {WORKSPACE_VERSION} core  ({WORKSPACE_TAGLINE})")
+        L.append(f"Script    : SHINYCAD Explicit tab {WORKSPACE_VERSION}")
         L.append(f"Source    : {self.inp_path.get()}")
         L.append(f"Output    : {self.out_dir.get()}")
         L.append(f"Units     : Mg / mm / s (stress in MPa, density in Mg/mm^3, velocity in mm/s)")
@@ -302,7 +302,7 @@ class RunMixin:
                 sflag = 23
             L.append(f"S_Flag: {sflag}")
             L.append(wrap(self._SFLAG_MEANING.get(
-                sflag, "see the OpenRadioss /FAIL/TENSSTRAIN documentation for this value")))
+                sflag, "see the OpenCourant /FAIL/TENSSTRAIN documentation for this value")))
             L.append(wrap("Thresholds are TOTAL strain (elastic + plastic). For S355 the "
                           "elastic part is ~0.0017, so a plastic-strain criterion should be "
                           "raised by that amount when entered here."))

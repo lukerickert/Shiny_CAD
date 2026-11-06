@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-job_audit.py  -  ORC**3 job auditor
+job_audit.py  -  job auditor
 ============================================================
 Walks a runs tree, and for every job (each *_0000*.rad it finds) reads the
 ACTUAL artifacts on disk - starter deck, engine deck, settings report, pv
@@ -262,7 +262,7 @@ def main():
     txt_path = os.path.abspath(args.out + ".txt")
     csv_path = os.path.abspath(args.out + ".csv")
     with open(txt_path, "w", encoding="utf-8") as fh:
-        fh.write("ORC**3 - JOB AUDIT\n")
+        fh.write("JOB AUDIT\n")
         fh.write(f"Generated : {datetime.now().isoformat(timespec='seconds')}\n")
         fh.write(f"Root      : {os.path.abspath(args.root)}\n")
         fh.write(f"Jobs found: {len(rows)}\n\n")

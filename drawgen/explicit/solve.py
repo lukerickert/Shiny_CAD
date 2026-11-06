@@ -1,4 +1,4 @@
-"""Solver submission of the explicit analysis (ORC**3 workspace_solve.py): local and remote (ssh/tsp) job execution,
+"""Solver submission of the explicit analysis: local and remote (ssh/tsp) job execution,
 the run queue and the job status records.
 
 SolveMixin of the headless workspace (host.Workspace). The status board is self.job_status / self.job_order; the
@@ -247,6 +247,13 @@ class SolveMixin:
                               getattr(self, "job_envs", {}).get(jobname, ""),
                               err=snap.get("err"), dmm=snap.get("dmm"),
                               elapsed=snap.get("elapsed"), nc=snap.get("nc"))
+        if new_st in ("Starter", "Starting engine"):
+            rec["trace"] = []                       # run monitor: a new run of the job
+        if kw.get("nc") is not None and kw.get("t") is not None:
+            tr = rec.setdefault("trace", [])
+            tr.append((kw["t"], kw.get("dt"), kw.get("err"), kw.get("dmm"), kw["nc"]))
+            if len(tr) > 4000:                      # every second point of the older half
+                del tr[0:2000:2]
         rec.update(kw)
         self._status_dirty = True
 
@@ -539,7 +546,7 @@ class SolveMixin:
         except Exception:
             anim_dt = 0.001
         # write_series.py historically lives two levels above exec/
-        # (<root>/OpenRadioss/exec -> <root>/write_series.py); a missing helper
+        # (<root>/exec -> <root>/write_series.py); a missing helper
         # is non-fatal - the GUI rebuilds the .vtk.series locally afterwards.
         helper = ex.rsplit("/", 2)[0] + "/write_series.py" if "/" in ex else "write_series.py"
         return (
@@ -1000,7 +1007,7 @@ class SolveMixin:
             self.log_msg(f"Local Execution Error [{jobname}]: {e}")
 
     def _queue_remove(self, key):
-        """Remove a queued deck ("q::<path>") or a finished status row ("s::<job>") (ORC**3: the selected row)."""
+        """Remove a queued deck ("q::<path>") or a finished status row ("s::<job>")."""
         iid = key or ""
         if iid.startswith("q::"):
             fp = iid[3:]

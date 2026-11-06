@@ -640,7 +640,7 @@ async function uploadLogo(file) {
 let DRAW_MODE = "annotate";
 function showTab(name) {
   if (name === "drawings" || name === "editor") name = "annotate";   // project states saved with the former Drawings and Title block editor tabs
-  const btn = name === "sketch" ? (window.sketchHostTab ? sketchHostTab() : "annotate") : name;
+  const btn = name === "sketch" ? (window.sketchHostTab ? sketchHostTab() : "annotate") : name === "xp" ? "fea" : name;   // the explicit pane: Analysis, solver OpenCourant
   if (name === "annotate" || (name === "sketch" && btn === "annotate")) DRAW_MODE = name;
   document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === btn));
   document.querySelectorAll(".dmode button").forEach(b => b.classList.toggle("active", b.dataset.dmode === name));

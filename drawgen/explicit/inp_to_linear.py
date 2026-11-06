@@ -2,7 +2,7 @@
 """
 inp_to_linear.py  -  downgrade a CalculiX/PrePoMax .inp from 2nd-order
                      (quadratic) to 1st-order (linear) elements so inp2rad
-                     (and OpenRadioss, which is first-order only) can read it.
+                     (and OpenCourant, which is first-order only) can read it.
 
 What it does
 ------------

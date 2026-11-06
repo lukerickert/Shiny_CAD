@@ -1,4 +1,4 @@
-"""Writer of synthetic OpenRadioss animation files (FASTMAGI10, big-endian) for the tests of explicit/anim.py."""
+"""Writer of synthetic OpenCourant animation files (FASTMAGI10, big-endian) for the tests of explicit/anim.py."""
 import numpy as np
 
 
@@ -20,7 +20,7 @@ def write_anim(path, time, xyz, quads=(), parts2=(), nodal=(), efun2=(), vect=()
     n2, n3, n1 = len(q), len(h), len(ln)
     i4 = lambda *v: np.asarray(v, ">i4").tobytes()
     f4 = lambda a: np.asarray(a, ">f4").tobytes()
-    out = [i4(0x542c), f4([time]), _t("TIME", 81), _t("anim", 81), _t("OpenRadioss", 81)]
+    out = [i4(0x542c), f4([time]), _t("TIME", 81), _t("anim", 81), _t("OpenCourant", 81)]
     flags = [1 if mass else 0, 1 if numbering else 0, 1 if n3 else 0, 1 if n1 else 0, 1 if hierarchy else 0, 0, 0, 0, 0, 0]
     out.append(i4(*flags))
     out.append(i4(nn, n2, len(parts2), len(nodal), len(efun2), len(vect), len(tens2), 0))

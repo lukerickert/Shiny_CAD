@@ -14,6 +14,14 @@ Cards:
   /PART, /PROP/TYPE13, /SPRING  springs (stiffnesses K1 to K6, the layout of the inp2rad TYPE13 springs)
   /MPC/<id>                    sum alpha * u = 0: one line per term: node, component 1 to 6, skew 0, alpha
   /ADMAS/5/<id>                added mass of single nodes (point and distributed masses): mass, node
+  /TH/NODE/<id>                time history of nodes (history output): variables, one line per node with its name
+  /TH/PART/<id>                time history of parts: variables, the part numbers; a part is given by its title as
+                               <P:TITLE>, replaced by the number of the /PART with that title
+  /TH/INTER/<id>               time history of interfaces: variables, interface numbers
+  /GRBRIC/BRIC/<id>            solid element group (10 elements per line)
+  /SECT/<id>                   section: three nodes of the section plane, the node group, the solid element group,
+                               Iframe 11 (global system, geometric centre)
+  /TH/SECTIO/<id>              time history of sections: variables, the sections
 """
 import glob
 import os
@@ -105,11 +113,75 @@ class Cards(object):
             if m > 0:
                 self.lines.append("%20.8g%10d" % (m, n))
 
+    def thnod(self, title, variables, nodes, prefix):
+        """/TH/NODE: variables (10 per line), nodes with the names <prefix>N<node>."""
+        f, tok = self.ph()
+        self.lines += ["/TH/NODE/%s" % tok, self.title(title)]
+        for k in range(0, len(variables), 10):
+            self.lines.append("".join("%-10s" % v for v in variables[k:k + 10]))
+        self.lines.append("#  node_ID   skew_ID node_name")
+        for n in sorted(int(x) for x in nodes):
+            self.lines.append("%10d%10d%sN%d" % (n, 0, prefix, n))
+
+    def thpart(self, title, variables, part_titles):
+        """/TH/PART: variables, the parts by title (<P:TITLE> resolved by apply())."""
+        f, tok = self.ph()
+        self.lines += ["/TH/PART/%s" % tok, self.title(title)]
+        for k in range(0, len(variables), 10):
+            self.lines.append("".join("%-10s" % v for v in variables[k:k + 10]))
+        toks = ["<P:%s>" % t for t in part_titles]
+        for k in range(0, len(toks), 10):
+            self.lines.append("".join(t.rjust(10) if len(t) < 10 else " " + t for t in toks[k:k + 10]))
+
+    def thinter(self, title, variables, inter_ids):
+        """/TH/INTER of interfaces given by their numbers."""
+        f, tok = self.ph()
+        self.lines += ["/TH/INTER/%s" % tok, self.title(title), "".join("%-10s" % v for v in variables[:10])]
+        self.lines += ["".join("%10d" % int(i) for i in inter_ids[k:k + 10]) for k in range(0, len(inter_ids), 10)]
+
+    def grbric(self, title, elems):
+        f, tok = self.ph()
+        self.lines += ["/GRBRIC/BRIC/%s" % tok, self.title(title)]
+        elems = sorted(int(e) for e in elems)
+        for k in range(0, len(elems), 10):
+            self.lines.append("".join("%10d" % e for e in elems[k:k + 10]))
+        return f
+
+    def sect(self, title, n3, nodes, elems):
+        """/SECT of the nodes and the solid elements on one side of a section; n3: three nodes of the plane. Returns
+        the field of its number."""
+        g = self.grnod(title + " nodes", nodes)
+        b = self.grbric(title + " elements", elems)
+        f, tok = self.ph()
+        self.lines += ["/SECT/%s" % tok, self.title(title),
+                       "# node_ID1  node_ID2  node_ID3   grnd_ID     ISAVE  frame_ID",
+                       "%10d%10d%10d%s%10d%10d" % (n3[0], n3[1], n3[2], g, 0, 0), "SECT",
+                       "# grbric_ID          grshel_ID grtrus_ID grbeam_ID grsprg_ID grtria_ID    Ninter              Iframe",
+                       "%s%10d%10d%10d%10d%10d%10d%10d%10d%10d" % (b, 0, 0, 0, 0, 0, 0, 0, 0, 11)]
+        return f
+
+    def thsect(self, title, variables, sect_fields):
+        f, tok = self.ph()
+        self.lines += ["/TH/SECTIO/%s" % tok, self.title(title), "".join("%-10s" % v for v in variables[:10]),
+                       "".join(sect_fields)]
+
     def inp_lines(self):
         return [PREFIX + ln for ln in self.lines]
 
 
 _TOKEN = re.compile(r" *<X(\d+)>")
+_PART = re.compile(r" *<P:([^>]*)>")
+
+
+def part_ids(rad_text):
+    """{title (upper case): /PART number} of a deck."""
+    out = {}
+    L = rad_text.splitlines()
+    for i, ln in enumerate(L):
+        m = re.match(r"/PART/(\d+)\s*$", ln.strip())
+        if m and i + 1 < len(L):
+            out.setdefault(L[i + 1].strip().upper(), int(m.group(1)))
+    return out
 
 
 def _max_id(rad_text):
@@ -149,9 +221,17 @@ def apply(inp_path, rad_path=None):
         return 0
     base = (_max_id(text) // 1000 + 1) * 1000
     out = ["#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|",
-           "# SHINYCAD constraints (couplings, springs, joints, equations)",
+           "# SHINYCAD constraints (couplings, springs, joints, equations) and time history",
            "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|"]
+    pids = part_ids(text) if any("<P:" in ln for ln in lines) else {}
+
+    def part(m):
+        t = m.group(1).strip().upper()
+        if t not in pids:
+            raise ValueError("time history: no /PART with the title %s in %s" % (t, os.path.basename(rad_path)))
+        return "%10d" % pids[t]
     for ln in lines:
+        ln = _PART.sub(part, ln)
         out.append(_TOKEN.sub(lambda m: str(base + int(m.group(1))).rjust(len(m.group(0))) if len(m.group(0)) > len("<X%s>" % m.group(1))
                               else str(base + int(m.group(1))), ln))
     k = text.rfind("\n/END")

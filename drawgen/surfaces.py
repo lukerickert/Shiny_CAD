@@ -3492,38 +3492,77 @@ def _oriented_surface(face):
     return BRep_Tool.Surface_s(face.wrapped), (-1.0 if face.wrapped.Orientation() == TopAbs_REVERSED else 1.0)
 
 
+class _Projector:
+    """Projection of points onto one surface: (point, u, v, distance) of the nearest point, or None. The extrema
+    data of the surface (the sample grid of a B-spline surface) is built once, in the constructor, and used for
+    every point."""
+
+    def __init__(self, surf):
+        from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
+        self.surf = surf
+        self._pr = GeomAPI_ProjectPointOnSurf()
+        self._pr.Init(surf, *surf.Bounds(), 1e-7)
+
+    def __call__(self, p):
+        from OCP.gp import gp_Pnt
+        pr = self._pr
+        pr.Perform(gp_Pnt(*p))
+        if not pr.NbPoints():
+            return None
+        q = pr.NearestPoint()
+        u, v = pr.LowerDistanceParameters()
+        return (q.X(), q.Y(), q.Z()), u, v, pr.LowerDistance()
+
+
 def _project(surf, p):
-    """(point, u, v, distance) of the projection of p onto the surface, or None."""
-    from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
-    from OCP.gp import gp_Pnt
-    pr = GeomAPI_ProjectPointOnSurf(gp_Pnt(*p), surf)
-    if not pr.NbPoints():
-        return None
-    q = pr.NearestPoint()
-    u, v = pr.LowerDistanceParameters()
-    return (q.X(), q.Y(), q.Z()), u, v, pr.LowerDistance()
+    """(point, u, v, distance) of the projection of p onto the surface, or None (one point; _Projector for many)."""
+    return _Projector(surf)(p)
 
 
-def _inside(face, surf, uv):
+def _inside(face, surf, uv, classifier=None):
+    """True when the parameters uv lie in the face (periodic surfaces: also shifted by one period). classifier: a
+    BRepClass_FaceClassifier reused between calls."""
     from OCP.BRepClass import BRepClass_FaceClassifier
     from OCP.TopAbs import TopAbs_IN, TopAbs_ON
     from OCP.gp import gp_Pnt2d
     u, v = uv
     us = [u + k * surf.UPeriod() for k in (-1, 0, 1)] if surf.IsUPeriodic() else [u]
     vs = [v + k * surf.VPeriod() for k in (-1, 0, 1)] if surf.IsVPeriodic() else [v]
-    return any(BRepClass_FaceClassifier(face.wrapped, gp_Pnt2d(a, b), 1e-6).State() in (TopAbs_IN, TopAbs_ON)
-               for a in us for b in vs)
+    cl = classifier or BRepClass_FaceClassifier()
+    for a in us:
+        for b in vs:
+            cl.Perform(face.wrapped, gp_Pnt2d(a, b), 1e-6)
+            if cl.State() in (TopAbs_IN, TopAbs_ON):
+                return True
+    return False
 
 
 def _closest_faces(ba, bb):
-    """The faces of the two bodies nearest to each other."""
+    """The faces of the two bodies nearest to each other (the first pair in face order when several are at the
+    same distance). The face pairs are taken in the order of the distance between their bounding boxes, a lower
+    bound of the face distance, and the search stops at the first pair whose boxes are further apart than the
+    nearest faces found."""
+    from OCP.Bnd import Bnd_Box
+    from OCP.BRepBndLib import BRepBndLib
+
+    def boxes(body):
+        out = []
+        for fc in body.faces():
+            b = Bnd_Box()
+            BRepBndLib.Add_s(fc.wrapped, b, False)
+            out.append((fc, b))
+        return out
+    fa_, fb_ = boxes(ba), boxes(bb)
+    pairs = sorted(((ba_.Distance(bb_), i, j) for i, (_, ba_) in enumerate(fa_) for j, (_, bb_) in enumerate(fb_)),
+                   key=lambda x: (x[0], x[1], x[2]))
     best = None
-    for fa in ba.faces():
-        for fb in bb.faces():
-            d = fa.distance_to(fb)
-            if best is None or d < best[0]:
-                best = (d, fa, fb)
-    return best[1], best[2]
+    for lower, i, j in pairs:
+        if best is not None and lower > best[0]:
+            break
+        d = fa_[i][0].distance_to(fb_[j][0])
+        if best is None or (d, i, j) < best[:3]:
+            best = (d, i, j, fa_[i][0], fb_[j][0])
+    return best[3], best[4]
 
 
 def _default_side(face, other):
@@ -3575,6 +3614,7 @@ def fillet_faces(fa, fb, r, sa, sb, n=48):
     from OCP.GeomAPI import GeomAPI_IntSS
     from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
     from build123d import Edge
+    from OCP.BRepClass import BRepClass_FaceClassifier
     ga, ka = _oriented_surface(fa)
     gb, kb = _oriented_surface(fb)
     oa = Geom_OffsetSurface(ga, sa * ka * r)
@@ -3583,6 +3623,8 @@ def fillet_faces(fa, fb, r, sa, sb, n=48):
     if not inter.IsDone() or inter.NbLines() == 0:
         raise ValueError("the faces have no fillet of radius %g on these sides (the offset surfaces do not meet; "
                          "try Flip or a smaller radius)" % r)
+    proj_a, proj_b = _Projector(ga), _Projector(gb)
+    cls_a, cls_b = BRepClass_FaceClassifier(), BRepClass_FaceClassifier()
     best = None
     for i in range(1, inter.NbLines() + 1):
         cu = inter.Line(i)
@@ -3594,10 +3636,11 @@ def fillet_faces(fa, fb, r, sa, sb, n=48):
         # the part of the spine whose contact points lie on both faces
         def good(t):
             p = cu.Value(t)
-            pa = _project(ga, (p.X(), p.Y(), p.Z()))
-            pb = _project(gb, (p.X(), p.Y(), p.Z()))
+            pa = proj_a((p.X(), p.Y(), p.Z()))
+            pb = proj_b((p.X(), p.Y(), p.Z()))
             return (pa is not None and pb is not None and abs(pa[3] - r) < 1e-3 * max(r, 1) + 1e-6 and
-                    abs(pb[3] - r) < 1e-3 * max(r, 1) + 1e-6 and _inside(fa, ga, pa[1:3]) and _inside(fb, gb, pb[1:3]))
+                    abs(pb[3] - r) < 1e-3 * max(r, 1) + 1e-6 and _inside(fa, ga, pa[1:3], cls_a) and
+                    _inside(fb, gb, pb[1:3], cls_b))
         rows = [(good(t), t, None, None) for t in (t0 + (t1 - t0) * k / n for k in range(n + 1))]
         runs, cur = [], []
         for row in rows:
@@ -3636,17 +3679,17 @@ def fillet_faces(fa, fb, r, sa, sb, n=48):
         # a fillet all the way round (a plane and a cylinder, a cone): two halves (no seam edge)
         t0, t1 = cu.FirstParameter(), cu.LastParameter()
         tm = 0.5 * (t0 + t1)
-        f1, a1, b1 = _arc_patch(cu, t0, tm, ga, gb, r, m // 2)
-        f2, a2, b2 = _arc_patch(cu, tm, t1, ga, gb, r, m // 2)
+        f1, a1, b1 = _arc_patch(cu, t0, tm, proj_a, proj_b, r, m // 2)
+        f2, a2, b2 = _arc_patch(cu, tm, t1, proj_a, proj_b, r, m // 2)
         return [f1, f2], [a1, a2], [b1, b2]
-    face, _, _ = _arc_patch(cu, ta, tb, ga, gb, r, m)
+    face, _, _ = _arc_patch(cu, ta, tb, proj_a, proj_b, r, m)
     # trimming curves: the contact curves extended a little beyond the face boundaries
     ext = 0.02 * (tb - ta)
     pts_a, pts_b = [], []
     for k in range(m + 1):
         p = cu.Value(ta - ext + (tb - ta + 2 * ext) * k / m)
         p = (p.X(), p.Y(), p.Z())
-        qa, qb = _project(ga, p), _project(gb, p)
+        qa, qb = proj_a(p), proj_b(p)
         if qa is None or qb is None:
             continue
         pts_a.append(qa[0])
@@ -3656,10 +3699,11 @@ def fillet_faces(fa, fb, r, sa, sb, n=48):
     return [face], [ea], [eb]
 
 
-def _arc_patch(cu, ta, tb, ga, gb, r, m, nu=9):
+def _arc_patch(cu, ta, tb, proj_a, proj_b, r, m, nu=9):
     """Fillet patch along the spine cu from ta to tb: at each spine point the circular arc of radius r from the
-    contact point on surface A to the one on surface B (the shorter arc), fitted with a B-spline surface. Returns
-    (face, contact edge A, contact edge B); the contact edges are the boundary curves of the face."""
+    contact point on surface A to the one on surface B (the shorter arc), fitted with a B-spline surface. proj_a,
+    proj_b: _Projector of surface A and of surface B. Returns (face, contact edge A, contact edge B); the contact
+    edges are the boundary curves of the face."""
     from OCP.GeomAPI import GeomAPI_PointsToBSplineSurface
     from OCP.GeomAbs import GeomAbs_C2
     from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace, BRepBuilderAPI_MakeEdge
@@ -3674,8 +3718,8 @@ def _arc_patch(cu, ta, tb, ga, gb, r, m, nu=9):
     for k in range(m + 1):
         q = cu.Value(ta + (tb - ta) * k / m)
         P = np.array([q.X(), q.Y(), q.Z()])
-        A = np.array(_project(ga, tuple(P))[0]) - P
-        B = np.array(_project(gb, tuple(P))[0]) - P
+        A = np.array(proj_a(tuple(P))[0]) - P
+        B = np.array(proj_b(tuple(P))[0]) - P
         th = math.acos(max(-1.0, min(1.0, float(A @ B) / (np.linalg.norm(A) * np.linalg.norm(B)))))
         for j in range(nu):
             s = j / (nu - 1)

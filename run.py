@@ -80,7 +80,12 @@ def main():
     # the geometry requests of the Part tab run in a separate process (drawgen/partworker.py): Cancel in the Part
     # tab ends a build that does not return. DRAWGEN_PART_WORKER=0 in the environment keeps them in this process.
     os.environ.setdefault("DRAWGEN_PART_WORKER", "1")
+    import time
+    t0 = time.time()
+    print("Starting SHINYCAD: loading the modules (the first start after an update or a restart of the PC can take "
+          "about a minute)", flush=True)
     from drawgen import web, pool, partworker
+    print("Modules loaded in %.0f s" % (time.time() - t0), flush=True)
     atexit.register(web.cleanup)
     atexit.register(pool.shutdown)
     threading.Thread(target=pool.warm, daemon=True).start()   # start the worker processes in the background

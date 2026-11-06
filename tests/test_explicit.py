@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""Explicit tab (drawgen/explicit, ORC**3 core): mesh view data and readers, the model .inp of the ShinyCAD geometry,
+"""Explicit tab (drawgen/explicit): mesh view data and readers, the model .inp of the ShinyCAD geometry,
 the deck build (inp2rad and the cards of the settings), run folders, the local solve with a stand-in for the
-OpenCourant executables (fake_openradioss.py), results, post-processing, the Explicit document in the project."""
+OpenCourant executables (fake_opencourant.py), results, post-processing, the Explicit document in the project."""
 import base64
 import glob
 import json
@@ -14,7 +14,7 @@ import pytest
 from conftest import part_rec, rect
 
 import anim_writer
-import fake_openradioss
+import fake_opencourant
 from drawgen.explicit import anim
 from drawgen.explicit import constants as C
 from drawgen.explicit import host, meshview, results
@@ -140,7 +140,7 @@ def test_read_inp_and_vtk_ascii_binary(tmp_path):
     anim_writer.write_anim(str(a), 0.005, [[0, 0, 0]])
     import subprocess
     import sys
-    out = subprocess.run([sys.executable, fake_openradioss.__file__, "anim_to_vtk", str(a)], capture_output=True, text=True).stdout
+    out = subprocess.run([sys.executable, fake_opencourant.__file__, "anim_to_vtk", str(a)], capture_output=True, text=True).stdout
     (tmp_path / "j_003.vtk").write_text(out)
     v = meshview.read_vtk(str(tmp_path / "j_003.vtk"))
     assert v["xyz"].shape == (50, 3) and v["time"] == pytest.approx(0.005)
@@ -168,20 +168,20 @@ def test_workspace_settings_and_executables(tmp_path):
     w = host.Workspace()
     snap = w.snapshot()
     assert snap["tie_mode"] == C.TIE_AUTO and snap["mat1"] == "None (Use PrePoMax Data)" and snap["mat_slots"][0][1] == "MAT1"
-    # ORC**3 run.json snapshot with three slots
+    # older run.json snapshot with three slots
     w.apply({"mat1": "Steel S355 (DNVGL 19-Point Standard)", "mat1_name": "S355", "mat2": "None (Use PrePoMax Data)",
              "mat2_name": "MAT2", "gravity": "false", "tstop": 0.02, "unknown": 1})
     assert w.mat_slots[0] == ["Steel S355 (DNVGL 19-Point Standard)", "S355"] and w.gravity.get() is False and w.tstop.get() == "0.02"
     assert [(a.get(), b.get()) for a, b in w._mat_slots()][0] == ("Steel S355 (DNVGL 19-Point Standard)", "S355")
     suffix = "_win64" if os.name == "nt" else "_linux64_gf"
     assert w._or_exe("starter") == "starter" + suffix and w._or_env() is None
-    d = fake_openradioss.install(str(tmp_path / "exec"))
+    d = fake_opencourant.install(str(tmp_path / "exec"))
     (tmp_path / "hm_cfg_files").mkdir()
     w.or_exec.set(d)
     assert os.path.isfile(w._or_exe("engine"))
     env = w._or_env()
     assert env["PATH"].startswith(d) and env["RAD_CFG_PATH"] == str(tmp_path / "hm_cfg_files") and env["KMP_STACKSIZE"]
-    # remote helpers (ORC**3)
+    # remote helpers
     w.apply({"share_map": "Z:/ => /home/u/RUN; Y:/x => /data", "remote_exec": "/opt/or/exec", "remote_scratch": "/scratch"})
     assert w._map_to_linux("Z:\\a\\b") == "/home/u/RUN/a/b" and w._map_to_linux("C:/a") is None
     p = w._remote_pipeline("job_b01", 8)
@@ -282,7 +282,7 @@ def test_model_inp_of_the_shinycad_geometry(client, xp_doc):
 
 
 def test_run_build_solve_results(client, xp_doc, tmp_path, monkeypatch):
-    exe = fake_openradioss.install(str(tmp_path / "exec"))
+    exe = fake_opencourant.install(str(tmp_path / "exec"))
     ok(client.put("/api/explicit/env", json={"or_exec": exe, "ssh_threads": "2", "run_target": host.LOCAL}))
     env = ok(client.get("/api/explicit/env"))
     assert all(v["found"] for v in env["executables"].values())
@@ -755,7 +755,7 @@ def test_velocities_and_node_sets_of_bodies_and_faces(client, tmp_path):
     impactor (*INITIAL CONDITIONS on all its nodes and its reference node, inp2rad /INIVEL/TRA), an imposed velocity
     on a reference point with a ramp of 1 ms (*AMPLITUDE and *BOUNDARY TYPE=VELOCITY, inp2rad /IMPVEL with its
     /FUNCT), node sets of the block body and of the bottom face of the solid (nodes at z = 0); an imposed velocity on
-    supported nodes is refused."""
+    supported nodes is refused; an imposed velocity with an amplitude of the document."""
     def surf(fid, name, plane, w, h):
         return {"id": fid, "name": name, "type": "surf_sketch", "kind": "planar", "plane": plane, "offset": 0,
                 "sketch": {"entities": rect(w, h)}}
@@ -820,9 +820,18 @@ def test_velocities_and_node_sets_of_bodies_and_faces(client, tmp_path):
     bad = dict(doc, velocities=[{"id": "v3", "name": "bad", "target": {"nset": "n2"}, "kind": "imposed", "v": [0, 0, 1], "dofs": [0, 0, 1, 0, 0, 0]}])
     j = wait_job(client, ok(client.post("/api/explicit/model", json={"name": "xv2", "doc": bad}))["job"])
     assert j["state"] == "error" and "held by support base" in j["error"]
+    # imposed velocity with an amplitude: its points from t = 0 (the first factor before the first point), constant
+    # after the last point; an amplitude not in the document refused
+    va = dict(doc["velocities"][1], amplitude="a1")
+    amp = dict(doc, amplitudes=[{"id": "a1", "name": "pulse", "points": [[0.002, 0.5], [0.0005, 0], [0.001, 1]]}], velocities=[va])
+    j = wait_job(client, ok(client.post("/api/explicit/model", json={"name": "xv3", "doc": amp}))["job"])
+    assert j["state"] == "done", j
+    assert "*AMPLITUDE, NAME=VA_1\n0, 0, 0.0005, 0, 0.001, 1, 0.002, 0.5\n1000.002, 0.5\n*BOUNDARY, AMPLITUDE=VA_1 , TYPE=VELOCITY" in open(j["result"]["inp"]).read()
+    j = wait_job(client, ok(client.post("/api/explicit/model", json={"name": "xv4", "doc": dict(amp, amplitudes=[])}))["job"])
+    assert j["state"] == "error" and "amplitude a1 not found" in j["error"]
 
 
-# --------------------------------------------------------------------------- ORC**3 MK2 functions
+# --------------------------------------------------------------------------- explicit functions
 
 def _wait(cond, timeout=60.0):
     t0 = time.time()
@@ -1002,7 +1011,7 @@ def test_history_env_dirs_results_csv_png_and_queue(client, tmp_path):
 
 
 def test_plot_ke_rebuilds_csv_from_t_file(client, tmp_path):
-    exe = fake_openradioss.install(str(tmp_path / "exec"))
+    exe = fake_opencourant.install(str(tmp_path / "exec"))
     ok(client.put("/api/explicit/env", json={"or_exec": exe}))
     d = tmp_path / "res"
     d.mkdir()
@@ -1128,7 +1137,7 @@ def test_anim_without_displacement_vector(tmp_path):
 
 def test_solve_without_vtk_conversion(client, xp_doc, tmp_path):
     """Convert to VTK off: no .vtk frames; the Results read the animation files."""
-    exe = fake_openradioss.install(str(tmp_path / "exec"))
+    exe = fake_opencourant.install(str(tmp_path / "exec"))
     ok(client.put("/api/explicit/env", json={"or_exec": exe, "run_target": host.LOCAL}))
     base = {"name": "xp_drop1", "doc": xp_doc, "settings": dict(xp_doc["settings"], vtk_convert=False)}
     wait_job(client, ok(client.post("/api/explicit/model", json=base))["job"])
@@ -1242,7 +1251,9 @@ def test_masses_and_reference_point_on_rigid_body(client):
     assert "SUP_1_HOLD_R, 4, 4" in text
     # a support on several items (selection target): the nodes of the bottom face and of the block body
     multi = dict(doc, velocities=[], supports=[{"id": "s2", "name": "both", "target": {"faces": [{"comp": "1", "face": bot}], "bodies": ["1"]},
-                                                "dofs": [1, 1, 1, 0, 0, 0]}])
+                                                "dofs": [1, 1, 1, 0, 0, 0]},
+                                               {"id": "s3", "name": "surf", "target": {"surface": "sf1"}, "dofs": [0, 0, 1, 0, 0, 0]}],
+                 surfaces=[{"id": "sf1", "name": "BASE", "faces": [{"comp": "1", "face": bot}]}])
     j = wait_job(client, ok(client.post("/api/explicit/model", json={"name": "xm3b", "doc": multi}))["job"])
     assert j["state"] == "done", j
     text = open(j["result"]["inp"]).read()
@@ -1254,6 +1265,12 @@ def test_masses_and_reference_point_on_rigid_body(client):
             for line in body.split("*")[0].splitlines():
                 blk.update(int(x) for x in line.replace(",", " ").split()[1:])
     assert held == blk and len(blk) > 0
+    # a support on a surface: the nodes of its faces (the bottom face: as the node set BOTTOM)
+    nodes = lambda name: set(int(x) for x in text.split("*NSET, NSET=%s\n" % name)[1].split("*")[0].replace(",", " ").split())
+    assert nodes("SUP_2_SURF") == nodes("BOTTOM")
+    bad = dict(multi, surfaces=[])
+    j = wait_job(client, ok(client.post("/api/explicit/model", json={"name": "xm3c", "doc": bad}))["job"])
+    assert j["state"] == "error" and "surface sf1 not found" in j["error"]
     # no mass: a rigid body of density 0 without masses; a velocity on a free reference point without a point mass
     norho = dict(doc, materials={"S355": {"library": "", "E": 210000, "nu": 0.3, "rho": 0}}, masses=[], velocities=[])
     j = wait_job(client, ok(client.post("/api/explicit/model", json={"name": "xm5", "doc": norho}))["job"])
@@ -1451,3 +1468,113 @@ def test_deck_view_flanges_claim_the_deck():
     cross = 2 * 3 * 250 * 120                       # beam flange under the deeper girder flanges: 2 girders x 3 beams
     assert area(view["BEAM_FLANGE"]) == pytest.approx(area(raw["BEAM_FLANGE"]) - cross)
     assert area(view["DECK"]) == pytest.approx(6000 * 4000 - area(raw["GIRDER_FLANGE"]) - area(raw["BEAM_FLANGE"]) + cross)
+
+
+def test_inp_source_model(client, tmp_path):
+    """Explicit model of a CalculiX .inp source (editable model): the elements of the file in B_ element sets, the
+    *NSET FIX of the file as a support node set, the strip (shell section of the tab, t 2 mm) as a rigid body with a
+    reference node at its centre of mass, an initial velocity on the bar; total mass from the volume and area."""
+    from test_analysis import write_test_inp
+    from drawgen import inpmodel
+    p = write_test_inp(str(tmp_path / "t.inp"))
+    v = inpmodel.view(p)
+    doc = {"name": "xinp", "source": {"kind": "shinycad", "type": "inp", "path": p, "name": "t.inp"},
+           "materials": {"STEEL": {"library": "", "E": 210000, "nu": 0.3, "rho": 7850}}, "default_material": "STEEL",
+           "mesh": {}, "bonded": True, "bodies": {"BEAM": {"role": "deformable", "material": "STEEL"}},
+           "shells": v["shells"],
+           "sections": [{"id": "s1", "name": "PLATE", "faces": [{"comp": "PLATE", "face": 0}], "t": 2.0, "material": "STEEL", "mode": "rigid"}],
+           "nsets": [{"id": "n1", "name": "FIX", "kind": "inp", "set": "FIX"}],
+           "supports": [{"id": "s1", "name": "fix", "target": {"nset": "n1"}, "dofs": [1, 1, 1, 1, 1, 1]}],
+           "velocities": [{"id": "v1", "name": "hit", "target": {"body": "BEAM"}, "kind": "initial", "v": [0, 0, -1000]}],
+           "settings": {}, "next": 3}
+    j = wait_job(client, ok(client.post("/api/explicit/model", json={"name": "xinp", "doc": doc}))["job"])
+    assert j["state"] == "done", j
+    s = j["result"]["summary"]
+    text = open(j["result"]["inp"]).read()
+    m = meshview.read_inp(j["result"]["inp"])
+    assert len(m["node_ids"]) >= 132
+    fix = text.split("*NSET, NSET=FIX\n")[1].split("*")[0].replace(",", " ").split()
+    assert sorted(int(x) for x in fix) == sorted(int(x) for x in "1 12 23 34 45 56 67 78 89".split())
+    rb = next(b for b in s["bodies"] if b["role"] == "rigid")
+    pos = {int(n): m["xyz"][i] for i, n in enumerate(m["node_ids"])}
+    assert np.allclose(pos[rb["ref_node"]], [50, 5, 20], atol=1e-6)
+    assert s["total_kg"] == pytest.approx((100 * 10 * 10 + 100 * 10 * 2) * 7.85e-6, rel=1e-6)
+
+
+def test_time_history_requests(client, xp_doc, tmp_path):
+    """History output of the document in the explicit model: a node request on a supported face (displacement,
+    velocity, reaction force) and a part request on both bodies (internal and kinetic energy) as /TH/NODE and /TH/PART
+    cards (**RAD lines; node names H1N<node>, the parts by their titles); after the build the cards in the starter deck
+    with the part numbers; after the run (fake th_to_csv: DZ -k, VZ -1000, REACZ 10 k per node, IE 5 k, KE 100 - 5 k
+    per part at row k) the curves of the requests in the results: uz mean, RFz total (10 k x the node count), the
+    energies of the two parts; the columns by position for a CSV without names; the run monitor of the job (the cycle
+    lines of the engine output); probes of a point field and a cell field over the frames."""
+    exe = fake_opencourant.install(str(tmp_path / "exec"))
+    ok(client.put("/api/explicit/env", json={"or_exec": exe, "ssh_threads": "2", "run_target": host.LOCAL}))
+    doc = dict(xp_doc, history=[
+        {"id": "h1", "name": "edge", "kind": "node", "target": xp_doc["supports"][0]["target"], "quantities": ["U", "V", "RF"]},
+        {"id": "h2", "name": "bodies", "kind": "element", "target": {"bodies": ["1", "2"]}, "quantities": ["ENER", "EKIN", "S"]},
+        {"id": "h3", "name": "contact", "kind": "contact", "target": None, "quantities": ["CF"]},
+        {"id": "h4", "name": "cut", "kind": "section", "target": {"faces": [xp_doc["supports"][0]["target"]]}, "quantities": ["SOF"]}])
+    base = {"name": "xp_th1", "doc": doc, "settings": dict(xp_doc["settings"])}
+    j = wait_job(client, ok(client.post("/api/explicit/model", json=base))["job"])
+    assert j["state"] == "done", j
+    h = j["result"]["summary"]["history"]
+    assert [x["vars"] for x in h][:2] == [["DX", "DY", "DZ", "VX", "VY", "VZ", "REACX", "REACY", "REACZ"], ["IE", "KE"]]
+    assert h[2]["vars"] == ["FNX", "FNY", "FNZ", "FTX", "FTY", "FTZ"] and h[3]["n"] > 0
+    assert h[1]["left_out"] == ["S"] and h[1]["n"] == 2
+    n_nodes = h[0]["n"]
+    text = open(j["result"]["inp"]).read()
+    assert "**RAD /TH/NODE/<X" in text and "**RAD SC_H1/h1/node/edge" in text and "<P:B_TARGET>" in text
+    assert "**RAD /TH/INTER/<X" in text and "**RAD /SECT/<X" in text and "**RAD /GRBRIC/BRIC/<X" in text and "**RAD /TH/SECTIO/<X" in text
+    r = ok(client.post("/api/explicit/run/new", json=dict(base, description="th")))
+    base["settings"]["out_dir"] = r["run"]
+    ok(client.post("/api/explicit/build", json=base))
+    s = wait_status(client, lambda s: not s["building"] and s["last_build"] and s["last_build"]["dir"].startswith(r["run"]))
+    rad = s["last_build"]["rad"]
+    deck = open(rad).read()
+    tail = deck.split("# SHINYCAD constraints")[1]
+    assert "<P:" not in tail and "/TH/PART/" in tail and "H1N" in tail
+    from drawgen.explicit import radcards, thist
+    pids = radcards.part_ids(deck)
+    gs = thist.groups(deck)
+    assert [g["type"] for g in gs] == ["NODE", "PART", "INTER", "SECTIO"] and gs[1]["objs"] == [pids["B_TARGET"], pids["B_IMPACTOR"]]
+    assert gs[2]["objs"] == [9999999] and gs[2]["titles"][9999999] == "GENERAL_SELF_CONTACT" and len(gs[3]["objs"]) == 1
+    sect = tail.split("/SECT/")[1].splitlines()
+    assert sect[0].strip() == str(gs[3]["objs"][0]) and sect[3][:10].strip().isdigit() and sect[6].rstrip().endswith("11")
+    assert len(gs[0]["objs"]) == n_nodes
+    base["settings"]["rad_target"] = rad
+    ok(client.post("/api/explicit/solve", json=dict(base, mode="run")))
+    job = os.path.basename(rad)[:-len("_0000.rad")]
+    wait_status(client, lambda s: not s["busy"] and any(r["job"] == job and r["status"] in ("Done", "Failed") for r in s["rows"]))
+    folder = os.path.dirname(rad)
+    mon = ok(client.get("/api/explicit/monitor?job=" + job))          # run monitor: the 5 cycle lines of the fake engine
+    assert mon["nc"] == [100, 200, 300, 400, 500] and mon["err"][2] == pytest.approx(-0.3) and mon["dmm"][4] == pytest.approx(5e-4)
+    res = ok(client.post("/api/explicit/results", json={"folder": folder, "job": job}))
+    th = {q["id"]: {x["name"]: x for x in q["series"]} for q in res["time_history"]}
+    assert "th_note" not in res, res.get("th_note")
+    assert th["h1"]["uz mean"]["v"] == pytest.approx([0, -1, -2, -3, -4]) and th["h1"]["|v| max"]["v"][2] == pytest.approx(1000)
+    assert th["h1"]["RFz total"]["v"][3] == pytest.approx(30 * n_nodes)
+    assert th["h2"]["internal energy"]["v"][2] == pytest.approx(20) and th["h2"]["kinetic energy"]["v"][0] == pytest.approx(200)
+    assert th["h3"]["Fz total"]["v"] == pytest.approx([0, 7, 14, 21, 28]) and th["h3"]["Fx total"]["v"][1] == pytest.approx(2)
+    assert th["h4"]["Fz total"]["v"][4] == pytest.approx(28) and th["h4"]["My"]["v"][2] == pytest.approx(6)
+    # probe: the z displacement of the centre point of the fake grid (-0.5 (k - 1) at frame k) and the von Mises
+    # stress of cell 3 (10 k + 3) over the frames
+    g = ok(client.post("/api/explicit/geometry", json={"folder": folder, "job": job}))
+    keys = [f["key"] for f in g["fields"]]
+    vmk = next(k for k in keys if "Von_Mises" in k)
+    pr = ok(client.post("/api/explicit/probe", json={"folder": folder, "job": job, "field": "point|Displacement|2", "probes": [{"point": 12, "cell": 0}]}))
+    assert pr["loc"] == "point" and pr["values"][0] == pytest.approx([0, -0.5, -1, -1.5, -2]) and len(pr["time"]) == 5
+    pr = ok(client.post("/api/explicit/probe", json={"folder": folder, "job": job, "field": vmk, "probes": [{"point": 0, "cell": 3}]}))
+    assert pr["loc"] == "cell" and pr["values"][0] == pytest.approx([13, 23, 33, 43, 53])
+    assert "node_ids" in g["payload"]
+    # a CSV without names: by position
+    csv = os.path.join(folder, job + "_Results.csv")
+    L = open(csv).read().splitlines()
+    n = len(L[1].split(","))
+    open(csv, "w").write(",".join(['"time"'] + ['"var %d"' % i for i in range(1, n)]) + "\n" + "\n".join(L[1:]) + "\n")
+    t2 = thist.series(folder, job)
+    assert "by position" in t2["note"]
+    th2 = {q["id"]: {x["name"]: x for x in q["series"]} for q in t2["time_history"]}
+    assert th2["h1"]["RFz total"]["v"] == th["h1"]["RFz total"]["v"] and th2["h2"]["kinetic energy"]["v"] == th["h2"]["kinetic energy"]["v"]
+    assert th2["h4"]["My"]["v"] == th["h4"]["My"]["v"]

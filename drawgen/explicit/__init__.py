@@ -1,1 +1,1 @@
-"""Explicit tab: ORC**3 core, inp2rad, deck generator."""
+"""Explicit tab: deck build, run manager, solve, post-processing, inp2rad, deck generator."""

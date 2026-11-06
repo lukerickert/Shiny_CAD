@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Rivet section of the Explicit tab (ORC**3 workspace_rivet.py): /TH/NODE gauge rings around a rivet hole and the
+"""Rivet section of the Explicit tab: /TH/NODE gauge rings around a rivet hole and the
 force vs relative-displacement curve (rivet_calibration/make_gauge_rings.build_rings, relative_disp.compute).
 
 Deck: the Target .rad. Gauge ring files: th_gauge_rings.inc and gauge_rings.json next to the deck. Results CSV: the

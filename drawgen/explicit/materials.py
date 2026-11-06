@@ -1,4 +1,4 @@
-"""Material, failure and timestep cards of the explicit analysis (ORC**3 workspace_materials.py): /MAT, /FAIL and
+"""Material, failure and timestep cards of the explicit analysis: /MAT, /FAIL and
 /FUNCT generators, the load-hold-unload curve, the Min dt advisor and the shell normal healing.
 
 MaterialsMixin of the headless workspace (host.Workspace)."""
@@ -466,7 +466,7 @@ class MaterialsMixin:
 
     def _gen_fail_tensstrain(self, mat_id):
         """/FAIL/TENSSTRAIN per the radioss2025 format (verified against the
-        OpenRadioss starter reader and hm_cfg definition):
+        OpenCourant starter reader and hm_cfg definition):
           card 1: Eps_t1, Eps_t2, fct_ID, Eps_f1, Eps_f2, S_Flag
           if S_Flag in {2,3,12,13,22,23}: element-size and temperature scaling
           cards are REQUIRED (written zeroed; the reader defaults zeros to 1.0);

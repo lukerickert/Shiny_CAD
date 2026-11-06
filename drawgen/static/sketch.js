@@ -1708,11 +1708,14 @@ function redraw() {
       out.push(`<rect x="${N(go[0] - 3)}" y="${N(go[1] - 3)}" width="6" height="6" fill="none" stroke="#1d2125" stroke-dasharray="2 1"/>`);
     }
   }
-  // reference geometry (section of the part with the sketch plane)
+  // reference geometry (section of the part with the sketch plane); behind the plane dimmed (10 % opacity) or
+  // hidden; references activated for snapping (hover) drawn over them
   for (const e of SK.refs || []) {
     if (!refShown(e)) continue;
-    if (e.kind === "proj") out.push(entSvg(e, "#9aa3b0", 1.0, ""));
-    else if (e.kind === "hidden") out.push(entSvg(e, "#b8bfc9", 0.9, "1 2.5"));
+    const dim = e.behind && behindMode() === "dim" && !(SK.awake && SK.awake.has(e.id)) ? ' stroke-opacity="0.1"' : "";
+    if (SK.awake && SK.awake.has(e.id)) { out.push(entSvg(e, "#1f77d0", 1.4, "")); continue; }
+    if (e.kind === "proj") out.push(entSvg(e, "#9aa3b0", 1.0, "", dim));
+    else if (e.kind === "hidden") out.push(entSvg(e, "#b8bfc9", 0.9, "1 2.5", dim));
     else if (e.kind === "axis") out.push(entSvg(e, "#6a3fa0", 1.0, "10 3 2 3"));
     else if (e.kind === "datum") { const q = S([e.x, e.y]); out.push(`<circle cx="${N(q[0])}" cy="${N(q[1])}" r="3.5" fill="none" stroke="#6a3fa0" stroke-width="1.4"/><path d="M${N(q[0] - 6)} ${N(q[1])} H${N(q[0] + 6)} M${N(q[0])} ${N(q[1] - 6)} V${N(q[1] + 6)}" stroke="#6a3fa0" stroke-width="1"/>`); }
     else out.push(entSvg(e, "#6b7480", 1.2, "2 3"));
@@ -1915,7 +1918,7 @@ function snapAt(p, opts) {
   if (!$("#sk-snap").checked || opts.nosnap) return { p, kind: null, ref: null };
   const tol = SNAP_PX / SK.view.s;
   const near = [];
-  for (const e of visibleEnts().concat(SK.refs || [])) {
+  for (const e of visibleEnts().concat((SK.refs || []).filter(snapRef))) {
     if (e.t === "text" || (opts.exclude && opts.exclude.has(e.id)) || (e.src === "sketch" && SK.showSketchRefs === false)) continue;
     const d = entDist(e, p);
     if (d < tol * 1.5) near.push([d, e]);
@@ -1945,6 +1948,40 @@ function snapAt(p, opts) {
     if (q) return { p: q, kind: "on", ref: isSolver(e) && e.t !== "point" && !e.isRef ? { on: e.id } : null };
   }
   return { p, kind: null, ref: null };
+}
+
+/** A reference entity snapped to: shown, and (model edges, hidden lines, earlier sketches) activated by hovering when
+ *  Hover to snap is on, not behind the plane unless activated. */
+function snapRef(e) {
+  if (!refShown(e)) return false;
+  if (!wakeable(e) || !SK.partEdit || SK.partEdit.drawing) return true;
+  if (SK.awake && SK.awake.has(e.id)) return true;
+  return !e.behind && SK.hoverSnap === false;
+}
+/** Hover to snap: a model reference under the cursor (within 6 px) for 350 ms becomes active for snapping. */
+let wakeTimer = null;
+function wakeAt(p) {
+  if (!SK.partEdit || SK.partEdit.drawing || (SK.hoverSnap === false && !(SK.refs || []).some(e => e.behind))) return;
+  const tol = HIT_PX / SK.view.s;
+  let best = null, bd = tol;
+  for (const e of SK.refs || []) {
+    if (!wakeable(e) || !refShown(e) || (SK.awake && SK.awake.has(e.id))) continue;
+    if (SK.hoverSnap === false && !e.behind) continue;
+    const d = entDist(e, p);
+    if (d <= bd) { bd = d; best = e; }
+  }
+  const id = best ? best.id : null;
+  if (id === SK.wakeCand) return;
+  SK.wakeCand = id;
+  clearTimeout(wakeTimer);
+  if (!id) return;
+  wakeTimer = setTimeout(() => {
+    if (SK.wakeCand !== id || !SK.partEdit) return;
+    SK.awake = SK.awake || new Set();
+    SK.awake.add(id);
+    msg("Reference active for snapping (Esc in Select clears the active references)");
+    redraw();
+  }, 350);
 }
 
 // ortho (Shift): horizontal or vertical from the base point
@@ -5531,6 +5568,7 @@ function bindCanvas(svg) {
     }
     if (SK.drag) { doDrag(e); return; }
     if (SK.win) { overlay(); return; }
+    wakeAt(p);
     if (SK.tool === "trim" && SK.trimSweep && (e.buttons & 1)) { trimSweep(p); SK.hover = null; overlay(); return; }
     if (SK.tool === "select") {
       SK.snap = null;
@@ -5754,6 +5792,7 @@ function escape() {
   if (SK.tool.startsWith("img")) { SK.lens = null; SK.ctrl = null; SK.round = null; setTool("select"); showProps(); overlay(); return; }
   if (SK.pick.length) { SK.pick = []; updateHint(); overlay(); return; }
   if (SK.tool !== "select") { setTool("select"); return; }
+  if (!SK.sel.size && SK.awake && SK.awake.size) { SK.awake.clear(); SK.wakeCand = null; msg("Active references cleared"); }
   SK.sel.clear(); redraw(); showProps();
 }
 
@@ -5826,8 +5865,9 @@ const KEYS = [
   ["KeyZ", false, "undo", "Undo"],
   ["KeyZ", true, "redo", "Redo"],
   ["KeyF", false, "fit", "Fit"],
+  ["KeyI", false, "isolate", "Isolate (feature sketch: the sketch plane only)"],
 ];
-const KEY_MIRROR = { KeyQ: "KeyP", KeyW: "KeyO", KeyE: "KeyI", KeyR: "KeyU", KeyT: "KeyY", KeyA: "Semicolon", KeyS: "KeyL", KeyD: "KeyK",
+const KEY_MIRROR = { KeyI: "KeyE", KeyQ: "KeyP", KeyW: "KeyO", KeyE: "KeyI", KeyR: "KeyU", KeyT: "KeyY", KeyA: "Semicolon", KeyS: "KeyL", KeyD: "KeyK",
                      KeyF: "KeyJ", KeyG: "KeyH", KeyZ: "Slash", KeyX: "Period", KeyC: "Comma", KeyV: "KeyM", KeyB: "KeyN",
                      Digit1: "Digit0", Digit2: "Digit9", Digit3: "Digit8", Digit4: "Digit7", Digit5: "Digit6", Digit6: "Digit5" };
 const KEYS_LEFT = KEYS.map(k => [KEY_MIRROR[k[0]] || k[0], k[1], k[2], k[3]]);
@@ -5857,6 +5897,7 @@ function runAction(a) {
     case "undo": return undo();
     case "redo": return redoOp();
     case "fit": return fit();
+    case "isolate": return setIsolate(!SK.isolate);
     case "escape": return escape();
   }
 }
@@ -6585,6 +6626,7 @@ async function exportSketch(fmt, overwrite) {
 window.sketchEditForPart = function (sketch, refs, title, onFinish, opts) {
   const saved = SK.doc ? { doc: JSON.stringify(SK.doc), dirty: SK.dirty } : null;
   SK.partEdit = { onFinish, saved, reload: opts && opts.reload || null, underlay: opts && opts.underlay || null };
+  SK.isolate = false; SK.awake = new Set(); SK.wakeCand = null;
   SK.hostSheet = null;
   const doc = JSON.parse(JSON.stringify(sketch || blankSketch("feature sketch")));
   doc.sheet = { page: "extents", title_block: false, origin: [0, 0] };
@@ -6598,14 +6640,26 @@ window.sketchEditForPart = function (sketch, refs, title, onFinish, opts) {
   document.querySelector("#tab-sketch .sk-file").classList.add("collapsed");
   $("#sk-parttitle").textContent = title;
   const ul = SK.partEdit.underlay;
-  if (ul) { ul.attach($("#sk-canvas")); ul.setCut(SK.cutMode || null); ul.setVisible(SK.showShaded !== false); }
+  if (ul) { ul.attach($("#sk-canvas")); ul.setCut(SK.cutMode || null); if (ul.setBehind) ul.setBehind(behindMode()); if (ul.setIsolate) ul.setIsolate(false); ul.setVisible(SK.showShaded !== false); }
   fitAll();
 };
+/** Isolate (I): only the sketch plane: the shaded model within the plane, the section and datums; the model
+ *  edges, hidden lines and earlier sketches hidden. Off when the sketch is closed. */
+function setIsolate(on) {
+  const pe = SK.partEdit;
+  if (!pe || pe.drawing) return msg("Isolate: feature sketches of the Part tab only", true);
+  SK.isolate = !!on;
+  if (pe.underlay && pe.underlay.setIsolate) pe.underlay.setIsolate(SK.isolate);
+  if ($("#sk-isolate")) $("#sk-isolate").checked = SK.isolate;
+  msg(SK.isolate ? "Isolate: the sketch plane only (I restores)" : "Isolate off");
+  redraw();
+}
 
 /** The reference geometry of the feature sketch (the frame entry apart). */
 function setRefs(refs) {
   SK.frameRef = (refs || []).find(e => e.t === "frame") || null;
   SK.refs = (refs || []).filter(e => e.t !== "frame").map((e, i) => Object.assign({ id: "ref" + i, isRef: true, layer: "" }, e));
+  SK.awake = new Set(); SK.wakeCand = null;
 }
 
 /** Reads the reference geometry again (Cut at plane, Flip): the model cut at the sketch plane on the server. */
@@ -7560,7 +7614,15 @@ function includeRef(r) {
 
 /** Reference geometry shown: Model edges (projection and hidden edges of the part) and Earlier sketches (curves of
  *  the earlier sketches, src "sketch") check boxes of the sketch bar; the section and datums are always shown. */
+/** Mode of the reference geometry and the shaded model behind the sketch plane: "dim" (10 % opacity), "hide",
+ *  "show". */
+function behindMode() { return SK.behind || "dim"; }
+/** References of the model away from the plane (projected model edges, hidden lines, earlier sketches): activated
+ *  for snapping by hovering (Hover to snap), hidden by Isolate. */
+function wakeable(e) { return e.kind === "proj" || e.kind === "hidden" || e.src === "sketch"; }
 function refShown(e) {
+  if (SK.isolate && wakeable(e) && SK.partEdit && !SK.partEdit.drawing) return false;
+  if (e.behind && behindMode() === "hide") return false;
   if (e.src === "sketch") return SK.showSketchRefs !== false;
   if (e.kind === "hidden") return SK.showProj !== false && SK.showHidden !== false;
   return SK.showProj !== false || e.kind !== "proj";
@@ -7587,6 +7649,16 @@ function bindRefToggles() {
   if (flip) { flip.closest("label").hidden = !(partSketch && pe.reload); flip.disabled = !SK.cutMode; }
   const sh = cb("#sk-shaded", SK.showShaded, v => { SK.showShaded = v; if (pe && pe.underlay) pe.underlay.setVisible(v); });
   if (sh) sh.closest("label").hidden = !(partSketch && pe.underlay);
+  if (SK.hoverSnap === undefined) SK.hoverSnap = true;
+  cb("#sk-hoversnap", SK.hoverSnap, v => { SK.hoverSnap = v; if (!v) SK.awake = new Set(); redraw(); });
+  const iso = cb("#sk-isolate", !!SK.isolate, v => setIsolate(v));
+  if (iso) iso.closest("label").hidden = !partSketch;
+  const bh = $("#sk-behind");
+  if (bh) {
+    bh.value = behindMode();
+    bh.onchange = () => { SK.behind = bh.value; if (pe && pe.underlay && pe.underlay.setBehind) pe.underlay.setBehind(SK.behind); redraw(); };
+    bh.closest("label").hidden = !partSketch;
+  }
 }
 /** Options of the reference geometry read for a feature sketch (the Part tab reads them before opening the sketch). */
 window.sketchRefOptions = () => ({ cut: SK.cutMode || null });
@@ -7624,6 +7696,7 @@ function endPartEdit(apply) {
   if (pe.underlay) { try { pe.underlay.dispose(); } catch (e) { console.error(e); } }
   SK.partEdit = null;
   SK.refs = [];
+  SK.isolate = false; SK.awake = new Set();
   SK.hostSheet = null;
   $("#sk-partbar").hidden = true;
   $("#sk-includesec").hidden = false;

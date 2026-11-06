@@ -180,6 +180,9 @@ def geometry(folder, job, rigid=None):
     d = _disp(v)
     xyz0 = v["xyz"] - d if d is not None else v["xyz"]
     pl = meshview.payload(xyz0, cells)
+    nid0 = (v.get("point") or {}).get("NODE_ID")
+    if nid0 is not None and len(np.asarray(nid0).reshape(-1)) == len(xyz0):
+        pl["node_ids"] = _b64(np.asarray(nid0).reshape(-1), np.uint32)        # node numbers (probe labels)
     # rigid cells (kept when eroded elements are hidden): PART_ID in the rigid parts or all nodes rigid
     rigid_mask = np.zeros(len(order), bool)
     rigid = rigid or {}
@@ -298,3 +301,33 @@ def frame(folder, job, k, field, rigid=None):
         out["active"] = _b64(act, np.uint8)
         out["eroded"] = int((~act).sum())
     return out
+
+
+
+def probe(folder, job, field, probes, rigid=None):
+    """Values of a field over the frames at probes [{"point": index into the view points, "cell": index into the
+    view cells}] (a point field at the point, a cell field at the cell): {"time": [s], "loc", "values": [[value per
+    frame] per probe]}."""
+    geometry(folder, job, rigid)
+    fr = frames(folder, job)
+    if not fr:
+        raise ValueError("no frames")
+    first = fr[0]["file"]
+    key = (folder, job, first, os.path.getmtime(first))
+    with _LOCK:
+        g = _GEO[key]
+    order = g["order"]
+    times, cols, loc = [], [[] for _ in probes], None
+    for e in fr:
+        v = _read(e["file"])
+        xyz = v["xyz"]
+        d = _disp(v)
+        if d is None and len(xyz) == len(g["xyz0"]):
+            d = xyz - g["xyz0"]
+        val, loc = _values(v, field, order, d)
+        times.append(e["time"] if e["time"] is not None else v.get("time"))
+        for j, q in enumerate(probes):
+            i = int(q.get("cell" if loc == "cell" else "point", -1))
+            x = float(val[i]) if val is not None and 0 <= i < len(val) else float("nan")
+            cols[j].append(x if np.isfinite(x) else None)
+    return {"time": times, "loc": loc, "values": cols}

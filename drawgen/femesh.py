@@ -9,7 +9,12 @@ job:
             "optimize": bool, "strategy": "tet" | "hex" | "hexsub" (default of the solid bodies),
             "tet_type": "C3D10" | "C3D4", "hex_type": "C3D8I" | "C3D8" | "C3D8R" | "C3D20" | "C3D20R"},
    "bodies": [{"id", "brep": path, "mode": "solid" | "plate" | "shell", "size": mm or null, "layers": n (plate),
-               "strategy": null (job default) | "tet" | "hex" | "hexsub", "t": mm (shell)}]}
+               "strategy": null (job default) | "tet" | "hex" | "hexsub", "t": mm (shell)}],
+   "refine": [{"box": [x0, y0, z0, x1, y1, z1] (mm, global), "size": mm}]}   mesh refinement regions (tetrahedra and
+               shells: Box fields; structured shell faces inside a region: the region size)
+Automatic size (job "size" 0: h = diagonal / 20): every face of the tetrahedral bodies and shells without a size of
+their own gets at most its width / ACROSS (3 elements across; width = area / largest bounding box extent), at least
+"size_min" (empty: h / 10); shell faces at least the shell thickness "t".
    "mesh" also: "shell_type": "S4" | "S4R" | "S8R" | "S3", "shell_algorithm": "quasi" | "frontal" | "delaunay" | "tri"
 
 out:
@@ -115,6 +120,84 @@ def _common_options(gmsh, opts, h):
     gmsh.option.setNumber("Mesh.HighOrderOptimize", 0)
 
 
+def _refine_fields(gmsh, job, f=1.0):
+    """Mesh refinement regions (job["refine"]: [{"box": [x0, y0, z0, x1, y1, z1], "size": mm}]): a Box field per region
+    (element size inside, growing over 3 x the size outside), their minimum as the background mesh; the minimum
+    element size follows the smallest region size. f: size factor of the algorithm (quasi-structured: 2)."""
+    R = [r for r in job.get("refine") or [] if float(r.get("size") or 0) > 0 and len(r.get("box") or []) == 6]
+    if not R:
+        return
+    ids = []
+    for r in R:
+        sz = float(r["size"]) * f
+        b = [float(v) for v in r["box"]]
+        pad = 0.25 * float(r["size"])
+        fid = gmsh.model.mesh.field.add("Box")
+        gmsh.model.mesh.field.setNumber(fid, "VIn", sz)
+        gmsh.model.mesh.field.setNumber(fid, "VOut", 1e22)
+        for k, v in (("XMin", b[0] - pad), ("YMin", b[1] - pad), ("ZMin", b[2] - pad),
+                     ("XMax", b[3] + pad), ("YMax", b[4] + pad), ("ZMax", b[5] + pad)):
+            gmsh.model.mesh.field.setNumber(fid, k, v)
+        gmsh.model.mesh.field.setNumber(fid, "Thickness", 3.0 * sz)
+        ids.append(fid)
+    mn = gmsh.model.mesh.field.add("Min")
+    gmsh.model.mesh.field.setNumbers(mn, "FieldsList", ids)
+    gmsh.model.mesh.field.setAsBackgroundMesh(mn)
+    smin = min(float(r["size"]) for r in R) * f
+    if gmsh.option.getNumber("Mesh.MeshSizeMin") > smin:
+        gmsh.option.setNumber("Mesh.MeshSizeMin", smin * 0.5)
+
+
+def _refined_size(gmsh, job, st, cur):
+    """Element size of a surface (structured shells): the smallest size of the refinement regions holding it."""
+    out = cur
+    R = [r for r in job.get("refine") or [] if float(r.get("size") or 0) > 0 and len(r.get("box") or []) == 6]
+    if not R:
+        return out
+    bb = gmsh.model.getBoundingBox(2, st)
+    for r in R:
+        b, pad = r["box"], 0.25 * float(r["size"]) + 1e-6
+        if all(bb[i] >= b[i] - pad and bb[i + 3] <= b[i + 3] + pad for i in range(3)):
+            out = min(out, float(r["size"])) if out else float(r["size"])
+    return out
+
+
+ACROSS = 3          # automatic element size: at least this many elements across every face
+
+
+def _face_width(gmsh, st):
+    """Width of a face: area / largest extent of its bounding box (a rectangle a x b: the shorter side)."""
+    try:
+        a = gmsh.model.occ.getMass(2, st)
+    except Exception:
+        return 0.0
+    bb = gmsh.model.getBoundingBox(2, st)
+    L = max(bb[3] - bb[0], bb[4] - bb[1], bb[5] - bb[2])
+    return a / L if L > 0 else 0.0
+
+
+def _across_sizes(gmsh, surfs, h, hmin):
+    """Automatic element size per face: ACROSS elements across the width of the face (h at most, hmin at least).
+    Returns {surface: size} of the faces narrower than ACROSS x h."""
+    out = {}
+    for st in surfs:
+        w = _face_width(gmsh, st)
+        if w > 0 and w / ACROSS < h:
+            out[st] = max(w / ACROSS, hmin)
+    return out
+
+
+def _point_sizes(gmsh, sizes, f=1.0):
+    """Mesh sizes at the points of the faces: the smallest size of the faces at each point (x f)."""
+    at = {}
+    for st, sz in sizes.items():
+        for d, t in gmsh.model.getBoundary([(2, st)], combined=False, recursive=True):
+            if d == 0:
+                at[t] = min(at.get(t, sz), sz)
+    for t, sz in at.items():
+        gmsh.model.mesh.setSize([(0, t)], sz * f)
+
+
 def _strategy(b, opts):
     st = b.get("strategy") or opts.get("strategy") or "tet"
     return st if st in ("tet", "hex", "hexsub") else "tet"
@@ -152,10 +235,20 @@ def _mesh(job):
             order = 1 if opts.get("tet_type") == "C3D4" else 2
             gmsh.option.setNumber("Mesh.ElementOrder", order)
             gmsh.option.setNumber("Mesh.SecondOrderIncomplete", 1 if order == 2 else 0)
+            if not size:
+                # automatic size: ACROSS elements across every face of the bodies without a size of their own
+                hmin = float(opts.get("size_min") or 0) or h / 10.0
+                auto = [b for b in solids if not b.get("size")]
+                faces = sorted(set(t for b in auto for d, t in gmsh.model.getBoundary([(3, v) for v in vol_of[b["id"]]], combined=False, oriented=False) if d == 2))
+                acr = _across_sizes(gmsh, faces, h, hmin)
+                if acr:
+                    _point_sizes(gmsh, acr)
+                    gmsh.option.setNumber("Mesh.MeshSizeMin", min(gmsh.option.getNumber("Mesh.MeshSizeMin"), hmin))
             for b in solids:
                 if b.get("size"):
                     pts = gmsh.model.getBoundary([(3, t) for t in vol_of[b["id"]]], combined=False, recursive=True)
                     gmsh.model.mesh.setSize([p for p in pts if p[0] == 0], float(b["size"]))
+            _refine_fields(gmsh, job)
             gmsh.model.mesh.generate(3)
             ntags, coords, _ = gmsh.model.mesh.getNodes()
             for i, t in enumerate(ntags):
@@ -552,6 +645,20 @@ def _shell_group(gmsh, group, job, opts, h, nid, eid, out_nodes, bodies, warning
                 for st in surf_of[b["id"]]:
                     surf_size[st] = float(b["size"])
         allsurf = sorted(seen)
+        acr = {}
+        if not float(job.get("size") or 0):
+            # automatic size: ACROSS elements across every face of the shells without a size of their own
+            hmin = float(opts.get("size_min") or 0) or h / 10.0
+            acr = _across_sizes(gmsh, [st for st in allsurf if st not in surf_size], h, hmin)
+            # shells: elements not smaller than the shell thickness (shell theory; explicit time step)
+            t_of = {st: float(b.get("t") or 0) for b in group for st in surf_of[b["id"]]}
+            acr = {st: min(max(sz, t_of.get(st, 0.0)), h) for st, sz in acr.items()}
+            acr = {st: sz for st, sz in acr.items() if sz < h}
+            surf_size.update(acr)
+        for st in allsurf:                               # refinement regions: the size of the faces inside them
+            rs = _refined_size(gmsh, job, st, surf_size.get(st))
+            if rs:
+                surf_size[st] = rs
         xmin, ymin, zmin, xmax, ymax, zmax = gmsh.model.getBoundingBox(-1, -1)
         tol = max(math.sqrt((xmax - xmin) ** 2 + (ymax - ymin) ** 2 + (zmax - zmin) ** 2) * 1e-6, 1e-6)
         tf, nfree = set(), len(allsurf)
@@ -566,7 +673,7 @@ def _shell_group(gmsh, group, job, opts, h, nid, eid, out_nodes, bodies, warning
         if f > 1.0 and opts.get("shell_structured", True) and not tri:
             _structured(gmsh, allsurf, surf_size, h, opts, tol, f)       # the curve divisions at twice the size
         gmsh.option.setNumber("Mesh.MeshSizeMax", h * f)
-        gmsh.option.setNumber("Mesh.MeshSizeMin", (float(opts.get("size_min") or 0) or h / 5.0) * f)
+        gmsh.option.setNumber("Mesh.MeshSizeMin", (float(opts.get("size_min") or 0) or (h / 10.0 if acr else h / 5.0)) * f)
         gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 1)
         curv = opts.get("curvature")
         gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 12 if curv is None else float(curv))
@@ -580,6 +687,9 @@ def _shell_group(gmsh, group, job, opts, h, nid, eid, out_nodes, bodies, warning
             if b.get("size") and surf_of[b["id"]]:
                 pts = gmsh.model.getBoundary([(2, t) for t in surf_of[b["id"]]], combined=False, recursive=True)
                 gmsh.model.mesh.setSize([p for p in pts if p[0] == 0], float(b["size"]) * f)
+        if acr:
+            _point_sizes(gmsh, acr, f)
+        _refine_fields(gmsh, job, f)
         gmsh.model.mesh.generate(2)
         if SHELL_ALGOS.get("delaunay" if tri else algo, 11) != 6:
             # faces where the quadrangle algorithm returned the boundary triangulation without inside nodes

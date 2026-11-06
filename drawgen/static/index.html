@@ -98,7 +98,7 @@
       <button type="button" class="tab" data-tab="part">Part</button>
       <button type="button" class="tab" data-tab="asm">Assembly</button>
       <button type="button" class="tab" data-tab="fea">Analysis</button>
-      <button type="button" class="tab" data-tab="xp">Explicit</button>
+      <button type="button" class="tab" data-tab="xp" hidden>Explicit</button>
       <button type="button" class="tab" data-tab="cam">CAM</button>
     </nav>
 
@@ -266,6 +266,9 @@
         <label class="check inline" title="The half of the model in front of the sketch plane (toward the viewer) is removed: the model edges are those of the remaining half, the section outline included"><input type="checkbox" id="sk-cut"> Cut at plane</label>
         <label class="check inline" title="Remove the half behind the sketch plane instead"><input type="checkbox" id="sk-cutflip"> Flip</label>
         <label class="check inline" title="The shaded model under the sketch, seen along the sketch plane normal (cut at the plane when Cut at plane is on)"><input type="checkbox" id="sk-shaded" checked> Shaded</label>
+        <label class="inline" title="The model edges, hidden lines, earlier sketches and the shaded model behind the sketch plane (away from the viewer): dimmed to 10 % opacity, hidden or shown. They are not snapped to unless activated by hovering">Behind plane <select id="sk-behind"><option value="dim">dim</option><option value="hide">hide</option><option value="show">show</option></select></label>
+        <label class="check inline" title="Model edges, hidden lines and earlier sketches snap only after the cursor rests on them for 350 ms (they are then drawn blue); Esc in Select clears them. Unchecked: all of them snap (except behind the plane)"><input type="checkbox" id="sk-hoversnap" checked> Hover to snap</label>
+        <label class="check inline" title="Only the sketch plane: the shaded model within the plane, the section and the datums (key I)"><input type="checkbox" id="sk-isolate"> Isolate</label>
         <button type="button" id="sk-include" title="Click reference geometry to copy it into the sketch as fixed entities">Include</button>
         <button type="button" id="sk-includesec" title="Copy the whole section into the sketch">Include section</button>
         <button type="button" id="sk-includeproj" title="Copy all visible model edges into the sketch">Include edges</button>
@@ -473,6 +476,7 @@
           <button type="button" data-add="curve_section" title="Intersection curve of surfaces or of a surface with the solid">Intersection curve</button>
           <button type="button" data-add="curve_blend" title="3D curve between two ends (edge ends, curve ends, points) with position, tangent or curvature continuity at each end">Blend curve</button>
           <button type="button" data-add="curve_points" title="3D curve through picked vertices and point features: polyline, spline, best-fit line or arc">Curve through points</button>
+          <button type="button" data-add="curve_points" data-init='{"space":true}' title="3D sketch: a curve body through points picked in space (vertices, edge midpoints, centres, centre lines, points on edges, a 3D snap grid) or typed">3D sketch</button>
           <button type="button" data-add="surf_from_curve" title="Extrude or revolve a curve body into a surface">Surface from curve</button>
           <button type="button" data-add="surf_trim" title="Split a surface body with the solid, a surface or a projected curve and keep pieces">Trim surface</button>
           <button type="button" data-add="surf_extend" title="Extend a surface body beyond its boundary by a distance">Extend surface</button>
@@ -632,6 +636,7 @@
             <div class="row"><button type="button" id="fa-openrun" title="Open the folder of the solver files (input file, results, report) on this PC">Open run folder</button><button type="button" id="fa-inp" title="Write the CalculiX input file without solving (Mesh)">Write input file</button></div>
           </div>
         </div>
+        <label class="inline" title="Solver of the analysis: CalculiX (static, modal, buckling, steps with dynamics) or OpenCourant (explicit dynamics: runs, build, solve); both work on the same model">Solver<select id="fa-solver"><option value="calculix">CalculiX</option><option value="explicit">OpenCourant (explicit)</option></select></label>
         <label class="inline" title="Geometry of the analysis: a saved assembly or part">Geometry<select id="fa-source"></select></label>
         <div class="toolbar">
           <button type="button" id="fa-update" data-icon="cam_refresh" title="Load the geometry again (after a change of the assembly or its parts)">Update</button>
@@ -677,9 +682,11 @@
         <div class="ann-props" id="fa-panel">
           <div id="fa-panels"></div>
           <section class="fa-card" id="fa-settings-card"><h2>Settings</h2><div id="fa-settings"></div></section>
+          <section class="fa-card" id="fa-inpfile-card" hidden><h2>Input file</h2><div id="fa-inpfile"></div></section>
           <section class="fa-card" id="fa-mats-card"><h2>Materials</h2><div id="fa-mats"></div></section>
           <section class="fa-card" id="fa-bodies-card"><h2>Bodies</h2><div id="fa-bodies"></div></section>
           <section class="fa-card" id="fa-sections-card"><h2>Sections</h2><div id="fa-sections"></div></section>
+          <section class="fa-card" id="fa-surfaces-card"><h2>Surfaces</h2><div id="fa-surfaces"></div></section>
           <section class="fa-card" id="fa-nsets-card"><h2>Node sets</h2><div id="fa-nsets"></div></section>
           <section class="fa-card" id="fa-members-card"><h2>Members</h2><div id="fa-members"></div></section>
           <section class="fa-card" id="fa-plates-card"><h2>Plates</h2><div id="fa-plates"></div></section>
@@ -689,8 +696,12 @@
           <section class="fa-card" id="fa-joints-card"><h2>Joints</h2><div id="fa-joints"></div></section>
           <section class="fa-card" id="fa-eqs-card"><h2>Equations</h2><div id="fa-eqs"></div></section>
           <section class="fa-card" id="fa-contacts-card"><h2>Contact</h2><div id="fa-contacts"></div></section>
+          <section class="fa-card" id="fa-steps-card"><h2>Steps</h2><div id="fa-steps"></div></section>
           <section class="fa-card" id="fa-sups-card"><h2>Supports</h2><div id="fa-sups"></div></section>
           <section class="fa-card" id="fa-loads-card"><h2>Loads</h2><div id="fa-loads"></div></section>
+          <section class="fa-card" id="fa-amps-card"><h2>Amplitudes</h2><div id="fa-amps"></div></section>
+          <section class="fa-card" id="fa-ivel-card"><h2>Initial velocities</h2><div id="fa-ivel"></div></section>
+          <section class="fa-card" id="fa-hist-card"><h2>History output</h2><div id="fa-hist"></div></section>
           <section class="fa-card" id="fa-results-card"><h2>Results</h2><div id="fa-results"><p class="hint">Solve to see the results.</p></div></section>
         </div>
       </div>
@@ -708,6 +719,7 @@
             <div class="row"><button type="button" id="xp-openrun" title="Open the folder of the model .inp and the run folders on this PC">Open explicit folder</button></div>
           </div>
         </div>
+        <label class="inline" title="Solver of the analysis: CalculiX (static, modal, buckling, steps with dynamics) or OpenCourant (explicit dynamics: runs, build, solve); both work on the same model">Solver<select id="xp-solver"><option value="calculix">CalculiX</option><option value="explicit" selected>OpenCourant (explicit)</option></select></label>
         <label class="inline" title="Geometry of the model: a saved assembly or part (Model: Source)">Geometry<select id="xp-source"></select></label>
         <div class="toolbar">
           <button type="button" id="xp-update" data-icon="cam_refresh" title="Load the geometry again (after a change of the assembly or its parts)">Update</button>

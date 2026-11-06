@@ -48,7 +48,7 @@ class Builder(tk.Tk):
             try:
                 import ctypes
                 ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                    "GR.ORC3.1")
+                    "SHINYCAD.inertia_builder")
             except Exception:
                 pass
             _ico = os.path.join(_here, "workspace_icon.ico")

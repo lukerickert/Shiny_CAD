@@ -1,4 +1,4 @@
-"""Post-processing of the explicit analysis (ORC**3 workspace_post.py): anim->vtk, pvbatch/ParaView rendering,
+"""Post-processing of the explicit analysis: anim->vtk, pvbatch/ParaView rendering,
 principal strain extraction, KE/IE curves and salvage.
 
 PostMixin of the headless workspace (host.Workspace)."""

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ==============================================================================
-RAD PREVIEW  -  one-cycle geometry preview of an OpenRadioss deck   (v1.0)
+RAD PREVIEW  -  one-cycle geometry preview of an OpenCourant deck   (v1.0)
 ==============================================================================
 Displays a starter deck (<job>_0000.rad) in ParaView before the real solve.
 
@@ -14,8 +14,8 @@ folder is not written to.
     python rad_preview.py            # window with an Add decks... dialog
 
 Windows. starter_win64, engine_win64 and anim_to_vtk_win64 must be on PATH
-(the OpenRadioss exec folder), as for the ORC**3 Solve tab. The paraview.exe
-path is shared with ORC**3 through workspace_config.json in %APPDATA%\\ORC3.
+(the OpenCourant exec folder). The paraview.exe path is kept in rad_preview.json in
+%APPDATA%\\drawgen.
 ==============================================================================
 """
 
@@ -51,13 +51,13 @@ UI = {
 
 
 # ==============================================================================
-# CONFIG (shared with ORC**3)
+# CONFIG
 # ==============================================================================
 def _state_dir():
     base = os.environ.get("APPDATA")
     if not base:
         return os.path.dirname(os.path.abspath(__file__))
-    d = os.path.join(base, "ORC3")
+    d = os.path.join(base, "drawgen")
     try:
         os.makedirs(d, exist_ok=True)
     except Exception:
@@ -65,7 +65,7 @@ def _state_dir():
     return d
 
 
-CONFIG_FILE = os.path.join(_state_dir(), "workspace_config.json")
+CONFIG_FILE = os.path.join(_state_dir(), "rad_preview.json")
 
 
 def load_config():
@@ -77,7 +77,7 @@ def load_config():
 
 
 def config_set(key, value):
-    """Update one key, leaving every other ORC**3 setting in the file intact."""
+    """Update one key, leaving every other setting in the file intact."""
     c = load_config()
     c[key] = value
     try:
@@ -182,7 +182,7 @@ def run_tool(cmd, cwd, log):
                              stderr=subprocess.STDOUT, text=True, bufsize=1,
                              creationflags=NO_WINDOW)
     except FileNotFoundError:
-        log(f"  {cmd[0]} not found on PATH - add the OpenRadioss exec folder to PATH.")
+        log(f"  {cmd[0]} not found on PATH - add the OpenCourant exec folder to PATH.")
         return 127
     for line in iter(p.stdout.readline, ""):
         if line.strip():

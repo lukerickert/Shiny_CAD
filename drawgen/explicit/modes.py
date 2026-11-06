@@ -1,4 +1,4 @@
-"""Analysis types of the explicit analysis (ORC**3 workspace_modes.py).
+"""Analysis types of the explicit analysis.
 
 Which sections of the Build panel each type shows. Hidden fields keep their values and still act at build time;
 the Build panel names a hidden field that is active.

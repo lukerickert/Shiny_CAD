@@ -5,6 +5,7 @@ rem The tests use a temporary copy of config.json and a temporary projects folde
 rem   run_tests.bat            all tests
 rem   run_tests.bat fast       without the browser tests
 rem   run_tests.bat -k mate    tests whose name contains "mate" (any pytest options)
+rem   run_tests.bat audit      the route and interface audit (tests\audit\README.md); reports in _export\audit\
 cd /d "%~dp0"
 set VENV=%LOCALAPPDATA%\drawgen\venv
 if not exist "%VENV%\Scripts\python.exe" (
@@ -22,6 +23,7 @@ if errorlevel 1 (
 )
 set ARGS=%*
 if /i "%1"=="fast" set ARGS=--ignore=tests\test_browser.py
+if /i "%1"=="audit" set ARGS=tests\test_audit_routes.py tests\test_audit_ui.py
 %PY% -m pytest tests -p no:cacheprovider %ARGS%
 echo.
 pause
