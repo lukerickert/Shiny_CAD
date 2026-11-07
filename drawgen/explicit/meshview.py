@@ -328,14 +328,16 @@ def _keyword_params(line):
 
 
 def read_inp(path):
-    """Nodes and elements of an Abaqus .inp (without *INCLUDE files and *PART instancing)."""
+    """Nodes and elements of an Abaqus .inp (with the *INCLUDE files in place; without *PART instancing)."""
+    from ..inpmodel import expand_lines
     nodes_id, nodes_xyz = [], []
     groups = {}                                       # (kind, elset) -> (ids, conn rows)
     shell_sec = {}                                    # ELSET (upper case) -> [thickness, offset]
     mode = None
     cur = None
     pending = []
-    with open(path, "r", errors="ignore") as f:
+    from contextlib import nullcontext
+    with nullcontext(expand_lines(path)) as f:           # the lines with the *INCLUDE files in place
         for raw in f:
             s = raw.strip()
             if not s or s.startswith("**"):

@@ -682,7 +682,7 @@
         <div class="ann-props" id="fa-panel">
           <div id="fa-panels"></div>
           <section class="fa-card" id="fa-settings-card"><h2>Settings</h2><div id="fa-settings"></div></section>
-          <section class="fa-card" id="fa-inpfile-card" hidden><h2>Input file</h2><div id="fa-inpfile"></div></section>
+          <section class="fa-card" id="fa-inpfile-card" hidden><h2>Input file</h2><p class="hint" id="fa-inpimport" hidden></p><div id="fa-inpfile"></div></section>
           <section class="fa-card" id="fa-mats-card"><h2>Materials</h2><div id="fa-mats"></div></section>
           <section class="fa-card" id="fa-bodies-card"><h2>Bodies</h2><div id="fa-bodies"></div></section>
           <section class="fa-card" id="fa-sections-card"><h2>Sections</h2><div id="fa-sections"></div></section>
@@ -1064,6 +1064,12 @@
       <input type="text" id="opt-browser" placeholder="e.g. &quot;C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe&quot; --app={url}">
     </label>
     <p class="hint">An executable path; {url} marks where the address goes. With --app={url}, Edge and Chrome open SHINYCAD in a window without tabs and address bar.</p>
+    <div class="row wrap opt-app"><strong>Program</strong>
+      <button type="button" id="opt-restart" title="Stops the server and starts it again (new program files are loaded); this tab reloads">Restart SHINYCAD</button>
+      <button type="button" id="opt-quit" title="Stops the server; the browser tab can then be closed">Quit SHINYCAD</button>
+      <button type="button" id="opt-shortcuts" title="SHINYCAD shortcuts on the Desktop and in the Start menu (no console window)">Create shortcuts</button>
+    </div>
+    <p class="hint" id="opt-appinfo"></p>
     <div id="opt-keylist" class="opt-keylist"></div>
   </div>
 </div>
@@ -1087,6 +1093,7 @@
 <script src="/static/reference.js"></script>
 <script src="/static/icons.js"></script>
 <script src="/static/cmdsearch.js"></script>
+<script src="/llm/static/llm.js"></script>
 <script type="module" src="/static/part.js"></script>
 <script type="module" src="/static/assembly.js"></script>
 <script type="module" src="/static/analysis.js"></script>

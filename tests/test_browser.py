@@ -490,6 +490,40 @@ def test_inp_file_curves(page, client, tmp_path):
     page.wait_for_function("(document.querySelector('#fa-inpfile .ii-src tr.hl td:last-child') || {}).textContent?.startsWith('41, 1001,')")
 
 
+def test_inp_import_steps_ui(page, client, tmp_path):
+    """Import of an .inp with a step: the *BOUNDARY as a support on the node set of the file, the *CLOAD as a force
+    (value x nodes), NLGEOM, the increments and the *CONTROLS in Settings; the note of what was read on the Input file
+    page; the load arrow at the centre of the node set."""
+    from test_analysis import write_test_inp
+    p = write_test_inp(str(tmp_path / "stp.inp"))
+    text = open(p).read().replace("*STEP\n*STATIC\n*BOUNDARY\nFIX, 1, 3\n*END STEP\n",
+        "*STEP, NLGEOM, INC=40\n*STATIC\n0.25, 1, 1e-5, 1\n*CONTROLS, PARAMETERS=TIME INCREMENTATION\n, , , 30\n"
+        "** Name: Root\n*BOUNDARY\nFIX, 1, 3\n** Name: Push\n*CLOAD\nPFIX, 3, -2\n*NODE PRINT, NSET=FIX\nRF\n*END STEP\n")
+    open(p, "w").write(text)
+    tab(page, "fea")
+    page.wait_for_function("window.__fea && window.__fea.FA.doc")
+    page.evaluate("p => { window.browse = async () => p; }", p)
+    page.select_option("#fa-source", "inp:")
+    page.wait_for_function("window.__fea.FA.geo && window.__fea.FA.geo.components.length === 2 && window.__fea.FA.doc.supports.length")
+    d = page.evaluate("window.__fea.FA.doc")
+    ns = {n["id"]: n["set"] for n in d["nsets"]}
+    assert [(s["name"], ns[s["target"]["nset"]], s["type"], s["dofs"]) for s in d["supports"]] == [("Root", "FIX", "dofs", [1, 1, 1, 0, 0, 0])]
+    assert [(l["name"], ns[l["target"]["nset"]], l["value"]) for l in d["loads"]] == [("Push", "PFIX", [0, 0, -6])]
+    nl = d["nonlinear"]
+    assert nl["nlgeom"] and nl["maxinc"] == 40 and nl["inc0"] == 0.25 and nl["controls"] == "*CONTROLS, PARAMETERS=TIME INCREMENTATION\n, , , 30"
+    page.click("#fa-tree [data-tp=settings]")
+    assert page.input_value("#fs-controls").startswith("*CONTROLS, PARAMETERS=TIME INCREMENTATION")
+    page.click("#fa-tree [data-tp=inpfile]")
+    wait_text(page, "#fa-inpimport", "Read from the file: 1 support(s), 1 load(s), one static step with NLGEOM")
+    assert "*NODE PRINT" in page.text_content("#fa-inpimport")
+    arrows = "(() => { let n = 0; window.__fea.FA.three.group.traverse(o => { if (o.type === 'ArrowHelper' && o.userData.kind === 'load') n++; }); return n; })()"
+    page.wait_for_function(arrows + " > 0")
+    page.click("#fa-tree [data-tp=settings]")
+    page.fill("#fs-controls", "*BOUNDARY\n1, 1")
+    page.dispatch_event("#fs-controls", "change")
+    assert page.evaluate("window.__fea.FA.doc.nonlinear.controls").startswith("*CONTROLS")
+
+
 def test_explicit_inp_source(page, client, tmp_path):
     """Explicit Geometry = Import CalculiX .inp: the bodies, materials, shell section and *NSET node sets of the file
     in the document; Mesh writes the model .inp from the elements of the file; a node selected in the view on the
@@ -579,9 +613,10 @@ def test_panel_model_tree(page, client, tmp_path, server_url):
     page.click("#fa-tree [data-tp=nsets]")
     page.click("#fa-nsets [data-nk=sup]")                     # a support on the node set: the Supports page
     page.wait_for_function("document.querySelector('#fa-tree .tp-row.sel').dataset.tp === 'sups'")
-    assert page.evaluate(vis, "#fa-sups-card") and page.inner_text("#fa-tree [data-tp=sups] .tp-count") == "1"
+    # the support read from the *BOUNDARY of the file and the new one
+    assert page.evaluate(vis, "#fa-sups-card") and page.inner_text("#fa-tree [data-tp=sups] .tp-count") == "2"
     page.evaluate("window.__fea.FA.sel = null")
-    page.click("#fa-tree .tp-leaf[data-tp=sups]")             # a support leaf: the support selected
+    page.click("#fa-tree .tp-leaf[data-tp=sups] >> nth=0")    # a support leaf: the support selected
     assert page.evaluate("window.__fea.FA.sel.kind") == "support"
     # the panel on the left: the view to the right of it; the width drag follows the side
     page.click("#fa-tp-side")
@@ -702,8 +737,10 @@ def test_analysis_steps_ui(page, client, tmp_path):
     page.dispatch_event("#fa-steps tr[data-st='2'] [data-stk=time]", "change")
     st = page.evaluate("window.__fea.FA.doc.steps[1]")
     assert st["kind"] == "dynamic" and st["time"] == 0.002
-    # a support on the node set FIX, released in step 2 of a second support
+    # a support on the node set FIX (in place of the one read from the file), released in step 2 of a second support
+    assert page.evaluate("window.__fea.FA.doc.supports.map(s => s.dofs)") == [[1, 1, 1, 0, 0, 0]]
     page.evaluate("""() => { const d = window.__fea.FA.doc, ns = d.nsets.find(n => n.set === 'FIX'), ps = d.nsets.find(n => n.set === 'PFIX');
+        d.supports = [];
         d.supports.push({id: 's1', name: 'root', type: 'fixed', target: {nset: ns.id}}, {id: 's2', name: 'proot', type: 'pinned', target: {nset: ps.id}});
         window.__fea.FA.sel = {kind: 'support', id: 's2'}; window.__fea.SH.render(); }""")
     page.evaluate("window.__fea.select('support', 's2')")
@@ -842,10 +879,10 @@ def test_analysis_time_history_ui(page, client, tmp_path):
     assert page.evaluate("window.__fea.FA.doc.history[0].quantities") == ["U", "RF"]
     # a contact request: the contact pairs of the document (not tied)
     page.evaluate("""() => { const d = window.__fea.FA.doc; d.contacts = [{id: 'c1', name: 'seat', type: 'surface', master: [], slave: []}, {id: 'c2', name: 'glue', type: 'tied', master: [], slave: []}];
-        d.history.push({id: 'h5', name: 'ct', kind: 'contact', target: null, quantities: ['CF']}); window.__fea.select(null); }""")
-    page.select_option("#fa-hist [data-hr=h5] [data-hk=contact]", "c1")
+        d.history.push({id: 'hct', name: 'ct', kind: 'contact', target: null, quantities: ['CF']}); window.__fea.select(null); }""")
+    page.select_option("#fa-hist [data-hr=hct] [data-hk=contact]", "c1")
     assert page.evaluate("window.__fea.FA.doc.history[1].target") == {"contact": "c1"}
-    assert page.locator("#fa-hist [data-hr=h5] [data-hk=contact] option").count() == 2
+    assert page.locator("#fa-hist [data-hr=hct] [data-hk=contact] option").count() == 2
     page.evaluate("() => { const d = window.__fea.FA.doc; d.history.pop(); d.contacts = []; window.__fea.select(null); }")
     page.press("body", "Escape")
     page.evaluate("""() => { const d = window.__fea.FA.doc, ns = d.nsets.find(n => n.set === 'FIX'), c = window.__fea.FA.geo.components.find(x => x.id === 'BEAM');

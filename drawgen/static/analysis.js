@@ -528,6 +528,49 @@ function importInp(j) {
   for (const [id, s] of Object.entries(j.shells || {})) d.shells[id] = Object.assign({}, s, d.shells[id] || {});
   d.nsets = d.nsets || [];
   for (const n of j.nsets || []) if (!d.nsets.some(x => x.kind === "inp" && x.set === n)) d.nsets.push({ id: SH.nid("ns"), name: n, kind: "inp", set: n });
+  if (j.analysis) importInpAnalysis(j.analysis);
+}
+/** Supports, loads, amplitudes and steps of the .inp (server: inpsteps.items) into the document: *BOUNDARY as
+ *  supports on the node sets (or nodes) of the file, *CLOAD as forces (total of the nodes), *DLOAD GRAV as gravity,
+ *  one step: the nonlinear step settings; several: the steps with a factor per step; *FREQUENCY, *BUCKLE: the
+ *  analysis type. What is not read is given in the status line. */
+function importInpAnalysis(A) {
+  const d = FA.doc;
+  const nsId = name => (d.nsets.find(x => x.kind === "inp" && x.set === name) || {}).id;
+  const tgt = t => (t && t.set ? { nset: nsId(t.set) } : t && t.nodes ? { nodes: t.nodes } : {});
+  const multi = (A.steps || []).length > 1 && (A.analysis_type || "static") === "static";
+  const clean = o => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== null && v !== undefined));
+  if (A.analysis_type && A.analysis_type !== "static") { d.analysis_type = A.analysis_type; if (A.modes) d.modes = A.modes; }
+  else if (multi) {
+    const same = A.steps.every(s => (s.controls || "") === (A.steps[0].controls || ""));
+    d.steps = A.steps.map((s, k) => clean({ id: String(k + 1), name: s.name, kind: s.kind, time: s.time, inc0: s.inc0, incmin: s.incmin, incmax: s.incmax, maxinc: s.maxinc,
+                                            controls: same ? null : s.controls || null }));
+    if (same && A.steps[0].controls) d.nonlinear = Object.assign({}, d.nonlinear || {}, { controls: A.steps[0].controls });
+  }
+  else if ((A.steps || []).length === 1) { const s = A.steps[0]; d.nonlinear = Object.assign({}, d.nonlinear || {}, clean({ inc0: s.inc0, incmin: s.incmin, incmax: s.incmax, maxinc: s.maxinc, controls: s.controls || null })); }
+  if (A.nlgeom) d.nonlinear = Object.assign({}, d.nonlinear || {}, { nlgeom: true });
+  d.amplitudes = d.amplitudes || [];
+  const ampId = {};
+  for (const a of A.amplitudes || []) { const id = nid("a"); d.amplitudes.push({ id, name: a.name, points: a.points }); ampId[a.name] = id; }
+  d.supports = d.supports || []; d.loads = d.loads || [];
+  for (const s of A.supports || []) {
+    const r = { id: nid("s"), name: s.name, target: tgt(s.target), type: s.value ? "displacement" : "dofs", dofs: s.dofs };
+    if (s.value) r.value = s.value;
+    if (multi) r.steps = Object.fromEntries(s.steps.map(k => [String(k + 1), 1]));
+    d.supports.push(r);
+  }
+  for (const l of A.loads || []) {
+    const r = { id: nid("l"), name: l.name, type: l.type, target: l.type === "gravity" ? {} : tgt(l.target), value: l.value };
+    if (l.amplitude && ampId[l.amplitude]) r.amplitude = ampId[l.amplitude];
+    if (multi) r.steps = Object.fromEntries(Object.entries(l.factors || {}).map(([k, f]) => [String(+k + 1), f]));
+    d.loads.push(r);
+  }
+  const n = (A.supports || []).length, m = (A.loads || []).length;
+  const st = A.analysis_type && A.analysis_type !== "static" ? `${A.analysis_type} analysis, ${A.modes} modes` : multi ? `${A.steps.length} steps` :
+    (A.steps || []).length ? `one static step${A.nlgeom ? " with NLGEOM" : ""}` : "no step";
+  FA.inpImport = `Read from the file: ${n} support(s), ${m} load(s), ${st}` + ((A.notes || []).length ? ". Not read: " + A.notes.join("; ") : "");
+  d.source.import_note = FA.inpImport;
+  status(FA.inpImport);
 }
 /** Import CalculiX .inp or Radioss .rad: a file dialog, then the file as the geometry source. */
 async function chooseInp() {
@@ -873,6 +916,10 @@ function targetPoint(tg) {
     return m && m[tg.end || "a"] && m[tg.end || "a"].xyz;
   }
   if (tg.comp !== undefined) { const r = faceRef(tg); return r && r.c; }
+  if (tg.nset !== undefined) {           // a node set of a mesh file: the centre of its nodes (server: inpsteps)
+    const ns = (FA.doc.nsets || []).find(x => x.id === tg.nset), C = ((FA.inp || {}).analysis || {}).nset_centre || {};
+    return ns && ns.kind === "inp" ? C[ns.set] || null : null;
+  }
   return null;
 }
 
@@ -1459,11 +1506,19 @@ function nonlinearHtml(d) {
     `<div class="grid2"><label title="Smallest increment before the solve stops">Min increment<input type="text" class="numf" data-nl="incmin" value="${v("incmin")}" placeholder="1e-5"></label>` +
     `<label title="Largest number of increments of the step">Max increments<input type="text" class="numf" data-nl="maxinc" value="${v("maxinc")}" placeholder="100"></label></div>` +
     `<label title="Results written every n increments (each written increment is a result state)">Output every n increments<input type="text" class="numf" data-nl="every" value="${v("every")}" placeholder="1"></label>` +
+    `<label title="*CONTROLS cards written in each nonlinear step after *STATIC or *DYNAMIC (for example PARAMETERS=TIME INCREMENTATION: more iterations before a cutback); keyword lines *CONTROLS only, data lines numbers and commas">Solver controls (*CONTROLS)<textarea id="fs-controls" rows="${Math.min(6, Math.max(2, String(nl.controls || "").split("\n").length + 1))}" placeholder="*CONTROLS, PARAMETERS=TIME INCREMENTATION&#10;, 12, 12, 30, 15, 4, , 5">${fesc(nl.controls || "")}</textarea></label>` +
     `<p class="hint">Loads and prescribed displacements are ramped linearly over the step. Beams and fasteners (U1 elements) are linear only.</p>`;
 }
 function bindNonlinear(d) {
   const nl = () => (d.nonlinear = d.nonlinear || {});
   $("#fs-nlgeom").onchange = () => { nl().nlgeom = $("#fs-nlgeom").checked; changed(); renderSettings(); };
+  $("#fs-controls").onchange = () => {
+    const t = $("#fs-controls").value.trim();
+    const bad = t.split(/\n/).map(x => x.trim()).filter(x => x && !x.startsWith("**")).find(x => x.startsWith("*") ? !/^\*\s*controls/i.test(x) : !/^[0-9eE+\-., \t]*$/.test(x));
+    if (bad) { status("Solver controls: *CONTROLS cards only (" + bad.slice(0, 30) + ")", true); return; }
+    if (t) nl().controls = t; else delete nl().controls;
+    changed();
+  };
   document.querySelectorAll("#fa-settings [data-nl]").forEach(el => el.onchange = () => {
     const k = el.dataset.nl, raw = el.value.trim(), v = fnum(raw);
     if (raw === "") delete nl()[k]; else if (v > 0) nl()[k] = (k === "maxinc" || k === "every") ? Math.round(v) : v; else { status("A positive number", true); el.value = nl()[k] ?? ""; return; }
@@ -2952,6 +3007,8 @@ function renderInpFile() {
   if (!card) return;
   const path = s.type === "inp" ? s.path || "" : "";
   card.hidden = !path;
+  const imp = $("#fa-inpimport");
+  if (imp) { imp.textContent = s.import_note || ""; imp.hidden = !s.import_note; }
   if (!path) { FA.inpFileShown = null; return; }
   if (FA.inpFileShown === path && box.innerHTML) return;
   FA.inpFileShown = path;

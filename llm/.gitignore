@@ -1,0 +1,4 @@
+refdocs/*
+refdocs.db
+!refdocs/README.txt
+settings.json

@@ -51,6 +51,11 @@ FEA_DIR = _Dir("analysis")
 
 app = Flask(__name__, static_folder=None)
 app.json.sort_keys = False
+try:                                    # Chat card of the Analysis tab (llm/README.md); not present without the llm folder
+    from llm.web import bp as _llm_bp
+    app.register_blueprint(_llm_bp)
+except ImportError:
+    pass
 FILES = {}          # file id -> {"name", "path", "source", "parts": [Part]}
 CACHE = {}          # projection cache
 LOCK = threading.Lock()
@@ -2276,6 +2281,90 @@ def cleanup():
         pass
 
 
+# --------------------------------------------------------------------------- the program: info, quit, restart
+
+APP_STARTED = time.time()
+
+
+def _running_jobs():
+    """Number of running CalculiX solves and busy OpenCourant environments (local, remote)."""
+    n = sum(1 for j in list(ANALYSIS_JOBS.values()) if j.get("state") == "running")
+    try:
+        n += len(EXPLICIT._busy_envs)
+    except Exception:
+        pass
+    return n
+
+
+def _local_request():
+    return request.remote_addr in ("127.0.0.1", "::1", "localhost")
+
+
+@app.route("/api/app/info", methods=["GET"])
+def app_info():
+    """{"app": "SHINYCAD", "started" (s since the epoch), "pid", "root" (program folder), "jobs" (running)}: read by
+    run.py when the port is in use."""
+    return jsonify({"app": "SHINYCAD", "started": APP_STARTED, "pid": os.getpid(), "root": APP_DIR, "jobs": _running_jobs()})
+
+
+def _quit_soon():
+    time.sleep(0.4)
+    try:
+        cleanup()
+        from . import pool
+        p = pool._POOL
+        pool.shutdown()
+        for proc in list(getattr(p, "_processes", {}).values() if p else []):
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+    finally:
+        os._exit(0)
+
+
+@app.route("/api/app/quit", methods=["POST"])
+def app_quit():
+    """Stops the server (requests from this PC only)."""
+    if not _local_request():
+        return error("quit: requests from this PC only", 403)
+    threading.Thread(target=_quit_soon, daemon=True).start()
+    return jsonify({"ok": True, "jobs": _running_jobs()})
+
+
+@app.route("/api/app/restart", methods=["POST"])
+def app_restart():
+    """Starts run.py --restart --no-browser with pythonw.exe of the running Python (Windows; elsewhere the running Python):
+    the new server stops this one and starts in its
+    place (the browser tab reloads when /api/app/info gives a new start time)."""
+    if not _local_request():
+        return error("restart: requests from this PC only", 403)
+    kw = {"cwd": APP_DIR, "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if sys.platform.startswith("win"):
+        kw["creationflags"] = 0x00000008 | 0x00000200          # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    else:
+        kw["start_new_session"] = True
+    from . import winapp
+    try:
+        port = str(request.environ.get("SERVER_PORT") or load_config().get("port") or 8765)
+        subprocess.Popen([winapp.pythonw(), os.path.join(APP_DIR, "run.py"), "--restart", "--no-browser", "--port", port], **kw)
+    except OSError as e:
+        return error("restart failed: %s" % e)
+    return jsonify({"ok": True, "started": APP_STARTED})
+
+
+@app.route("/api/app/shortcuts", methods=["POST"])
+def app_shortcuts():
+    """Creates the SHINYCAD shortcuts on the Desktop and in the Start menu (Windows) again."""
+    from . import winapp
+    if not sys.platform.startswith("win"):
+        return error("shortcuts: Windows only")
+    try:
+        return jsonify({"paths": winapp.ensure_shortcuts(APP_DIR, force=True)})
+    except Exception as e:  # noqa: BLE001
+        return error("shortcuts: %s" % e)
+
+
 # --------------------------------------------------------------------------- analysis (CalculiX)
 
 ANALYSIS_JOBS = {}      # job id -> {"state", "stage", "message", "error", "result", "name", "proc"}
@@ -2353,11 +2442,18 @@ def fea_plates():
 @app.route("/api/analysis/inp_geometry", methods=["POST"])
 def fea_inp_geometry():
     """{"path"} -> view data of a CalculiX .inp (inpmodel.view): {"components", "materials", "bodies", "shells",
-    "nsets", "warnings", "nodes", "elements"}."""
-    from . import inpmodel
+    "nsets", "warnings", "nodes", "elements"}, with "analysis": the supports, loads, amplitudes and steps of an .inp
+    (inpsteps.items) for the import into the document."""
+    from . import inpmodel, inpsteps
     path = ((request.get_json(force=True) or {}).get("path") or "").strip().strip('"')
     try:
-        return jsonify(inpmodel.view(path))
+        out = inpmodel.view(path)
+        if not path.lower().endswith(".rad"):
+            try:
+                out["analysis"] = inpsteps.items(path)
+            except Exception as e:  # noqa: BLE001
+                out["analysis"] = {"supports": [], "loads": [], "amplitudes": [], "steps": [], "notes": ["steps not read: %s" % e]}
+        return jsonify(out)
     except (inpmodel.InpError, OSError, ValueError, KeyError, IndexError) as e:
         return error("inp: %s" % e)
 

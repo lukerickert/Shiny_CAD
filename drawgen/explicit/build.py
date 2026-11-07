@@ -814,7 +814,13 @@ class BuildMixin:
         
         bcs = []
         try:
-            with open(inp_file, 'r') as f: lines = f.readlines()
+            # the *INCLUDE files in place: the safe .inp in the build folder is complete (relative include paths
+            # would not resolve there)
+            from ..inpmodel import expand_lines
+            incs = []
+            lines = [ln + "\n" for ln in expand_lines(inp_file, incs)]
+            for inc in incs:
+                self.log_msg(("  *INCLUDE %s: read" if inc["found"] else "WARNING: *INCLUDE file not found: %s") % inc["path"])
             lines = self._maybe_downgrade_quadratic(lines)
             in_vel = False
             for line in lines:

@@ -709,6 +709,43 @@ function bind() {
   $("#logo-clear").onclick = () => { state.cfg.title_block.logo_file = ""; $("#logo-name").textContent = "No logo (save the title block to keep it)"; tbPreview(); };
 }
 
+// ------------------------------------------------------------------ the program: restart, quit, shortcuts
+async function appInfo() { try { return await (await fetch("/api/app/info", { cache: "no-store" })).json(); } catch (e) { return null; } }
+function bindApp() {
+  const info = $("#opt-appinfo");
+  const jobsOk = async what => {
+    const i = await appInfo();
+    return !(i && i.jobs) || confirm(`${i.jobs} job(s) are running. ${what} anyway? (a CalculiX or OpenCourant run started by this server goes on, but the server no longer follows it)`);
+  };
+  $("#opt-restart").onclick = async () => {
+    if (!(await jobsOk("Restart"))) return;
+    const i0 = await appInfo();
+    try { await postJSON("/api/app/restart", {}); } catch (e) { showErr(e); return; }
+    status("Restarting SHINYCAD...");
+    if (info) info.textContent = "Restarting: the page reloads when the new server runs.";
+    const t0 = Date.now();
+    const poll = async () => {
+      const i = await appInfo();
+      if (i && i0 && i.started !== i0.started) { location.reload(); return; }
+      if (Date.now() - t0 > 180000) { status("Restart: the new server did not answer within 3 min (see %LOCALAPPDATA%\\drawgen\\shinycad.log)", true); return; }
+      setTimeout(poll, 1000);
+    };
+    setTimeout(poll, 1500);
+  };
+  $("#opt-quit").onclick = async () => {
+    if (!(await jobsOk("Quit"))) return;
+    try { await postJSON("/api/app/quit", {}); } catch (e) { showErr(e); return; }
+    document.body.innerHTML = `<div style="padding:40px;font:16px sans-serif">SHINYCAD has stopped. Close this tab; the SHINYCAD shortcut starts it again.</div>`;
+  };
+  $("#opt-shortcuts").onclick = async () => {
+    try {
+      const j = await (await postJSON("/api/app/shortcuts", {})).json();
+      if (info) info.textContent = "Shortcuts: " + (j.paths || []).join("; ");
+      status("Shortcuts created");
+    } catch (e) { showErr(e); }
+  };
+}
+
 (async function init() {
   bind();
   showTab("project");
@@ -720,6 +757,7 @@ function bind() {
   $("#opt-tolunit").onchange = e => setOption("tol_unit", e.target.value);
   $("#opt-browser").onchange = e => setOption("browser", e.target.value.trim());
   document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("#opt-dialog").hidden) $("#opt-dialog").hidden = true; });
+  bindApp();
   loadOptions();
   try {
     const r = await api("/api/config");

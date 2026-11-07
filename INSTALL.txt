@@ -36,15 +36,25 @@ Installation
 2. Double-click start.bat.
    The first start creates the Python environment in %LOCALAPPDATA%\drawgen\venv
    and installs build123d, flask, ezdxf, reportlab, gmsh, shapely and fonttools from requirements.txt.
-3. The browser opens http://localhost:8765.
-   Close the command window to stop the server.
+3. The browser opens http://localhost:8765. The command window closes; the program runs without one.
+   The start also creates the shortcut SHINYCAD (SHINYCAD icon) on the Desktop and in the Start menu.
+
+Later starts: the SHINYCAD shortcut (or start.bat).
+- SHINYCAD running and its program files unchanged: a new browser tab of it.
+- Program files changed since it started (an update): the running SHINYCAD is stopped and the new
+  version starts. With CalculiX or OpenCourant jobs running it is kept (message); Options > Restart
+  SHINYCAD loads the new version later.
+Options (top right) > Restart SHINYCAD, Quit SHINYCAD, Create shortcuts.
+Output of the program: %LOCALAPPDATA%\drawgen\shinycad.log (the run before: shinycad.log.1).
+start.bat --console runs the program in the command window (Ctrl+C or closing the window stops it).
 
 Later starts use the existing environment.
 When requirements.txt changes, start.bat installs the packages again.
 
 Troubleshooting
 ---------------
-start.bat keeps its window open with a message when it stops.
+start.bat keeps its window open with a message when the installation stops.
+Errors at the start of the program are shown in a message box with the path of shinycad.log.
 - "Windows protected your PC": the zip came from the internet. Click More info > Run anyway,
   or before extracting: right-click the zip > Properties > Unblock.
 - "run.py, requirements.txt or drawgen\web.py is missing": start.bat was started from inside
@@ -52,7 +62,8 @@ start.bat keeps its window open with a message when it stops.
 - "Python 3.10 to 3.14 was not found": install Python 3.14 (64-bit) from python.org with the
   options "py launcher" and "Add python.exe to PATH".
 - "Package installation failed": no connection to pypi.org (internet, proxy, firewall).
-- "SHINYCAD stopped with an error": the lines above the message give the cause.
+- "SHINYCAD stopped with an error": the message and shinycad.log give the cause.
+- "Port 8765 is in use by another program": set another "port" in config.json, or end that program.
 
 First use
 ---------
@@ -67,6 +78,8 @@ Command line options (run.py, through the environment):
   run.py --port 9000        other port
   run.py --no-browser       no browser at the start
   run.py --browser "<cmd>"  browser command for this start
+  run.py --restart          stop the running SHINYCAD and start again
+  run.py --shortcuts        create the SHINYCAD shortcuts again
 
 Tests
 -----

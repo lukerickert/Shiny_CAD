@@ -27,7 +27,11 @@ def _icon(app_dir):
 
 
 def command(app_dir, python=None):
+    """Open command of the file types: run.py --open with pythonw.exe (no console window) when there is one."""
     py = python or sys.executable
+    w = os.path.join(os.path.dirname(py), "pythonw.exe")
+    if os.path.isfile(w):
+        py = w
     return '"%s" "%s" --open "%%1"' % (py, os.path.join(app_dir, "run.py"))
 
 

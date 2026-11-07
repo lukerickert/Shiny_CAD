@@ -130,12 +130,28 @@ A plate body must be a prism of its largest planar face (the opposite face has t
 | **Initial increment**, **Max increment**, **Min increment** | Increment sizes as fractions of the step (step time 1); defaults 0.1, 0.25, 1e-5 |
 | **Max increments** | Largest number of increments of a step (default 100) |
 | **Output every n increments** | Results (`*NODE FILE`, `*EL FILE`, `*NODE PRINT`, `*EL PRINT`) every n increments (default 1) |
+| **Solver controls (*CONTROLS)** | `*CONTROLS` cards written in each nonlinear step after `*STATIC` or `*DYNAMIC`, for example `*CONTROLS, PARAMETERS=TIME INCREMENTATION` with its data lines (more iterations before a cutback). Keyword lines must be `*CONTROLS`, data lines numbers and commas; other text is refused. Empty: none |
 
 A nonlinear static step (`*STEP, INC=n` with `*STATIC` increments) is used with a contact pair other than tied, a plastic or hyperelastic material, or **Large deformation**; the heading of **Nonlinear step** states whether it is used. Loads and prescribed displacements are ramped linearly over the step. In a nonlinear or dynamic step, beams are written as B31 elements (`*BEAM SECTION` RECT, CIRC for ROUND, PIPE or BOX; CalculiX expands them to 3D elements), so large deformation and the material law apply to them; I and GENERAL sections are refused there. B31 beams give displacements and the reactions of their supports (forces), not section forces (the member table shows zeros). Fasteners (U1 elements with preload) are linear only: a nonlinear or dynamic solve with fasteners is refused (**Mesh**: a warning). Rods (T3D2) take any law. The report lists the law of each material, the hardening tables, the hyperelastic constants and the increment settings.
 
 ### 12.3.3 Mesh file as geometry
 
 **Geometry** **Import CalculiX .inp or Radioss .rad…** opens a file dialog; the file becomes the geometry (`source` `{"type": "inp", "path", "name"}`). The nodes and elements of the file are the mesh: **Mesh** and **Solve** do not mesh, and the mesh settings, refinement regions and plates do not apply. The solve writes a new `job.inp` with the supports, loads, contact pairs and other items of the tab.
+`*INCLUDE, INPUT=<file>` lines are read in place (nested; a relative path from the folder of the file that includes it; an absolute path; quotes allowed). An include file that is not found is a warning of the import; a change of an include file is read at the next view. The Explicit build writes the included lines into its `.inp` for inp2rad. **File text** of the **Input file** page shows the lines of the main file only.
+
+The import also reads the step data of an .inp (not of a .rad) into the tab (`drawgen/inpsteps.py`), so the model is ready to solve:
+
+| In the file | In the tab |
+|---|---|
+| `*BOUNDARY` (degrees of freedom 1 to 6, a value; `ENCASTRE`, `PINNED`, `XSYMM`, `YSYMM`, `ZSYMM`, `XASYMM`, `YASYMM`, `ZASYMM`) | A support per node set of the file (target the node set) or per group of node numbers with the same degrees of freedom (target the mesh nodes): **dofs** with the held components, **displacement** with the values when a value is not 0. Named by the `** Name:` comment above the keyword (PrePoMax), else `BC <set>` |
+| `*CLOAD` (degrees of freedom 1 to 3) | A force on the node set (or the nodes): the value x the number of nodes, shared equally by the nodes (the same nodal forces as the file). `AMPLITUDE=`: the amplitude of the file in **Amplitudes** |
+| `*DLOAD` `GRAV` | A gravity load (g x direction, mm/s^2) |
+| `*STEP` `NLGEOM`, `INC` | **Large deformation (NLGEOM)**, **Max increments** |
+| `*STATIC` / `*DYNAMIC` data line (first increment, step time, minimum, maximum increment) | One step: **Initial increment**, **Min increment**, **Max increment** (fractions of the step time, at most 1). Several steps: the **Steps** with kind and time, the supports and loads with a factor per step (a load whose direction is the same in every step: one load with the factors, else one per step) |
+| `*CONTROLS` | **Solver controls (*CONTROLS)** (several steps with different controls: the controls of each step) |
+| `*FREQUENCY`, `*BUCKLE` | **Analysis type** modal or buckling with **Number of modes** (the other steps not read) |
+
+Model data before the first step act in every step; `OP=NEW` removes the boundary conditions or loads of the steps before; boundary conditions and loads carry over to the next step otherwise. Not read (listed in the note): `*DLOAD` pressures, `*DSLOAD`, moments of `*CLOAD` (degrees of freedom 4 to 6), `*BOUNDARY, TYPE=VELOCITY`, the amplitude of a `*BOUNDARY`, `*NODE PRINT`, `*EL PRINT` (set them in **History output**) and the output requests (the tab writes its own). The **Input file** page gives the note: "Read from the file: n support(s), m load(s), ..." with what was not read. The import is made once per file; items added to the document before stay.
 
 | Item of the file | In the tab |
 |---|---|

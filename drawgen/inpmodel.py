@@ -2,9 +2,9 @@
 """CalculiX / Abaqus .inp files (and Radioss starter decks, radmodel.py) as the geometry of the Analysis and Explicit
 tabs (source {"type": "inp", "path"}).
 
-read(path) parses *NODE, *ELEMENT (TYPE, ELSET), *ELSET and *NSET (GENERATE), *MATERIAL with *ELASTIC, *DENSITY and
-*PLASTIC, *SOLID SECTION and *SHELL SECTION (ELSET, MATERIAL, OFFSET, thickness). Steps, boundary conditions and
-loads of the file are not read (supports and loads are set in the tab).
+read(path) parses (with the *INCLUDE files in place) *NODE, *ELEMENT (TYPE, ELSET), *ELSET and *NSET (GENERATE), *MATERIAL with *ELASTIC, *DENSITY and
+*PLASTIC, *SOLID SECTION and *SHELL SECTION (ELSET, MATERIAL, OFFSET, thickness). The steps, boundary conditions and
+loads of the file are read by inpsteps.py (the import of the tab).
 
 Bodies: one per element set with a section (elements in no section: one body per element type, "<TYPE>_ELEMENTS").
 The exterior element faces of a body are grouped into faces (connected, normals within FEATURE_ANGLE); the face
@@ -72,6 +72,46 @@ def _nums(s):
     return out
 
 
+def expand_lines(path, includes=None, _seen=None):
+    """Lines of an .inp with the *INCLUDE, INPUT=<file> files in place (nested; a relative path from the folder of the
+    file that includes it; quotes removed; a file included twice is read once). includes: a list that gets
+    {"file", "path", "found"} per *INCLUDE."""
+    seen = _seen if _seen is not None else set()
+    ap = os.path.normcase(os.path.abspath(path))
+    if ap in seen:
+        return []
+    seen.add(ap)
+    with open(path, "r", errors="replace") as f:
+        raw = f.read().splitlines()
+    out = []
+    for ln in raw:
+        s = ln.strip()
+        if s[:8].upper() == "*INCLUDE":
+            inc = _params(s).get("INPUT", "")
+            inc = inc.strip().strip('"').strip("'") if isinstance(inc, str) else ""
+            p = inc if os.path.isabs(inc) else os.path.join(os.path.dirname(os.path.abspath(path)), inc)
+            ok = bool(inc) and os.path.isfile(p)
+            if includes is not None:
+                includes.append({"file": inc, "path": p, "found": ok})
+            if ok:
+                out += expand_lines(p, includes, seen)
+            continue
+        out.append(ln)
+    return out
+
+
+def file_key(path, includes=()):
+    """Key of a file and its include files for caches: (path, mtime, size) of each."""
+    out = []
+    for p in [path] + [i["path"] for i in includes if i.get("found")]:
+        try:
+            st = os.stat(p)
+            out.append((os.path.abspath(p), st.st_mtime, st.st_size))
+        except OSError:
+            out.append((os.path.abspath(p), None, None))
+    return tuple(out)
+
+
 def read(path):
     """{"nodes": {id: (x, y, z)}, "elements": {id: (type, [nodes])}, "elsets": {name: [ids]}, "nsets": {name: [ids]},
     "materials": {name: {"E", "nu", "rho" (kg/m^3), "plastic"}}, "sections": [{"elset", "kind", "material", "t",
@@ -94,8 +134,11 @@ def read(path):
         es = prm.get("ELSET")
         if es:
             elsets.setdefault(es.upper(), []).append(eid)
-    with open(path, "r", errors="replace") as f:
-        lines = f.read().splitlines()
+    includes = []
+    lines = expand_lines(path, includes)
+    for i in includes:
+        if not i["found"]:
+            warnings.append("*INCLUDE file not found: %s" % i["path"])
     for raw in lines:
         line = raw.strip()
         if not line or line.startswith("**"):
@@ -174,9 +217,10 @@ def read(path):
     for et, n in skipped.items():
         warnings.append("%s elements left out (%d): only solid and shell elements are read" % (et, n))
     if not nodes or not elements:
-        raise InpError("%s: no nodes or no solid and shell elements" % os.path.basename(path))
+        miss = [i["path"] for i in includes if not i["found"]]
+        raise InpError("%s: no nodes or no solid and shell elements%s" % (os.path.basename(path), "; *INCLUDE file(s) not found: " + ", ".join(miss) if miss else ""))
     return {"nodes": nodes, "elements": elements, "elsets": elsets, "nsets": nsets, "materials": materials,
-            "sections": sections, "warnings": warnings}
+            "sections": sections, "warnings": warnings, "includes": includes}
 
 
 # --------------------------------------------------------------------------- bodies and faces
@@ -353,8 +397,9 @@ def model(path):
     st = os.stat(path)
     key = (os.path.abspath(path), st.st_mtime, st.st_size)
     with _LOCK:
-        if key in _CACHE:
-            return _CACHE[key]
+        hit = _CACHE.get(key)
+    if hit is not None and file_key(path, hit["m"].get("includes") or []) == hit["fkey"]:
+        return hit
     m = read(path)
     X = m["nodes"]
     bodies = []
@@ -363,7 +408,7 @@ def model(path):
         grp, edge_of = _group(X, fac, kind == "shell")
         bodies.append({"id": name, "kind": kind, "section": sec, "elements": ids, "facets": fac, "group": grp,
                        "nfaces": (max(grp) + 1) if grp else 0, "edges": _split_corners(X, _edges(fac, grp, edge_of))})
-    out = {"m": m, "bodies": bodies}
+    out = {"m": m, "bodies": bodies, "fkey": file_key(path, m.get("includes") or [])}
     with _LOCK:
         _CACHE.clear()
         _CACHE[key] = out
@@ -415,7 +460,7 @@ def view(path):
             erefs.append({"kind": "line" if straight else "other", "c": np.mean(P, axis=0).tolist(), "n": (d / L).tolist() if L > 0 else None})
         shell = b["kind"] == "shell"
         lo, hi = np.min(V, axis=0).tolist(), np.max(V, axis=0).tolist()
-        comps.append({"id": b["id"], "name": b["id"], "mkey": "inp_%s_%x" % (b["id"], abs(hash((path, os.path.getmtime(path)))) & 0xffffff),
+        comps.append({"id": b["id"], "name": b["id"], "mkey": "inp_%s_%x" % (b["id"], abs(hash(M["fkey"])) & 0xffffff),
                       "mesh": {"vertices": V, "triangles": T, "face_of_tri": fot, "face_body": [0 if shell else None] * b["nfaces"],
                                "edges": edges, "bbox": lo + hi, "wire": [i for w in sorted(wire) for i in w]},
                       "refs": refs, "erefs": erefs, "surfaces": [{"id": SHELL_ID, "name": b["id"], "color": "#5b7fb5"}] if shell else [],

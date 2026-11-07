@@ -3,6 +3,8 @@ rem SHINYCAD: creates the Python environment on first start, then starts the ser
 rem The environment is placed in %LOCALAPPDATA%\drawgen\venv to keep file paths below the
 rem Windows 260 character limit. When requirements.txt changes, the packages are installed again.
 rem Python: the py launcher (newest of 3.14 to 3.10), else python.exe on PATH.
+rem The program runs with pythonw.exe (no console window; output in %LOCALAPPDATA%\drawgen\shinycad.log);
+rem start.bat --console runs it in this window instead.
 cd /d "%~dp0"
 if not exist "%~dp0run.py" goto notextracted
 if not exist "%~dp0requirements.txt" goto notextracted
@@ -53,7 +55,13 @@ if errorlevel 1 goto pipfail
 copy /y requirements.txt "%VENV%\installed.txt" >nul
 
 :run
-"%VENV%\Scripts\python.exe" run.py %*
+if /i "%~1"=="--console" goto runconsole
+if not exist "%VENV%\Scripts\pythonw.exe" goto runconsole
+start "" "%VENV%\Scripts\pythonw.exe" run.py %*
+exit /b 0
+
+:runconsole
+"%VENV%\Scripts\python.exe" run.py
 if errorlevel 1 goto runfail
 exit /b 0
 

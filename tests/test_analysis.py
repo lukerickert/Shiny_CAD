@@ -2013,3 +2013,107 @@ def test_run_monitor_readers(tmp_path):
     snap = mon.snapshot()
     assert snap["cvg"]["incs"] == q["incs"] and snap["stage"] == "Reading the input file" and snap["increment"] == "step 1, increment 2, attempt 2, iteration 2"
     assert snap["stages"] == [{"name": "Increments", "t0": snap["elapsed"]}] and snap["estimate"] is None and snap["sta"] is None
+
+
+def test_inp_include_files(tmp_path):
+    """*INCLUDE, INPUT=<file> in an .inp used as geometry: the nodes, elements, sets and sections of the include file
+    (relative to the including file, and an absolute path in quotes) are read in place, in the view and in the mesh of
+    the explicit tab; a change of the include file is read again; an include file not found is a warning (and named
+    in the error when the file has no elements)."""
+    import time as _t
+    from drawgen import inpmodel
+    from drawgen.explicit import meshview
+    full = open(write_test_inp(str(tmp_path / "full.inp"))).read()
+    mesh, rest = full.split("*NSET, NSET=FIX")
+    (tmp_path / "mesh").mkdir()
+    inc = tmp_path / "mesh" / "mesh.inp"
+    inc.write_text(mesh.replace("*HEADING\ntest\n", ""))
+    main = tmp_path / "main.inp"
+    main.write_text("*HEADING\nwith include\n*INCLUDE, INPUT=mesh/mesh.inp\n*NSET, NSET=FIX" + rest)
+    m = inpmodel.read(str(main))
+    assert len(m["nodes"]) == 132 and len(m["elements"]) == 60 and m["includes"][0]["found"] and not m["warnings"]
+    assert sorted(m["nsets"]) == ["FIX", "PFIX"] and {s["elset"] for s in m["sections"]} == {"BEAM", "PLATE"}
+    assert [c["id"] for c in inpmodel.view(str(main))["components"]] == ["BEAM", "PLATE"]
+    assert len(meshview.read_inp(str(main))["node_ids"]) == 132
+    main.write_text('*HEADING\n*INCLUDE, INPUT="%s"\n*NSET, NSET=FIX' % inc + rest)
+    assert len(inpmodel.model(str(main))["m"]["nodes"]) == 132
+    _t.sleep(0.05)
+    inc.write_text(inc.read_text().replace("*NODE\n", "*NODE\n9999, 500, 0, 0\n", 1))
+    os.utime(inc, (_t.time() + 5, _t.time() + 5))
+    assert 9999 in inpmodel.model(str(main))["m"]["nodes"]
+    main.write_text("*INCLUDE, INPUT=nope.inp\n" + full)
+    assert inpmodel.read(str(main))["warnings"] == ["*INCLUDE file not found: %s" % os.path.join(str(tmp_path), "nope.inp")]
+    main.write_text("*INCLUDE, INPUT=nope.inp\n")
+    with pytest.raises(inpmodel.InpError, match="not found: .*nope.inp"):
+        inpmodel.read(str(main))
+
+
+def _steps_inp(tmp_path, body):
+    p = write_test_inp(str(tmp_path / "st.inp"))
+    text = open(p).read().replace("*STEP\n*STATIC\n*BOUNDARY\nFIX, 1, 3\n*END STEP\n", body)
+    open(p, "w").write(text)
+    return p
+
+
+def test_inp_steps_items(tmp_path):
+    """Supports, loads, amplitudes and steps of an .inp (inpsteps.items): a model-data boundary condition in every
+    step, ENCASTRE and a degree of freedom range with a value, *CLOAD on a node set (the total of its nodes) and on
+    two nodes (one load), OP=NEW, a load scaled in the second step (one load with factors), *DLOAD GRAV (kept in the
+    second step), an
+    amplitude, *CONTROLS of a step, the step settings (fractions of the step time), the names of PrePoMax comments;
+    *FREQUENCY; the keywords not read in the notes."""
+    from drawgen import inpsteps
+    p = _steps_inp(tmp_path, "*BOUNDARY\n1, 1, 3\n*AMPLITUDE, NAME=RAMP\n0, 0, 2, 1\n"
+                   "*STEP, NLGEOM, INC=50\n*STATIC\n0.2, 2, 1e-6, 0.5\n*CONTROLS, PARAMETERS=TIME INCREMENTATION\n, , , 30\n"
+                   "** Name: Clamp\n*BOUNDARY\nFIX, ENCASTRE\n*BOUNDARY\nPFIX, 1, 2, 0.5\n"
+                   "** Name: Tip\n*CLOAD, AMPLITUDE=RAMP\nPFIX, 3, -1\n*CLOAD\n1011, 1, 2\n1022, 1, 2\n*DLOAD\nBEAM, GRAV, 9810, 0, 0, -1\n"
+                   "*NODE PRINT, NSET=FIX\nRF\n*END STEP\n"
+                   "*STEP\n*STATIC\n0.1, 1\n*BOUNDARY, OP=NEW\nFIX, ENCASTRE\n*CLOAD, OP=NEW\n** Name: Tip\n*CLOAD, AMPLITUDE=RAMP\nPFIX, 3, -2\n*END STEP\n")
+    r = inpsteps.items(p)
+    S = {(tuple(sorted(s["target"].items())) if "set" in s["target"] else ("nodes", tuple(s["target"]["nodes"]))): s for s in r["supports"]}
+    clamp = S[(("set", "FIX"),)]
+    assert clamp["name"] == "Clamp" and clamp["dofs"] == [1] * 6 and clamp["value"] is None and clamp["steps"] == [0, 1]
+    assert S[(("set", "PFIX"),)]["dofs"] == [1, 1, 0, 0, 0, 0] and S[(("set", "PFIX"),)]["value"][:2] == [0.5, 0.5] and S[(("set", "PFIX"),)]["steps"] == [0]
+    assert S[("nodes", (1,))]["dofs"][:3] == [1, 1, 1] and S[("nodes", (1,))]["steps"] == [0]
+    L = {l["name"]: l for l in r["loads"]}
+    assert L["Tip"]["target"] == {"set": "PFIX"} and L["Tip"]["value"] == [0, 0, -3] and L["Tip"]["factors"] == {0: 1.0, 1: 2.0} and L["Tip"]["amplitude"] == "RAMP"
+    two = next(l for l in r["loads"] if "nodes" in (l["target"] or {}))
+    assert two["target"] == {"nodes": [1011, 1022]} and two["value"] == [4, 0, 0] and two["factors"] == {0: 1.0}
+    assert L["Gravity"]["value"] == [0, 0, -9810] and L["Gravity"]["factors"] == {0: 1.0, 1: 1.0}
+    assert r["amplitudes"] == [{"name": "RAMP", "points": [[0, 0], [2, 1]]}]
+    s0, s1 = r["steps"]
+    assert s0["nlgeom"] and s0["maxinc"] == 50 and s0["time"] == 2 and s0["inc0"] == pytest.approx(0.1) and s0["incmax"] == pytest.approx(0.25)
+    assert s0["controls"] == "*CONTROLS, PARAMETERS=TIME INCREMENTATION\n, , , 30" and s1["controls"] == "" and r["nlgeom"]
+    assert any("*NODE PRINT" in n for n in r["notes"]) and r["nset_centre"]["PFIX"] == pytest.approx([0, 5, 20])
+    p = _steps_inp(tmp_path, "*STEP\n*FREQUENCY\n4\n*BOUNDARY\nFIX, 1, 6\n*END STEP\n")
+    r = inpsteps.items(p)
+    assert r["analysis_type"] == "modal" and r["modes"] == 4 and r["supports"][0]["dofs"] == [1] * 6
+
+
+@needs_ccx
+def test_inp_import_ready_to_solve(tmp_path):
+    """An .inp with its step read into the document as the import of the tab does (node sets, supports, loads,
+    nonlinear step with *CONTROLS): the solve gives the reaction of the *CLOAD (value x nodes of the set) and writes
+    the *CONTROLS cards; controls other than *CONTROLS refused."""
+    from drawgen import inpmodel, inpsteps
+    p = _steps_inp(tmp_path, "*STEP, NLGEOM, INC=40\n*STATIC\n0.25, 1, 1e-5, 1\n*CONTROLS, PARAMETERS=TIME INCREMENTATION\n, , , 30\n"
+                   "*BOUNDARY\nFIX, 1, 3\nPFIX, 1, 6\n*CLOAD\nPFIX, 3, -2\n*END STEP\n")
+    v, A = inpmodel.view(p), inpsteps.items(p)
+    nsets = [{"id": "n%d" % i, "name": n, "kind": "inp", "set": n} for i, n in enumerate(v["nsets"])]
+    nid = {n["set"]: n["id"] for n in nsets}
+    s = A["steps"][0]
+    doc = {"source": {"type": "inp", "path": p, "name": "st.inp"}, "materials": v["materials"], "default_material": "STEEL",
+           "bodies": v["bodies"], "shells": v["shells"], "nsets": nsets,
+           "sections": [{"id": "s1", "name": "PLATE", "faces": [{"comp": "PLATE", "face": 0}], "t": 2.0, "material": "STEEL"}],
+           "supports": [{"id": "s%d" % k, "name": x["name"], "target": {"nset": nid[x["target"]["set"]]}, "type": "dofs", "dofs": x["dofs"]} for k, x in enumerate(A["supports"])],
+           "loads": [{"id": "l0", "name": "tip", "type": "force", "target": {"nset": nid[A["loads"][0]["target"]["set"]]}, "value": A["loads"][0]["value"]}],
+           "nonlinear": {"nlgeom": True, "inc0": s["inc0"], "incmin": s["incmin"], "incmax": s["incmax"], "maxinc": s["maxinc"], "controls": s["controls"]},
+           "members": [], "fasteners": [], "contacts": []}
+    r = analysis.run(doc, {"components": []}, None, str(tmp_path / "wd"), CCX, meta={"name": "inp_steps"})
+    reac = {x["name"]: x["F"] for x in r["tables"]["total"]["reactions"]}
+    assert np.sum(list(reac.values()), axis=0)[2] == pytest.approx(6.0, abs=1e-3) and np.allclose(r["tables"]["total"]["applied"], [0, 0, -6], atol=1e-6)
+    job = open(str(tmp_path / "wd" / "job.inp")).read()
+    assert "*STATIC\n0.25, 1, 1e-05, 1\n*CONTROLS, PARAMETERS=TIME INCREMENTATION\n, , , 30\n" in job
+    doc["nonlinear"]["controls"] = "*BOUNDARY\n1, 1, 3"
+    with pytest.raises(analysis.AnalysisError, match="CONTROLS cards only"):
+        analysis.run(doc, {"components": []}, None, str(tmp_path / "wd2"), CCX, meta={"name": "inp_steps2"})

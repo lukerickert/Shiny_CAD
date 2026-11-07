@@ -13,7 +13,8 @@ Analysis record (JSON, <name>.fea.json):
                  "stiffness": N/mm^3 (penalty slope; empty: 10 x the largest E per mm), "adjust": mm (slave nodes
                  within this distance moved onto the master), "tol": mm (tied: position tolerance)}],
    "nonlinear": {"nlgeom": bool, "inc0": first increment (fraction of the step), "incmin", "incmax", "maxinc":
-                 number of increments, "every": output every n increments},
+                 number of increments, "every": output every n increments, "controls": text of *CONTROLS cards written
+                 in each nonlinear step (a step's own "controls" first)},
    "steps": [{"id", "name", "kind": "static" | "dynamic" (*DYNAMIC, implicit) | "explicit" (*DYNAMIC, EXPLICIT),
               "time": s (step time; static default 1), "inc0", "incmin", "incmax" (fractions of the step time),
               "maxinc", "every", "alpha" (dynamic: Hilber-Hughes-Taylor alpha, -1/3 .. 0, default -0.05)}]
@@ -92,7 +93,8 @@ support:  {"id", "name", "target": face reference | edge reference | {"member", 
           Prescribed displacements act in the load step (with a fastener preload step they are 0 in the preload step).
 load:     {"id", "name", "type": "force" | "moment" | "pressure" | "gravity" | "line",
            "target": face reference | {"member", "end"} | {"member"} | edge reference (line) | {"faces": [face refs]}
-           (force and moment over all faces by area, pressure on each) | {"edges": [edge refs]} (line), "value": [x, y, z] | p}
+           (force and moment over all faces by area, pressure on each) | {"edges": [edge refs]} (line) |
+           {"nset": node set id} | {"nodes": [mesh node ids]} (a force shared equally by the nodes), "value": [x, y, z] | p}
           force on a face: total force distributed by area; moment on a face: about the face centre, distributed
           by area (RBE3 distribution); pressure: MPa, positive into the face; line: N/mm on a member (global);
           gravity: acceleration vector (mm/s^2) on all bodies and members.
@@ -311,7 +313,28 @@ def resolve_steps(doc):
                     "time": num(st, "time", 1.0 if kind == "static" else 0.01),
                     "inc0": num(src, "inc0", 0.1 if kind == "static" else 0.01), "incmin": num(src, "incmin", 1e-5),
                     "incmax": num(src, "incmax", 0.25 if kind == "static" else 0.05), "maxinc": int(num(src, "maxinc", 100 if kind == "static" else 10000)),
-                    "every": int(num(src, "every", 1)), "alpha": max(-1.0 / 3, min(0.0, alpha))})
+                    "every": int(num(src, "every", 1)), "alpha": max(-1.0 / 3, min(0.0, alpha)),
+                    "controls": controls_lines(st.get("controls") or nl.get("controls") or "", st.get("name") or "Step %d" % (i + 1))})
+    return out
+
+
+_CTRL_DATA = re.compile(r"^[0-9eE+\-., \t]*$")
+
+
+def controls_lines(text, what):
+    """*CONTROLS cards of a step (doc["nonlinear"]["controls"], a step's "controls"): the lines of the text, comment
+    and empty lines left out; keyword lines must be *CONTROLS, data lines numbers and commas."""
+    out = []
+    for ln in str(text or "").splitlines():
+        s = ln.strip()
+        if not s or s.startswith("**"):
+            continue
+        if s.startswith("*"):
+            if not s.upper().replace(" ", "").startswith("*CONTROLS"):
+                raise AnalysisError("%s: solver controls take *CONTROLS cards only, not %s" % (what, s.split(",")[0]))
+        elif not out or not _CTRL_DATA.match(s):
+            raise AnalysisError("%s: solver controls: %r is not a data line of a *CONTROLS card (numbers and commas)" % (what, s))
+        out.append(s)
     return out
 
 
@@ -2193,6 +2216,23 @@ class Model(object):
             self.loads.append({"l": ld, "name": name, "type": typ})
             return
         tgt = single_target(tgt)
+        if "nset" in tgt:
+            # a node set: a force (N) shared equally by its nodes (an *CLOAD of an imported .inp: the value x the nodes)
+            ns = next((x for x in self.doc.get("nsets") or [] if str(x.get("id")) == str(tgt["nset"])), None)
+            if ns is None:
+                raise AnalysisError("load %s: node set not found" % name)
+            if typ != "force":
+                raise AnalysisError("load %s: a node set takes a force (N), shared equally by its nodes" % name)
+            ids = sorted(self.node_set(ns))
+            if not ids:
+                raise AnalysisError("load %s: node set %s has no nodes" % (name, ns.get("name")))
+            F = np.asarray(val, float)
+            for n in ids:
+                for d in range(3):
+                    if F[d]:
+                        self.cload(n, d + 1, F[d] / len(ids))
+            self.loads.append({"l": ld, "name": name, "type": typ, "total": F})
+            return
         if is_multi(tgt):
             fr, er, br, vr, nr, elr = (list(tgt.get(k) or []) for k in MULTI_KEYS)
             if vr or nr or elr:
@@ -3017,13 +3057,16 @@ class Model(object):
                 if incr:
                     L += ["*STEP%s, INC=%d" % (nlg, u["maxinc"]), "*STATIC",
                           "%.6g, %.6g, %.6g, %.6g" % (min(u["inc0"], 1.0) * T, T, u["incmin"] * T, min(u["incmax"], 1.0) * T)]
+                    L += u.get("controls") or []
                 else:
                     L += ["*STEP", "*STATIC"]
             elif u["kind"] == "dynamic":
                 L += ["*STEP%s, INC=%d" % (nlg, u["maxinc"]), "*DYNAMIC, ALPHA=%.6g" % u["alpha"],
                       "%.6g, %.6g, %.6g, %.6g" % (min(u["inc0"], 1.0) * T, T, u["incmin"] * T, min(u["incmax"], 1.0) * T)]
+                L += u.get("controls") or []
             else:
                 L += ["*STEP%s, INC=%d" % (nlg, u["maxinc"]), "*DYNAMIC, EXPLICIT", "%.6g, %.6g" % (min(u["inc0"], 1.0) * T, T)]
+                L += u.get("controls") or []
             # OP=NEW in the first step and where a support is released; else the boundary conditions are modified
             # (OP=NEW in a later step loses the rotation conditions of expanded shell nodes in CalculiX)
             active = set(i for i, sp in enumerate(self.supports) if st == 0 or step_factor(sp.get("s") or {}, u["id"]) != 0)

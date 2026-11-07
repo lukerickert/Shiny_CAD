@@ -12,7 +12,19 @@ An environment whose Python no longer starts (Python removed or reinstalled) is 
 The first start creates the environment in `%LOCALAPPDATA%\drawgen\venv` and installs `build123d`, `flask`, `ezdxf`, `reportlab`, `gmsh`, `shapely` and `fonttools` (approximately 500 MB, internet connection required).
 Later starts use the existing environment. When `requirements.txt` differs from the installed copy, the packages are installed again before the start.
 The server runs at `http://localhost:8765` and the browser opens automatically.
-Close the command window to stop the server.
+`start.bat` starts the program with `pythonw.exe` of the environment and its command window closes; `start.bat --console` runs it in the command window instead (Ctrl+C or closing the window stops it).
+The start creates the shortcut **SHINYCAD** (SHINYCAD icon, `shinycad.ico` made from `logo.png`) on the Desktop and in the Start menu (Programs): `pythonw.exe run.py` in the program folder, without a console window. The shortcuts are made once per program folder and Python environment (`%LOCALAPPDATA%\drawgen\shortcuts.json`); a deleted shortcut is not made again until **Create shortcuts** (Options) or `run.py --shortcuts`.
+
+| Start (shortcut, `start.bat`, a document file) | Behaviour |
+|---|---|
+| SHINYCAD not running | It starts and the browser opens |
+| SHINYCAD running, program files (`run.py`, `drawgen\*.py`) unchanged since its start | A new browser tab of the running program (a document file: opened in it) |
+| SHINYCAD running, program files changed since its start | The running program is stopped (`/api/app/quit`) and the new version starts; with CalculiX or OpenCourant jobs running it is kept and a message says so |
+| `run.py --restart` | The running program is stopped and started again |
+| The port in use by another program | Message: set another `port` in `config.json` or end that program |
+
+**Options** ([section 3.1](03-use.md#31-options)): **Restart SHINYCAD** (the server is stopped and started again; the browser tab reloads when the new server answers), **Quit SHINYCAD** (the server stops), **Create shortcuts**. With jobs running, both ask first; a solver run started by the server goes on, but the new server does not follow it.
+Without a console window, the output of the program is written to `%LOCALAPPDATA%\drawgen\shinycad.log` (the run before: `shinycad.log.1`), and an error at the start is shown in a message box. The console programs started by the server (CalculiX, OpenCourant, ssh) open no console window. The document file types open with `pythonw.exe` as well.
 
 | Message or behaviour of `start.bat` | Cause and action |
 |---|---|
@@ -20,7 +32,8 @@ Close the command window to stop the server.
 | run.py, requirements.txt or drawgen\web.py is missing | Started from inside the zip. Extract the zip (**Extract All...**) and start `start.bat` in the extracted folder |
 | Python 3.10 to 3.14 was not found | Install Python 3.14 (64-bit) from python.org with **py launcher** and **Add python.exe to PATH** |
 | Package installation failed | No connection to pypi.org (internet, proxy, firewall) on the first start |
-| SHINYCAD stopped with an error | The lines above the message give the cause, for example Port 8765 is already in use |
+| SHINYCAD stopped with an error | The message box and `shinycad.log` give the cause |
+| Port 8765 is in use by another program | Set another `port` in `config.json`, or end that program |
 
 Manual installation:
 
@@ -33,6 +46,7 @@ py -3.14 -m venv %LOCALAPPDATA%\drawgen\venv
 The **Analysis** tab needs the CalculiX solver `ccx` and the **Explicit** tab needs OpenCourant ([section 1.1](#11-solvers)). ParaView is used for the strain extraction and the renders of the Explicit tab ([section 13.1](13-explicit.md#131-executables-and-settings-of-this-pc)).
 
 `run.py --port 9000` sets a different port and `run.py --no-browser` does not open the browser.
+`run.py --restart` stops the running program and starts again; `run.py --shortcuts` creates the shortcuts again.
 `run.py --browser "<command>"` opens the program in that browser for this start ([section 3.1](03-use.md#31-options) **Browser**).
 The server listens on 127.0.0.1 only.
 

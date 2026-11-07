@@ -685,3 +685,26 @@ def test_part_worker_round_trip_and_cancel(client, monkeypatch):
         assert r.status_code == 200
     finally:
         w.shutdown()
+
+
+def test_app_info_quit_restart_routes(client):
+    """The program routes: /api/app/info (name, start time, process, program folder, running jobs); quit and restart
+    refused for a request from another computer; shortcuts Windows only. run.py: the newest time of the program files
+    (run.py, drawgen/*.py), a free port without a running SHINYCAD."""
+    import importlib.util
+    import sys
+    import time as _t
+    from drawgen import web, winapp
+    j = ok(client.get("/api/app/info"))
+    assert j["app"] == "SHINYCAD" and j["pid"] == os.getpid() and j["root"] == web.APP_DIR and j["jobs"] == 0 and j["started"] <= _t.time()
+    far = {"REMOTE_ADDR": "10.1.2.3"}
+    assert client.post("/api/app/quit", json={}, environ_base=far).status_code == 403
+    assert client.post("/api/app/restart", json={}, environ_base=far).status_code == 403
+    if not sys.platform.startswith("win"):
+        assert client.post("/api/app/shortcuts", json={}).status_code >= 400 and winapp.ensure_shortcuts(web.APP_DIR) == []
+    spec = importlib.util.spec_from_file_location("shinycad_run", os.path.join(web.APP_DIR, "run.py"))
+    run = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(run)
+    t = run.code_mtime(web.APP_DIR)
+    assert t >= os.path.getmtime(os.path.join(web.APP_DIR, "drawgen", "web.py")) and t >= os.path.getmtime(os.path.join(web.APP_DIR, "run.py"))
+    assert run.running_instance(1) is None
